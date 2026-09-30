@@ -13,6 +13,13 @@
 //! pre-loop `Backfilled ...` / `Found N source files` lines are emitted
 //! through plain `eprintln!` without colliding with an active bar.
 //!
+//! (v1.14.0+) Between `start_indexing` and the first per-document call,
+//! [`crate::indexer::progress::ProgressReporter::report_scanned`] is called once
+//! for every file the scan visits. A run stopped through a
+//! [`crate::indexer::progress::CancelToken`] ends with
+//! [`crate::indexer::progress::ProgressReporter::finish_cancelled`] instead of
+//! [`crate::indexer::progress::ProgressReporter::finish`].
+//!
 //! (v1.13.0+) One more destination, which `groove` itself never selects: a
 //! reporter built by
 //! [`crate::indexer::progress::ProgressReporter::with_callback`] hands every
@@ -29,7 +36,8 @@
 //! has to capture or redirect it.
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Caller-facing intent for progress output.
 #[derive(Debug, Clone, Copy)]
@@ -42,11 +50,85 @@ pub enum ProgressMode {
     Auto,
 }
 
+/// (v1.14.0+) A flag an application sets to stop an indexing run.
+///
+/// Hand a clone to [`ProgressReporter::with_cancel`] and keep one; calling
+/// [`CancelToken::cancel`] on either, from any thread, is seen by
+/// [`crate::indexer::rebuild_index`] the next time it looks. It looks after
+/// each scanned file, before it applies the renames it detected, before each
+/// document, and once after the last document, before the deletion sweep.
+/// When it sees the flag it stops there, a callback reporter receives
+/// [`ProgressEvent::Cancelled`] in place of [`ProgressEvent::Finished`], and
+/// the call returns `Ok` with [`crate::indexer::IndexResult::cancelled`] set.
+/// What the index looks like afterwards is described on that field.
+///
+/// Setting the flag does not stop the run at once:
+///
+/// - The longest stretch between two of those points is one document's
+///   embedding. With `provider = "openai-compatible"` that includes the
+///   retries of every batch. A rough bound for one batch is
+///   `(max_retries + 1) * timeout_seconds + max_retries * 75` seconds, taking
+///   every wait at its largest possible value. Adding up the bound of each
+///   retry's own wait instead (60 seconds while `Retry-After` can set it, 75
+///   seconds from the seventh retry on) gives 420 seconds with the defaults
+///   and `11 * timeout_seconds + 660` seconds at `max_retries = 10`. Both are
+///   estimates from the constants, per batch; multiply by the number of
+///   batches the document needs. FastEmbed has no retry loop.
+/// - A document whose move requires it to be parsed again (a rename across
+///   parsers, or any rename under the static context mode) is re-parsed
+///   before the run looks at the flag, so the moved document does not keep
+///   what its old path's parser wrote. Such documents are processed first,
+///   so the wait is at most that many documents.
+/// - Once the deletion sweep has begun the flag is too late: the run
+///   completes, reports [`ProgressEvent::Finished`], and returns with
+///   `cancelled == false`.
+///
+/// A set flag stays set; there is no `reset`. Resume by starting a new run
+/// with a new token: documents the stopped run committed are skipped by
+/// their hash.
+///
+/// The flag is stored and loaded with `Ordering::Relaxed`. It carries no data
+/// of its own -- the run reads nothing that the thread setting the flag wrote
+/// before setting it -- so all the run needs is to see the store eventually,
+/// which any ordering provides.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// A token that is not set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the flag. Calling it again, or from another thread, is harmless.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`CancelToken::cancel`] has been called on this token or on a
+    /// clone of it.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// One step of an indexing run, as a value.
 ///
 /// Handed to the closure a [`ProgressReporter::with_callback`] reporter was
 /// built with. The `&str` fields borrow from the caller's loop, so a consumer
 /// that keeps an event past the call has to copy them.
+///
+/// (v1.14.0+) One run delivers, in this order: [`ProgressEvent::Started`],
+/// one [`ProgressEvent::Scanning`] per scanned file, the
+/// [`ProgressEvent::Renamed`] events, one [`ProgressEvent::Indexed`] or
+/// [`ProgressEvent::Unchanged`] per document, the [`ProgressEvent::Deleted`]
+/// events, and at most one terminal event, [`ProgressEvent::Finished`] or
+/// [`ProgressEvent::Cancelled`]. A stopped run's sequence ends in the phase it
+/// stopped in, so [`ProgressEvent::Deleted`] never comes before
+/// [`ProgressEvent::Cancelled`]. A run that returns `Err` or panics delivers
+/// no terminal event (see [`ProgressEvent::Finished`]). Documents whose move
+/// forces a re-parse come first, then the rest, each group in the order the
+/// walk found them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressEvent<'a> {
     /// `total` source files were discovered. Emitted once, from
@@ -59,18 +141,35 @@ pub enum ProgressEvent<'a> {
     /// [`ProgressEvent::Started`], and the `total` every later event carries
     /// stays the one this event announced.
     Started { total: usize },
+    /// (v1.14.0+) The scan visited one more file. Emitted once per file by
+    /// [`ProgressReporter::report_scanned`], after [`ProgressEvent::Started`]
+    /// and before every other event, and never when `total` is 0. `total` is
+    /// the number [`ProgressEvent::Started`] carried.
+    ///
+    /// `done` counts every file the scan looked at, **including** the ones it
+    /// declined (over the size cap, not stat-able, unreadable, a hard link),
+    /// so it reaches `total` when the scan ends. That is where it differs from
+    /// the `done` of [`ProgressEvent::Indexed`] and
+    /// [`ProgressEvent::Unchanged`], which counts documents processed and so
+    /// never counts a declined file: the scan reports files seen, the loop
+    /// after it reports documents. The two counts are separate, and the
+    /// document count starts again from 1.
+    Scanning { done: usize, total: usize },
     /// A file was parsed and embedded. `done` counts the files reported so
     /// far, indexed and unchanged together, and `total` is the number
     /// [`ProgressEvent::Started`] carried.
     ///
     /// `done` can stop short of `total`: the scan declines a file that is over
     /// the size cap, cannot be stat'd, or is a hard link, and such a file
-    /// reaches no `report_*` call at all — neither
+    /// reaches neither document call -- neither
     /// [`ProgressReporter::report_indexed`] nor
     /// [`ProgressReporter::report_unchanged`], which are the two that advance
-    /// `done`. That is the same anchor the non-TTY `Progress: N/M` lines
-    /// already report, not something this path adds, so a consumer must not
-    /// read `done < total` at [`ProgressEvent::Finished`] as a failure.
+    /// `done`. (v1.14.0+) It does reach [`ProgressReporter::report_scanned`],
+    /// which counts it in [`ProgressEvent::Scanning`] instead. That is the
+    /// same anchor the non-TTY `Progress: N/M` lines already report, not
+    /// something this path adds, so a consumer must not read `done < total` at
+    /// [`ProgressEvent::Finished`] or [`ProgressEvent::Cancelled`] as a
+    /// failure.
     Indexed {
         rel: &'a str,
         chunks: u32,
@@ -104,6 +203,20 @@ pub enum ProgressEvent<'a> {
     /// raised by the callback itself — unwinds straight out of the call, so
     /// there is no `Err` either. See [`ProgressReporter::with_callback`].
     Finished,
+    /// (v1.14.0+) The run stopped early because the reporter's
+    /// [`CancelToken`] was set. Emitted **only** from
+    /// [`ProgressReporter::finish_cancelled`], in place of
+    /// [`ProgressEvent::Finished`], and nothing follows it.
+    ///
+    /// `done` counts the documents reported ([`ProgressEvent::Indexed`] plus
+    /// [`ProgressEvent::Unchanged`]) wherever the run stopped -- never scanned
+    /// files, so a run stopped during or right after the scan reports 0 --
+    /// and `total` is the number [`ProgressEvent::Started`] carried.
+    /// `done < total` does not mean documents were left: a run stopped after
+    /// its last document, with only the deletion sweep to go, still falls
+    /// short by the files the scan declined. How to draw either number, as a
+    /// count or as a share, is the consumer's choice.
+    Cancelled { done: usize, total: usize },
 }
 
 /// What [`ProgressReporter::with_callback`] takes.
@@ -125,6 +238,15 @@ pub type ProgressCallback = Box<dyn Fn(ProgressEvent<'_>) + Send>;
 /// Output reporter, owned by `rebuild_index`.
 pub struct ProgressReporter {
     inner: ProgressInner,
+    /// (v1.14.0+) Set by [`ProgressReporter::with_cancel`]; `None` means the
+    /// run cannot be stopped this way. Beside `inner` rather than inside it,
+    /// because it has to work in every mode.
+    cancel: Option<CancelToken>,
+    /// (v1.14.0+) Files [`ProgressReporter::report_scanned`] has counted. Kept
+    /// apart from the document counters inside `inner` (`count`), which the
+    /// scan must not advance: the non-TTY `Progress: N/M` lines and the
+    /// callback's `done` count documents.
+    scanned: AtomicU64,
 }
 
 enum ProgressInner {
@@ -164,6 +286,16 @@ enum ProgressInner {
 }
 
 impl ProgressReporter {
+    /// The one place a reporter is assembled from its mode, so a field added to
+    /// [`ProgressReporter`] is initialised once.
+    fn from_inner(inner: ProgressInner) -> Self {
+        Self {
+            inner,
+            cancel: None,
+            scanned: AtomicU64::new(0),
+        }
+    }
+
     /// Build a reporter from explicit mode (used by MCP server with `Quiet`).
     pub fn new(mode: ProgressMode) -> Self {
         let inner = match mode {
@@ -171,7 +303,7 @@ impl ProgressReporter {
             ProgressMode::Quiet => ProgressInner::Quiet,
             ProgressMode::Auto => ProgressInner::AutoPending,
         };
-        Self { inner }
+        Self::from_inner(inner)
     }
 
     /// CLI flag adapter. clap's `conflicts_with` ensures `(true, true)` is
@@ -204,6 +336,13 @@ impl ProgressReporter {
     /// embedding application whose stderr must stay quiet has to capture or
     /// redirect it, and one that interleaves the two streams cannot assume a
     /// diagnostic it sees belongs to the event it saw last.
+    ///
+    /// (v1.14.0+) Two more things follow from that. The scan's `Skipping ...`
+    /// warnings arrive between [`ProgressEvent::Scanning`] events, each one
+    /// just before the [`ProgressEvent::Scanning`] of the file it names. And a
+    /// run stopped through a [`CancelToken`] writes no summary lines: it ends
+    /// at [`ProgressEvent::Cancelled`], sometimes after a warning about the
+    /// declared-field set that stays true after the stop.
     ///
     /// # Panics
     ///
@@ -254,14 +393,12 @@ impl ProgressReporter {
     /// behind an `Arc` and reported to from several threads at once. Put a
     /// `Mutex` around it if that is ever wanted.
     pub fn with_callback(f: ProgressCallback) -> Self {
-        Self {
-            inner: ProgressInner::Callback {
-                f,
-                total: 0,
-                count: AtomicU64::new(0),
-                started: false,
-            },
-        }
+        Self::from_inner(ProgressInner::Callback {
+            f,
+            total: 0,
+            count: AtomicU64::new(0),
+            started: false,
+        })
     }
 
     /// Initialise bar / counter once `total` is known (= after source-file
@@ -433,6 +570,59 @@ impl ProgressReporter {
         }
     }
 
+    /// (v1.14.0+) Let `token` stop the run this reporter is handed to. Works
+    /// on a reporter of any mode, whether built by [`ProgressReporter::new`],
+    /// [`ProgressReporter::from_cli_flags`] or
+    /// [`ProgressReporter::with_callback`]; calling it again replaces the
+    /// earlier token. Keep a clone of `token` and call [`CancelToken::cancel`]
+    /// on it -- see [`CancelToken`] for where
+    /// [`crate::indexer::rebuild_index`] looks and how long that can take.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// (v1.14.0+) Whether this reporter's [`CancelToken`] is set. `false` for
+    /// a reporter that was given none, which is every reporter `groove`
+    /// itself builds.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+    }
+
+    /// (v1.14.0+) One file of the scan that hashes every source file before
+    /// the per-document loop, whether the scan kept it or declined it.
+    /// Counted apart from the documents: see [`ProgressEvent::Scanning`].
+    ///
+    /// Two modes show it. Callback emits [`ProgressEvent::Scanning`]. Tty
+    /// writes `scanning N/M` into the bar's message and leaves the bar where
+    /// it is, because the same bar then draws the documents, and clears the
+    /// message once the scan reaches `total`. Non-TTY `--progress` stays
+    /// silent and leaves its `Progress: N/M` count alone, since that counts
+    /// documents; Verbose and Quiet say nothing.
+    pub fn report_scanned(&self) {
+        let done = tick_done(&self.scanned);
+        match &self.inner {
+            ProgressInner::Tty(bar) => {
+                let total = bar.length().unwrap_or(0);
+                if done as u64 >= total {
+                    bar.set_message("");
+                } else {
+                    bar.set_message(format!("scanning {done}/{total}"));
+                }
+            }
+            ProgressInner::Callback { f, total, .. } => {
+                f(ProgressEvent::Scanning {
+                    done,
+                    total: *total,
+                });
+            }
+            ProgressInner::Verbose
+            | ProgressInner::Quiet
+            | ProgressInner::AutoPending
+            | ProgressInner::NonTty { .. } => {}
+        }
+    }
+
     /// Tear down (clear bar, emit [`ProgressEvent::Finished`], etc.). Owned
     /// consume so the caller can rely on "the reporter is done at this point".
     ///
@@ -443,6 +633,33 @@ impl ProgressReporter {
         match &self.inner {
             ProgressInner::Tty(bar) => bar.finish_and_clear(),
             ProgressInner::Callback { f, .. } => f(ProgressEvent::Finished),
+            ProgressInner::Verbose
+            | ProgressInner::Quiet
+            | ProgressInner::AutoPending
+            | ProgressInner::NonTty { .. } => {}
+        }
+    }
+
+    /// (v1.14.0+) Tear down a run that stopped because its [`CancelToken`]
+    /// was set: the counterpart of [`ProgressReporter::finish`], and the only
+    /// place [`ProgressEvent::Cancelled`] is emitted. It consumes the reporter
+    /// for the same reason [`ProgressReporter::finish`] does -- `Drop` runs
+    /// right behind it and
+    /// emits neither terminal event -- so a run ends in
+    /// [`ProgressEvent::Finished`] or [`ProgressEvent::Cancelled`], never
+    /// both. Tty clears its bar; the other modes have nothing to tear down.
+    pub fn finish_cancelled(self) {
+        match &self.inner {
+            ProgressInner::Tty(bar) => bar.finish_and_clear(),
+            ProgressInner::Callback {
+                f, total, count, ..
+            } => {
+                let done = saturating_usize(count.load(Ordering::Relaxed));
+                f(ProgressEvent::Cancelled {
+                    done,
+                    total: *total,
+                });
+            }
             ProgressInner::Verbose
             | ProgressInner::Quiet
             | ProgressInner::AutoPending
@@ -491,7 +708,13 @@ fn should_emit(count: u64, total: u64, step: u64) -> bool {
 /// than `as`, so a 32-bit target cannot wrap a large count into a small number
 /// and hand a consumer a progress bar that walks backwards.
 fn tick_done(count: &AtomicU64) -> usize {
-    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+    saturating_usize(count.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+/// `u64` counter to the `usize` the events carry, saturating instead of
+/// wrapping. The one place this conversion is decided: [`tick_done`] and
+/// [`ProgressReporter::finish_cancelled`] both go through it.
+fn saturating_usize(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
@@ -580,6 +803,8 @@ mod tests {
                 step: 1,
                 count: AtomicU64::new(0),
             },
+            cancel: None,
+            scanned: AtomicU64::new(0),
         };
         r.report_indexed("foo.md", 3);
         if let ProgressInner::NonTty { count, .. } = &r.inner {
@@ -600,6 +825,8 @@ mod tests {
                 step: 1,
                 count: AtomicU64::new(0),
             },
+            cancel: None,
+            scanned: AtomicU64::new(0),
         };
         r.report_indexed("a.md", 1);
         r.report_unchanged("b.md");
@@ -660,6 +887,8 @@ mod tests {
                 ProgressEvent::Renamed { old, new } => format!("renamed:{old}->{new}"),
                 ProgressEvent::Deleted { rel } => format!("deleted:{rel}"),
                 ProgressEvent::Finished => "finished".to_string(),
+                ProgressEvent::Scanning { done, total } => format!("scanning:{done}/{total}"),
+                ProgressEvent::Cancelled { done, total } => format!("cancelled:{done}/{total}"),
             };
             sink.lock().expect("recorder mutex").push(line);
         });
@@ -859,5 +1088,216 @@ mod tests {
             !recorded(&log).contains(&"finished".to_string()),
             "finish() was never reached, so no Finished can have been emitted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation and scan progress (feature-60)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_token_clones_share_one_flag() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CancelToken>();
+
+        let token = CancelToken::new();
+        let clone = token.clone();
+        assert!(!token.is_cancelled() && !clone.is_cancelled());
+        assert!(!CancelToken::default().is_cancelled());
+
+        clone.cancel();
+        assert!(
+            token.is_cancelled(),
+            "cancel() on a clone must be seen through the original"
+        );
+        // Idempotent: a second call must not panic and leaves the flag set.
+        clone.cancel();
+        assert!(token.is_cancelled());
+
+        // Any thread may set it.
+        let other = CancelToken::new();
+        let remote = other.clone();
+        std::thread::spawn(move || remote.cancel())
+            .join()
+            .expect("worker thread");
+        assert!(other.is_cancelled());
+    }
+
+    #[test]
+    fn test_reporter_without_token_is_never_cancelled() {
+        let (_log, f) = recorder();
+        let reporters = vec![
+            ProgressReporter::new(ProgressMode::Verbose),
+            ProgressReporter::new(ProgressMode::Quiet),
+            ProgressReporter::new(ProgressMode::Auto),
+            ProgressReporter::from_cli_flags(false, false),
+            ProgressReporter::from_cli_flags(true, false),
+            ProgressReporter::from_cli_flags(false, true),
+            ProgressReporter::with_callback(f),
+        ];
+        for r in &reporters {
+            assert!(
+                !r.is_cancelled(),
+                "a reporter given no token is never cancelled"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_cancel_applies_in_every_mode() {
+        let token = CancelToken::new();
+        let (_log, f) = recorder();
+        let reporters = vec![
+            ProgressReporter::new(ProgressMode::Verbose).with_cancel(token.clone()),
+            ProgressReporter::new(ProgressMode::Quiet).with_cancel(token.clone()),
+            ProgressReporter::new(ProgressMode::Auto).with_cancel(token.clone()),
+            ProgressReporter::from_cli_flags(true, false).with_cancel(token.clone()),
+            ProgressReporter::with_callback(f).with_cancel(token.clone()),
+        ];
+        for r in &reporters {
+            assert!(!r.is_cancelled(), "the token is not set yet");
+        }
+        token.cancel();
+        for r in &reporters {
+            assert!(r.is_cancelled(), "every mode follows its token");
+        }
+
+        // A second with_cancel replaces the first token.
+        let set = CancelToken::new();
+        set.cancel();
+        let r = ProgressReporter::new(ProgressMode::Quiet)
+            .with_cancel(set)
+            .with_cancel(CancelToken::new());
+        assert!(!r.is_cancelled(), "the later token wins");
+    }
+
+    #[test]
+    fn test_callback_scanning_counts_against_started_total() {
+        let (log, f) = recorder();
+        let mut r = ProgressReporter::with_callback(f);
+        r.start_indexing(3);
+        r.report_scanned();
+        r.report_scanned();
+        r.report_scanned();
+        r.report_indexed("a.md", 1);
+        r.finish();
+
+        assert_eq!(
+            recorded(&log),
+            vec![
+                "started:3",
+                "scanning:1/3",
+                "scanning:2/3",
+                "scanning:3/3",
+                "indexed:a.md:1:1/3",
+                "finished",
+            ],
+            "the scan counts files against Started's total, and the document count starts from 1"
+        );
+    }
+
+    #[test]
+    fn test_callback_finish_cancelled_emits_cancelled_once_and_no_finished() {
+        let (log, f) = recorder();
+        let mut r = ProgressReporter::with_callback(f);
+        r.start_indexing(2);
+        r.report_indexed("a.md", 1);
+        r.finish_cancelled();
+
+        let got = recorded(&log);
+        assert_eq!(
+            got,
+            vec!["started:2", "indexed:a.md:1:1/2", "cancelled:1/2"]
+        );
+        // `finish_cancelled` consumes `self`, so `Drop` runs right behind it;
+        // it must add neither a second terminal event nor a `Finished`.
+        assert_eq!(
+            got.iter()
+                .filter(|line| line.starts_with("cancelled:") || *line == "finished")
+                .count(),
+            1,
+            "exactly one terminal event"
+        );
+    }
+
+    #[test]
+    fn test_callback_cancelled_done_ignores_scanned_files() {
+        let (log, f) = recorder();
+        let mut r = ProgressReporter::with_callback(f);
+        r.start_indexing(3);
+        r.report_scanned();
+        r.report_scanned();
+        r.finish_cancelled();
+
+        assert_eq!(
+            recorded(&log),
+            vec!["started:3", "scanning:1/3", "scanning:2/3", "cancelled:0/3"],
+            "Cancelled.done counts documents, never scanned files"
+        );
+    }
+
+    #[test]
+    fn test_callback_cancelled_done_counts_reported_documents() {
+        let (log, f) = recorder();
+        let mut r = ProgressReporter::with_callback(f);
+        r.start_indexing(3);
+        r.report_scanned();
+        r.report_scanned();
+        r.report_scanned();
+        r.report_indexed("a.md", 1);
+        r.report_unchanged("b.md");
+        r.finish_cancelled();
+
+        assert_eq!(
+            recorded(&log).last().map(String::as_str),
+            Some("cancelled:2/3"),
+            "Indexed and Unchanged both count toward Cancelled.done"
+        );
+    }
+
+    #[test]
+    fn test_nontty_report_scanned_does_not_tick_progress_count() {
+        // `Progress: N/M` counts documents; the scan must not advance it, or
+        // N would run to twice M.
+        let r = ProgressReporter::from_inner(ProgressInner::NonTty {
+            total: 3,
+            step: 1,
+            count: AtomicU64::new(0),
+        });
+        r.report_scanned();
+        r.report_scanned();
+        r.report_scanned();
+        let ProgressInner::NonTty { count, .. } = &r.inner else {
+            panic!("expected NonTty variant");
+        };
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "the scan must not tick count"
+        );
+        r.report_indexed("a.md", 1);
+        assert_eq!(count.load(Ordering::Relaxed), 1, "documents still tick it");
+    }
+
+    #[test]
+    fn test_tty_report_scanned_moves_the_message_not_the_bar() {
+        // A hidden draw target: the bar keeps its state but renders nothing.
+        use indicatif::{ProgressBar, ProgressDrawTarget};
+        let bar = ProgressBar::with_draw_target(Some(2), ProgressDrawTarget::hidden());
+        let r = ProgressReporter::from_inner(ProgressInner::Tty(bar));
+        let ProgressInner::Tty(bar) = &r.inner else {
+            panic!("expected Tty variant");
+        };
+
+        r.report_scanned();
+        assert_eq!(bar.message(), "scanning 1/2");
+        assert_eq!(bar.position(), 0, "the scan must not move the bar");
+
+        r.report_scanned();
+        assert_eq!(
+            bar.message(),
+            "",
+            "the message is cleared once the scan reaches total, so an unchanged-only run does not keep it"
+        );
+        assert_eq!(bar.position(), 0, "the bar still belongs to the documents");
     }
 }

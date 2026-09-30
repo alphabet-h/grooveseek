@@ -614,6 +614,35 @@ pub struct IndexResult {
     pub forced_rejected: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
+    /// (v1.14.0+) The run stopped at a check point because the
+    /// [`progress::CancelToken`] on its reporter was set
+    /// ([`progress::ProgressReporter::with_cancel`]). Always `false` for
+    /// `groove index` and the MCP `rebuild_index` tool, which set no token.
+    ///
+    /// The counts then cover what the run did before it stopped:
+    /// [`Self::updated`], [`Self::skipped`], [`Self::embedded`] and the rest
+    /// count up to the stop, [`Self::renamed`] is 0 if it stopped during the
+    /// scan, [`Self::deleted`] is always 0, and [`Self::total_documents`] /
+    /// [`Self::total_chunks`] are the index as it stands.
+    ///
+    /// That index is consistent per document: no document is half written,
+    /// and a document whose move forced a re-parse was re-parsed before the
+    /// stop. The next run resumes it -- documents committed here are skipped
+    /// by their hash. Rows of files deleted from disk stay until a run
+    /// completes, and so does the bookkeeping a completed run records (the
+    /// frontmatter policy and the declared-field set; until the latter is
+    /// recorded, field filters are refused and the next run refreshes the
+    /// fields). A stopped run leaves no declared-field pass of its own open.
+    /// After a stopped `force` run the index holds only the documents
+    /// committed before the stop; an incremental run adds the rest, and with
+    /// no schema it records the empty declared-field set the way a completed
+    /// run does.
+    ///
+    /// [`Self::fails_strict_frontmatter`], [`Self::fails_all_inputs_rejected`]
+    /// and [`Self::fails_forced_rebuild_rejections`] judge a completed run. Do
+    /// not report a result with `cancelled == true` as a failed run because of
+    /// them.
+    pub cancelled: bool,
 }
 
 impl IndexResult {
@@ -1246,6 +1275,7 @@ pub fn rebuild_index(
         forced_rejected,
         total_chunks: total_chunks_in_db,
         duration_ms,
+        cancelled: false,
     })
 }
 
