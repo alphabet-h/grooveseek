@@ -123,7 +123,7 @@ struct DiskEntry {
     size: u64,
 }
 
-/// [`scan_disk_entries`] の結果。`entries` = hash 計算済みの index 候補、
+/// [`scan_disk_entries_observed`] の結果。`entries` = hash 計算済みの index 候補、
 /// `skipped` = disk に存在するが read 失敗 / size 超過で載らなかった rel path。
 /// `skipped` は prune 統一原則 (§4.2) で visited_paths へ union し、既存 entry を保護する。
 struct DiskScan {
@@ -320,6 +320,8 @@ pub(crate) fn scanned_rel_paths(kb_path: &Path, registry: &Registry) -> Vec<Stri
 /// - **size skip**: 拡張子ごとの cap (`max_binary_bytes` / `max_text_bytes`) を
 ///   超えるファイルは read 前に skip する ([`size_cap_exceeded`] の
 ///   `fs::metadata` 判定でメモリ読込自体を回避)。
+/// - (feature-60) Test-only entry point; the production path is [`scan_disk_entries_observed`].
+#[cfg(test)]
 fn scan_disk_entries(
     source_files: &[std::path::PathBuf],
     kb_path: &Path,
@@ -327,71 +329,119 @@ fn scan_disk_entries(
     max_binary_bytes: u64,
     max_text_bytes: u64,
 ) -> DiskScan {
+    scan_disk_entries_observed(
+        source_files,
+        kb_path,
+        registry,
+        max_binary_bytes,
+        max_text_bytes,
+        &mut || std::ops::ControlFlow::Continue(()),
+    )
+    .0
+}
+
+/// (feature-60) The scan: hash every file in `source_files`, calling `on_file` once for every
+/// file it visits -- declined or not, after that file's outcome is recorded -- and stopping as
+/// soon as `on_file` answers `Break`. Returns the scan as far as it got and whether it was
+/// stopped, so a stopped run can still count the files it declined. The one implementation of
+/// the scan (AGENTS.md "One question gets one implementation"): [`rebuild_index`] passes an
+/// observer that reports the file and looks at the cancel token, and the test-only
+/// `scan_disk_entries` (not linked: it is `#[cfg(test)]`, which rustdoc does not see) passes
+/// one that never stops it.
+fn scan_disk_entries_observed(
+    source_files: &[std::path::PathBuf],
+    kb_path: &Path,
+    registry: &Registry,
+    max_binary_bytes: u64,
+    max_text_bytes: u64,
+    on_file: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
+) -> (DiskScan, std::ops::ControlFlow<()>) {
     let binary_exts = registry.binary_extensions();
-    let mut entries = Vec::with_capacity(source_files.len());
-    let mut skipped = Vec::new();
-    let mut oversize = Vec::new();
-
+    let mut scan = DiskScan {
+        entries: Vec::with_capacity(source_files.len()),
+        skipped: Vec::new(),
+        oversize: Vec::new(),
+    };
     for p in source_files {
-        let rel = index_rel_path_or_whole(kb_path, p);
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
-
-        match size_cap_exceeded(p, is_binary, max_binary_bytes, max_text_bytes) {
-            Ok(Some((len, cap))) => {
-                let kind = size_cap_kind(is_binary);
-                eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
-                oversize.push((rel.clone(), len));
-                skipped.push(rel);
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("Skipping {rel}: failed to stat: {e}");
-                skipped.push(rel);
-                continue;
-            }
+        scan_one_file(
+            p,
+            kb_path,
+            &binary_exts,
+            max_binary_bytes,
+            max_text_bytes,
+            &mut scan,
+        );
+        if on_file().is_break() {
+            return (scan, std::ops::ControlFlow::Break(()));
         }
+    }
+    (scan, std::ops::ControlFlow::Continue(()))
+}
 
-        // (BU-20) The walk already refused hard links; this catches one that
-        // arrived between the walk and now. A refusal joins `skipped`, like
-        // every other reason this loop declines a file: the *new* bytes are
-        // what is being refused, the row already in the database came from
-        // bytes that were legitimate when they were read, and the next full
-        // run's walk-time check is what evicts it — which is where that
-        // decision belongs (§4.2, skip preserves).
-        let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
-        match read_for_index(p, &rel, cap) {
-            Ok((Some(bytes), _)) => {
-                let hash = sha256_hex_bytes(&bytes);
-                entries.push(DiskEntry {
-                    rel,
-                    hash,
-                    full: p.clone(),
-                    size: bytes.len() as u64,
-                });
-            }
-            Ok((None, measured)) => {
-                // (codex P2 round 5) The file can cross the cap between the
-                // stat above and this read, and then it is *this* check that
-                // catches it — so the length has to come from here too, or the
-                // row keeps a size the read has just disproved.
-                if let Some(len) = measured {
-                    oversize.push((rel.clone(), len));
-                }
-                skipped.push(rel);
-            }
-            Err(e) => {
-                eprintln!("Skipping {rel}: failed to read: {e}");
-                skipped.push(rel);
-            }
+/// (feature-60) One file of [`scan_disk_entries_observed`]: hash it into `scan.entries`, or
+/// record in `scan.skipped` (and, for a size refusal, `scan.oversize`) why it was declined.
+/// Split out of the loop so the observer runs after every outcome, including the ones that
+/// end early here.
+fn scan_one_file(
+    p: &std::path::Path,
+    kb_path: &Path,
+    binary_exts: &[&str],
+    max_binary_bytes: u64,
+    max_text_bytes: u64,
+    scan: &mut DiskScan,
+) {
+    let rel = index_rel_path_or_whole(kb_path, p);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
+
+    match size_cap_exceeded(p, is_binary, max_binary_bytes, max_text_bytes) {
+        Ok(Some((len, cap))) => {
+            let kind = size_cap_kind(is_binary);
+            eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+            scan.oversize.push((rel.clone(), len));
+            scan.skipped.push(rel);
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Skipping {rel}: failed to stat: {e}");
+            scan.skipped.push(rel);
+            return;
         }
     }
 
-    DiskScan {
-        entries,
-        skipped,
-        oversize,
+    // (BU-20) The walk already refused hard links; this catches one that
+    // arrived between the walk and now. A refusal joins `skipped`, like
+    // every other reason this loop declines a file: the *new* bytes are
+    // what is being refused, the row already in the database came from
+    // bytes that were legitimate when they were read, and the next full
+    // run's walk-time check is what evicts it — which is where that
+    // decision belongs (§4.2, skip preserves).
+    let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
+    match read_for_index(p, &rel, cap) {
+        Ok((Some(bytes), _)) => {
+            let hash = sha256_hex_bytes(&bytes);
+            scan.entries.push(DiskEntry {
+                rel,
+                hash,
+                full: p.to_path_buf(),
+                size: bytes.len() as u64,
+            });
+        }
+        Ok((None, measured)) => {
+            // (codex P2 round 5) The file can cross the cap between the
+            // stat above and this read, and then it is *this* check that
+            // catches it — so the length has to come from here too, or the
+            // row keeps a size the read has just disproved.
+            if let Some(len) = measured {
+                scan.oversize.push((rel.clone(), len));
+            }
+            scan.skipped.push(rel);
+        }
+        Err(e) => {
+            eprintln!("Skipping {rel}: failed to read: {e}");
+            scan.skipped.push(rel);
+        }
     }
 }
 
@@ -936,6 +986,21 @@ pub fn rebuild_index(
         source_files.len(),
         registry.extensions()
     );
+    // (feature-60) What this run has done so far, in the shape it returns. Counted here as the
+    // run goes and completed by `complete_index_result`, whether the run finishes or stops at
+    // a check point, so the two returns cannot count differently.
+    let mut tally = IndexResult {
+        unspellable,
+        ..IndexResult::default()
+    };
+    // (feature-60) The declared-field pass a stopped run closes, built once and handed to every
+    // check point (C1-C4). Only shared borrows: `pass_token`, `stored_declared` and
+    // `declared_json` are read, never changed, for the rest of the run.
+    let pass_to_close = PassToClose {
+        token: pass_token.as_deref(),
+        observed_at_start: stored_declared.as_deref(),
+        declared_json: &declared_json,
+    };
 
     // 罠 H2: bar lifetime を rebuild_index 内に閉じる lazy init。
     // Backfilled / Found 行を出した後に bar を構築するので衝突しない。
@@ -947,12 +1012,23 @@ pub fn rebuild_index(
     // もう一度 `fs::read` する — ファイル OS キャッシュで 2 度目の
     // read は十分安く、代わりにピークメモリを `filecount * avg_size` から
     // `filecount * avg_path_len + 1 file worth of content` に圧縮できる。
-    let scan = scan_disk_entries(
+    //
+    // (feature-60) Every file the scan visits is reported, declined or not, and is check point
+    // C1: a set token stops the scan right after the file it just reported.
+    let (scan, scan_flow) = scan_disk_entries_observed(
         &source_files,
         &kb_path,
         registry,
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
+        &mut || {
+            progress.report_scanned();
+            if progress.is_cancelled() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        },
     );
     let disk_entries = scan.entries;
     let scan_oversize = scan.oversize;
@@ -960,7 +1036,16 @@ pub fn rebuild_index(
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
     let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
-    let mut skipped_count: u32 = skipped_paths.len() as u32;
+    tally.skipped = skipped_paths.len() as u32;
+
+    // (feature-60) Check points C1 and C2. C1: the observer above stopped the scan at a file.
+    // C2: the token was set after the last file -- or, on an empty knowledge base, where there
+    // is no file and so no C1, from the `Started { total: 0 }` callback. The scan wrote
+    // nothing, and the renames below are the next write, so this is the last point where the
+    // index reads as it did before the scan.
+    if scan_flow.is_break() || progress.is_cancelled() {
+        return stop_cancelled_run(db, embedder, progress, pass_to_close, tally, None, start);
+    }
 
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
@@ -986,7 +1071,7 @@ pub fn rebuild_index(
     // nothing) is a pre-existing edit-time gap this round does not touch, not a stale
     // cross-parser row.
     let mut crossed_parser_renames: HashSet<String> = HashSet::new();
-    let renamed: u32 = if force {
+    tally.renamed = if force {
         0
     } else {
         let db_path_hashes = db.all_path_hashes()?;
@@ -1048,15 +1133,10 @@ pub fn rebuild_index(
     // embedder rather than counted from `Updated`, which a metadata-only update also
     // returns. MCP holds the embedder's lock for the whole run (`server.rs`), so no
     // watcher embed falls in between.
-    let embedded_before = embedder.documents_embedded();
-    let run_refused_after_accepting_before = embedder.documents_refused_after_accepting();
-    let mut embed_rejected: u32 = 0;
-    let mut forced_rejected: u32 = 0;
+    let embedded_since = EmbeddedBaseline::read(embedder);
 
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
-    let mut updated: u32 = 0;
-    let mut frontmatter_unparsed: u32 = 0;
     let mut refreshed: u32 = 0;
     let mut refreshed_fields: u32 = 0;
     // (#251, codex P2 round 2) The one-time check is recorded as done only when every
@@ -1120,9 +1200,9 @@ pub fn rebuild_index(
                 chunks,
                 frontmatter_unparsed: fm_unparsed,
             } => {
-                updated += 1;
+                tally.updated += 1;
                 if fm_unparsed {
-                    frontmatter_unparsed += 1;
+                    tally.frontmatter_unparsed += 1;
                 }
                 progress.report_indexed(&entry.rel, chunks);
             }
@@ -1132,22 +1212,22 @@ pub fn rebuild_index(
                 reason,
                 frontmatter_unparsed: fm_unparsed,
             } => {
-                skipped_count += 1;
+                tally.skipped += 1;
                 // A refusal that came after an accepted batch of the same file proves the
                 // endpoint works, so it is not counted toward "every input rejected".
                 if reason == SKIPPED_EMBED_REJECTED
                     && embedder.documents_refused_after_accepting()
                         == refused_after_accepting_before
                 {
-                    embed_rejected += 1;
+                    tally.embed_rejected += 1;
                 }
                 // (codex P1 on PR #329) In a forced rebuild any refusal counts: the reset
                 // emptied the index, so no previous row stands in for the file.
                 if force && reason == SKIPPED_EMBED_REJECTED {
-                    forced_rejected += 1;
+                    tally.forced_rejected += 1;
                 }
                 if fm_unparsed {
-                    frontmatter_unparsed += 1;
+                    tally.frontmatter_unparsed += 1;
                 }
                 // What the check has to have read is the bytes the *row* was written
                 // from, and a skip retains that row. A skip decided before parsing read
@@ -1166,7 +1246,7 @@ pub fn rebuild_index(
             // A refusal counts as a skip here for the same reason a size cap
             // does: the file is not indexed and the reason is already on stderr.
             SingleResult::Refused => {
-                skipped_count += 1;
+                tally.skipped += 1;
                 if refresh_any && indexed_markdown_hash(db, registry, &entry.rel)?.is_some() {
                     refresh_pending = true;
                 }
@@ -1176,7 +1256,7 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
             } => {
                 if fm_unparsed {
-                    frontmatter_unparsed += 1;
+                    tally.frontmatter_unparsed += 1;
                     refreshed += 1;
                 }
                 if refresh_fields {
@@ -1191,9 +1271,6 @@ pub fn rebuild_index(
             }
         }
     }
-    let accepted_files = (embedder.documents_embedded() - embedded_before)
-        + (embedder.documents_refused_after_accepting() - run_refused_after_accepting_before);
-    let embedded = u32::try_from(accepted_files).unwrap_or(u32::MAX);
 
     if refreshed > 0 {
         eprintln!(
@@ -1211,10 +1288,9 @@ pub fn rebuild_index(
     // 3. Delete documents in DB that no longer exist on disk.
     //    §4.2 統一原則: visited ∪ skipped は保持、それ以外 (= disk から消えた) のみ削除。
     let all_db_paths = db.all_document_paths()?;
-    let mut deleted: u32 = 0;
     for db_path in documents_to_delete(&all_db_paths, &visited_paths, &skipped_paths) {
         db.delete_document(&db_path)?;
-        deleted += 1;
+        tally.deleted += 1;
         progress.report_deleted(&db_path);
     }
 
@@ -1253,30 +1329,103 @@ pub fn rebuild_index(
         force || !refresh_fields || !refresh_pending,
     )?;
 
-    // Count total documents remaining (includes unchanged ones)
-    let total_documents = db.document_count()?;
-    // Count total chunks in DB (includes unchanged ones)
-    let total_chunks_in_db = db.chunk_count()?;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
+    let result = complete_index_result(db, embedder, tally, Some(embedded_since), start, false)?;
     progress.finish();
+    Ok(result)
+}
 
-    Ok(IndexResult {
-        total_documents,
-        updated,
-        renamed,
-        deleted,
-        skipped: skipped_count,
-        frontmatter_unparsed,
-        unspellable,
-        embed_rejected,
-        embedded,
-        forced_rejected,
-        total_chunks: total_chunks_in_db,
-        duration_ms,
-        cancelled: false,
-    })
+/// (feature-60) The two embedder counters a run's [`IndexResult::embedded`] is measured
+/// against, read once before the per-document loop. Before that point nothing has been
+/// embedded, which is why a run stopped earlier passes `None` to [`complete_index_result`].
+#[derive(Clone, Copy)]
+struct EmbeddedBaseline {
+    embedded: u64,
+    refused_after_accepting: u64,
+}
+
+impl EmbeddedBaseline {
+    fn read(embedder: &Embedder) -> Self {
+        Self {
+            embedded: embedder.documents_embedded(),
+            refused_after_accepting: embedder.documents_refused_after_accepting(),
+        }
+    }
+
+    /// (AW-04) Files the endpoint accepted at least one batch of since `self` was read:
+    /// every file embedded whole, plus every file refused only after an earlier batch of it
+    /// was accepted.
+    fn accepted_since(self, embedder: &Embedder) -> u32 {
+        let accepted = (embedder.documents_embedded() - self.embedded)
+            + (embedder.documents_refused_after_accepting() - self.refused_after_accepting);
+        u32::try_from(accepted).unwrap_or(u32::MAX)
+    }
+}
+
+/// (feature-60) Fill in what a run measures rather than counts -- the files the endpoint
+/// accepted, the index's size, the time taken -- and whether it stopped early. The one place
+/// an [`IndexResult`] is completed, for a run that finished and for one that stopped at a
+/// check point alike (AGENTS.md "One question gets one implementation"). `embedded_since` is
+/// `None` for a run stopped before the per-document loop, which embedded nothing.
+fn complete_index_result(
+    db: &Database,
+    embedder: &Embedder,
+    mut tally: IndexResult,
+    embedded_since: Option<EmbeddedBaseline>,
+    start: Instant,
+    cancelled: bool,
+) -> Result<IndexResult> {
+    tally.embedded = embedded_since.map_or(0, |baseline| baseline.accepted_since(embedder));
+    // Count total documents remaining (includes unchanged ones)
+    tally.total_documents = db.document_count()?;
+    // Count total chunks in DB (includes unchanged ones)
+    tally.total_chunks = db.chunk_count()?;
+    tally.duration_ms = start.elapsed().as_millis() as u64;
+    tally.cancelled = cancelled;
+    Ok(tally)
+}
+
+/// (feature-60) The three values [`finish_declared_fields_pass`] takes about this run's
+/// declared-field pass, handed to [`stop_cancelled_run`] together. Built once in
+/// [`rebuild_index`] and copied to each check point, so every stop closes the same pass.
+#[derive(Clone, Copy)]
+struct PassToClose<'a> {
+    token: Option<&'a str>,
+    observed_at_start: Option<&'a str>,
+    declared_json: &'a str,
+}
+
+/// (feature-60) End a run that found its cancel token set at a check point: no deletion
+/// sweep, no generation key, no summary line. If the run opened a declared-field pass, it is
+/// closed with `record = false` -- this pass's token and dirty mark are cleared and no
+/// generation is written, or, if another run took the pass over, nothing is touched -- so a
+/// stopped run never leaves its own token behind (without this, a stopped `force` over a
+/// schema-less knowledge base would leave a token no later incremental run clears). That call
+/// may log one of its existing warnings, which stay true after the stop; an `Err` from it is
+/// returned as is, like the completed path's `?`, and then no terminal event is emitted. The
+/// result is completed by [`complete_index_result`] before
+/// [`progress::ProgressReporter::finish_cancelled`] emits
+/// [`progress::ProgressEvent::Cancelled`].
+fn stop_cancelled_run(
+    db: &Database,
+    embedder: &Embedder,
+    progress: progress::ProgressReporter,
+    pass: PassToClose<'_>,
+    tally: IndexResult,
+    embedded_since: Option<EmbeddedBaseline>,
+    start: Instant,
+) -> Result<IndexResult> {
+    if pass.token.is_some() {
+        finish_declared_fields_pass(
+            db,
+            pass.token,
+            pass.observed_at_start,
+            pass.declared_json,
+            false,
+        )?;
+    }
+    let result = complete_index_result(db, embedder, tally, embedded_since, start, true)?;
+    progress.finish_cancelled();
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -4154,6 +4303,62 @@ mod tests {
             "the hard link's bytes must never reach an entry"
         );
         assert_eq!(scan.skipped, vec!["notes.md".to_string()]);
+    }
+
+    /// (feature-60) The observer runs once per visited file, declined files included, and a
+    /// `Break` ends the scan right there with what it had so far -- so a stopped run can still
+    /// count the files it declined. `scan_disk_entries` is the same scan with an observer that
+    /// never stops it.
+    #[test]
+    fn scan_disk_entries_observed_calls_the_observer_per_file_and_stops_on_break() {
+        let tmp = mk_tmp("scanobserved");
+        write_file(&tmp.0, "a.md", "# a");
+        write_file(&tmp.0, "b.md", "# b");
+        write_file(&tmp.0, "c.md", "# c");
+        let reg = Registry::defaults();
+        // `0-gone.md` does not exist: the stat fails and the scan declines it.
+        let source = vec![
+            tmp.0.join("0-gone.md"),
+            tmp.0.join("a.md"),
+            tmp.0.join("b.md"),
+            tmp.0.join("c.md"),
+        ];
+
+        let mut calls = 0;
+        let (scan, flow) = scan_disk_entries_observed(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+            &mut || {
+                calls += 1;
+                if calls == 2 {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+        );
+        assert!(flow.is_break());
+        assert_eq!(
+            calls, 2,
+            "the declined file is a visit too, and nothing after the Break is scanned"
+        );
+        assert_eq!(scan.skipped, vec!["0-gone.md".to_string()]);
+        let rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, ["a.md"]);
+
+        let full = scan_disk_entries(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        let rels: Vec<&str> = full.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, ["a.md", "b.md", "c.md"]);
+        assert_eq!(full.skipped, vec!["0-gone.md".to_string()]);
     }
 
     /// The other half of the same wiring: a plain file still reads, so the test
