@@ -854,9 +854,10 @@ pub enum SingleResult {
 ///
 /// (v1.14.0+) A reporter carrying a [`progress::CancelToken`]
 /// ([`progress::ProgressReporter::with_cancel`]) can stop the run at a check point: after each
-/// scanned file, before the renames, before each document (after any forced re-parses), and before the deletion sweep. The
-/// run then returns `Ok` with [`IndexResult::cancelled`] set; see [`progress::CancelToken`] for
-/// how late a stop can come and [`IndexResult::cancelled`] for the index it leaves.
+/// scanned file, before the renames, before each document (after any forced re-parses), and
+/// before the deletion sweep. The run then returns `Ok` with [`IndexResult::cancelled`] set;
+/// see [`progress::CancelToken`] for how late a stop can come and [`IndexResult::cancelled`]
+/// for the index it leaves.
 #[allow(clippy::too_many_arguments)] // D-10 で 8 個に。config struct 化は別 cycle
 pub fn rebuild_index(
     db: &Database,

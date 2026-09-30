@@ -55,7 +55,7 @@ pub enum ProgressMode {
 /// Hand a clone to [`ProgressReporter::with_cancel`] and keep one; calling
 /// [`CancelToken::cancel`] on either, from any thread, is seen by
 /// [`crate::indexer::rebuild_index`] the next time it looks. It looks after
-/// each scanned file, before it applies the renames it detected, before each
+/// each scanned file, before it looks for renames to apply, before each
 /// document, and once after the last document, before the deletion sweep.
 /// When it sees the flag it stops there, a callback reporter receives
 /// [`ProgressEvent::Cancelled`] in place of [`ProgressEvent::Finished`], and
@@ -64,6 +64,13 @@ pub enum ProgressMode {
 ///
 /// Setting the flag does not stop the run at once:
 ///
+/// - The segment before the first of those points is not interruptible. It
+///   holds the steps [`crate::indexer::rebuild_index`] runs before the scan:
+///   on a `force` run the provider probe (with its retries), otherwise the
+///   full-text and quality backfills; then the context-mode reset, the
+///   declared-field and chunk-policy bookkeeping, and the directory walk that
+///   collects the source files. The stop delay includes whatever those take.
+///   The bound below covers the embedding retry only, not these steps.
 /// - The longest stretch between two of those points is one document's
 ///   embedding. With `provider = "openai-compatible"` that includes the
 ///   retries of every batch. A rough bound for one batch is
@@ -644,8 +651,7 @@ impl ProgressReporter {
     /// was set: the counterpart of [`ProgressReporter::finish`], and the only
     /// place [`ProgressEvent::Cancelled`] is emitted. It consumes the reporter
     /// for the same reason [`ProgressReporter::finish`] does -- `Drop` runs
-    /// right behind it and
-    /// emits neither terminal event -- so a run ends in
+    /// right behind it and emits neither terminal event -- so a run ends in
     /// [`ProgressEvent::Finished`] or [`ProgressEvent::Cancelled`], never
     /// both. Tty clears its bar; the other modes have nothing to tear down.
     pub fn finish_cancelled(self) {
@@ -701,8 +707,8 @@ fn should_emit(count: u64, total: u64, step: u64) -> bool {
     count > 0 && (count.is_multiple_of(step) || count == total)
 }
 
-/// Advance a counter by one and return the new value the way the events spell it. The callback's document counter and the
-/// scan's `scanned` counter both go through it.
+/// Advance a counter by one and return the new value the way the events spell it. The
+/// callback's document counter and the scan's `scanned` counter both go through it.
 ///
 /// The counter is an `AtomicU64` to match [`ProgressInner::NonTty`]'s, while
 /// the event field is `usize` because `total` arrives as one. Saturating rather
