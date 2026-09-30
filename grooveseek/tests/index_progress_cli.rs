@@ -126,3 +126,57 @@ fn test_index_quiet_progress_conflict() {
         "expected clap mutual exclusion error, got:\n{stderr}"
     );
 }
+
+/// (feature-60) Criterion 10. The scan reports its progress through the
+/// reporter, but the non-TTY `Progress: N/M` lines count documents: the scan
+/// must not advance them, or `N` would run to twice `M`.
+#[test]
+fn test_index_progress_non_tty_does_not_count_the_scan() {
+    let kb = build_small_kb();
+    let (stderr, status) = run_index(kb.kb(), &["--progress"]);
+    assert!(
+        status.success(),
+        "exit failed: {status:?}\nstderr:\n{stderr}"
+    );
+    let counts: Vec<(u64, u64)> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("Progress: "))
+        .filter_map(|rest| {
+            let (n, rest) = rest.split_once('/')?;
+            let m = rest.split_whitespace().next()?;
+            Some((n.parse().ok()?, m.parse().ok()?))
+        })
+        .collect();
+    assert!(
+        !counts.is_empty(),
+        "expected Progress lines, got:\n{stderr}"
+    );
+    assert!(
+        counts.iter().all(|(n, m)| n <= m),
+        "a Progress count ran past its total: {counts:?}\n{stderr}"
+    );
+    assert_eq!(
+        counts.len(),
+        5,
+        "one line per document (step 1 for 5 documents), none for the scan: {counts:?}"
+    );
+}
+
+/// (feature-60) Criterion 11. The scan's progress is shown only by a callback
+/// reporter and by the `--progress` bar on a terminal; the default per-file
+/// output and `--quiet` gain no line for it.
+#[test]
+fn test_index_default_and_quiet_do_not_mention_scanning() {
+    for args in [&[][..], &["--quiet"][..]] {
+        let kb = build_small_kb();
+        let (stderr, status) = run_index(kb.kb(), args);
+        assert!(
+            status.success(),
+            "{args:?}: exit failed: {status:?}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.to_ascii_lowercase().contains("scanning"),
+            "{args:?} must not mention the scan, got:\n{stderr}"
+        );
+    }
+}

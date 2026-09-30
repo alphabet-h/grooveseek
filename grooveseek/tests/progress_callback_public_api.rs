@@ -32,6 +32,8 @@ fn callback_path_is_nameable_and_usable_from_another_crate() {
             ProgressEvent::Renamed { old, new } => format!("renamed:{old}->{new}"),
             ProgressEvent::Deleted { rel } => format!("deleted:{rel}"),
             ProgressEvent::Finished => "finished".to_string(),
+            ProgressEvent::Scanning { done, total } => format!("scanning:{done}/{total}"),
+            ProgressEvent::Cancelled { done, total } => format!("cancelled:{done}/{total}"),
         };
         sink.lock().expect("recorder mutex").push(line);
     });

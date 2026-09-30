@@ -104,7 +104,7 @@ fn unchanged(rel: &str, done: usize, total: usize) -> Ev {
 /// What a test runs inside the callback, after the event is logged.
 type Hook = Box<dyn Fn(&Ev) + Send>;
 
-/// A callback that appends every event to a log and then hands it to `hook`,
+/// A callback that appends every event but `Scanning` to a log and then hands it to `hook`,
 /// and the log.
 fn recorder(hook: Hook) -> (Arc<Mutex<Vec<Ev>>>, ProgressCallback) {
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -119,6 +119,12 @@ fn recorder(hook: Hook) -> (Arc<Mutex<Vec<Ev>>>, ProgressCallback) {
             ProgressEvent::Renamed { old, new } => Ev::Renamed(old.to_string(), new.to_string()),
             ProgressEvent::Deleted { rel } => Ev::Deleted(rel.to_string()),
             ProgressEvent::Finished => Ev::Finished,
+            // The scan's progress is not logged here: the exact sequences these
+            // tests pin predate it, and `index_cancel.rs` pins it instead.
+            ProgressEvent::Scanning { .. } => return,
+            ProgressEvent::Cancelled { .. } => {
+                unreachable!("no test in this file sets a cancel token")
+            }
         };
         sink.lock().expect("recorder mutex").push(owned.clone());
         hook(&owned);
