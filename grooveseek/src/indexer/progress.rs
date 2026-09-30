@@ -13,7 +13,9 @@
 //! pre-loop `Backfilled ...` / `Found N source files` lines are emitted
 //! through plain `eprintln!` without colliding with an active bar.
 //!
-//! (v1.14.0+) Between `start_indexing` and the first per-document call,
+//! (v1.14.0+) Between
+//! [`crate::indexer::progress::ProgressReporter::start_indexing`] and the
+//! first per-document call,
 //! [`crate::indexer::progress::ProgressReporter::report_scanned`] is called once
 //! for every file the scan visits. A run stopped through a
 //! [`crate::indexer::progress::CancelToken`] ends with
@@ -88,7 +90,7 @@ pub enum ProgressMode {
 ///   so the wait is at most that many documents.
 /// - Once the deletion sweep has begun the flag is too late: the run
 ///   completes, reports [`ProgressEvent::Finished`], and returns with
-///   `cancelled == false`.
+///   `false` in [`crate::indexer::IndexResult::cancelled`].
 ///
 /// A set flag stays set; there is no `reset`. Resume by starting a new run
 /// with a new token: documents the stopped run committed are skipped by
@@ -150,12 +152,14 @@ pub enum ProgressEvent<'a> {
     Started { total: usize },
     /// (v1.14.0+) The scan visited one more file. Emitted once per file by
     /// [`ProgressReporter::report_scanned`], after [`ProgressEvent::Started`]
-    /// and before every other event, and never when `total` is 0. `total` is
-    /// the number [`ProgressEvent::Started`] carried.
+    /// and before every other event, and never when
+    /// [`ProgressEvent::Started::total`] is 0. This event's
+    /// [`ProgressEvent::Scanning::total`] is the number
+    /// [`ProgressEvent::Started`] carried.
     ///
     /// `done` counts every file the scan looked at, **including** the ones it
     /// declined (over the size cap, not stat-able, unreadable, a hard link),
-    /// so it reaches `total` when the scan ends. That is where it differs from
+    /// so it reaches the total when the scan ends. That is where it differs from
     /// the `done` of [`ProgressEvent::Indexed`] and
     /// [`ProgressEvent::Unchanged`], which counts documents processed and so
     /// never counts a declined file: the scan reports files seen, the loop
@@ -174,9 +178,9 @@ pub enum ProgressEvent<'a> {
     /// `done`. (v1.14.0+) It does reach [`ProgressReporter::report_scanned`],
     /// which counts it in [`ProgressEvent::Scanning`] instead. That is the
     /// same anchor the non-TTY `Progress: N/M` lines already report, not
-    /// something this path adds, so a consumer must not read `done < total` at
-    /// [`ProgressEvent::Finished`] or [`ProgressEvent::Cancelled`] as a
-    /// failure.
+    /// something this path adds, so a consumer must not read a `done` short
+    /// of the total at [`ProgressEvent::Finished`] or
+    /// [`ProgressEvent::Cancelled`] as a failure.
     Indexed {
         rel: &'a str,
         chunks: u32,
@@ -218,8 +222,9 @@ pub enum ProgressEvent<'a> {
     /// `done` counts the documents reported ([`ProgressEvent::Indexed`] plus
     /// [`ProgressEvent::Unchanged`]) wherever the run stopped -- never scanned
     /// files, so a run stopped during or right after the scan reports 0 --
-    /// and `total` is the number [`ProgressEvent::Started`] carried.
-    /// `done < total` does not mean documents were left: a run stopped after
+    /// and [`ProgressEvent::Cancelled::total`] is the number
+    /// [`ProgressEvent::Started`] carried. A `done` short of the total does
+    /// not mean documents were left: a run stopped after
     /// its last document, with only the deletion sweep to go, still falls
     /// short by the files the scan declined. How to draw either number, as a
     /// count or as a share, is the consumer's choice.
@@ -603,7 +608,7 @@ impl ProgressReporter {
     /// Two modes show it. Callback emits [`ProgressEvent::Scanning`]. Tty
     /// writes `scanning N/M` into the bar's message and leaves the bar where
     /// it is, because the same bar then draws the documents, and clears the
-    /// message once the scan reaches `total`. Non-TTY `--progress` stays
+    /// message once the scan has visited every file. Non-TTY `--progress` stays
     /// silent and leaves its `Progress: N/M` count alone, since that counts
     /// documents; Verbose and Quiet say nothing.
     pub fn report_scanned(&self) {

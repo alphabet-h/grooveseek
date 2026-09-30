@@ -345,9 +345,9 @@ fn scan_disk_entries(
 /// soon as `on_file` answers `Break`. Returns the scan as far as it got and whether it was
 /// stopped, so a stopped run can still count the files it declined. The one implementation of
 /// the scan (AGENTS.md "One question gets one implementation"): [`rebuild_index`] passes an
-/// observer that reports the file and looks at the cancel token, and the test-only
-/// `scan_disk_entries` (not linked: it is `#[cfg(test)]`, which rustdoc does not see) passes
-/// one that never stops it.
+/// observer that reports the file and looks at the cancel token, and the test-only wrapper
+/// next to it in this module (not linked: it is `#[cfg(test)]`, which rustdoc does not see)
+/// passes one that never stops it.
 fn scan_disk_entries_observed(
     source_files: &[std::path::PathBuf],
     kb_path: &Path,
@@ -378,8 +378,9 @@ fn scan_disk_entries_observed(
     (scan, std::ops::ControlFlow::Continue(()))
 }
 
-/// (feature-60) One file of [`scan_disk_entries_observed`]: hash it into `scan.entries`, or
-/// record in `scan.skipped` (and, for a size refusal, `scan.oversize`) why it was declined.
+/// (feature-60) One file of [`scan_disk_entries_observed`]: hash it into the scan's
+/// [`DiskScan::entries`], or record in [`DiskScan::skipped`] (and, for a size refusal,
+/// [`DiskScan::oversize`]) why it was declined.
 /// Split out of the loop so the observer runs after every outcome, including the ones that
 /// end early here.
 fn scan_one_file(
@@ -681,7 +682,8 @@ pub struct IndexResult {
     /// (v1.14.0+) The run stopped at a check point because the
     /// [`progress::CancelToken`] on its reporter was set
     /// ([`progress::ProgressReporter::with_cancel`]). Always `false` for
-    /// `groove index` and the MCP `rebuild_index` tool, which set no token.
+    /// `groove index` and the MCP tool that rebuilds the index, which call
+    /// [`rebuild_index`] with no token.
     ///
     /// The counts then cover what the run did before it stopped:
     /// [`Self::updated`], [`Self::skipped`], [`Self::embedded`] and the rest
@@ -704,8 +706,8 @@ pub struct IndexResult {
     ///
     /// [`Self::fails_strict_frontmatter`], [`Self::fails_all_inputs_rejected`]
     /// and [`Self::fails_forced_rebuild_rejections`] judge a completed run. Do
-    /// not report a result with `cancelled == true` as a failed run because of
-    /// them.
+    /// not report a result whose [`Self::cancelled`] is `true` as a failed run
+    /// because of them.
     pub cancelled: bool,
 }
 
@@ -1452,7 +1454,8 @@ struct PassToClose<'a> {
 
 /// (feature-60) End a run that found its cancel token set at a check point: no deletion
 /// sweep, no generation key, no summary line. If the run opened a declared-field pass, it is
-/// closed with `record = false` -- this pass's token and dirty mark are cleared and no
+/// closed by [`finish_declared_fields_pass`] with recording turned off -- this pass's
+/// token and dirty mark are cleared and no
 /// generation is written, or, if another run took the pass over, nothing is touched -- so a
 /// stopped run never leaves its own token behind (without this, a stopped `force` over a
 /// schema-less knowledge base would leave a token no later incremental run clears). That call
@@ -4363,7 +4366,7 @@ mod tests {
 
     /// (feature-60) The observer runs once per visited file, declined files included, and a
     /// `Break` ends the scan right there with what it had so far -- so a stopped run can still
-    /// count the files it declined. `scan_disk_entries` is the same scan with an observer that
+    /// count the files it declined. [`scan_disk_entries`] is the same scan with an observer that
     /// never stops it.
     #[test]
     fn scan_disk_entries_observed_calls_the_observer_per_file_and_stops_on_break() {

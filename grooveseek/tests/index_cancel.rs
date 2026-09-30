@@ -4,8 +4,8 @@
 //!
 //! These run [`grooveseek::indexer::rebuild_index`] in-process against
 //! [`crate::common::embed_mock`], each test body in a hermetic child of this
-//! test binary, the way `index_progress_callback.rs` does -- its module doc
-//! says why. The recorder here keeps every event,
+//! test binary, the way the in-process progress-callback tests beside this
+//! one do -- their module doc says why. The recorder here keeps every event,
 //! [`grooveseek::indexer::progress::ProgressEvent::Scanning`] included, which
 //! is why these live in a file of their own: the recorder there leaves the
 //! scan out so its exact sequences stay as they were.
@@ -84,8 +84,8 @@ fn unchanged(rel: &str, done: usize, total: usize) -> Ev {
     Ev::Unchanged(rel.to_string(), done, total)
 }
 
-/// `Scanning(1, total)` .. `Scanning(total, total)`: a scan that visited every
-/// file.
+/// The [`Ev::Scanning`] events of a scan that visited every file: `done` runs
+/// from 1 to the total, which every event carries.
 fn scanning(total: usize) -> Vec<Ev> {
     (1..=total).map(|done| Ev::Scanning(done, total)).collect()
 }
@@ -171,7 +171,7 @@ impl Fixture {
     }
 
     /// [`grooveseek::indexer::rebuild_index`] wired the way `groove index`
-    /// wires it, with `progress` as the reporter.
+    /// wires it, with the reporter passed in.
     fn rebuild(&self, force: bool, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
         let kb = self.layout.kb();
         let cfg = Config::load_from(&self.config).expect("load groove.toml");
@@ -225,9 +225,12 @@ fn doc(title: &str, body: &str) -> String {
     format!("---\ntitle: {title}\n---\n\n## {title}\n\n{body}\n")
 }
 
-/// Criteria 3 and 4: a run with no token reports one `Scanning` per file the
+/// Criteria 3 and 4: a run with no token reports one
+/// [`grooveseek::indexer::progress::ProgressEvent::Scanning`] per file the
 /// walk found -- the one the scan declines for its size too, so `done`
-/// reaches `total` -- between `Started` and the first document event, and is
+/// reaches the total -- between
+/// [`grooveseek::indexer::progress::ProgressEvent::Started`] and the first
+/// document event, and is
 /// otherwise the sequence it was before. The document `done` still stops at
 /// the files the loop processed.
 #[test]
@@ -256,9 +259,12 @@ fn scan_reports_every_visited_file_including_declined_ones() {
     );
 }
 
-/// The reporter's promise that `total == 0` reports no `Scanning`, pinned at
-/// the only place that produces the event: a run over an empty knowledge base
-/// goes from `Started { total: 0 }` straight to its terminal event.
+/// The reporter's promise that a
+/// [`grooveseek::indexer::progress::ProgressEvent::Started::total`] of 0
+/// reports no `Scanning`, pinned at the only place that produces the event: a
+/// run over an empty knowledge base goes from
+/// [`grooveseek::indexer::progress::ProgressEvent::Started`] with a total of 0
+/// straight to its terminal event.
 #[test]
 fn a_scan_with_no_files_emits_no_scanning_event() {
     if run_in_hermetic_child("a_scan_with_no_files_emits_no_scanning_event") {
@@ -333,7 +339,7 @@ fn cancel_during_scan_embeds_nothing() {
 /// set a token in that gap, so C2 cannot be told apart from here. What this
 /// pins is the property both share: nothing past the scan runs. The first
 /// file's `Scanning` stopping the run (C1 mid-scan) is
-/// `cancel_during_scan_embeds_nothing`.
+/// [`cancel_during_scan_embeds_nothing`].
 #[test]
 fn cancel_after_the_last_scanned_file_applies_no_rename() {
     if run_in_hermetic_child("cancel_after_the_last_scanned_file_applies_no_rename") {
@@ -378,8 +384,9 @@ fn cancel_after_the_last_scanned_file_applies_no_rename() {
 }
 
 /// Criterion 14: on an empty knowledge base there is no file to scan, so no
-/// `Scanning` and no C1; a token set from `Started { total: 0 }` is still
-/// honoured.
+/// `Scanning` and no C1; a token set from
+/// [`grooveseek::indexer::progress::ProgressEvent::Started`] with a total of 0
+/// is still honoured.
 ///
 /// The run stops at C2 -- the first check point after `Started` when there is
 /// nothing to scan. From outside, C4 would give the same sequence here (no
@@ -633,7 +640,8 @@ fn cancel_after_the_last_document_leaves_deleted_rows_and_generation_keys() {
 }
 
 /// Criterion 9: once the deletion sweep has begun a token is too late. The
-/// run completes, reports `Finished`, and returns with `cancelled == false`.
+/// run completes, reports `Finished`, and returns with `false` in
+/// [`grooveseek::indexer::IndexResult::cancelled`].
 #[test]
 fn cancel_during_the_deletion_sweep_is_too_late_and_the_run_finishes() {
     if run_in_hermetic_child("cancel_during_the_deletion_sweep_is_too_late_and_the_run_finishes") {
