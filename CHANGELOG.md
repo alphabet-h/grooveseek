@@ -74,6 +74,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **An application that embeds the library can stop an indexing run, and sees
+  the scan that precedes it.** `indexer::progress::CancelToken` is a cloneable
+  flag; hand it to `ProgressReporter::with_cancel` and call `cancel()` from any
+  thread. `rebuild_index` looks at it after each scanned file, before applying
+  renames, before each document, and before the deletion sweep; when it is set
+  the run stops there, emits `ProgressEvent::Cancelled { done, total }` in
+  place of `Finished`, and returns `Ok` with `IndexResult::cancelled` set.
+  `done` counts documents reported, never scanned files, so a stop during the
+  scan reports 0. What it stops is consistent per document: every document
+  committed before the stop is complete, a later run skips it by its hash, a
+  document whose move requires it to be re-parsed is re-parsed before the run
+  stops, rows of files deleted from disk stay until a run completes, and the
+  bookkeeping a completed run records is left for the next one. A cancel that
+  arrives after the deletion sweep has begun is too late and the run
+  completes. The scan that hashes every file now reports
+  `ProgressEvent::Scanning { done, total }` once per file, counting the files
+  it declines too, so `done` reaches `total` when the scan ends; `groove index
+  --progress` on a terminal shows it as `scanning N/M` beside the bar.
+  Documents whose move forces a re-parse are now indexed before the others.
+  Nothing else about `groove index` or the MCP `rebuild_index` tool changes:
+  neither sets a token. The Rust API remains outside the compatibility promise
+  ([docs/stability.md](docs/stability.md)).
+
 - **`[embedding] max_input_chars` and `max_retries`** (openai-compatible only).
   Inputs are cut to `max_input_chars` characters before they are sent (default
   8000; 0 is refused). A batch is sent again up to `max_retries` times after

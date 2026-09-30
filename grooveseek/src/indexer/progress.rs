@@ -161,8 +161,8 @@ pub enum ProgressEvent<'a> {
     ///
     /// `done` can stop short of `total`: the scan declines a file that is over
     /// the size cap, cannot be stat'd, or is a hard link, and such a file
-    /// reaches neither document call -- neither
-    /// [`ProgressReporter::report_indexed`] nor
+    /// reaches neither of the document calls,
+    /// [`ProgressReporter::report_indexed`] and
     /// [`ProgressReporter::report_unchanged`], which are the two that advance
     /// `done`. (v1.14.0+) It does reach [`ProgressReporter::report_scanned`],
     /// which counts it in [`ProgressEvent::Scanning`] instead. That is the
@@ -701,7 +701,8 @@ fn should_emit(count: u64, total: u64, step: u64) -> bool {
     count > 0 && (count.is_multiple_of(step) || count == total)
 }
 
-/// Advance the callback counter and return `done` the way the events spell it.
+/// Advance a counter by one and return the new value the way the events spell it. The callback's document counter and the
+/// scan's `scanned` counter both go through it.
 ///
 /// The counter is an `AtomicU64` to match [`ProgressInner::NonTty`]'s, while
 /// the event field is `usize` because `total` arrives as one. Saturating rather

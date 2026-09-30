@@ -500,6 +500,10 @@ fn cancel_after_a_document_keeps_it_and_the_next_run_skips_it() {
     let result = result.expect("a stopped run returns Ok");
     assert!(result.cancelled, "{result:?}");
     assert_eq!(result.updated, 1, "{result:?}");
+    assert_eq!(
+        result.embedded, 1,
+        "the second document is never embedded: {result:?}"
+    );
     let mut expected = vec![Ev::Started(3)];
     expected.extend(scanning(3));
     expected.extend([indexed("a.md", 1, 3), Ev::Cancelled(1, 3)]);
