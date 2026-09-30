@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-10-01
+
 ### Security
 
 - **A loopback embedding endpoint is no longer reached through a proxy.** With
@@ -5920,7 +5922,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.14.0...HEAD
+[1.14.0]: https://github.com/alphabet-h/grooveseek/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/alphabet-h/grooveseek/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/alphabet-h/grooveseek/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/alphabet-h/grooveseek/compare/v1.10.0...v1.11.0
