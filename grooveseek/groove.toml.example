@@ -217,7 +217,9 @@ enabled = ["md"]
 # `groove index --force` runs or the file shrinks under the cap, and an edit
 # that leaves the file over the cap keeps the old text searchable.
 # get_document and resources/read still stop at 50 MiB (binary) and 1 MiB
-# (text), so a document indexed past that is searchable without a uri. A
+# (text), so a document indexed past that is searchable without a uri.
+# They also parse with the built-in 50 MiB decompression budget, so while
+# max_decompressed_size is above it no binary document gets a uri. A
 # config found beside a
 # knowledge base cannot set these three; pass --config.
 # [index]

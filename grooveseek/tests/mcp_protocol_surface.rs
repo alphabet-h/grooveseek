@@ -863,3 +863,79 @@ fn list_topics_describes_the_children_tree_it_returns() {
          continuation that kept its indentation is a defect: {description:?}"
     );
 }
+
+/// (feature-61) With `[index].max_decompressed_size` above the built-in read
+/// budget, the resource surface stops offering binary documents: a read parses
+/// with that budget, so a PDF the index was allowed to inflate further may be
+/// one a read refuses, and the raw size recorded in the index cannot say which.
+/// The Markdown document beside it stays on offer.
+///
+/// The index is seeded through the library, as in
+/// [`start_with_indexed_paths`], so no model run is needed for the rows. The
+/// search side of the same rule is covered by unit tests in
+/// [`grooveseek::server`]: a hit needs embedded chunks, which this seeding does
+/// not write.
+#[test]
+fn a_raised_decompression_cap_keeps_binary_documents_off_the_resource_surface() {
+    let layout = TempKbLayout::new("groove-protocol-surface-inflate");
+    layout.write("notes/a.md", "---\ntitle: Doc\n---\n\n## body\n\ntext\n");
+    layout.write("notes/b.pdf", "not really a pdf; never parsed here\n");
+    let cfg = layout.root().join("groove.toml");
+    std::fs::write(
+        &cfg,
+        concat!(
+            "[watch]\nenabled = false\n",
+            "[parsers]\nenabled = [\"md\", \"pdf\"]\n",
+            "[index]\nmax_decompressed_size = \"unlimited\"\n",
+        ),
+    )
+    .expect("write groove.toml");
+    {
+        let db_path = grooveseek::resolve_db_path(layout.kb());
+        let db = grooveseek::db::Database::open(&db_path.to_string_lossy()).expect("open db");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("meta");
+        for path in ["notes/a.md", "notes/b.pdf"] {
+            db.upsert_document(path, Some("Doc"), None, None, None, &[], None, "h", 64)
+                .expect("upsert");
+        }
+    }
+    let (guard, base) = common::mcp::spawn_mcp_server(layout.kb(), &cfg);
+
+    let topic = "kb://topic/notes";
+    let resp = rpc_named(
+        &base,
+        "resources/read",
+        Some(topic),
+        serde_json::json!({"uri": topic, "_meta": meta()}),
+    );
+    let body = resp["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the notes group must be readable: {resp}"));
+    assert!(
+        body.contains("kb://doc/notes/a.md"),
+        "the Markdown document stays on offer: {body}"
+    );
+    assert!(
+        !body.contains("kb://doc/notes/b.pdf"),
+        "a binary document must not be offered while the index may inflate past what a read parses: {body}"
+    );
+
+    let pdf = "kb://doc/notes/b.pdf";
+    let refused = rpc_named(
+        &base,
+        "resources/read",
+        Some(pdf),
+        serde_json::json!({"uri": pdf, "_meta": meta()}),
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not a document this server offers"),
+        "the read refuses it at membership, the same rule as the listing: {refused}"
+    );
+
+    // The guard kills the server before the layout removes the directory the
+    // server holds its database under (see [`start`]).
+    drop(guard);
+    drop(layout);
+}

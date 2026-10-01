@@ -4857,7 +4857,8 @@ mod tests {
         let unlimited = FileSizeLimits {
             binary: FileSizeLimit::Unlimited,
             text: FileSizeLimit::Unlimited,
-            decompressed: FileSizeLimit::Unlimited,
+            // Default, not raised: a raised one withholds every binary uri (tested next to ServableRules).
+            decompressed: FileSizeLimit::Bytes(crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES),
         };
         let registry = Registry::from_enabled_with_plugins(
             &["md".to_string(), "pdf".to_string()],
@@ -4993,6 +4994,116 @@ mod tests {
             .expect("the index path admits it under \"unlimited\"");
         assert_eq!(indexed.frontmatter.title.as_deref(), Some("Bomb"));
         assert!(indexed.raw_content.contains("inflated body"));
+    }
+
+    /// A registry over Markdown and PDF whose decompression cap is `decompressed`
+    /// and whose raw caps are the defaults.
+    fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
+        use crate::parser::{CodeParsersConfig, FileSizeLimits};
+        let limits = FileSizeLimits {
+            decompressed,
+            ..FileSizeLimits::default()
+        };
+        Registry::from_enabled_with_plugins(
+            &["md".to_string(), "pdf".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            limits,
+        )
+        .expect("md + pdf")
+    }
+
+    /// feature-61: a read parses with the built-in decompression budget, so
+    /// once `[index].max_decompressed_size` is raised past it a binary document
+    /// the index accepted may be one a read refuses. The raw size cannot tell
+    /// which, so no binary document gets a link; text is not affected.
+    #[test]
+    fn a_raised_decompression_cap_withholds_binary_uris_but_not_text_ones() {
+        use crate::parser::{DEFAULT_MAX_DECOMPRESSED_BYTES, FileSizeLimit};
+        for raised in [
+            FileSizeLimit::Unlimited,
+            FileSizeLimit::Bytes(DEFAULT_MAX_DECOMPRESSED_BYTES + 1),
+        ] {
+            let registry = md_and_pdf_registry_inflating_to(raised);
+            let rules = ServableRules::new(&registry, vec![]);
+            assert!(
+                !rules.allows("a.pdf"),
+                "{raised}: a read may refuse what the index inflated, so no link"
+            );
+            assert!(rules.allows("notes/a.md"), "{raised}: text is unaffected");
+            let unknown = ServableRules::sizes_unavailable(&registry);
+            assert!(!unknown.allows("a.pdf"));
+        }
+    }
+
+    #[test]
+    fn the_default_decompression_cap_keeps_binary_uris() {
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, vec![]);
+        assert!(rules.allows("a.pdf"));
+    }
+
+    /// The boundary belongs to the served side: a cap equal to the read budget
+    /// inflates no further than a read may.
+    #[test]
+    fn a_decompression_cap_exactly_at_the_read_budget_keeps_binary_uris() {
+        use crate::parser::{DEFAULT_MAX_DECOMPRESSED_BYTES, FileSizeLimit};
+        let registry =
+            md_and_pdf_registry_inflating_to(FileSizeLimit::Bytes(DEFAULT_MAX_DECOMPRESSED_BYTES));
+        let rules = ServableRules::new(&registry, vec![]);
+        assert!(rules.allows("a.pdf"));
+        assert!(rules.allows("notes/a.md"));
+    }
+
+    /// The same rule on search hits: a PDF hit under a raised decompression
+    /// cap carries no URI, a Markdown hit beside it does.
+    #[test]
+    fn a_binary_search_hit_has_no_uri_while_the_index_may_inflate_past_a_read() {
+        let registry = md_and_pdf_registry_inflating_to(crate::parser::FileSizeLimit::Unlimited);
+        let rules = ServableRules::new(&registry, vec![]);
+        let uri_of = |path: &str| {
+            let h = crate::db::SearchHit {
+                start_line: None,
+                end_line: None,
+                symbol_kind: None,
+                score: 1.0,
+                path: path.to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: "x".to_string(),
+                match_spans: None,
+                expanded_from: None,
+            };
+            HitWithUri::new(h, &rules).uri
+        };
+        assert_eq!(uri_of("docs/report.pdf"), None);
+        assert_eq!(
+            uri_of("notes/a.md"),
+            Some("kb://doc/notes/a.md".to_string())
+        );
+        let json = serde_json::to_value(HitWithUri::new(
+            crate::db::SearchHit {
+                start_line: None,
+                end_line: None,
+                symbol_kind: None,
+                score: 1.0,
+                path: "docs/report.pdf".to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: "x".to_string(),
+                match_spans: None,
+                expanded_from: None,
+            },
+            &rules,
+        ))
+        .unwrap();
+        assert!(json.get("uri").is_none(), "the key is omitted: {json}");
     }
 
     #[test]

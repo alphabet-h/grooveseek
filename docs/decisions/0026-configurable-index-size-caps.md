@@ -134,11 +134,15 @@ changing anything for a configuration that does not ask for it.
   purpose.** A document indexed past the read cap is reported as
   `larger-than-a-read-returns` (Warning, exit 1), the same treatment text over
   1 MiB already gets.
-- **A document that inflates past 50 MiB is searchable but not fully
-  readable.** Indexed under a raised `max_decompressed_size`, it still carries
-  a `uri` (what is on offer is decided by raw size alone), but a read of it is
-  refused with the decompression message, or comes back without the parts that
-  are over the budget on their own.
+- **Raising `max_decompressed_size` takes every binary document off offer.**
+  A read parses with the built-in budget, and the index records only raw size,
+  which cannot say which binary documents inflate past it. So while the key is
+  above the default, no binary hit carries a `uri` and `resources/list` offers
+  none; they stay searchable, and `get_document` still refuses one that
+  inflates past the budget with the decompression message, or returns it
+  without the parts that are over the budget on their own. Text is unaffected.
+  Recording the inflated size at index time would let the server offer the
+  binary documents that fit; that is not done yet.
 - **Lowering a cap keeps what was indexed under the higher one** until
   `groove index --force` runs or the file shrinks under the cap, because the
   scan's size skip protects existing rows rather than deleting them. An edit

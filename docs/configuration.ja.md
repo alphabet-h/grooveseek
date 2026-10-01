@@ -120,7 +120,10 @@ max_chunk_chars = 3500
 # `groove index --force` を打つか、ファイルが上限の下まで縮むまで残る。上限を超えたままの
 # 編集では古いテキストが検索に出続ける。読み出しは連動しない:
 # `get_document` / `resources/read` はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、
-# それを超えて索引した文書は検索には出るが `uri` を持たない。この 3 キーは watcher も
+# それを超えて索引した文書は検索には出るが `uri` を持たない。読み出しは組み込みの
+# 展開 budget (50 MiB) でも parse するので、`max_decompressed_size` をそれより上げて
+# いる間はバイナリ文書のどれにも `uri` が付かず、`resources/list` も提示しない
+# (検索には出る)。この 3 キーは watcher も
 # 読み、KB の隣で見つかった config からは設定できない (下の表)。根拠: ADR-0026。
 # [index]
 # fail_on_frontmatter_error = true

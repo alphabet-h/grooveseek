@@ -32,7 +32,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   binary formats and 1 MiB for text, so a document indexed past that is searchable but carries
   no `uri` ([ADR-0005](docs/decisions/0005-record-document-size-in-the-index.md)), and
   `groove doctor` lists it the way it already lists text over 1 MiB. Reads keep the built-in
-  50 MiB decompression budget too, whatever `max_decompressed_size` says. A config found beside a
+  50 MiB decompression budget too, whatever `max_decompressed_size` says, so while that key is
+  above the default no binary document carries a `uri` or is offered as a resource; they stay
+  searchable. A config found beside a
   knowledge base cannot set any of the three, raised or lowered: they fall back to the
   defaults with a warning. Pass `--config` to accept one that sets them.
   See [ADR-0026](docs/decisions/0026-configurable-index-size-caps.md).
