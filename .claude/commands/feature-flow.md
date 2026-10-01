@@ -175,7 +175,9 @@ cycle 完了時に必ず:
 (skill は同 session 内で反映される)。`/clear` は background task を止めないので、下の leak 確認が効く:
 
 1. **handoff doc を即時 write**: `.dev/knowledge/session-<YYYY-MM-DD>-<topic>-handoff.md`
-   - **書く前に鎖の末端を取る** (`powershell -NoProfile -File .dev/tools/handoff_tail.ps1`、stdout の 1 行)。それが直前の
+   - **書く前に鎖の末端を取る** (`powershell -NoProfile -File .dev/tools/handoff_tail.ps1`)。**exit 0 で stdout がちょうど
+     1 行の時だけ先へ進む** — script は鎖が切れていても候補の path を印字して exit 1 するので、stdout だけ見て 1 本選ばない。
+     exit 0 以外なら、切れた鎖の上に新 handoff を足さず、出力を添えて user に報告して close-out を止める。返った 1 行が直前の
      handoff で、**型もそれ** — 開いて同じ節立て (frontmatter の title / date / tags、`## ★ 次にやること`、今日やったこと、
      閉じる直前の状態、guard、環境の罠、kuriya) で書く。**session を `/next-work` から始めていない時ほど必要** —
      その場合は `.dev/README.md` の handoff の段落も読んでいない
@@ -192,15 +194,8 @@ cycle 完了時に必ず:
    - 完了基準 checklist
    - background task leak の確認 (`run_in_background` の polling が残っていないか)
    - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。**handoff のたびに、その場で測る**: 報告モード (`powershell -NoProfile -File .dev/tools/disk-sweep.ps1`、何も消さない) を打ち、空きと `target` の TOTAL を書いて user にも伝える。**SessionStart の値で済ませない、`LOW` が出ていたかどうかで分岐もしない** — あれは session の始めの値で、`/full-audit` や `--ignored` の test や cross build を挟めば、始めは閾値より上でも閉じる時には割っている。release を切った session は Phase 7 step 7 でも測っているが、その後に build していればそれも古いので、ここでも測る。**`.dev/tools/disk-sweep.ps1` が無い checkout (前提の節) では測れない** — handoff は止めず、この項に「disk: 未計測 (script なし)」と書く。PowerShell を手で組んで代用しない、「クリーンアップした」とも書かない (Phase 7 step 7 にも同じ句がある)。消すのは user が `/disk-sweep apply` と打った時だけで、controller からは測るところまで。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
-2. **kuriya の goal を新 handoff に向け、鎖を確かめる**。goal (handoff の path を body に持つ item。番号と運用は
-   `.dev/README.md` の handoff の段落) を `mcp__kuriya__update` で新 path + state + next に差し替える — `/next-work` は
-   goal の body と末端の path を突き合わせ、食い違うと両方を user に見せて止まる。**差し替えたら `mcp__kuriya__status` で
-   読み戻し、goal の body が新 handoff の path で始まっていることを見る** (update が通ったつもりで通っていない形を残さない)。
-   **kuriya が未接続、または読み戻しが合わない時は「再開できる」と言わない**: handoff の冒頭 (`前の handoff:` の次) に
-   「kuriya goal 未更新 — 次 session の `/next-work` は goal と末端の食い違いで止まる。本 handoff を正として goal の body を
-   本 path に update してから続ける」と書き、step 4 の通知にも同じ 1 文を足す。食い違いを黙って残して `/clear` へ進まない。
-   続けて、もう一度 `powershell -NoProfile -File .dev/tools/handoff_tail.ps1` を打ち、**exit 0 で新 handoff の path 1 行**が
-   返ることを見る (2 行返る = step 1 の `前の handoff:` を書き忘れている)
+2. **push の前に鎖を確かめる**。もう一度 `powershell -NoProfile -File .dev/tools/handoff_tail.ps1` を打ち、**exit 0 で
+   新 handoff の path 1 行**が返ることを見る (2 行返る = step 1 の `前の handoff:` を書き忘れている。直してから先へ)
 3. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
    無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
    ```bash
@@ -211,10 +206,26 @@ cycle 完了時に必ず:
    ```
    `.dev` の pre-push hook (`.dev/tools/hooks/pre-push`) が step 2 と同じ script を打ち、末端が 1 本でなければ push を
    止める。**止まったら handoff に marker を足して push し直す。`--no-verify` で迂回しない** — 迂回した push は次 session の
-   入口をそのまま塞ぐ
-4. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
-   step 2 で goal を更新できなかった時は、この文の後に「kuriya の goal は未更新です。次 session の `/next-work` は食い違いを
-   報告して止まるので、handoff を正として goal を更新してから続けてください」を足す (「再開できます」だけで終えない)
+   入口をそのまま塞ぐ。**commit か push がそれ以外の理由 (network / 認証 / 別の hook) で失敗したら step 4 へ進まない** —
+   remote に無い handoff を goal が指す状態を作らないため。直して push が通ってから続ける。直せなければ
+   「handoff は local のみ、goal は未更新」と user に伝えて止まる
+4. **push が通ってから、kuriya の goal を新 handoff に向ける**。goal (handoff の path を body に持つ item。番号と運用は
+   `.dev/README.md` の handoff の段落) を `mcp__kuriya__update` で新 path + state + next に差し替え、**`mcp__kuriya__status` で
+   読み戻して goal の body が新 handoff の path で始まっていることを見る** (update が通ったつもりで通っていない形を残さない)。
+   できなかった時は 2 通りを分けて handoff の冒頭 (`前の handoff:` の次) に書き、その 1 行を commit / push し直す:
+   - **kuriya に繋がらない**: 「kuriya goal 未更新 (未接続)。次 session で kuriya が繋がっていれば `/next-work` は goal と
+     末端の食い違いを見せて止まる — 本 handoff を正として goal を本 path に update して続ける。繋がっていなければ
+     `/next-work` は突き合わせ無しで本 handoff から続く」
+   - **繋がるが読み戻しが合わない**: もう 1 回 update して読み戻す。それでも合わなければ「kuriya goal 不一致 (update が
+     反映されない)。次 session の `/next-work` は食い違いで止まる — 本 handoff を正として goal を直してから続ける」
+5. **`/next-work` の Phase 0 を自分で通してから「再開できる」と言う**。次 session の入口が見るものを、閉じる側が同じ順で打つ:
+   末端 (`handoff_tail.ps1` が exit 0 で新 handoff 1 行) / goal の body が末端の path で始まる (または step 4 の 1 行が
+   handoff にある) / root と `.dev` の `git -C <絶対パス> status --short --branch` が clean で想定の branch / handoff が
+   別 repo を挙げていればそこも同じ status。**何を見るかの家は `.claude/commands/next-work.md` の Phase 0 (step 3〜6) で、
+   判定の中身はここに写さない** — 写しは食い違う。1 つでも通らなければ直す。直せないものは handoff の「閉じる直前の状態」に
+   「次 session の入口で止まる理由」として書き (書いたら commit / push し直す)、step 6 の通知にも書く
+6. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
+   step 4 / 5 で残したものがあれば、この文の後にそれを 1 文ずつ足す (「再開できます」だけで終えない)
 
 context が切り替わったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
