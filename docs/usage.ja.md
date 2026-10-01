@@ -446,7 +446,7 @@ groove doctor --kb-path /path/to/knowledge-base
 groove doctor --kb-path ... --format json | jq '.findings[]'
 ```
 
-検索は 1 つの chunk について 3 つのテーブルが一致していることを前提にしている — 本文・embedding・全文検索行。**ずれてもエラーにはならない**: embedding の無い chunk は単にベクトル検索に出ず、全文検索行の無い chunk はキーワード検索に出ないだけ。これまでは full index を回して修復されるのを見るまで気付けなかった。`doctor` は直接それを問う。あわせて、MCP の resource 面が**どの索引済み文書を提示していないか、なぜか**も報告する — 現在の `[parsers].enabled` に無い拡張子 / resource read が返せるサイズを超える文書 / 以前のバージョンで索引されたため size が未記録の文書。
+検索は 1 つの chunk について 3 つのテーブルが一致していることを前提にしている — 本文・embedding・全文検索行。**ずれてもエラーにはならない**: embedding の無い chunk は単にベクトル検索に出ず、全文検索行の無い chunk はキーワード検索に出ないだけ。これまでは full index を回して修復されるのを見るまで気付けなかった。`doctor` は直接それを問う。あわせて、MCP の resource 面が**どの索引済み文書を提示していないか、なぜか**も報告する — 現在の `[parsers].enabled` に無い拡張子 / resource read が返せるサイズを超える文書 / `[index].max_decompressed_size` を組み込みの既定より上げている間のバイナリ文書 (`binary-uris-withheld`、warning。検索には残り、キーを既定に戻せば URI も戻る) / 以前のバージョンで索引されたため size が未記録の文書。
 
 さらに、**定義単位ではなく行単位で chunk 化されたソースファイル**も名指しする — 定義が入れ子の上限より深かったか、ファイルが 1 ファイルあたりの chunk 数の上限を超える chunk を要求したか、のいずれか。これらのファイルは欠けなく索引されて検索にも出るが、chunk が定義の symbol kind / 見出し / スコープを持たないので、定義の形をしたクエリでは辿り着けない。直し方はコマンドではなく**ファイルの側**にある — index を回し直しても同じ上限に当たって同じ判断になる。
 

@@ -141,6 +141,8 @@ changing anything for a configuration that does not ask for it.
   none; they stay searchable, and `get_document` still refuses one that
   inflates past the budget with the decompression message, or returns it
   without the parts that are over the budget on their own. Text is unaffected.
+  `groove doctor` names the withheld binary documents as `binary-uris-withheld`
+  (Warning, exit 1), so this too keeps a raised configuration yellow.
   Recording the inflated size at index time would let the server offer the
   binary documents that fit; that is not done yet.
 - **Lowering a cap keeps what was indexed under the higher one** until

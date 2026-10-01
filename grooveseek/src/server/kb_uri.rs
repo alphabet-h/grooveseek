@@ -201,6 +201,32 @@ impl<'a> ServableRules<'a> {
         v.sort();
         v
     }
+
+    /// The binary documents among `paths` that [`Self::allows`] withholds
+    /// because `[index].max_decompressed_size` is raised past the read budget,
+    /// sorted so a report is stable. Empty while the cap is at or below
+    /// [`crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES`].
+    ///
+    /// The same two fields [`Self::allows`] reads, for the reason
+    /// [`Self::oversized_paths`] gives: `groove doctor` explains this predicate
+    /// rather than an equivalent of it. A path withheld for another reason as
+    /// well (its size, its name) is listed here too, because raising the cap
+    /// is a reason on its own.
+    pub(crate) fn withheld_binary<'p>(
+        &self,
+        paths: impl IntoIterator<Item = &'p str>,
+    ) -> Vec<String> {
+        if self.binary_reads_bounded {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = paths
+            .into_iter()
+            .filter(|p| self.is_binary(p))
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v
+    }
 }
 
 impl KbCore {
@@ -291,8 +317,10 @@ impl KbCore {
                 //
                 // The message says "offers", not "indexed", because those
                 // stopped being the same thing: a document can be indexed and
-                // still be held back, by an extension the registry dropped or a
-                // size past what a read returns. Naming the index would send
+                // still be held back, by an extension the registry dropped, a
+                // size past what a read returns, or (a binary document) a
+                // decompression cap raised past a read's. `groove doctor`
+                // names each of them. Naming the index would send
                 // someone looking for a document `groove status` counts.
                 if !paths.iter().any(|p| p == rel) {
                     return Err((
