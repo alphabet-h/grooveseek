@@ -158,7 +158,10 @@ const PDF_DOC_TEXT_MAX_BYTES: usize = super::MAX_RAW_BINARY_BYTES as usize;
 /// 値は crate 自身の `PARSING_TIMEOUT_SECS` (= 120、"Timeout for long-running
 /// parsing operations") に合わせた。正規の PDF は 50 MB でも数秒で終わるので、
 /// 遅いマシンでの false positive 余裕は十分ある。
-const PDF_DOC_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+///
+/// (feature-61) `[index]` で raw 上限を上げてもこの秒数は動かさない。
+/// [`super::raised_limits_warning`] が利用者にそう伝える。
+pub(crate) const PDF_DOC_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
 ///

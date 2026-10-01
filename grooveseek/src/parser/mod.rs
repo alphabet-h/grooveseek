@@ -167,12 +167,17 @@ pub struct ParsedDocument {
 /// chunker.
 pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 
-/// バイナリ形式ファイルの生バイト上限 (50 MiB)。index 時の size skip (indexer)
-/// と get_document の raw cap (server) で共有する。テキスト形式には
-/// [`MAX_RAW_TEXT_BYTES`] を使う。
+/// バイナリ形式ファイルの生バイト上限の**既定値** (50 MiB)。
+///
+/// (feature-61) 索引時の上限は `[index].max_binary_file_size` で変えられ、実際に効く値は
+/// [`Registry::limits`] が持つ ([`FileSizeLimits`])。`get_document` / `resources/read`
+/// の読み出し側は索引の設定に連動しない別の定数 ([`crate::server`] の
+/// `GET_DOCUMENT_BINARY_MAX_BYTES`) を使う。名前は ADR-0004 / ADR-0005 と docs が
+/// 参照しているので変えない。テキスト形式の既定は [`MAX_RAW_TEXT_BYTES`]。
 pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 
-/// (BU-02) テキスト形式ファイルの生バイト上限 (50 MiB)。
+/// (BU-02) テキスト形式ファイルの生バイト上限の**既定値** (50 MiB)。
+/// (feature-61) `[index].max_text_file_size` で変えられる ([`FileSizeLimits::text`])。
 ///
 /// もともとテキストには index 時の上限が無く、`fs::read` が丸ごとメモリに
 /// 載せていた。`rebuild_index` は MCP ツールとしてクライアントから叩けるので、
@@ -182,6 +187,217 @@ pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 /// 載せる**という同じ制約から来ているため。50 MiB の Markdown は
 /// 2,000 万文字級で、正当な知識ベースの文書としては現実的でない。
 pub const MAX_RAW_TEXT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// (feature-61) 展開 budget の既定値 (50 MiB)。xlsx の展開 pre-flight、docx / pptx の
+/// 累積展開量、PDF の文書単位テキスト量が使う。`[index].max_decompressed_size` で変えられる
+/// ([`FileSizeLimits::decompressed`])。
+///
+/// [`MAX_RAW_BINARY_BYTES`] と同じ数だが連動させない (ADR-0026): xlsx の XML は圧縮で
+/// 数倍に縮むので、raw 上限に連動させると raw を上げた workbook が展開側で skip され、
+/// 通すには両方を `"unlimited"` にするしかなくなる。その瞬間に zip-bomb の防御が全ファイルで
+/// 消える。
+pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 50 * 1024 * 1024;
+
+/// (feature-61) `[index]` のサイズ上限 1 つ分。
+///
+/// TOML では整数 (bytes)、単位付き文字列 (`"300 MiB"`、`"2 GB"`)、または `"unlimited"`
+/// (大文字小文字を区別しない) で書く。単位は `B` / `KB` / `MB` / `GB` / `TB` (1000 進) と
+/// `KiB` / `MiB` / `GiB` / `TiB` (1024 進)、大文字小文字を区別しない。小数は受けない。
+/// `0` と負値は拒否して `"unlimited"` を案内する — `0` を「無制限」と読む製品と「既定」
+/// 「全拒否」と読む製品があり、どれとも取り違えさせないため (ADR-0026)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawFileSizeLimit")]
+pub enum FileSizeLimit {
+    /// この bytes 数まで。TOML から来る値は 1 以上。
+    Bytes(u64),
+    /// 上限なし。
+    Unlimited,
+}
+
+impl FileSizeLimit {
+    /// 比較に使う上限 (bytes)。
+    ///
+    /// [`FileSizeLimit::Unlimited`] は `u64::MAX` を返す。**「無制限」を `u64::MAX` で表すのは
+    /// ここだけ**で、他所で `== u64::MAX` を判定しない (sentinel を散らすと、同じ値が場所に
+    /// よって別の意味を持ち始める)。消費側はすべて `len > cap`、`cap.saturating_add(1)`、
+    /// `cap.saturating_sub(total)` で比べるので、`u64::MAX` は比較が偽になるだけで
+    /// overflow しない ([`crate::links::read_checked`]、[`ooxml`] の `read_zip_part`、
+    /// [`xlsx`] の pre-flight)。
+    pub fn cap_bytes(&self) -> u64 {
+        match self {
+            Self::Bytes(n) => *n,
+            Self::Unlimited => u64::MAX,
+        }
+    }
+}
+
+impl std::fmt::Display for FileSizeLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(n) => write!(f, "{n} bytes"),
+            Self::Unlimited => f.write_str("unlimited"),
+        }
+    }
+}
+
+/// [`FileSizeLimit`] の TOML 上の書き方 3 種。
+///
+/// [`FileSizeLimit`] 自体を untagged にしないのは、untagged だと [`TryFrom`] のエラーが
+/// "did not match any variant" に潰れて案内文が消えるため。`Int` を `i64` で受けるのは
+/// 負値を自分の言葉で断るため (`u64` だと serde 段の型エラーになる)、`Float` を受けるのは
+/// `1.5` に「小数は受けない」と答えるため。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawFileSizeLimit {
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// `0` / 負値 / `"0 MiB"` に添える案内。
+const UNLIMITED_HINT: &str = "use \"unlimited\" to lift the limit";
+
+/// 小数に添える案内。
+const NO_FRACTIONS: &str =
+    "fractions are not accepted (write \"1536 MiB\" rather than \"1.5 GiB\")";
+
+impl TryFrom<RawFileSizeLimit> for FileSizeLimit {
+    type Error = String;
+
+    fn try_from(raw: RawFileSizeLimit) -> std::result::Result<Self, Self::Error> {
+        match raw {
+            RawFileSizeLimit::Int(n) => match u64::try_from(n) {
+                Ok(bytes) if bytes >= 1 => Ok(Self::Bytes(bytes)),
+                _ => Err(format!(
+                    "a size limit must be at least 1 byte, got {n}; {UNLIMITED_HINT}"
+                )),
+            },
+            RawFileSizeLimit::Float(x) => Err(format!(
+                "a size limit is a whole number of bytes, got {x}; {NO_FRACTIONS}"
+            )),
+            RawFileSizeLimit::Str(s) => parse_size_text(&s),
+        }
+    }
+}
+
+/// 文字列で書かれた [`FileSizeLimit`] を読む。`"unlimited"`、または
+/// `<整数><空白?><単位>` (単位なしは bytes)。
+fn parse_size_text(text: &str) -> std::result::Result<FileSizeLimit, String> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("unlimited") {
+        return Ok(FileSizeLimit::Unlimited);
+    }
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, rest) = trimmed.split_at(digits_end);
+    if digits.is_empty() {
+        return Err(format!(
+            "expected a byte count, a size such as \"300 MiB\", or \"unlimited\", got {text:?}"
+        ));
+    }
+    if rest.starts_with('.') {
+        return Err(format!(
+            "a size limit is a whole number of bytes, got {text:?}; {NO_FRACTIONS}"
+        ));
+    }
+    let unit = rest.trim_start();
+    let multiplier: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        "kib" => 1 << 10,
+        "mib" => 1 << 20,
+        "gib" => 1 << 30,
+        "tib" => 1 << 40,
+        _ => {
+            return Err(format!(
+                "unknown unit {unit:?} in {text:?}; use B, KB, MB, GB, TB, KiB, MiB, GiB or TiB"
+            ));
+        }
+    };
+    let overflow = || format!("{text:?} is more bytes than this build can count");
+    let count: u64 = digits.parse().map_err(|_| overflow())?;
+    if count == 0 {
+        return Err(format!(
+            "a size limit must be at least 1 byte, got {text:?}; {UNLIMITED_HINT}"
+        ));
+    }
+    count
+        .checked_mul(multiplier)
+        .map(FileSizeLimit::Bytes)
+        .ok_or_else(overflow)
+}
+
+/// (feature-61) `[index]` の 3 つのサイズ上限。
+///
+/// [`Registry`] が運び ([`Registry::limits`])、indexer は raw 上限 2 つを、binary parser は
+/// 構築時に展開 budget を読む。[`crate::config::Config::file_size_limits`] が `[index]` から
+/// 解決する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSizeLimits {
+    /// `[index].max_binary_file_size` — pdf / docx / xlsx / pptx の生バイト上限。
+    pub binary: FileSizeLimit,
+    /// `[index].max_text_file_size` — md / txt (と registry の非 binary parser) の生バイト上限。
+    pub text: FileSizeLimit,
+    /// `[index].max_decompressed_size` — xlsx / docx / pptx の展開後合計と PDF の文書単位
+    /// テキスト量。
+    pub decompressed: FileSizeLimit,
+}
+
+impl Default for FileSizeLimits {
+    fn default() -> Self {
+        Self {
+            binary: FileSizeLimit::Bytes(MAX_RAW_BINARY_BYTES),
+            text: FileSizeLimit::Bytes(MAX_RAW_TEXT_BYTES),
+            decompressed: FileSizeLimit::Bytes(DEFAULT_MAX_DECOMPRESSED_BYTES),
+        }
+    }
+}
+
+/// (feature-61) 3 つのどれかが既定より大きい (`"unlimited"` を含む) なら `true`。
+///
+/// 既定ちょうどと、下げた場合は `false`。[`crate::config::Config::build_parser_registry`] が
+/// これで [`raised_limits_warning`] を出すかを決める (process ごとに 1 回)。
+pub fn should_warn_raised_limits(limits: &FileSizeLimits) -> bool {
+    let defaults = FileSizeLimits::default();
+    limits.binary.cap_bytes() > defaults.binary.cap_bytes()
+        || limits.text.cap_bytes() > defaults.text.cap_bytes()
+        || limits.decompressed.cap_bytes() > defaults.decompressed.cap_bytes()
+}
+
+/// (feature-61) [`should_warn_raised_limits`] が `true` の時に出す警告文。stderr に出るので
+/// ASCII のみ。
+pub fn raised_limits_warning(limits: &FileSizeLimits) -> String {
+    let defaults = FileSizeLimits::default();
+    let mut msg = format!(
+        concat!(
+            "[index] sets a size cap above its built-in default: ",
+            "binary {binary} (default {default_binary}), ",
+            "text {text} (default {default_text}), ",
+            "decompressed {decompressed} (default {default_decompressed}). ",
+            "A file being indexed is held in memory whole, and an .xlsx also holds its ",
+            "shared-strings table expanded; an allocation failure aborts the process ",
+            "instead of skipping the file. PDF text extraction still stops after ",
+            "{timeout} s whatever the cap."
+        ),
+        binary = limits.binary,
+        default_binary = defaults.binary,
+        text = limits.text,
+        default_text = defaults.text,
+        decompressed = limits.decompressed,
+        default_decompressed = defaults.decompressed,
+        timeout = pdf::PDF_DOC_EXTRACT_TIMEOUT.as_secs(),
+    );
+    if [limits.binary, limits.text, limits.decompressed].contains(&FileSizeLimit::Unlimited) {
+        msg.push_str(
+            " With \"unlimited\", memory use is bounded only by the files placed in the knowledge base.",
+        );
+    }
+    msg
+}
 
 /// (AU-33) `ParsedDocument::raw_content` — the chunk bodies rejoined.
 ///
@@ -721,5 +937,173 @@ mod tests {
             .parse_bytes(b"## H\n\nbody enough body enough body enough", "x.md", &[])
             .expect("healthy parser must still return Ok through the panic guard");
         assert_eq!(doc.chunks.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-61: [index] size caps
+    // -----------------------------------------------------------------------
+
+    /// One `FileSizeLimit` behind a key, so the values go through serde the way
+    /// `[index]` puts them through it.
+    #[derive(Debug, serde::Deserialize)]
+    struct OneLimit {
+        v: FileSizeLimit,
+    }
+
+    fn limit(toml_value: &str) -> std::result::Result<FileSizeLimit, String> {
+        toml::from_str::<OneLimit>(&format!("v = {toml_value}\n"))
+            .map(|one| one.v)
+            .map_err(|e| e.to_string())
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn file_size_limit_parses_bytes_units_and_unlimited() {
+        let cases: &[(&str, FileSizeLimit)] = &[
+            ("1", FileSizeLimit::Bytes(1)),
+            ("52428800", FileSizeLimit::Bytes(52_428_800)),
+            ("\"300 MiB\"", FileSizeLimit::Bytes(300 * MIB)),
+            ("\"300MiB\"", FileSizeLimit::Bytes(300 * MIB)),
+            ("\"2 GB\"", FileSizeLimit::Bytes(2_000_000_000)),
+            ("\"7 KB\"", FileSizeLimit::Bytes(7_000)),
+            ("\"3 MB\"", FileSizeLimit::Bytes(3_000_000)),
+            ("\"1 TB\"", FileSizeLimit::Bytes(1_000_000_000_000)),
+            ("\"4 KiB\"", FileSizeLimit::Bytes(4 * 1024)),
+            ("\"16 GiB\"", FileSizeLimit::Bytes(16 * 1024 * MIB)),
+            ("\"1 TiB\"", FileSizeLimit::Bytes(1024 * 1024 * MIB)),
+            ("\"512 B\"", FileSizeLimit::Bytes(512)),
+            ("\"4096\"", FileSizeLimit::Bytes(4096)),
+            ("\"unlimited\"", FileSizeLimit::Unlimited),
+            ("\"UNLIMITED\"", FileSizeLimit::Unlimited),
+        ];
+        for (text, want) in cases {
+            assert_eq!(limit(text), Ok(*want), "v = {text}");
+        }
+        assert_eq!(FileSizeLimit::Bytes(42).cap_bytes(), 42);
+        assert_eq!(FileSizeLimit::Unlimited.cap_bytes(), u64::MAX);
+        let defaults = FileSizeLimits::default();
+        for l in [defaults.binary, defaults.text, defaults.decompressed] {
+            assert_eq!(
+                l.cap_bytes(),
+                50 * MIB,
+                "every default is the previous fixed 50 MiB"
+            );
+        }
+    }
+
+    #[test]
+    fn file_size_limit_rejects_zero_and_points_at_unlimited() {
+        for text in ["0", "-1", "\"0 MiB\""] {
+            let err = limit(text).expect_err(text);
+            assert!(
+                err.contains("use \"unlimited\" to lift the limit"),
+                "v = {text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_size_limit_rejects_fractions_unknown_units_and_empty() {
+        for text in ["1.5", "\"1.5 GiB\""] {
+            let err = limit(text).expect_err(text);
+            assert!(
+                err.contains("fractions are not accepted"),
+                "v = {text}: {err}"
+            );
+        }
+        let err = limit("\"300 XB\"").expect_err("unknown unit");
+        assert!(err.contains("unknown unit"), "{err}");
+        for text in ["\"\"", "\"unlimited!\"", "\"lots\""] {
+            let err = limit(text).expect_err(text);
+            assert!(
+                err.contains("a size such as \"300 MiB\", or \"unlimited\""),
+                "v = {text}: {err}"
+            );
+        }
+    }
+
+    /// Review Focus 1: spacing and case are the operator's, not an error; a
+    /// digit run too long for u64 is an error with a reason, not a panic.
+    #[test]
+    fn file_size_limit_accepts_spacing_and_case_and_refuses_overflow() {
+        assert_eq!(limit("\" 300 mib \""), Ok(FileSizeLimit::Bytes(300 * MIB)));
+        assert_eq!(limit("\"300  MiB\""), Ok(FileSizeLimit::Bytes(300 * MIB)));
+        assert_eq!(limit("\" Unlimited \""), Ok(FileSizeLimit::Unlimited));
+        assert_eq!(
+            limit("\"50 MiB\""),
+            Ok(FileSizeLimits::default().binary),
+            "writing the default out is the default"
+        );
+        for text in ["\"18446744073709551616\"", "\"99999999999 TiB\""] {
+            let err = limit(text).expect_err(text);
+            assert!(
+                err.contains("more bytes than this build can count"),
+                "v = {text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn raising_a_cap_above_the_default_is_announced_and_lowering_is_not() {
+        let d = FileSizeLimits::default();
+        assert!(
+            !should_warn_raised_limits(&d),
+            "the defaults are not a raise"
+        );
+
+        let lowered = FileSizeLimits {
+            binary: FileSizeLimit::Bytes(1024),
+            text: FileSizeLimit::Bytes(1),
+            decompressed: FileSizeLimit::Bytes(1),
+        };
+        assert!(
+            !should_warn_raised_limits(&lowered),
+            "lowering is not announced"
+        );
+
+        // Review Focus 2: naming the default value is not a raise.
+        let at_default = FileSizeLimits {
+            binary: FileSizeLimit::Bytes(MAX_RAW_BINARY_BYTES),
+            text: FileSizeLimit::Bytes(MAX_RAW_TEXT_BYTES),
+            decompressed: FileSizeLimit::Bytes(DEFAULT_MAX_DECOMPRESSED_BYTES),
+        };
+        assert!(!should_warn_raised_limits(&at_default));
+
+        let timeout = format!("{} s", pdf::PDF_DOC_EXTRACT_TIMEOUT.as_secs());
+        for raised in [
+            FileSizeLimits {
+                binary: FileSizeLimit::Bytes(MAX_RAW_BINARY_BYTES + 1),
+                ..d
+            },
+            FileSizeLimits {
+                text: FileSizeLimit::Unlimited,
+                ..d
+            },
+            FileSizeLimits {
+                decompressed: FileSizeLimit::Bytes(16 * 1024 * MIB),
+                ..d
+            },
+        ] {
+            assert!(should_warn_raised_limits(&raised), "{raised:?}");
+            let msg = raised_limits_warning(&raised);
+            assert!(msg.is_ascii(), "the warning goes to stderr: {msg}");
+            assert!(msg.contains("aborts the process"), "{msg}");
+            assert!(msg.contains(&timeout), "{msg}");
+        }
+
+        let unlimited = FileSizeLimits {
+            binary: FileSizeLimit::Unlimited,
+            ..d
+        };
+        assert!(
+            raised_limits_warning(&unlimited)
+                .contains("bounded only by the files placed in the knowledge base")
+        );
+        let finite = FileSizeLimits {
+            binary: FileSizeLimit::Bytes(6 * MAX_RAW_BINARY_BYTES),
+            ..d
+        };
+        assert!(!raised_limits_warning(&finite).contains("bounded only by"));
     }
 }
