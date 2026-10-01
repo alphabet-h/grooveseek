@@ -26,8 +26,8 @@ Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっ
   状態を出す) — Phase 6 step 0 (b) のローカル前掃除に使う
 - `.dev/` が **それ自体の private repository** として初期化済 (`git -C .dev rev-parse --show-toplevel` が
   `/.dev` で終わる)。root repo は `.dev/` を `.git/info/exclude` で除外しているだけ (ADR-0000) なので、
-  nested repo が無い checkout では `git -C .dev` が**親 repo を拾う** — その状態で Phase 6 step 6 の
-  push を実行してはいけない。本 command が読む `.dev/release-checklist.md` / `.dev/feature-ideas.md` /
+  nested repo が無い checkout では `git -C .dev` が**親 repo を拾う** — その状態で「handoff と session の区切り」
+  step 3 の push を実行してはいけない。本 command が読む `.dev/release-checklist.md` / `.dev/feature-ideas.md` /
   `.dev/knowledge/*.md` も、書き出す `.dev/specs/` `.dev/plans/` `.dev/knowledge/` も、すべてこの
   private repo 側にある。**公開 repo を clone しただけの checkout には無い**ので、本 command は
   そのままでは動かない (= owner 用の workflow で、手順を公開側へ写して二重化することはしない)
@@ -211,19 +211,19 @@ cycle 完了時に必ず:
    「handoff は local のみ、goal は未更新」と user に伝えて止まる
 4. **push が通ってから、kuriya の goal を新 handoff に向ける**。goal (handoff の path を body に持つ item。番号と運用は
    `.dev/README.md` の handoff の段落) を `mcp__kuriya__update` で新 path + state + next に差し替え、**`mcp__kuriya__status` で
-   読み戻して goal の body が新 handoff の path で始まっていることを見る** (update が通ったつもりで通っていない形を残さない)。
+   読み戻して goal の body に新 handoff の path が入っていることを見る** (update が通ったつもりで通っていない形を残さない)。
    できなかった時は 2 通りを分けて handoff の冒頭 (`前の handoff:` の次) に書き、その 1 行を commit / push し直す:
    - **kuriya に繋がらない**: 「kuriya goal 未更新 (未接続)。次 session で kuriya が繋がっていれば `/next-work` は goal と
      末端の食い違いを見せて止まる — 本 handoff を正として goal を本 path に update して続ける。繋がっていなければ
      `/next-work` は突き合わせ無しで本 handoff から続く」
    - **繋がるが読み戻しが合わない**: もう 1 回 update して読み戻す。それでも合わなければ「kuriya goal 不一致 (update が
      反映されない)。次 session の `/next-work` は食い違いで止まる — 本 handoff を正として goal を直してから続ける」
-5. **`/next-work` の Phase 0 を自分で通してから「再開できる」と言う**。次 session の入口が見るものを、閉じる側が同じ順で打つ:
-   末端 (`handoff_tail.ps1` が exit 0 で新 handoff 1 行) / goal の body が末端の path で始まる (または step 4 の 1 行が
-   handoff にある) / root と `.dev` の `git -C <絶対パス> status --short --branch` が clean で想定の branch / handoff が
-   別 repo を挙げていればそこも同じ status。**何を見るかの家は `.claude/commands/next-work.md` の Phase 0 (step 3〜6) で、
-   判定の中身はここに写さない** — 写しは食い違う。1 つでも通らなければ直す。直せないものは handoff の「閉じる直前の状態」に
-   「次 session の入口で止まる理由」として書き (書いたら commit / push し直す)、step 6 の通知にも書く
+5. **`/next-work` の Phase 0 を自分で通してから「再開できる」と言う**。`.claude/commands/next-work.md` を開き、Phase 0 の
+   step 3〜6 (末端を取る / 末端を読む — 遡りを含む / kuriya と突き合わせる / repo 状態を見る) を**そこに書いてあるとおりに**
+   実行する。**判定の中身 (何を一致とみなすか、どの repo を見るか、何が止まる条件か) はここに写さない** — 家は next-work で、
+   写しは食い違う。step 4 で「goal 未更新 / 不一致」の 1 行を handoff に書いた場合、突き合わせが食い違うのは想定どおりで、
+   その 1 行があること自体を確認する。それ以外で 1 つでも止まる条件に当たれば直す。直せないものは handoff の
+   「閉じる直前の状態」に「次 session の入口で止まる理由」として書き (書いたら commit / push し直す)、step 6 の通知にも書く
 6. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
    step 4 / 5 で残したものがあれば、この文の後にそれを 1 文ずつ足す (「再開できます」だけで終えない)
 
