@@ -194,7 +194,11 @@ cycle 完了時に必ず:
    - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。**handoff のたびに、その場で測る**: 報告モード (`powershell -NoProfile -File .dev/tools/disk-sweep.ps1`、何も消さない) を打ち、空きと `target` の TOTAL を書いて user にも伝える。**SessionStart の値で済ませない、`LOW` が出ていたかどうかで分岐もしない** — あれは session の始めの値で、`/full-audit` や `--ignored` の test や cross build を挟めば、始めは閾値より上でも閉じる時には割っている。release を切った session は Phase 7 step 7 でも測っているが、その後に build していればそれも古いので、ここでも測る。**`.dev/tools/disk-sweep.ps1` が無い checkout (前提の節) では測れない** — handoff は止めず、この項に「disk: 未計測 (script なし)」と書く。PowerShell を手で組んで代用しない、「クリーンアップした」とも書かない (Phase 7 step 7 にも同じ句がある)。消すのは user が `/disk-sweep apply` と打った時だけで、controller からは測るところまで。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
 2. **kuriya の goal を新 handoff に向け、鎖を確かめる**。goal (handoff の path を body に持つ item。番号と運用は
    `.dev/README.md` の handoff の段落) を `mcp__kuriya__update` で新 path + state + next に差し替える — `/next-work` は
-   goal の body と末端の path を突き合わせ、食い違うと止まる。kuriya 未接続なら handoff に「goal 未更新」と書く。
+   goal の body と末端の path を突き合わせ、食い違うと両方を user に見せて止まる。**差し替えたら `mcp__kuriya__status` で
+   読み戻し、goal の body が新 handoff の path で始まっていることを見る** (update が通ったつもりで通っていない形を残さない)。
+   **kuriya が未接続、または読み戻しが合わない時は「再開できる」と言わない**: handoff の冒頭 (`前の handoff:` の次) に
+   「kuriya goal 未更新 — 次 session の `/next-work` は goal と末端の食い違いで止まる。本 handoff を正として goal の body を
+   本 path に update してから続ける」と書き、step 4 の通知にも同じ 1 文を足す。食い違いを黙って残して `/clear` へ進まない。
    続けて、もう一度 `powershell -NoProfile -File .dev/tools/handoff_tail.ps1` を打ち、**exit 0 で新 handoff の path 1 行**が
    返ることを見る (2 行返る = step 1 の `前の handoff:` を書き忘れている)
 3. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
@@ -209,6 +213,8 @@ cycle 完了時に必ず:
    止める。**止まったら handoff に marker を足して push し直す。`--no-verify` で迂回しない** — 迂回した push は次 session の
    入口をそのまま塞ぐ
 4. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
+   step 2 で goal を更新できなかった時は、この文の後に「kuriya の goal は未更新です。次 session の `/next-work` は食い違いを
+   報告して止まるので、handoff を正として goal を更新してから続けてください」を足す (「再開できます」だけで終えない)
 
 context が切り替わったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
