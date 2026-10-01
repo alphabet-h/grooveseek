@@ -8,8 +8,8 @@ use anyhow::Result;
 // `XlsParser` はここでは import しない: AU-06 で registry から外したため
 // (型そのものは `parser::XlsParser` として残っており、その unit test も残る)。
 use super::{
-    CodeParsersConfig, DocxParser, MarkdownParser, Parser, PdfParser, PptxParser, TxtParser,
-    XlsxParser,
+    CodeParsersConfig, DocxParser, FileSizeLimits, MarkdownParser, Parser, PdfParser, PptxParser,
+    TxtParser, XlsxParser,
 };
 
 /// Every id this build recognises, whether or not it can act on it.
@@ -257,6 +257,13 @@ pub struct Registry {
     /// budget is baked into the instance, so this is the only place left that still knows the
     /// number the chunks in a given index were cut at.
     code_max_chunk_chars: Option<usize>,
+    /// (feature-61) The `[index]` size caps this registry was built with.
+    ///
+    /// Kept here for the same reason as `code_max_chunk_chars`: the decompression budget is
+    /// baked into the binary parsers when they are built, and the indexer reads the two raw
+    /// caps from here ([`Registry::limits`]) rather than from the constants, so one registry
+    /// is the one answer to "how much of a file does this run read".
+    limits: FileSizeLimits,
 }
 
 impl Registry {
@@ -264,12 +271,17 @@ impl Registry {
     /// Unknown ids fail loudly — this catches typos (`"markdown"` instead of
     /// `"md"`) and parsers that don't exist yet (`"rst"` / `"adoc"`).
     ///
-    /// This is "build from ids alone": default `[parsers.code]` settings and no plugin
+    /// This is "build from ids alone": default `[parsers.code]` settings, the default size caps and no plugin
     /// directory, for the callers and tests that have no configuration to hand. Everything
     /// that does have one goes through [`Self::from_enabled_with_plugins`], of which this is
     /// the ids-only shorthand.
     pub fn from_enabled(ids: &[String]) -> Result<Self> {
-        Self::from_enabled_with_plugins(ids, &CodeParsersConfig::default(), None)
+        Self::from_enabled_with_plugins(
+            ids,
+            &CodeParsersConfig::default(),
+            None,
+            FileSizeLimits::default(),
+        )
     }
 
     /// Same, with the `[parsers.code]` settings a code parser needs and the directory grammar
@@ -284,10 +296,15 @@ impl Registry {
     /// existing one keeps its meaning — "build from ids alone" — for the callers and tests
     /// that have no configuration to hand. There used to be a middle rung taking only `code`;
     /// it had no caller but [`Self::from_enabled`] and was folded into this one.
+    ///
+    /// (feature-61) `limits` are the `[index]` size caps: the binary parsers are built with
+    /// `limits.decompressed` as their decompression budget, and [`Self::limits`] hands the raw
+    /// caps to the indexer.
     pub fn from_enabled_with_plugins(
         ids: &[String],
         code: &CodeParsersConfig,
         plugins: Option<PluginSource<'_>>,
+        limits: FileSizeLimits,
     ) -> Result<Self> {
         if ids.is_empty() {
             anyhow::bail!("[parsers].enabled must contain at least one id (got empty list)");
@@ -295,6 +312,7 @@ impl Registry {
         let mut parsers: Vec<Box<dyn Parser>> = Vec::with_capacity(ids.len());
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut code_max_chunk_chars = None;
+        let budget = limits.decompressed.cap_bytes();
         for id in ids {
             let lower = id.to_ascii_lowercase();
             if !seen.insert(lower.clone()) {
@@ -303,8 +321,8 @@ impl Registry {
             let parser: Box<dyn Parser> = match lower.as_str() {
                 "md" => Box::new(MarkdownParser),
                 "txt" => Box::new(TxtParser),
-                "pdf" => Box::new(PdfParser::default()),
-                "xlsx" => Box::new(XlsxParser::default()),
+                "pdf" => Box::new(PdfParser::with_budget(budget)),
+                "xlsx" => Box::new(XlsxParser::with_budget(budget)),
                 // AU-06: `.xls` は無効。`XlsParser` 自体は残してあるが、
                 // ここで registry に載せない = indexing から到達しない。
                 "xls" => anyhow::bail!(
@@ -317,8 +335,8 @@ impl Registry {
                      aborts the process rather than skipping the file. Convert the workbook \
                      to .xlsx, which is read as a stream."
                 ),
-                "docx" => Box::new(DocxParser::default()),
-                "pptx" => Box::new(PptxParser::default()),
+                "docx" => Box::new(DocxParser::with_budget(budget)),
+                "pptx" => Box::new(PptxParser::with_budget(budget)),
                 // (feature-56) The one grammar compiled in. Others are loaded from a plugin
                 // directory, which arrives with the loader.
                 "rs" => {
@@ -366,22 +384,40 @@ impl Registry {
         Ok(Self {
             parsers,
             code_max_chunk_chars,
+            limits,
         })
     }
 
     /// Default registry: `["md"]` only. Pre-feature-20 behaviour — `.txt`
     /// support is opt-in via `groove.toml` `[parsers].enabled = ["md", "txt"]`.
+    /// The size caps are the built-in defaults.
     pub fn defaults() -> Self {
-        Self {
-            parsers: vec![Box::new(MarkdownParser)],
-            code_max_chunk_chars: None,
-        }
+        Self::defaults_with_limits(FileSizeLimits::default())
+    }
+
+    /// (feature-61) [`Self::defaults`] with the `[index]` size caps a configuration set, for a
+    /// configuration with no `[parsers]` section (`Config::build_parser_registry`'s `None`
+    /// arm). Built through [`Self::from_enabled_with_plugins`] so there is one way a registry
+    /// is put together.
+    pub fn defaults_with_limits(limits: FileSizeLimits) -> Self {
+        Self::from_enabled_with_plugins(
+            &["md".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            limits,
+        )
+        .expect("\"md\" is built into every build and needs no plugin")
     }
 
     /// (feature-56) The chunk budget the code parsers were built with, or `None` when this
     /// registry has none.
     pub fn code_max_chunk_chars(&self) -> Option<usize> {
         self.code_max_chunk_chars
+    }
+
+    /// (feature-61) The `[index]` size caps this registry was built with.
+    pub fn limits(&self) -> FileSizeLimits {
+        self.limits
     }
 
     /// Lookup a parser by file extension (lowercase, no leading dot).
@@ -643,8 +679,13 @@ mod tests {
         // Every id this build can construct a parser for without a file being
         // placed first, which is exactly `available_ids`.
         let ids: Vec<String> = available_ids().iter().map(|s| s.to_string()).collect();
-        let registry = Registry::from_enabled_with_plugins(&ids, &Default::default(), None)
-            .expect("every available id builds");
+        let registry = Registry::from_enabled_with_plugins(
+            &ids,
+            &Default::default(),
+            None,
+            FileSizeLimits::default(),
+        )
+        .expect("every available id builds");
         let mut extensions = registry.extensions();
         extensions.sort_unstable();
         let mut expected = available_ids();
@@ -662,8 +703,13 @@ mod tests {
         let code = CodeParsersConfig::default();
 
         // No directory could be worked out: (iii).
-        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, None)
-            .expect_err("a plugin id with nowhere to look must fail");
+        let err = Registry::from_enabled_with_plugins(
+            &["py".into()],
+            &code,
+            None,
+            FileSizeLimits::default(),
+        )
+        .expect_err("a plugin id with nowhere to look must fail");
         assert!(
             err.to_string().contains("GROOVE_GRAMMAR_DIR"),
             "unexpected message: {err}"
@@ -678,8 +724,13 @@ mod tests {
             dir: &dir,
             knowledge_base: &kb,
         };
-        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(source))
-            .expect_err("a plugin id with no file must fail");
+        let err = Registry::from_enabled_with_plugins(
+            &["py".into()],
+            &code,
+            Some(source),
+            FileSizeLimits::default(),
+        )
+        .expect_err("a plugin id with no file must fail");
         let msg = err.to_string();
         assert!(msg.contains("is not in"), "unexpected message: {msg}");
         assert!(
@@ -688,8 +739,13 @@ mod tests {
         );
 
         // An id nothing claims is still a typo, wherever the directory is.
-        let err = Registry::from_enabled_with_plugins(&["rst".into()], &code, Some(source))
-            .expect_err("an unknown id must still fail");
+        let err = Registry::from_enabled_with_plugins(
+            &["rst".into()],
+            &code,
+            Some(source),
+            FileSizeLimits::default(),
+        )
+        .expect_err("an unknown id must still fail");
         assert!(err.to_string().contains("unknown id"), "{err}");
     }
 
@@ -731,8 +787,13 @@ mod tests {
             dir: &grammars,
             knowledge_base: &kb,
         };
-        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(source))
-            .expect_err("a library resolving into the knowledge base must be refused");
+        let err = Registry::from_enabled_with_plugins(
+            &["py".into()],
+            &code,
+            Some(source),
+            FileSizeLimits::default(),
+        )
+        .expect_err("a library resolving into the knowledge base must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("refusing to load"),
@@ -764,8 +825,13 @@ mod tests {
             dir: &grammars,
             knowledge_base: &kb,
         };
-        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(source))
-            .expect_err("a library resolving into the knowledge base must be refused");
+        let err = Registry::from_enabled_with_plugins(
+            &["py".into()],
+            &code,
+            Some(source),
+            FileSizeLimits::default(),
+        )
+        .expect_err("a library resolving into the knowledge base must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("refusing to load"),
@@ -800,6 +866,7 @@ mod tests {
             &["md".into(), "txt".into()],
             &Default::default(),
             None,
+            FileSizeLimits::default(),
         )
         .expect("no plugin id means the directory is never needed");
     }
@@ -932,5 +999,121 @@ mod tests {
         }
         assert!(!r.has_extension("exe"));
         assert!(!r.has_extension(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-61: the registry carries the [index] size caps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn registry_without_index_section_keeps_the_fifty_mib_defaults() {
+        let fifty = 50 * 1024 * 1024;
+        for r in [
+            Registry::defaults(),
+            Registry::default(),
+            Registry::from_enabled(&["md".into(), "pdf".into()]).unwrap(),
+        ] {
+            let l = r.limits();
+            assert_eq!(l, FileSizeLimits::default());
+            assert_eq!(
+                (
+                    l.binary.cap_bytes(),
+                    l.text.cap_bytes(),
+                    l.decompressed.cap_bytes()
+                ),
+                (fifty, fifty, fifty)
+            );
+        }
+        let custom = FileSizeLimits {
+            binary: crate::parser::FileSizeLimit::Unlimited,
+            ..FileSizeLimits::default()
+        };
+        let r = Registry::defaults_with_limits(custom);
+        assert_eq!(r.limits(), custom);
+        assert_eq!(r.extensions(), vec!["md"], "still the default parser set");
+    }
+
+    /// feature-61: the four binary parsers are built with the registry's
+    /// decompression budget. Two 10-byte parts fit 15 bytes one at a time but
+    /// not together; MINIMAL_PDF's first page alone is over 15 bytes.
+    #[test]
+    fn the_registry_builds_binary_parsers_with_the_decompressed_budget() {
+        use crate::parser::ParserExt;
+        use std::io::Write;
+
+        fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                for (name, body) in entries {
+                    zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(body).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            buf
+        }
+
+        let ten: &[u8] = b"0123456789";
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "docx",
+                zip_of(&[("word/document.xml", ten), ("docProps/core.xml", ten)]),
+            ),
+            (
+                "pptx",
+                zip_of(&[("docProps/core.xml", ten), ("ppt/slides/slide1.xml", ten)]),
+            ),
+            ("xlsx", zip_of(&[("a.xml", ten), ("b.xml", ten)])),
+            (
+                "pdf",
+                include_bytes!("../../tests/fixtures/binary/minimal.pdf").to_vec(),
+            ),
+        ];
+        let ids: Vec<String> = ["md", "pdf", "docx", "xlsx", "pptx"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tight = FileSizeLimits {
+            decompressed: crate::parser::FileSizeLimit::Bytes(15),
+            ..FileSizeLimits::default()
+        };
+        let tight =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, tight)
+                .expect("md + the binary formats");
+        let roomy = Registry::from_enabled_with_plugins(
+            &ids,
+            &CodeParsersConfig::default(),
+            None,
+            FileSizeLimits::default(),
+        )
+        .expect("md + the binary formats");
+
+        for (ext, bytes) in &cases {
+            let hint = format!("budget.{ext}");
+            let err = tight
+                .by_extension(ext)
+                .expect("registered")
+                .parse_bytes(bytes, &hint, &[])
+                .expect_err("15 bytes is under what this document inflates to");
+            assert!(
+                err.to_string().contains("max_decompressed_size"),
+                "{ext}: {err}"
+            );
+            // The default budget may still refuse a fixture for another reason
+            // (these zips are not real workbooks), but never for its size.
+            if let Err(e) =
+                roomy
+                    .by_extension(ext)
+                    .expect("registered")
+                    .parse_bytes(bytes, &hint, &[])
+            {
+                assert!(
+                    !e.to_string().contains("max_decompressed_size"),
+                    "{ext}: {e}"
+                );
+            }
+        }
     }
 }

@@ -1216,6 +1216,7 @@ impl Config {
                             dir,
                             knowledge_base: kb_path,
                         }),
+                    crate::parser::FileSizeLimits::default(),
                 )
             }
             None => Ok(crate::parser::Registry::defaults()),
