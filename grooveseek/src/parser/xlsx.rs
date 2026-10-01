@@ -6,7 +6,28 @@ use calamine::{Data, Reader};
 
 use super::{ParsedDocument, Parser, single_text_chunk};
 
-pub struct XlsxParser;
+pub struct XlsxParser {
+    /// (feature-61) 文書 1 本の展開後合計の上限 (`[index].max_decompressed_size`)。
+    decompressed_budget: u64,
+}
+
+impl XlsxParser {
+    /// (feature-61) 展開 budget を `budget` bytes にした parser。[`super::Registry`] が
+    /// `[index].max_decompressed_size` から作る。
+    pub fn with_budget(budget: u64) -> Self {
+        Self {
+            decompressed_budget: budget,
+        }
+    }
+}
+
+impl Default for XlsxParser {
+    /// 展開 budget = [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]。
+    fn default() -> Self {
+        Self::with_budget(super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+}
+
 pub struct XlsParser;
 
 impl Parser for XlsxParser {
@@ -28,7 +49,31 @@ impl Parser for XlsxParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        parse_workbook_bytes(bytes, path_hint, WorkbookFormat::Xlsx)
+        parse_workbook_bytes_budgeted(
+            bytes,
+            path_hint,
+            WorkbookFormat::Xlsx,
+            SHEET_MAX_BYTES,
+            self.decompressed_budget,
+        )
+    }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    /// Same parse as [`super::Parser::parse_bytes_inner`], other budget.
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        _exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_workbook_bytes_budgeted(
+            bytes,
+            path_hint,
+            WorkbookFormat::Xlsx,
+            SHEET_MAX_BYTES,
+            super::DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
     }
 }
 
@@ -81,7 +126,11 @@ enum WorkbookFormat {
 ///   (巨大セル 1 個で切断すると内容が中途半端になるより、1 行は完全に残す方針)。
 const SHEET_MAX_BYTES: usize = 1024 * 1024;
 
-/// xlsx / xls 共有の抽出本体。`SHEET_MAX_BYTES` を渡す薄い wrapper。
+/// xls 用の抽出入口。[`SHEET_MAX_BYTES`] と既定の展開 budget を渡す薄い wrapper。
+///
+/// (feature-61) xlsx は [`XlsxParser`] が構築時の budget で
+/// [`parse_workbook_bytes_budgeted`] を直接呼ぶので、ここを通るのは registry から到達しない
+/// [`XlsParser`] だけ。
 fn parse_workbook_bytes(
     bytes: &[u8],
     path_hint: &str,
@@ -90,17 +139,37 @@ fn parse_workbook_bytes(
     parse_workbook_bytes_capped(bytes, path_hint, format, SHEET_MAX_BYTES)
 }
 
-/// cap を注入できる本体 (unit test が小さい cap で truncate 分岐を突くため分離)。
-/// XLSX/XLS で抽出方式が異なる (下記 fn 群 の doc comment 参照) ため format
-/// 別の実装へ dispatch するだけの薄い wrapper。
+/// シート上限を注入できる版 (unit test が小さい cap で truncate 分岐を突くため分離)。
+/// 展開 budget は既定値。
 fn parse_workbook_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
     format: WorkbookFormat,
     sheet_max_bytes: usize,
 ) -> Result<ParsedDocument> {
+    parse_workbook_bytes_budgeted(
+        bytes,
+        path_hint,
+        format,
+        sheet_max_bytes,
+        super::DEFAULT_MAX_DECOMPRESSED_BYTES,
+    )
+}
+
+/// シート上限と展開 budget の両方を取る本体。XLSX/XLS で抽出方式が異なる (下記 fn 群の
+/// doc comment 参照) ため format 別の実装へ dispatch するだけの薄い wrapper。xls (BIFF) は
+/// zip 展開を経由しないので展開 budget を使わない。
+fn parse_workbook_bytes_budgeted(
+    bytes: &[u8],
+    path_hint: &str,
+    format: WorkbookFormat,
+    sheet_max_bytes: usize,
+    decompressed_budget: u64,
+) -> Result<ParsedDocument> {
     match format {
-        WorkbookFormat::Xlsx => parse_xlsx_bytes_capped(bytes, path_hint, sheet_max_bytes),
+        WorkbookFormat::Xlsx => {
+            parse_xlsx_bytes_capped(bytes, path_hint, sheet_max_bytes, decompressed_budget)
+        }
         WorkbookFormat::Xls => parse_xls_bytes_capped(bytes, path_hint, sheet_max_bytes),
     }
 }
@@ -111,12 +180,13 @@ fn parse_xlsx_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
     sheet_max_bytes: usize,
+    decompressed_budget: u64,
 ) -> Result<ParsedDocument> {
     // codex P2 (PR #70 round 2, zip-bomb hardening): calamine は zip 展開を
-    // 内部で行うため `ooxml::read_zip_entry` の累積 budget 機構が効かない。
+    // 内部で行うため `ooxml::read_zip_part` の累積 budget 機構が効かない。
     // calamine を呼ぶ前に、実際に読まれる XML part の申告 uncompressed
-    // size 合計を検査する。
-    preflight_xlsx_decompression_budget(bytes, path_hint)?;
+    // size 合計を検査する。(feature-61) budget は parser が構築時に受け取った値。
+    preflight_xlsx_decompression_budget_capped(bytes, path_hint, decompressed_budget)?;
 
     let cursor = Cursor::new(bytes);
     // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
@@ -125,7 +195,7 @@ fn parse_xlsx_bytes_capped(
     let mut xlsx = calamine::Xlsx::new(cursor)
         .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
-    let frontmatter = xlsx_frontmatter(bytes, path_hint);
+    let frontmatter = xlsx_frontmatter(bytes, path_hint, decompressed_budget);
     let title = frontmatter.title.as_deref().unwrap_or("");
     let mut chunks = Vec::new();
     // `sheet_names()` は Vec<String> を owned で返すため、ループ中に
@@ -266,7 +336,7 @@ fn parse_xls_bytes_capped(
         .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
     // xls (BIFF) には core.xml が無いため常にファイル名 fallback。
-    let frontmatter = xlsx_frontmatter(bytes, path_hint);
+    let frontmatter = xlsx_frontmatter(bytes, path_hint, super::DEFAULT_MAX_DECOMPRESSED_BYTES);
     let title = frontmatter.title.as_deref().unwrap_or("");
     let mut chunks = Vec::new();
     for name in xls.sheet_names() {
@@ -308,10 +378,16 @@ fn parse_xls_bytes_capped(
     })
 }
 
-/// calamine 呼び出し前の pre-flight 検査 (cap は固定で `super::MAX_RAW_BINARY_BYTES`
-/// を使う薄い wrapper)。詳細は [`preflight_xlsx_decompression_budget_capped`] 参照。
+/// calamine 呼び出し前の pre-flight 検査を、既定の展開 budget
+/// ([`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]) で行う (test 専用)。本番は parser の budget で
+/// [`preflight_xlsx_decompression_budget_capped`] を直接呼ぶ (feature-61)。
+#[cfg(test)]
 fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<()> {
-    preflight_xlsx_decompression_budget_capped(bytes, path_hint, super::MAX_RAW_BINARY_BYTES)
+    preflight_xlsx_decompression_budget_capped(
+        bytes,
+        path_hint,
+        super::DEFAULT_MAX_DECOMPRESSED_BYTES,
+    )
 }
 
 /// アーカイブ内の **全 entry** について展開後サイズを累計し、`cap` を超えて
@@ -366,12 +442,15 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// 展開量が `cap` 以内」という、言い切れる不変条件にする。
 ///
 /// トレードオフ: `xl/media/*` の画像など calamine が読まないパートも budget
-/// に乗るため、「展開後の合計が cap を超える画像だらけの xlsx」は skip される。
-/// raw 入力自体が既に `MAX_RAW_BINARY_BYTES` で頭打ちで、画像は圧縮済み
-/// (= 展開してもほぼ 1:1) なので、該当するのは raw cap 付近かつ中身の大半が
-/// 画像という稀なファイルに限られる。名前ベースの穴を残すより、この誤検知を
-/// 受け入れる方を選ぶ (skip は理由付きの warn として出るので silent failure
-/// ではない)。
+/// に乗る。つまり画像も `[index].max_decompressed_size` に数えるので、
+/// 「展開後の合計が cap を超える画像だらけの xlsx」は skip される。画像は
+/// 圧縮済み (= 展開してもほぼ 1:1) なので、展開後の合計はおおむねファイルの
+/// 大きさ以上になる。(feature-61) raw の上限は `[index].max_binary_file_size`
+/// で展開 budget より大きくできるため、これは稀な場合ではない: ファイル側の
+/// 上限だけを上げた運用者は、画像の多い workbook で展開側のメッセージを見る
+/// ことになり、`max_decompressed_size` も上げる必要がある。名前ベースの穴を
+/// 残すより、この誤検知を受け入れる方を選ぶ (skip は理由付きの warn として
+/// 出るので silent failure ではない)。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -404,9 +483,7 @@ fn preflight_xlsx_decompression_budget_capped(
         let remaining = cap.saturating_sub(total);
         if declared > remaining {
             anyhow::bail!(
-                "{path_hint}: declared entry size exceeds {cap} bytes cap \
-                 (zip-bomb guard; entry {name:?} declares {declared} bytes with \
-                 {remaining} bytes of budget left)"
+                "{path_hint}: declared entry size exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declares {declared} bytes with {remaining} bytes of budget left; raise [index].max_decompressed_size to admit this file)"
             );
         }
 
@@ -421,9 +498,7 @@ fn preflight_xlsx_decompression_budget_capped(
         total = total.saturating_add(actual);
         if total > cap {
             anyhow::bail!(
-                "{path_hint}: actual decompressed size of the archive exceeds {cap} bytes cap \
-                 (zip-bomb guard; entry {name:?} declared {declared} bytes but expands past \
-                 the remaining budget)"
+                "{path_hint}: actual decompressed size of the archive exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declared {declared} bytes but expands past the remaining budget; raise [index].max_decompressed_size to admit this file)"
             );
         }
     }
@@ -452,15 +527,17 @@ fn count_decompressed_bytes(reader: &mut impl std::io::Read, limit: u64) -> u64 
     total
 }
 
-fn xlsx_frontmatter(bytes: &[u8], path_hint: &str) -> super::Frontmatter {
+/// `docProps/core.xml` から frontmatter を取る。読めなければ (zip でない xls、core.xml が
+/// 無い・`cap` を超える・壊れている) ファイル名 fallback。`cap` は展開 budget。
+fn xlsx_frontmatter(bytes: &[u8], path_hint: &str, cap: u64) -> super::Frontmatter {
     if let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) {
         let mut budget: u64 = 0;
-        super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget).unwrap_or_else(|_| {
-            super::Frontmatter {
+        super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap).unwrap_or_else(
+            |_| super::Frontmatter {
                 title: super::txt::derive_title_pub(path_hint),
                 ..Default::default()
-            }
-        })
+            },
+        )
     } else {
         super::Frontmatter {
             title: super::txt::derive_title_pub(path_hint),
@@ -826,7 +903,7 @@ mod tests {
 
         // 前提の確認: 拡張子なしのパートでも calamine は普通に読む。
         let legit = make_xlsx_with_worksheet_part("worksheets/payload", SHEET);
-        let doc = XlsxParser
+        let doc = XlsxParser::default()
             .parse_bytes(&legit, "odd-name.xlsx", &[])
             .expect("calamine resolves the worksheet through rels, not by file name");
         assert_eq!(
@@ -866,8 +943,8 @@ mod tests {
 
     #[test]
     fn test_xlsx_parser_is_binary() {
-        assert!(XlsxParser.is_binary());
-        assert_eq!(XlsxParser.extension(), "xlsx");
+        assert!(XlsxParser::default().is_binary());
+        assert_eq!(XlsxParser::default().extension(), "xlsx");
     }
 
     #[test]
@@ -884,7 +961,7 @@ mod tests {
     // (team-lead 指示: 「skeleton の parse_bytes Err test があれば brief の指示に従う」)。
     #[test]
     fn test_xlsx_parse_bytes_garbage_is_err() {
-        let err = XlsxParser
+        let err = XlsxParser::default()
             .parse_bytes(b"not a real xlsx", "x.xlsx", &[])
             .expect_err("garbage bytes must be Err");
         assert!(err.to_string().contains("cannot open workbook"));
@@ -937,9 +1014,11 @@ mod tests {
         // するため、ODS payload では reader open 自体が Err になり
         // per-file skip 経路に落ちることを検証する。
         let bytes = make_fake_ods_bytes();
-        let err = XlsxParser.parse_bytes(&bytes, "fake.xlsx", &[]).expect_err(
-            "ODS payload disguised as .xlsx must be rejected (no cross-format probing)",
-        );
+        let err = XlsxParser::default()
+            .parse_bytes(&bytes, "fake.xlsx", &[])
+            .expect_err(
+                "ODS payload disguised as .xlsx must be rejected (no cross-format probing)",
+            );
         assert!(
             err.to_string().contains("cannot open workbook"),
             "got: {err}"
@@ -948,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_xlsx_parse_fallback_wraps_raw_text() {
-        let doc = XlsxParser.parse("hello world content here", "x.xlsx", &[]);
+        let doc = XlsxParser::default().parse("hello world content here", "x.xlsx", &[]);
         assert_eq!(doc.chunks.len(), 1);
         assert!(doc.chunks[0].content.contains("hello world"));
     }
@@ -959,7 +1038,7 @@ mod tests {
             ("Sales", &[&["Q1", "100"], &["Q2", "200"]]),
             ("Notes", &[&["memo"]]),
         ]);
-        let doc = XlsxParser
+        let doc = XlsxParser::default()
             .parse_bytes(&bytes, "docs/book.xlsx", &[])
             .unwrap();
         assert_eq!(doc.chunks.len(), 2);
@@ -973,7 +1052,9 @@ mod tests {
     #[test]
     fn test_xlsx_empty_sheet_produces_no_chunk() {
         let bytes = make_minimal_xlsx(&[("Empty", &[]), ("Has", &[&["x"]])]);
-        let doc = XlsxParser.parse_bytes(&bytes, "b.xlsx", &[]).unwrap();
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "b.xlsx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 1, "empty sheet must be skipped");
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("Sheet: Has"));
     }
@@ -1074,7 +1155,7 @@ mod tests {
     #[test]
     fn test_xlsx_context_is_title_and_sheet() {
         let bytes = make_minimal_xlsx(&[("Sales", &[&["Q1", "100"]])]);
-        let doc = XlsxParser
+        let doc = XlsxParser::default()
             .parse_bytes(&bytes, "docs/book.xlsx", &[])
             .unwrap();
         // core.xml 無し → filename title ("book")
@@ -1095,7 +1176,9 @@ mod tests {
         // 2 セル分だけを読み、Excel の実用上限に近い座標
         // (1,048,576 行 × 16,384 列) でも即座に完走できることを確認する。
         let bytes = make_sparse_xlsx(1_000_000, 16_000);
-        let doc = XlsxParser.parse_bytes(&bytes, "sparse.xlsx", &[]).unwrap();
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "sparse.xlsx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 1);
         assert!(
             doc.chunks[0].content.contains("near"),
@@ -1107,5 +1190,109 @@ mod tests {
             "got: {:?}",
             doc.chunks[0].content
         );
+    }
+
+    /// feature-61 (AC5): the preflight runs against the budget the parser was
+    /// built with, before calamine opens anything.
+    #[test]
+    fn xlsx_preflight_budget_follows_the_parser_it_was_built_with() {
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+        let err = XlsxParser::with_budget(5)
+            .parse_bytes(&bytes, "x.xlsx", &[])
+            .expect_err("a 5-byte budget refuses the archive");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zip-bomb guard") && msg.contains("max_decompressed_size"),
+            "{msg}"
+        );
+        assert!(!msg.contains("file too large"), "{msg}");
+
+        let doc = XlsxParser::with_budget(1 << 20)
+            .parse_bytes(&bytes, "x.xlsx", &[])
+            .expect("1 MiB is plenty for this workbook");
+        assert_eq!(doc.chunks.len(), 1);
+        assert!(
+            XlsxParser::default()
+                .parse_bytes(&bytes, "x.xlsx", &[])
+                .is_ok()
+        );
+    }
+
+    /// feature-61 (codex critical): the read path does not take the budget the
+    /// parser was built with -- the 5-byte parser whose preflight refuses the
+    /// archive on the index path reads it on the read path.
+    #[test]
+    fn xlsx_read_path_ignores_the_parser_budget() {
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+        let tiny = XlsxParser::with_budget(5);
+        assert!(tiny.parse_bytes(&bytes, "x.xlsx", &[]).is_err());
+        let read = tiny
+            .parse_bytes_for_read(&bytes, "x.xlsx", &[])
+            .expect("the read path keeps the default budget");
+        assert_eq!(read.chunks.len(), 1);
+    }
+
+    /// feature-61 (AC5): [`xlsx_frontmatter`] swallows a core.xml error, so the
+    /// budget is observed through the title instead: core.xml one byte over the
+    /// budget falls back to the file name, exactly the budget reads it.
+    #[test]
+    fn xlsx_frontmatter_reads_core_xml_under_the_parser_budget() {
+        let core: &[u8] = br#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Workbook Title</dc:title></cp:coreProperties>"#;
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            zip.start_file("docProps/core.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(core).unwrap();
+            zip.finish().unwrap();
+        }
+        let fits = xlsx_frontmatter(&bytes, "book.xlsx", core.len() as u64);
+        assert_eq!(fits.title.as_deref(), Some("Workbook Title"));
+        let over = xlsx_frontmatter(&bytes, "book.xlsx", core.len() as u64 - 1);
+        assert_eq!(
+            over.title,
+            crate::parser::txt::derive_title_pub("book.xlsx"),
+            "a core.xml read that ignored the budget would have found the title"
+        );
+    }
+
+    /// feature-61 (AC6): `"unlimited"` is `u64::MAX` in every comparison, and
+    /// each of them only turns false -- nothing overflows.
+    #[test]
+    fn an_unlimited_cap_never_refuses_a_read_for_size() {
+        let cap = crate::parser::FileSizeLimit::Unlimited.cap_bytes();
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+
+        // xlsx preflight: `cap.saturating_sub(total)`, `remaining.saturating_add(1)`.
+        preflight_xlsx_decompression_budget_capped(&bytes, "x.xlsx", cap)
+            .expect("no archive is over an unlimited budget");
+        let doc = XlsxParser::with_budget(cap)
+            .parse_bytes(&bytes, "x.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 1);
+
+        // ooxml: `cap.saturating_add(1)` on the take, `*budget > cap` on the total.
+        // The running total starts near the top so the sum saturates.
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+        let mut budget: u64 = u64::MAX - 1;
+        let read = crate::parser::ooxml::read_zip_entry_capped(
+            &mut archive,
+            "xl/workbook.xml",
+            &mut budget,
+            cap,
+        )
+        .expect("an unlimited cap never errs on the total");
+        assert!(read.is_some());
+        assert_eq!(budget, u64::MAX);
+
+        // read_checked: `len > cap` is false, `take(cap.saturating_add(1))`.
+        let path = crate::test_support::unique_temp_path("groove-f61-unlimited");
+        std::fs::write(&path, &bytes).unwrap();
+        let content = crate::links::read_checked(&path, cap);
+        let _ = std::fs::remove_file(&path);
+        let crate::links::Content::Bytes(read_back) = content.expect("read") else {
+            panic!("an unlimited cap refused the read");
+        };
+        assert_eq!(read_back, bytes);
     }
 }

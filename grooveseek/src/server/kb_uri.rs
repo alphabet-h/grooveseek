@@ -50,8 +50,9 @@ pub(crate) enum LoadFailure {
 /// listing and per-document addressing coexist.
 ///
 /// The key is **omitted** for a hit [`ServableRules`] would not hand over —
-/// an extension the active parser registry no longer covers, or a document
-/// past the size a read is allowed to return. Such a row stays in the index on
+/// an extension the active parser registry no longer covers, a document
+/// past the size a read is allowed to return, or a binary document while the
+/// index may inflate further than a read parses. Such a row stays in the index on
 /// purpose (AU-06) and stays in the search results, but neither `get_document`
 /// nor `resources/read` will open it — so the honest answer is no link, not a
 /// broken one.
@@ -93,6 +94,10 @@ pub(crate) struct ServableRules<'a> {
     /// caller knows, so the two states must not share a representation
     /// (codex P2 round 1).
     sizes_known: bool,
+    /// (feature-61) True while `[index].max_decompressed_size` is at or below
+    /// [`crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES`], the budget a read
+    /// parses with. See [`Self::allows`] for what false withholds.
+    binary_reads_bounded: bool,
 }
 
 impl<'a> ServableRules<'a> {
@@ -100,6 +105,8 @@ impl<'a> ServableRules<'a> {
     /// 拡張子ごとの本当の cap は [`max_bytes_for`] で当てる —
     /// `load_document_blocking` が `read_checked` に渡すのと**同じ chooser** なので、
     /// 提示側と read 側が別々の上限を持つことが構造的に起こらない。
+    /// (feature-61) binary 側の cap は索引の設定に連動しない
+    /// [`GET_DOCUMENT_BINARY_MAX_BYTES`]。
     pub(crate) fn new(registry: &'a Registry, rows: Vec<(String, u64)>) -> Self {
         let oversized = rows
             .into_iter()
@@ -112,7 +119,7 @@ impl<'a> ServableRules<'a> {
                     > max_bytes_for(
                         registry,
                         ext,
-                        crate::parser::MAX_RAW_BINARY_BYTES,
+                        GET_DOCUMENT_BINARY_MAX_BYTES,
                         GET_DOCUMENT_MAX_BYTES,
                     )
             })
@@ -122,7 +129,15 @@ impl<'a> ServableRules<'a> {
             registry,
             oversized,
             sizes_known: true,
+            binary_reads_bounded: Self::binary_reads_bounded(registry),
         }
+    }
+
+    /// Whether the index inflates binary documents no further than a read
+    /// may: the registry's decompression cap against the fixed budget the read
+    /// path parses with.
+    fn binary_reads_bounded(registry: &Registry) -> bool {
+        registry.limits().decompressed.cap_bytes() <= crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES
     }
 
     /// The rules to use when the sizes could not be read.
@@ -134,6 +149,7 @@ impl<'a> ServableRules<'a> {
             registry,
             oversized: std::collections::HashSet::new(),
             sizes_known: false,
+            binary_reads_bounded: Self::binary_reads_bounded(registry),
         }
     }
 
@@ -144,11 +160,34 @@ impl<'a> ServableRules<'a> {
     /// path the index holds is turned away here only when an earlier version
     /// stored it; `groove doctor` names those on Windows
     /// (`name-not-spellable-on-windows`), and the next `groove index` removes them.
+    ///
+    /// (feature-61) A binary document is also withheld while
+    /// `[index].max_decompressed_size` is above
+    /// [`crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES`]. The read path parses
+    /// with that built-in budget whatever `[index]` says, just as its raw cap
+    /// is the fixed [`GET_DOCUMENT_BINARY_MAX_BYTES`]; once the index was
+    /// allowed to inflate further than a read may, the recorded raw size no
+    /// longer tells which binary documents a read would accept, so the server
+    /// cannot promise any of them. It withholds the link and the document
+    /// stays searchable — the shape ADR-0005 gives text past the read cap.
+    /// Text documents are unaffected. Measuring the inflated size at index
+    /// time and persisting it would let this offer the binary documents that
+    /// do fit, instead of none.
     pub(crate) fn allows(&self, path: &str) -> bool {
         self.sizes_known
             && crate::indexer::extension_is_registered(path, self.registry)
             && !self.oversized.contains(path)
+            && (self.binary_reads_bounded || !self.is_binary(path))
             && crate::resources::doc_is_addressable(path)
+    }
+
+    /// Whether the registry parses this document with a binary parser.
+    fn is_binary(&self, path: &str) -> bool {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| self.registry.by_extension(ext))
+            .is_some_and(|p| p.is_binary())
     }
 
     /// The documents held back for their size, sorted so a report is stable.
@@ -159,6 +198,32 @@ impl<'a> ServableRules<'a> {
     /// server is worse than no doctor.
     pub(crate) fn oversized_paths(&self) -> Vec<String> {
         let mut v: Vec<String> = self.oversized.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// The binary documents among `paths` that [`Self::allows`] withholds
+    /// because `[index].max_decompressed_size` is raised past the read budget,
+    /// sorted so a report is stable. Empty while the cap is at or below
+    /// [`crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES`].
+    ///
+    /// The same two fields [`Self::allows`] reads, for the reason
+    /// [`Self::oversized_paths`] gives: `groove doctor` explains this predicate
+    /// rather than an equivalent of it. A path withheld for another reason as
+    /// well (its size, its name) is listed here too, because raising the cap
+    /// is a reason on its own.
+    pub(crate) fn withheld_binary<'p>(
+        &self,
+        paths: impl IntoIterator<Item = &'p str>,
+    ) -> Vec<String> {
+        if self.binary_reads_bounded {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = paths
+            .into_iter()
+            .filter(|p| self.is_binary(p))
+            .map(str::to_string)
+            .collect();
         v.sort();
         v
     }
@@ -252,8 +317,10 @@ impl KbCore {
                 //
                 // The message says "offers", not "indexed", because those
                 // stopped being the same thing: a document can be indexed and
-                // still be held back, by an extension the registry dropped or a
-                // size past what a read returns. Naming the index would send
+                // still be held back, by an extension the registry dropped, a
+                // size past what a read returns, or (a binary document) a
+                // decompression cap raised past a read's. `groove doctor`
+                // names each of them. Naming the index would send
                 // someone looking for a document `groove status` counts.
                 if !paths.iter().any(|p| p == rel) {
                     return Err((

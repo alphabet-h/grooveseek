@@ -51,7 +51,7 @@ pub(crate) use documents::GET_DOCUMENT_MAX_BYTES;
 // `get_document` does -- which errors say "not there" and which say "could not
 // look" is one question.
 pub(crate) use documents::path_probe_failed;
-use documents::{EXTRACTED_TEXT_MAX_BYTES, max_bytes_for};
+use documents::{EXTRACTED_TEXT_MAX_BYTES, GET_DOCUMENT_BINARY_MAX_BYTES, max_bytes_for};
 
 // Named only by `mod tests`, and again the compiler is what said so: left
 // unconditional, every name below warned as unused in the plain library build.
@@ -4845,6 +4845,265 @@ mod tests {
             rules.allows("big.pdf"),
             "a binary document over the *text* cap is still readable"
         );
+    }
+
+    /// feature-61 (AC8): raising the index caps does not move the read side.
+    /// A binary document indexed past 50 MiB under `"unlimited"` is searchable
+    /// but carries no URI, and a read of it is refused at the path check
+    /// (before the handle-bound read in [`crate::links::read_checked`]).
+    #[test]
+    fn a_document_indexed_past_the_read_cap_is_searchable_without_a_uri() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let unlimited = FileSizeLimits {
+            binary: FileSizeLimit::Unlimited,
+            text: FileSizeLimit::Unlimited,
+            // Default, not raised: a raised one withholds every binary uri (tested next to ServableRules).
+            decompressed: FileSizeLimit::Bytes(crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES),
+        };
+        let registry = Registry::from_enabled_with_plugins(
+            &["md".to_string(), "pdf".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            unlimited,
+        )
+        .expect("md + pdf");
+        let fifty = 50 * 1024 * 1024;
+        assert_eq!(GET_DOCUMENT_BINARY_MAX_BYTES, fifty);
+        assert_eq!(
+            max_bytes_for(
+                &registry,
+                "pdf",
+                GET_DOCUMENT_BINARY_MAX_BYTES,
+                GET_DOCUMENT_MAX_BYTES
+            ),
+            fifty,
+            "the read cap does not follow the registry's index caps"
+        );
+
+        let rules = ServableRules::new(
+            &registry,
+            vec![
+                ("huge.pdf".to_string(), GET_DOCUMENT_BINARY_MAX_BYTES + 1),
+                ("edge.pdf".to_string(), GET_DOCUMENT_BINARY_MAX_BYTES),
+            ],
+        );
+        assert!(
+            !rules.allows("huge.pdf"),
+            "a read of this would be refused, so offering it is a broken link"
+        );
+        assert!(rules.allows("edge.pdf"));
+
+        let kb = TempKb::new("f61-read-cap");
+        let huge = std::fs::File::create(kb.path.join("huge.pdf")).unwrap();
+        huge.set_len(GET_DOCUMENT_BINARY_MAX_BYTES + 1).unwrap();
+        drop(huge);
+        match validate_get_document_path(
+            &kb.path,
+            "huge.pdf",
+            &registry,
+            GET_DOCUMENT_MAX_BYTES,
+            GET_DOCUMENT_BINARY_MAX_BYTES,
+        ) {
+            ValidatePathOutcome::NotFound(e) => {
+                assert!(e.error.starts_with("File too large"), "{}", e.error)
+            }
+            other => panic!("a binary file past 50 MiB must be refused: {other:?}"),
+        }
+    }
+
+    /// feature-61 (codex critical): raising `[index].max_decompressed_size`
+    /// does not move the read side either. A small docx whose parts inflate
+    /// past the built-in budget is indexed under `"unlimited"`, but a read of it
+    /// through the same registry is refused by the default budget -- the
+    /// decompression sibling of [`GET_DOCUMENT_BINARY_MAX_BYTES`].
+    #[test]
+    fn a_read_keeps_the_default_decompression_budget_when_the_index_is_unlimited() {
+        use crate::parser::{
+            CodeParsersConfig, DEFAULT_MAX_DECOMPRESSED_BYTES, FileSizeLimit, FileSizeLimits,
+            ParserExt,
+        };
+        use std::io::Write as _;
+        let registry = Registry::from_enabled_with_plugins(
+            &["md".to_string(), "docx".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            FileSizeLimits {
+                decompressed: FileSizeLimit::Unlimited,
+                ..FileSizeLimits::default()
+            },
+        )
+        .expect("md + docx");
+
+        // word/document.xml is exactly the default budget (each part is allowed
+        // up to it), and core.xml then takes the per-document total past it.
+        let head = concat!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t>inflated body</w:t></w:r></w:p>"#
+        );
+        let tail = "</w:body></w:document>";
+        let budget = usize::try_from(DEFAULT_MAX_DECOMPRESSED_BYTES).unwrap();
+        let mut doc_xml = String::with_capacity(budget);
+        doc_xml.push_str(head);
+        doc_xml.extend(std::iter::repeat_n(' ', budget - head.len() - tail.len()));
+        doc_xml.push_str(tail);
+        assert_eq!(doc_xml.len(), budget);
+        let core_xml: &[u8] = br#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Bomb</dc:title></cp:coreProperties>"#;
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let opt = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("word/document.xml", opt).unwrap();
+            zip.write_all(doc_xml.as_bytes()).unwrap();
+            zip.start_file("docProps/core.xml", opt).unwrap();
+            zip.write_all(core_xml).unwrap();
+            zip.finish().unwrap();
+        }
+        drop(doc_xml);
+
+        let kb = TempKb::new("f61-read-budget");
+        let file = kb.path.join("bomb.docx");
+        std::fs::write(&file, &bytes).unwrap();
+        // The raw read cap admits it: what refuses it has to be the budget.
+        let cap = max_bytes_for(
+            &registry,
+            "docx",
+            GET_DOCUMENT_BINARY_MAX_BYTES,
+            GET_DOCUMENT_MAX_BYTES,
+        );
+        assert!((bytes.len() as u64) < cap, "fixture: {} bytes", bytes.len());
+        let crate::links::Content::Bytes(read) = crate::links::read_checked(&file, cap).unwrap()
+        else {
+            panic!("the raw read cap must admit the fixture");
+        };
+
+        let err = build_document_response(&registry, "bomb.docx", "docx", &read)
+            .expect_err("the read path must keep the default decompression budget");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_decompressed_size")
+                && msg.contains(&DEFAULT_MAX_DECOMPRESSED_BYTES.to_string()),
+            "{msg}"
+        );
+
+        // The index path through the same registry follows `[index]`.
+        let indexed = registry
+            .by_extension("docx")
+            .unwrap()
+            .parse_bytes(&read, "bomb.docx", &[])
+            .expect("the index path admits it under \"unlimited\"");
+        assert_eq!(indexed.frontmatter.title.as_deref(), Some("Bomb"));
+        assert!(indexed.raw_content.contains("inflated body"));
+    }
+
+    /// A registry over Markdown and PDF whose decompression cap is `decompressed`
+    /// and whose raw caps are the defaults.
+    fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
+        use crate::parser::{CodeParsersConfig, FileSizeLimits};
+        let limits = FileSizeLimits {
+            decompressed,
+            ..FileSizeLimits::default()
+        };
+        Registry::from_enabled_with_plugins(
+            &["md".to_string(), "pdf".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            limits,
+        )
+        .expect("md + pdf")
+    }
+
+    /// feature-61: a read parses with the built-in decompression budget, so
+    /// once `[index].max_decompressed_size` is raised past it a binary document
+    /// the index accepted may be one a read refuses. The raw size cannot tell
+    /// which, so no binary document gets a link; text is not affected.
+    #[test]
+    fn a_raised_decompression_cap_withholds_binary_uris_but_not_text_ones() {
+        use crate::parser::{DEFAULT_MAX_DECOMPRESSED_BYTES, FileSizeLimit};
+        for raised in [
+            FileSizeLimit::Unlimited,
+            FileSizeLimit::Bytes(DEFAULT_MAX_DECOMPRESSED_BYTES + 1),
+        ] {
+            let registry = md_and_pdf_registry_inflating_to(raised);
+            let rules = ServableRules::new(&registry, vec![]);
+            assert!(
+                !rules.allows("a.pdf"),
+                "{raised}: a read may refuse what the index inflated, so no link"
+            );
+            assert!(rules.allows("notes/a.md"), "{raised}: text is unaffected");
+            let unknown = ServableRules::sizes_unavailable(&registry);
+            assert!(!unknown.allows("a.pdf"));
+        }
+    }
+
+    #[test]
+    fn the_default_decompression_cap_keeps_binary_uris() {
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, vec![]);
+        assert!(rules.allows("a.pdf"));
+    }
+
+    /// The boundary belongs to the served side: a cap equal to the read budget
+    /// inflates no further than a read may.
+    #[test]
+    fn a_decompression_cap_exactly_at_the_read_budget_keeps_binary_uris() {
+        use crate::parser::{DEFAULT_MAX_DECOMPRESSED_BYTES, FileSizeLimit};
+        let registry =
+            md_and_pdf_registry_inflating_to(FileSizeLimit::Bytes(DEFAULT_MAX_DECOMPRESSED_BYTES));
+        let rules = ServableRules::new(&registry, vec![]);
+        assert!(rules.allows("a.pdf"));
+        assert!(rules.allows("notes/a.md"));
+    }
+
+    /// The same rule on search hits: a PDF hit under a raised decompression
+    /// cap carries no URI, a Markdown hit beside it does.
+    #[test]
+    fn a_binary_search_hit_has_no_uri_while_the_index_may_inflate_past_a_read() {
+        let registry = md_and_pdf_registry_inflating_to(crate::parser::FileSizeLimit::Unlimited);
+        let rules = ServableRules::new(&registry, vec![]);
+        let uri_of = |path: &str| {
+            let h = crate::db::SearchHit {
+                start_line: None,
+                end_line: None,
+                symbol_kind: None,
+                score: 1.0,
+                path: path.to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: "x".to_string(),
+                match_spans: None,
+                expanded_from: None,
+            };
+            HitWithUri::new(h, &rules).uri
+        };
+        assert_eq!(uri_of("docs/report.pdf"), None);
+        assert_eq!(
+            uri_of("notes/a.md"),
+            Some("kb://doc/notes/a.md".to_string())
+        );
+        let json = serde_json::to_value(HitWithUri::new(
+            crate::db::SearchHit {
+                start_line: None,
+                end_line: None,
+                symbol_kind: None,
+                score: 1.0,
+                path: "docs/report.pdf".to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: "x".to_string(),
+                match_spans: None,
+                expanded_from: None,
+            },
+            &rules,
+        ))
+        .unwrap();
+        assert!(json.get("uri").is_none(), "the key is omitted: {json}");
     }
 
     #[test]

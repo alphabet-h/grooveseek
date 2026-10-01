@@ -7,7 +7,27 @@ use quick_xml::reader::Reader;
 
 use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
 
-pub struct DocxParser;
+pub struct DocxParser {
+    /// (feature-61) 文書 1 本の展開後合計の上限 (`[index].max_decompressed_size`)。
+    decompressed_budget: u64,
+}
+
+impl DocxParser {
+    /// (feature-61) 展開 budget を `budget` bytes にした parser。[`super::Registry`] が
+    /// `[index].max_decompressed_size` から作る。
+    pub fn with_budget(budget: u64) -> Self {
+        Self {
+            decompressed_budget: budget,
+        }
+    }
+}
+
+impl Default for DocxParser {
+    /// 展開 budget = [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]。
+    fn default() -> Self {
+        Self::with_budget(super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+}
 
 impl Parser for DocxParser {
     fn extension(&self) -> &'static str {
@@ -28,28 +48,55 @@ impl Parser for DocxParser {
         path_hint: &str,
         exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
-            anyhow!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}")
-        })?;
-        // 文書単位の累積展開済みバイト数。word/document.xml + docProps/core.xml
-        // の両読み出しで共有し、累積が cap を超えたら Err にする (codex P2,
-        // PR #70 round 2 zip-bomb hardening: 個々のエントリが cap 未満でも
-        // 積算で無制限に膨らむのを防ぐ)。
-        let mut budget: u64 = 0;
-        let doc_xml = super::ooxml::read_zip_entry(&mut zip, "word/document.xml", &mut budget)?
-            .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
-        // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
-        let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
-        super::ooxml::warn_if_truncated(path_hint, "word/document.xml", &doc_xml);
-        let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
-        let raw_content = super::join_chunk_bodies(&chunks);
-        Ok(ParsedDocument {
-            frontmatter,
-            chunks,
-            raw_content,
-            frontmatter_error: None,
-        })
+        parse_with_budget(bytes, path_hint, exclude_headings, self.decompressed_budget)
     }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_with_budget(
+            bytes,
+            path_hint,
+            exclude_headings,
+            super::DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+    }
+}
+
+/// The one docx parse; the two [`super::Parser`] entries differ only in the
+/// decompression budget they pass as `cap`.
+fn parse_with_budget(
+    bytes: &[u8],
+    path_hint: &str,
+    exclude_headings: &[&str],
+    cap: u64,
+) -> Result<ParsedDocument> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| anyhow!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}"))?;
+    // 文書単位の累積展開済みバイト数。word/document.xml + docProps/core.xml
+    // の両読み出しで共有し、累積が cap を超えたら Err にする (codex P2,
+    // PR #70 round 2 zip-bomb hardening: 個々のエントリが cap 未満でも
+    // 積算で無制限に膨らむのを防ぐ)。
+    let mut budget: u64 = 0;
+    let doc_xml =
+        super::ooxml::read_zip_part(&mut zip, path_hint, "word/document.xml", &mut budget, cap)?
+            .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
+    // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
+    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap)?;
+    super::ooxml::warn_if_truncated(path_hint, "word/document.xml", &doc_xml);
+    let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
+    let raw_content = super::join_chunk_bodies(&chunks);
+    Ok(ParsedDocument {
+        frontmatter,
+        chunks,
+        raw_content,
+        frontmatter_error: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +375,9 @@ mod tests {
             r#"<w:p><w:r><w:t>kept before the break</w:t></w:r></w:p>"#,
             r#"<w:p><w:r><w:t"#,
         ));
-        let doc = DocxParser.parse_bytes(&bytes, "broken.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "broken.docx", &[])
+            .unwrap();
         assert!(
             doc.raw_content.contains("kept before the break"),
             "text read before the error should survive: {:?}",
@@ -373,7 +422,7 @@ mod tests {
 
         // 本文は読めているので、返り値としては成功のまま。
         let bytes = docx_with_raw_document_xml(xml);
-        let doc = DocxParser
+        let doc = DocxParser::default()
             .parse_bytes(&bytes, "unclosed.docx", &[])
             .unwrap();
         assert!(doc.raw_content.contains("kept"));
@@ -389,7 +438,9 @@ mod tests {
             "<w:t>alpha</w:t><w:br/><w:t>beta</w:t><w:tab/><w:t>gamma</w:t>",
             "</w:r></w:p>",
         ));
-        let doc = DocxParser.parse_bytes(&bytes, "breaks.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "breaks.docx", &[])
+            .unwrap();
         assert!(
             !doc.raw_content.contains("alphabeta"),
             "a line break must not glue the words: {:?}",
@@ -406,8 +457,8 @@ mod tests {
 
     #[test]
     fn test_docx_parser_is_binary() {
-        assert!(DocxParser.is_binary());
-        assert_eq!(DocxParser.extension(), "docx");
+        assert!(DocxParser::default().is_binary());
+        assert_eq!(DocxParser::default().extension(), "docx");
     }
 
     // NOTE: skeleton 時点の `not_yet_implemented` 固定文言 assert は、本 task で
@@ -416,7 +467,7 @@ mod tests {
     // なることを検証するテストに更新する (controller 事前承認済み)。
     #[test]
     fn test_docx_parse_bytes_garbage_is_err() {
-        let err = DocxParser
+        let err = DocxParser::default()
             .parse_bytes(b"not a real docx", "x.docx", &[])
             .expect_err("garbage bytes must be Err");
         assert!(err.to_string().contains("cannot open docx zip"));
@@ -424,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_docx_parse_fallback_wraps_raw_text() {
-        let doc = DocxParser.parse("hello world content here", "x.docx", &[]);
+        let doc = DocxParser::default().parse("hello world content here", "x.docx", &[]);
         assert_eq!(doc.chunks.len(), 1);
         assert!(doc.chunks[0].content.contains("hello world"));
     }
@@ -437,7 +488,9 @@ mod tests {
             (Some("Heading2"), "節1.1"),
             (None, "本文B これは十分な長さの本文です十分な長さの本文です"),
         ]);
-        let doc = DocxParser.parse_bytes(&bytes, "docs/a.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "docs/a.docx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 2);
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("章1"));
         assert_eq!(doc.chunks[0].level, Some(2));
@@ -459,7 +512,9 @@ mod tests {
                 "本文 これは十分な長さの本文ですよ十分な長さの本文ですよ",
             ),
         ]);
-        let doc = DocxParser.parse_bytes(&bytes, "a.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "a.docx", &[])
+            .unwrap();
         assert_eq!(doc.chunks[0].heading, None);
         assert!(doc.chunks[0].level.is_none());
     }
@@ -474,7 +529,7 @@ mod tests {
             zip.write_all(b"<Types/>").unwrap();
             zip.finish().unwrap();
         }
-        let err = DocxParser
+        let err = DocxParser::default()
             .parse_bytes(&buf, "empty.docx", &[])
             .expect_err("zip without word/document.xml must be Err");
         assert!(err.to_string().contains("word/document.xml missing"));
@@ -489,7 +544,9 @@ mod tests {
             None,
             "A&amp;B これは十分な長さの本文ですこれは十分な長さの本文です",
         )]);
-        let doc = DocxParser.parse_bytes(&bytes, "e.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "e.docx", &[])
+            .unwrap();
         assert!(
             doc.chunks[0].content.contains("A&B"),
             "entity reference must resolve, got: {:?}",
@@ -514,7 +571,7 @@ mod tests {
                 "public body enough length enough length enough length",
             ),
         ]);
-        let doc = DocxParser
+        let doc = DocxParser::default()
             .parse_bytes(&bytes, "docs/s.docx", &["Secret"])
             .unwrap();
         let joined: String = doc
@@ -542,7 +599,9 @@ mod tests {
             r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>表内セル十分な長さのセル内容です十分な長さです</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
         );
         let bytes = wrap_document_xml(body);
-        let doc = DocxParser.parse_bytes(&bytes, "t.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "t.docx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 1);
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("章1"));
         assert!(doc.chunks[0].content.contains("表内セル"));
@@ -558,7 +617,9 @@ mod tests {
             (Some("Heading2"), "節1.1"),
             (None, "本文B これは十分な長さの本文です十分な長さの本文です"),
         ]);
-        let doc = DocxParser.parse_bytes(&bytes, "docs/a.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "docs/a.docx", &[])
+            .unwrap();
         assert_eq!(doc.chunks[0].context.as_deref(), Some("a > 章1"));
         assert_eq!(doc.chunks[1].context.as_deref(), Some("a > 章1 > 節1.1"));
     }
@@ -577,7 +638,9 @@ mod tests {
                 "本文 これは十分な長さの本文ですよ十分な長さの本文ですよ",
             ),
         ]);
-        let doc = DocxParser.parse_bytes(&bytes, "a.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "a.docx", &[])
+            .unwrap();
         assert_eq!(doc.chunks[0].heading, None);
         assert_eq!(doc.chunks[0].context.as_deref(), Some("a"));
     }
@@ -591,7 +654,9 @@ mod tests {
         // ことを検証する。
         let bytes =
             make_minimal_docx(&[(Some("Heading1"), "章1"), (Some("Heading3"), "小節1.1.1")]);
-        let doc = DocxParser.parse_bytes(&bytes, "docs/a.docx", &[]).unwrap();
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "docs/a.docx", &[])
+            .unwrap();
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("章1"));
         assert_eq!(doc.chunks[0].level, Some(2));
         assert_eq!(doc.chunks[1].heading.as_deref(), Some("小節1.1.1"));
@@ -599,6 +664,46 @@ mod tests {
         assert_eq!(
             doc.chunks[1].context.as_deref(),
             Some("a > 章1 > 小節1.1.1")
+        );
+    }
+
+    /// feature-61 (AC5): the budget the parser was built with reaches the
+    /// `docProps/core.xml` read as well. document.xml fits; document.xml plus
+    /// core.xml is one byte over, so the parse fails at core.xml, which it
+    /// would not if that read still used the 50 MiB constant.
+    #[test]
+    fn ooxml_budget_follows_the_docx_parser_it_was_built_with() {
+        let doc_xml: &[u8] = br#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>"#;
+        let core_xml: &[u8] = br#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Core</dc:title></cp:coreProperties>"#;
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("word/document.xml", opt).unwrap();
+            zip.write_all(doc_xml).unwrap();
+            zip.start_file("docProps/core.xml", opt).unwrap();
+            zip.write_all(core_xml).unwrap();
+            zip.finish().unwrap();
+        }
+        let both = (doc_xml.len() + core_xml.len()) as u64;
+
+        let err = DocxParser::with_budget(both - 1)
+            .parse_bytes(&bytes, "budget.docx", &[])
+            .expect_err("document.xml plus core.xml is one byte over the budget");
+        let msg = err.to_string();
+        assert!(msg.contains("max_decompressed_size"), "{msg}");
+        assert!(!msg.contains("file too large"), "{msg}");
+
+        let doc = DocxParser::with_budget(both)
+            .parse_bytes(&bytes, "budget.docx", &[])
+            .expect("exactly the budget is allowed");
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("Core"));
+
+        assert!(
+            DocxParser::default()
+                .parse_bytes(&bytes, "budget.docx", &[])
+                .is_ok(),
+            "the default is the previous 50 MiB"
         );
     }
 }

@@ -103,8 +103,33 @@ max_chunk_chars = 3500
 # `frontmatter:unparsed` で索引され、`warning:` 行で名指しされ、summary で数えられる。
 # on にしても全ファイルを索引し終えてから exit 1 になる。MCP `rebuild_index` は
 # 件数と一緒に `error` を返す。watcher はこのキーを読まない。
+#
+# 任意: サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
+# `max_text_file_size` (md / txt) は `groove index` / `rebuild_index` / watcher が読む
+# ファイル 1 本の生バイト上限で、超えたファイルは warning 付きで skip される。
+# `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF から取り出す
+# テキスト量の上限。どれも既定は 50 MiB で、バイト数、単位付きの大きさ ("300 MiB"、
+# "2 GB"。KB / MB / GB / TB は 1000 進、KiB / MiB / GiB / TiB は 1024 進、小数は不可)、
+# または "unlimited" を書ける。`0` はエラーで、メッセージが "unlimited" を案内する —
+# 0 を「無制限」「既定」「全拒否」のどれと読むかが製品ごとに違うため。
+# 300 MB の workbook には `max_binary_file_size` と `max_decompressed_size` の両方が
+# 要る: 中の XML はファイルの数倍に展開されるので、ファイル側の上限だけを上げても
+# zip-bomb の検査は残る。既定を超える値は 1 回だけ警告される: 索引中はファイルを
+# まるごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF の
+# 抽出は上限に関係なく 120 秒で打ち切られる。上限を下げても、索引済みの文書は
+# `groove index --force` を打つか、ファイルが上限の下まで縮むまで残る。上限を超えたままの
+# 編集では古いテキストが検索に出続ける。読み出しは連動しない:
+# `get_document` / `resources/read` はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、
+# それを超えて索引した文書は検索には出るが `uri` を持たない。読み出しは組み込みの
+# 展開 budget (50 MiB) でも parse するので、`max_decompressed_size` をそれより上げて
+# いる間はバイナリ文書のどれにも `uri` が付かず、`resources/list` も提示しない
+# (検索には出る)。この 3 キーは watcher も
+# 読み、KB の隣で見つかった config からは設定できない (下の表)。根拠: ADR-0026。
 # [index]
 # fail_on_frontmatter_error = true
+# max_binary_file_size = "unlimited"
+# max_text_file_size = "50 MiB"
+# max_decompressed_size = "16 GiB"
 
 # `groove index` は存在すれば `<kb_path>/groove-schema.toml` も読む
 # (v1.9.0+)。宣言された key — `title` / `date` / `topic` / `depth` / `tags`
@@ -296,8 +321,9 @@ bind = "127.0.0.1:3100"
 
 信頼しない config も**読み込みはする**。KB の見せ方を決めるだけのもの
 (`[search]` / `[quality_filter]` / `exclude_dirs` / `[watch]` /
-`[contextual]` / `[index]`) はそのまま効く。制限するのは 7 つだけで、これらは「どのコードを
-実行するか」「何を読み、何が外に出るか」「誰から届くか」を決めるため:
+`[contextual]` / `[index].fail_on_frontmatter_error`) はそのまま効く。制限するのは 8 つだけで、
+これらは「どのコードを実行するか」「何を読み、何が外に出るか」「1 回の run がファイルを
+どれだけメモリに持つか」「誰から届くか」を決めるため:
 
 | フィールド | 信頼しない config の場合 |
 | --- | --- |
@@ -308,6 +334,7 @@ bind = "127.0.0.1:3100"
 | `[parsers]` | 警告して無視し、既定の集合 (Markdown のみ) を使う。`enabled` は**そもそもどの parser を走らせるか**を決めるので、KB の隣で見つかった config が、運用者が外していた最も入力面の広い形式 (`pdf` / `xlsx` / `pptx` / `docx`) を再有効化したり、grammar plugin が `dlopen` される言語を名指ししたりできてしまう。`grammar_dir` が向きだけを決めているスイッチがこちら — 有効な言語が plugin を必要としなければ、plugin は探されない。上 2 つと違い**キーが無い場合の差し替えは不要** — `[parsers]` を省略した時点で Markdown のみに落ちており、この規則が行き着く先と同じだから。`[parsers.code]` も一緒に落ちる (設定する対象の parser が残らないため) |
 | `[eval].golden` | 警告して無視し、`groove eval` / `groove tune` は `<kb_path>/.groove-eval.yml` に落ちる。`--golden` は従来どおり効く。この値は**それらのコマンドが読むファイル**を名指しするもので、絶対パスならマシン上のどのファイルでも指せる。読みは 1 MiB で bound され YAML として parse されるので、植えられたパスが晒せるのは「bound された読み出しの中身が parse error 経由で表に出る」までで、コード実行ではない — それでも、KB の隣で見つかった config が選んでよいものではない。`[parsers]` と同じく**キーが無い場合の差し替えは不要** — 落ちた先は実行時の KB に対する定数だから。`[eval]` の他のキーはそのまま効く |
 | `[embedding]` | 警告して無視し、組み込みの FastEmbed provider に戻す。外部 endpoint はインデックス時に document のチャンクを、検索時にクエリを受け取るので、その外向き通信を opt-in できるのは `--config` で名指しした config (または上に挙げた他の信頼する置き場所) だけ |
+| `[index]` のサイズ上限 (`max_binary_file_size` / `max_text_file_size` / `max_decompressed_size`) | 警告して無視し、組み込みの 50 MiB を使う。`rebuild_index` は MCP ツールなので、KB の隣に植えた config と巨大なファイル 1 本があれば、クライアントの好きな時点で daemon にそのファイルをまるごとメモリへ読ませられてしまい、しかも確保に失敗すると skip ではなく process が abort する。既定より**下げる**値も同じく落とす — 1 バイトの上限を植えれば KB 全体を索引させないことができるため。`[parsers]` と同じく**キーが無い場合の差し替えは不要** — 落ちた先は組み込みの定数だから。`fail_on_frontmatter_error` はそのまま効く |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
 `kb_path = "/srv/kb/knowledge-base"` も通る (project-local な `groove.toml` に

@@ -194,30 +194,64 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// one round; it turned out every caller wanted it, because a row that says a
 /// file is small enough to serve when the read has just proved otherwise is
 /// what makes the resource surface offer something unreadable.
-fn read_for_index(
+///
+/// The last argument names the `[index]` key that set `cap` (from
+/// [`size_cap_key`]): a size refusal names it, so the warning says what to
+/// raise, the way the decompression-side messages already do.
+fn read_for_index_under(
     full: &Path,
     rel: &str,
     cap: u64,
+    key: &str,
 ) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
     match crate::links::read_checked(full, cap)? {
         crate::links::Content::Bytes(bytes) => Ok((Some(bytes), None)),
         crate::links::Content::Refused(refused) => {
-            eprintln!("Skipping {rel}: {}", refused.log_line(full));
             let measured = match refused {
                 crate::links::Refused::TooLarge { len, .. } => Some(len),
                 // The other refusals say nothing about size, so there is
                 // nothing to record and the row keeps what it had.
                 _ => None,
             };
+            if measured.is_some() {
+                eprintln!(
+                    "Skipping {rel}: {}; raise [index].{key} to admit it",
+                    refused.log_line(full)
+                );
+            } else {
+                eprintln!("Skipping {rel}: {}", refused.log_line(full));
+            }
             Ok((None, measured))
         }
     }
+}
+
+/// [`read_for_index_under`] under the text cap's key, for the tests that read
+/// a Markdown file through it.
+#[cfg(test)]
+fn read_for_index(
+    full: &Path,
+    rel: &str,
+    cap: u64,
+) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
+    read_for_index_under(full, rel, cap, size_cap_key(false))
 }
 
 /// 超過警告に使う「binary」/「text」の語。cap が拡張子で決まるので、
 /// 警告文も同じ分岐で選ぶ (どちらの上限に当たったか読み手に分かるように)。
 fn size_cap_kind(is_binary_ext: bool) -> &'static str {
     if is_binary_ext { "binary" } else { "text" }
+}
+
+/// The `[index]` key that sets the cap a file of this kind is held to, chosen
+/// by the same branch as [`size_cap_kind`], so a size warning can say which key
+/// admits the file.
+fn size_cap_key(is_binary_ext: bool) -> &'static str {
+    if is_binary_ext {
+        "max_binary_file_size"
+    } else {
+        "max_text_file_size"
+    }
 }
 
 /// Whether `\` separates path components on this platform, or is an ordinary
@@ -304,8 +338,8 @@ pub(crate) fn scanned_rel_paths(kb_path: &Path, registry: &Registry) -> Vec<Stri
         &files,
         kb_path,
         registry,
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
     )
     .entries
     .into_iter()
@@ -397,8 +431,10 @@ fn scan_one_file(
 
     match size_cap_exceeded(p, is_binary, max_binary_bytes, max_text_bytes) {
         Ok(Some((len, cap))) => {
-            let kind = size_cap_kind(is_binary);
-            eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+            let (kind, key) = (size_cap_kind(is_binary), size_cap_key(is_binary));
+            eprintln!(
+                "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+            );
             scan.oversize.push((rel.clone(), len));
             scan.skipped.push(rel);
             return;
@@ -419,7 +455,7 @@ fn scan_one_file(
     // run's walk-time check is what evicts it — which is where that
     // decision belongs (§4.2, skip preserves).
     let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
-    match read_for_index(p, &rel, cap) {
+    match read_for_index_under(p, &rel, cap, size_cap_key(is_binary)) {
         Ok((Some(bytes), _)) => {
             let hash = sha256_hex_bytes(&bytes);
             scan.entries.push(DiskEntry {
@@ -1042,8 +1078,8 @@ pub fn rebuild_index(
         &source_files,
         &kb_path,
         registry,
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
         &mut || {
             progress.report_scanned();
             if progress.is_cancelled() {
@@ -1653,10 +1689,11 @@ fn index_single_disk_entry(
     // a swapped-in hard link has to get past, and cannot.
     let cap = applicable_cap(
         parser.is_binary(),
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
     );
-    let bytes = match read_for_index(&entry.full, &entry.rel, cap) {
+    let key = size_cap_key(parser.is_binary());
+    let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, key) {
         Ok((Some(b), _)) => b,
         Ok((None, measured)) => {
             // (codex P2 round 5) Same window as the scan: if the handle check
@@ -2028,8 +2065,9 @@ pub fn write_parsed_document(
 /// - `rel` は forward-slash、`kb_path` からの相対パス (e.g. `"notes/a.md"`)
 /// - 拡張子が `registry` に登録されていなければ `Skipped` を返す
 /// - hash が DB と一致なら `Unchanged`、違えば upsert + embedding 再計算
-/// - **size cap**: `is_binary()` な拡張子が `MAX_RAW_BINARY_BYTES` を超えていれば
-///   `fs::read` する前に skip する ([`size_cap_exceeded`]、codex P2 round 2:
+/// - **size cap**: registry の上限 ([`Registry::limits`]、`[index]` で変えられる。既定は
+///   [`crate::parser::MAX_RAW_BINARY_BYTES`] / [`crate::parser::MAX_RAW_TEXT_BYTES`]) を
+///   超えていれば `fs::read` する前に skip する ([`size_cap_exceeded`]、codex P2 round 2:
 ///   watcher の create/modify 経路は元々これをバイパスして全量 read/hash していた)
 ///
 /// watcher から Create/Modify イベントを受けた時に呼ぶ。
@@ -2060,11 +2098,13 @@ pub fn reindex_single_file(
     if let Ok(Some((len, cap))) = size_cap_exceeded(
         &full,
         is_binary_ext,
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
     ) {
-        let kind = size_cap_kind(is_binary_ext);
-        eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        let (kind, key) = (size_cap_kind(is_binary_ext), size_cap_key(is_binary_ext));
+        eprintln!(
+            "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+        );
         // (codex P2 round 4) Same as the full scan: the row stays, so without
         // this its recorded size is the last one small enough to index and the
         // resource surface keeps offering a file a read now refuses. Doing it
@@ -2081,11 +2121,12 @@ pub fn reindex_single_file(
 
     let cap = applicable_cap(
         is_binary_ext,
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
     );
-    let (maybe_bytes, measured) = read_for_index(&full, rel, cap)
-        .with_context(|| format!("failed to read {}", full.display()))?;
+    let (maybe_bytes, measured) =
+        read_for_index_under(&full, rel, cap, size_cap_key(is_binary_ext))
+            .with_context(|| format!("failed to read {}", full.display()))?;
     let Some(bytes) = maybe_bytes else {
         // (codex P2 round 5) The watcher has the same stat-then-read window.
         if let Some(len) = measured
@@ -2365,10 +2406,9 @@ pub enum RenameOutcome {
 /// 単一ファイルの rename を処理する。
 /// - `old_rel` / `new_rel` とも forward-slash、`kb_path` 相対
 /// - DB 側の path を UPDATE し、必要なら再 index (内容変更がある場合)
-/// - **size cap**: `is_binary()` な拡張子の新 path が `MAX_RAW_BINARY_BYTES`
-///   を超えていれば hash 再計算のための `fs::read` をスキップする
-///   ([`size_cap_exceeded`]、codex P2 round 3。これで scan / reindex /
-///   rename の 3 read 経路すべてが同じ size-cap guard を通るようになった)
+/// - **size cap**: 新 path が registry の上限 ([`Registry::limits`]) を超えていれば hash
+///   再計算のための `fs::read` をスキップする ([`size_cap_exceeded`]、codex P2 round 3。
+///   これで scan / reindex / rename の 3 read 経路すべてが同じ size-cap guard を通る)
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -2430,11 +2470,13 @@ pub fn rename_single_file(
     if let Ok(Some((len, cap))) = size_cap_exceeded(
         &full,
         is_binary_ext,
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
     ) {
-        let kind = size_cap_kind(is_binary_ext);
-        eprintln!("Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        let (kind, key) = (size_cap_kind(is_binary_ext), size_cap_key(is_binary_ext));
+        eprintln!(
+            "Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+        );
         // (codex P2 round 11 on PR #291) Crossed a parser: the row is the old parser's
         // and nothing below will rewrite it. Settle before recording a size for it.
         if crosses_a_parser {
@@ -2454,11 +2496,12 @@ pub fn rename_single_file(
 
     let cap = applicable_cap(
         is_binary_ext,
-        crate::parser::MAX_RAW_BINARY_BYTES,
-        crate::parser::MAX_RAW_TEXT_BYTES,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
     );
-    let (maybe_bytes, measured) = read_for_index(&full, new_rel, cap)
-        .with_context(|| format!("failed to read {}", full.display()))?;
+    let (maybe_bytes, measured) =
+        read_for_index_under(&full, new_rel, cap, size_cap_key(is_binary_ext))
+            .with_context(|| format!("failed to read {}", full.display()))?;
     let Some(new_bytes) = maybe_bytes else {
         // (codex P2 round 6) The rename target has the same stat-then-read
         // window as every other reader, and this was the last caller still
@@ -4542,6 +4585,47 @@ mod tests {
             scan.oversize,
             vec![("big.md".to_string(), 10)],
             "the refused file's real length must come back, and only that file's"
+        );
+    }
+
+    /// feature-61 (AC4): the scan takes its caps from the registry. A binary
+    /// file one byte over the default is declined under the default caps and
+    /// scanned under raised ones, and the text cap stays its own key.
+    /// [`scanned_rel_paths`] passes the registry's caps the way the full run
+    /// does; the full run itself is pinned by the integration tests for the size caps.
+    #[test]
+    fn a_raised_binary_cap_admits_a_file_the_default_skips() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let tmp = mk_tmp("f61-raised");
+        write_file(&tmp.0, "small.md", "# h\n\nbody\n");
+        let big = std::fs::File::create(tmp.0.join("big.pdf")).unwrap();
+        big.set_len(crate::parser::MAX_RAW_BINARY_BYTES + 1)
+            .unwrap();
+        drop(big);
+        let ids = ["md".to_string(), "pdf".to_string()];
+        let registry = |limits: FileSizeLimits| {
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+                .expect("md + pdf")
+        };
+
+        let mut by_default = scanned_rel_paths(&tmp.0, &registry(FileSizeLimits::default()));
+        by_default.sort();
+        assert_eq!(
+            by_default,
+            vec!["small.md".to_string()],
+            "one byte over the default binary cap is declined"
+        );
+
+        // Raised binary cap, and a text cap below small.md: one scan shows both
+        // that the binary key admits big.pdf and that it does not move the text key.
+        let raised = FileSizeLimits {
+            binary: FileSizeLimit::Bytes(crate::parser::MAX_RAW_BINARY_BYTES + 1),
+            text: FileSizeLimit::Bytes(4),
+            ..FileSizeLimits::default()
+        };
+        assert_eq!(
+            scanned_rel_paths(&tmp.0, &registry(raised)),
+            vec!["big.pdf".to_string()]
         );
     }
 

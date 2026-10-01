@@ -16,7 +16,8 @@
 //! **Servability.** Which indexed documents the resource surface is holding
 //! back, and why. This is *not* a second implementation of that rule: the
 //! extension check is [`crate::indexer::paths_with_unregistered_extension`] and
-//! the size check is [`crate::server::ServableRules`], the same values the
+//! the size check and the raised-decompression-cap check are
+//! [`crate::server::ServableRules`], the same values the
 //! server answers `resources/list` from, and on Windows the name check is
 //! [`crate::resources::doc_is_addressable`], the predicate the walk, the
 //! watcher and `get_document` of [`crate::server`] ask (ADR-0023). A doctor
@@ -301,6 +302,28 @@ pub fn run(
         // Naming it would send someone to a remedy that cannot work
         // (codex P2 round 1).
         "split the document into parts under the read cap",
+    ));
+
+    // (feature-61) The other half of what `ServableRules::allows` withholds:
+    // every binary document while the index may inflate further than a read.
+    // Asked of the same rules value, so it cannot drift from the server.
+    let withheld = rules.withheld_binary(all_paths.iter().map(String::as_str));
+    findings.extend(finding(
+        "binary-uris-withheld",
+        Severity::Warning,
+        format!(
+            concat!(
+                "{} indexed binary document(s) carry no uri because ",
+                "[index].max_decompressed_size is raised past the budget a read parses with; ",
+                "they stay searchable"
+            ),
+            withheld.len()
+        ),
+        truncated(withheld),
+        concat!(
+            "lower [index].max_decompressed_size to the built-in default to restore their uris ",
+            "(get_document still tries them meanwhile)"
+        ),
     ));
 
     let unrecorded = db.documents_without_recorded_size()?;
@@ -957,6 +980,76 @@ mod tests {
             .expect("the oversized document must be explained");
         assert_eq!(f.severity, Severity::Warning);
         assert_eq!(f.samples, vec!["notes/a.md".to_string()]);
+    }
+
+    /// md + pdf, with `[index].max_decompressed_size` set to `decompressed`
+    /// and every other cap at its default.
+    fn registry_md_pdf_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
+        use crate::parser::{CodeParsersConfig, FileSizeLimits};
+        Registry::from_enabled_with_plugins(
+            &["md".to_string(), "pdf".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            FileSizeLimits {
+                decompressed,
+                ..FileSizeLimits::default()
+            },
+        )
+        .expect("md + pdf")
+    }
+
+    const WITHHELD_BINARY: &str = "binary-uris-withheld";
+
+    /// feature-61: while `[index].max_decompressed_size` is raised past the
+    /// read budget, the resource surface withholds every binary document's
+    /// uri. doctor names them, whatever their raw size.
+    #[test]
+    fn binary_documents_a_raised_decompression_cap_withholds_are_named() {
+        let db = db_with_one_chunk();
+        with_document_named(&db, "report.pdf");
+        let registry = registry_md_pdf_inflating_to(crate::parser::FileSizeLimit::Unlimited);
+
+        let report = run(&db, &registry, None).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == WITHHELD_BINARY)
+            .expect("the withheld binary document must be named");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.count, 1);
+        assert_eq!(f.samples, vec!["report.pdf".to_string()]);
+        assert!(
+            f.summary.contains("[index].max_decompressed_size"),
+            "{}",
+            f.summary
+        );
+        assert!(f.summary.is_ascii() && f.remedy.is_ascii());
+    }
+
+    /// At the default cap the same binary row carries its uri: no finding.
+    #[test]
+    fn binary_documents_at_the_default_decompression_cap_are_no_finding() {
+        let db = db_with_one_chunk();
+        with_document_named(&db, "report.pdf");
+        let registry =
+            registry_md_pdf_inflating_to(crate::parser::FileSizeLimits::default().decompressed);
+
+        let report = run(&db, &registry, None).expect("run");
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// A raised cap with no binary document indexed withholds nothing.
+    #[test]
+    fn a_raised_decompression_cap_with_only_text_documents_is_no_finding() {
+        let db = db_with_one_chunk();
+        let registry = registry_md_pdf_inflating_to(crate::parser::FileSizeLimit::Unlimited);
+
+        let report = run(&db, &registry, None).expect("run");
+        assert!(
+            report.findings.iter().all(|f| f.check != WITHHELD_BINARY),
+            "{:?}",
+            report.findings
+        );
     }
 
     /// Adds a document with one chunk under the given path, so the only

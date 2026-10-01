@@ -95,7 +95,8 @@ pub struct Config {
     /// 省略時 (`None`) は `ContextualConfig::default()` (enabled=false) 相当。
     pub contextual: Option<ContextualConfig>,
     /// `[index]` セクション (#251)。`groove index` と MCP `rebuild_index` の設定。
-    /// 省略時 (`None`) は [`IndexConfig::default()`] (fail_on_frontmatter_error=false)。
+    /// 省略時 (`None`) は [`IndexConfig::default()`] (fail_on_frontmatter_error=false、
+    /// サイズ上限は組み込み既定)。サイズ上限 3 つは watcher も読む (feature-61)。
     pub index: Option<IndexConfig>,
 }
 
@@ -250,9 +251,10 @@ fn resolve_embedding_api_key(
         .or_else(|| configured_api_key.filter(|key| !key.trim().is_empty()))
 }
 
-/// `[index]` section (`groove.toml`), #251. Settings that apply to
-/// `groove index` and the MCP `rebuild_index` tool; the watcher reads none of
-/// them.
+/// `[index]` section (`groove.toml`), #251. Settings that apply to a full run,
+/// [`crate::indexer::rebuild_index`], whether `groove index` or the MCP tool
+/// started it. The watcher reads the three size caps (feature-61) but not
+/// `fail_on_frontmatter_error`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexConfig {
@@ -267,6 +269,22 @@ pub struct IndexConfig {
     /// note was saved half-written.
     #[serde(default)]
     pub fail_on_frontmatter_error: bool,
+    /// (feature-61) The largest pdf / docx / xlsx / pptx file a full run
+    /// ([`crate::indexer::rebuild_index`], from `groove index` or the MCP tool) and the watcher
+    /// read, in raw bytes. `None` is
+    /// [`crate::parser::MAX_RAW_BINARY_BYTES`]. Dropped from an untrusted config (R8 in
+    /// [`Config::restrict_untrusted`]).
+    #[serde(default)]
+    pub max_binary_file_size: Option<crate::parser::FileSizeLimit>,
+    /// (feature-61) The same for md / txt. `None` is [`crate::parser::MAX_RAW_TEXT_BYTES`].
+    #[serde(default)]
+    pub max_text_file_size: Option<crate::parser::FileSizeLimit>,
+    /// (feature-61) How far an .xlsx / .docx / .pptx may inflate in total, and how much text a
+    /// PDF may yield. `None` is [`crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES`]. Not tied to
+    /// `max_binary_file_size`: raising the file cap alone never lifts the zip-bomb check
+    /// (ADR-0026).
+    #[serde(default)]
+    pub max_decompressed_size: Option<crate::parser::FileSizeLimit>,
 }
 
 /// `get_best_practice` の opt-in 設定。
@@ -1100,6 +1118,33 @@ impl Config {
             );
         }
 
+        // R8 (feature-61): how much of a file a run reads into memory.
+        //
+        // `rebuild_index` is an MCP tool, so a config planted beside a knowledge base together
+        // with one huge file could otherwise make the daemon read that file whole at a moment
+        // of a client's choosing -- and an allocation failure aborts the process, which
+        // `catch_unwind` does not stop. Dropped in both directions: a planted 1-byte cap would
+        // keep every document out of the index instead.
+        //
+        // Like R5 and R6, **an absent key needs no substitute**: what a dropped key falls back
+        // to is a built-in constant. `fail_on_frontmatter_error` only shapes how a run reports,
+        // and stays.
+        if let Some(index) = self.index.as_mut() {
+            let dropped = [
+                ("max_binary_file_size", index.max_binary_file_size.take()),
+                ("max_text_file_size", index.max_text_file_size.take()),
+                ("max_decompressed_size", index.max_decompressed_size.take()),
+            ];
+            for (key, value) in dropped {
+                if value.is_some() {
+                    tracing::warn!(
+                        config = %shown.display(),
+                        "ignoring [index].{key} from a config found in an untrusted location (it sets how much of a file groove reads into memory); pass --config to accept it"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1181,9 +1226,31 @@ impl Config {
         }
     }
 
+    /// (feature-61) `[index]` のサイズ上限を解決する。キーが無ければ組み込みの既定値。
+    /// untrusted config のキーはここに来る前に [`Self::restrict_untrusted`] の R8 が落としている。
+    pub fn file_size_limits(&self) -> crate::parser::FileSizeLimits {
+        let defaults = crate::parser::FileSizeLimits::default();
+        let Some(index) = &self.index else {
+            return defaults;
+        };
+        crate::parser::FileSizeLimits {
+            binary: index.max_binary_file_size.unwrap_or(defaults.binary),
+            text: index.max_text_file_size.unwrap_or(defaults.text),
+            decompressed: index.max_decompressed_size.unwrap_or(defaults.decompressed),
+        }
+    }
+
     /// 設定から `parser::Registry` を構築する。キー省略時は
     /// `Registry::defaults()` = `["md"]` のみ (legacy 後方互換)。
+    ///
+    /// (feature-61) `[index]` のサイズ上限は**両分岐**に乗せる。`[parsers]` が無く `[index]` に
+    /// 上限だけがある構成で設定が黙って無視されないため。既定を超える上限は、ここで process
+    /// ごとに 1 回 warn する (呼び出し元は `groove serve` / `groove index` / `groove doctor` の各コマンドで 1 回ずつ)。
     pub fn build_parser_registry(&self, kb_path: &Path) -> Result<crate::parser::Registry> {
+        let limits = self.file_size_limits();
+        if crate::parser::should_warn_raised_limits(&limits) {
+            tracing::warn!("{}", crate::parser::raised_limits_warning(&limits));
+        }
         match &self.parsers {
             // (feature-56) `[parsers.code]` reaches the parser here rather than at parse time:
             // `Parser::parse_bytes_inner` takes no configuration, so a code parser has to be
@@ -1216,9 +1283,10 @@ impl Config {
                             dir,
                             knowledge_base: kb_path,
                         }),
+                    limits,
                 )
             }
-            None => Ok(crate::parser::Registry::defaults()),
+            None => Ok(crate::parser::Registry::defaults_with_limits(limits)),
         }
     }
 
@@ -3376,6 +3444,98 @@ lambda = 0.5
         );
     }
 
+    // (feature-61) `[index]` size caps.
+
+    #[test]
+    fn index_section_reads_the_size_caps() {
+        use crate::parser::FileSizeLimit;
+        let cfg: Config = toml::from_str(concat!(
+            "[index]\n",
+            "max_binary_file_size = \"unlimited\"\n",
+            "max_text_file_size = 1048576\n",
+            "max_decompressed_size = \"16 GiB\"\n",
+        ))
+        .unwrap();
+        let limits = cfg.file_size_limits();
+        assert_eq!(limits.binary, FileSizeLimit::Unlimited);
+        assert_eq!(limits.text, FileSizeLimit::Bytes(1_048_576));
+        assert_eq!(limits.decompressed, FileSizeLimit::Bytes(16 << 30));
+        assert!(!cfg.is_empty());
+    }
+
+    /// AC2 + Review Focus 4: a bad value names its key, whichever way it is bad.
+    #[test]
+    fn index_section_errors_name_the_key() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "max_binary_file_size",
+                "0",
+                "use \"unlimited\" to lift the limit",
+            ),
+            (
+                "max_text_file_size",
+                "-1",
+                "use \"unlimited\" to lift the limit",
+            ),
+            (
+                "max_decompressed_size",
+                "\"0 MiB\"",
+                "use \"unlimited\" to lift the limit",
+            ),
+            ("max_binary_file_size", "1.5", "fractions are not accepted"),
+            (
+                "max_text_file_size",
+                "\"1.5 GiB\"",
+                "fractions are not accepted",
+            ),
+            ("max_decompressed_size", "\"300 XB\"", "unknown unit"),
+            ("max_binary_file_size", "\"\"", "or \"unlimited\""),
+            ("max_text_file_size", "\"unlimited!\"", "or \"unlimited\""),
+            ("max_decompressed_size", "false", ""),
+        ];
+        for (key, value, says) in cases {
+            let mut file = tempfile("groove-config-f61-key");
+            write!(file, "[index]\n{key} = {value}\n").unwrap();
+            let err = Config::load_from(file.path()).expect_err("an invalid size must not load");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(key), "the message must name {key}: {msg}");
+            assert!(msg.contains(says), "{key} = {value}: {msg}");
+        }
+    }
+
+    #[test]
+    fn index_limits_apply_without_a_parsers_section() {
+        use crate::parser::{FileSizeLimit, FileSizeLimits};
+        let kb = Path::new(KB_NOT_UNDER_TEST);
+
+        let cfg: Config = toml::from_str("[index]\nmax_text_file_size = \"2 MiB\"\n").unwrap();
+        assert!(cfg.parsers.is_none());
+        let registry = cfg.build_parser_registry(kb).expect("registry");
+        assert_eq!(
+            registry.extensions(),
+            vec!["md"],
+            "still the default parser set"
+        );
+        assert_eq!(registry.limits().text, FileSizeLimit::Bytes(2 << 20));
+        assert_eq!(registry.limits().binary, FileSizeLimits::default().binary);
+
+        let with_parsers: Config = toml::from_str(concat!(
+            "[parsers]\n",
+            "enabled = [\"md\", \"pdf\"]\n",
+            "[index]\n",
+            "max_binary_file_size = \"unlimited\"\n",
+        ))
+        .unwrap();
+        let registry = with_parsers.build_parser_registry(kb).expect("registry");
+        assert_eq!(registry.limits().binary, FileSizeLimit::Unlimited);
+
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            empty.build_parser_registry(kb).expect("registry").limits(),
+            FileSizeLimits::default()
+        );
+    }
+
     #[test]
     fn test_toml_example_parses_with_all_keys_uncommented() {
         // groove.toml.example のすべてのキーが Config で受け入れられるかを検証。
@@ -4579,6 +4739,83 @@ lambda = 0.5
             .and_then(|e| e.golden.clone())
             .expect("a named config keeps its golden file");
         assert_eq!(golden, chosen);
+    }
+
+    // -----------------------------------------------------------------------
+    // R8 (feature-61): the [index] size caps
+    // -----------------------------------------------------------------------
+
+    /// AC7: a config found beside a knowledge base cannot raise how much of a
+    /// file a run reads into memory; the same file named with --config can.
+    #[test]
+    fn an_untrusted_config_cannot_raise_the_index_size_caps() {
+        use crate::parser::{FileSizeLimit, FileSizeLimits};
+        let dir = TempDir::new("groove-untrusted-index-caps");
+        let toml = dir.path().join("groove.toml");
+        std::fs::write(
+            &toml,
+            concat!(
+                "kb_path = \"kb\"\n",
+                "[index]\n",
+                "fail_on_frontmatter_error = true\n",
+                "max_binary_file_size = \"unlimited\"\n",
+                "max_text_file_size = \"unlimited\"\n",
+                "max_decompressed_size = \"unlimited\"\n",
+            ),
+        )
+        .unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let index = d
+            .config
+            .index
+            .as_ref()
+            .expect("[index] survives; only the size caps are privileged");
+        assert!(index.fail_on_frontmatter_error, "how a run reports stays");
+        assert_eq!(
+            (
+                index.max_binary_file_size,
+                index.max_text_file_size,
+                index.max_decompressed_size
+            ),
+            (None, None, None)
+        );
+        let registry = d
+            .config
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .expect("registry");
+        assert_eq!(registry.limits(), FileSizeLimits::default());
+
+        let named = Config::discover_in(Some(&toml), dir.path(), None, &roots)
+            .expect("--config is trusted");
+        assert_eq!(named.trust, ConfigTrust::Trusted);
+        assert_eq!(
+            named.config.file_size_limits().binary,
+            FileSizeLimit::Unlimited
+        );
+    }
+
+    /// Review Focus 3: the rule is where the file was found, not which way the
+    /// value points. A planted 1-byte text cap would keep every note out of
+    /// the index.
+    #[test]
+    fn an_untrusted_config_cannot_lower_the_index_size_caps_either() {
+        let dir = TempDir::new("groove-untrusted-index-lower");
+        std::fs::write(
+            dir.path().join("groove.toml"),
+            "kb_path = \"kb\"\n[index]\nmax_text_file_size = 1\n",
+        )
+        .unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(
+            d.config.file_size_limits(),
+            crate::parser::FileSizeLimits::default()
+        );
     }
 
     // -----------------------------------------------------------------------

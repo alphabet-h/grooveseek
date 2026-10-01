@@ -139,8 +139,10 @@ const PDF_PAGE_TEXT_MAX_BYTES: usize = 1024 * 1024;
 /// 見ていない (`MAX_DECOMPRESSED_SIZE` 256 MB / stream、`MAX_PAGES` 100,000)。
 /// per-page 上限だけでは 100,000 ページ × 1 MiB まで積める。OOXML 側で
 /// PR #70 round 2 が塞いだ「per-entry はあるが累積が無い」穴と同じ形なので、
-/// 同じ `MAX_RAW_BINARY_BYTES` を文書単位の budget として使う。
-const PDF_DOC_TEXT_MAX_BYTES: usize = super::MAX_RAW_BINARY_BYTES as usize;
+/// 文書単位の budget を持つ。(feature-61) 本番の値は [`PdfParser`] が構築時に受け取る
+/// `[index].max_decompressed_size` で、この定数はその既定値 (test 専用)。
+#[cfg(test)]
+const PDF_DOC_TEXT_MAX_BYTES: usize = super::DEFAULT_MAX_DECOMPRESSED_BYTES as usize;
 
 /// 1 文書の抽出にかけてよい実時間の上限 (AU-05、codex P1)。
 ///
@@ -151,14 +153,18 @@ const PDF_DOC_TEXT_MAX_BYTES: usize = super::MAX_RAW_BINARY_BYTES as usize;
 /// `StackSafeContext` の timeout は抽出経路から使われていないので、
 /// ここで実時間を見るしかない。
 ///
-/// 残余の大きさは有界ではある: 入力は `MAX_RAW_BINARY_BYTES` (50 MB) で、
+/// 残余の大きさは有界ではある (既定の raw 上限での計算): 入力は
+/// [`crate::parser::MAX_RAW_BINARY_BYTES`] (50 MB) で、
 /// DEFLATE の理論最大比が ~1032:1 なので累積展開量は高々 ~51 GB、
 /// 300 MB/s 程度の実効速度で ~170 秒。この上限はそれを 120 秒に切り下げる。
 ///
 /// 値は crate 自身の `PARSING_TIMEOUT_SECS` (= 120、"Timeout for long-running
 /// parsing operations") に合わせた。正規の PDF は 50 MB でも数秒で終わるので、
 /// 遅いマシンでの false positive 余裕は十分ある。
-const PDF_DOC_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+///
+/// (feature-61) `[index]` で raw 上限を上げてもこの秒数は動かさない。
+/// [`super::raised_limits_warning`] が利用者にそう伝える。
+pub(crate) const PDF_DOC_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
 ///
@@ -350,7 +356,27 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
     Ok(())
 }
 
-pub struct PdfParser;
+pub struct PdfParser {
+    /// (feature-61) 文書 1 本から取り出すテキストの累積上限 (`[index].max_decompressed_size`)。
+    decompressed_budget: u64,
+}
+
+impl PdfParser {
+    /// (feature-61) 文書テキスト budget を `budget` bytes にした parser。[`super::Registry`] が
+    /// `[index].max_decompressed_size` から作る。
+    pub fn with_budget(budget: u64) -> Self {
+        Self {
+            decompressed_budget: budget,
+        }
+    }
+}
+
+impl Default for PdfParser {
+    /// 文書テキスト budget = [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]。
+    fn default() -> Self {
+        Self::with_budget(super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+}
 
 impl Parser for PdfParser {
     fn extension(&self) -> &'static str {
@@ -373,39 +399,58 @@ impl Parser for PdfParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        let (pages, frontmatter) = extract_pdf(bytes, path_hint)?;
-        reject_unindexable_pages(&pages, path_hint)?;
-
-        let title = frontmatter.title.as_deref().unwrap_or("");
-        let mut chunks = Vec::new();
-        for (i, page_text) in pages.iter().enumerate() {
-            let content = post_process(page_text);
-            if content.trim().is_empty() {
-                continue; // 空ページは chunk を作らない
-            }
-            let heading = format!("p.{}", i + 1);
-            let context = super::build_context(&[title, &heading]);
-            chunks.push(super::Chunk {
-                index: chunks.len(),
-                heading: Some(heading),
-                level: None,
-                content,
-                context,
-                line_range: None,
-                symbol_kind: None,
-            });
-        }
-
-        // frontmatter は extract_pdf が同じ PdfDocument から抽出済み (§4.5)。
-        let raw_content = super::join_chunk_bodies(&chunks);
-
-        Ok(ParsedDocument {
-            frontmatter,
-            chunks,
-            raw_content,
-            frontmatter_error: None,
-        })
+        parse_with_budget(bytes, path_hint, self.decompressed_budget)
     }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        _exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_with_budget(bytes, path_hint, super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+}
+
+/// The one PDF parse; the two [`super::Parser`] entries differ only in the
+/// document text budget they pass.
+fn parse_with_budget(bytes: &[u8], path_hint: &str, budget: u64) -> Result<ParsedDocument> {
+    // 32-bit では usize に収まらない budget は usize::MAX (= 実質無制限) に倒す。
+    let doc_budget = usize::try_from(budget).unwrap_or(usize::MAX);
+    let (pages, frontmatter) = extract_pdf_with_budget(bytes, path_hint, doc_budget)?;
+    reject_unindexable_pages(&pages, path_hint)?;
+
+    let title = frontmatter.title.as_deref().unwrap_or("");
+    let mut chunks = Vec::new();
+    for (i, page_text) in pages.iter().enumerate() {
+        let content = post_process(page_text);
+        if content.trim().is_empty() {
+            continue; // 空ページは chunk を作らない
+        }
+        let heading = format!("p.{}", i + 1);
+        let context = super::build_context(&[title, &heading]);
+        chunks.push(super::Chunk {
+            index: chunks.len(),
+            heading: Some(heading),
+            level: None,
+            content,
+            context,
+            line_range: None,
+            symbol_kind: None,
+        });
+    }
+
+    // frontmatter は extract_pdf が同じ PdfDocument から抽出済み (§4.5)。
+    let raw_content = super::join_chunk_bodies(&chunks);
+
+    Ok(ParsedDocument {
+        frontmatter,
+        chunks,
+        raw_content,
+        frontmatter_error: None,
+    })
 }
 
 /// oxidize-pdf でページ本文 (`Vec<String>`, 1 要素 = 1 ページ) + metadata frontmatter
@@ -424,13 +469,31 @@ impl Parser for PdfParser {
 /// oxidize-pdf は `ParseResult` ベースのエラー設計なので、open / extract 失敗 (暗号化
 /// PDF 等) は panic ではなく `Err` として返る (4.1.1 dry-run で確認、4.3.0 も同様 —
 /// encrypted fixture テストが担保)。
+#[cfg(test)]
 fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatter)> {
+    extract_pdf_with_budget(bytes, path_hint, PDF_DOC_TEXT_MAX_BYTES)
+}
+
+/// [`PdfParser`] の抽出本体。上の doc を持つ、この module の test 専用 wrapper (既定 budget
+/// で呼ぶもの) と同じ処理を、parser が構築時に受け取った文書テキスト budget (`doc_budget`) で行う
+/// (feature-61)。
+fn extract_pdf_with_budget(
+    bytes: &[u8],
+    path_hint: &str,
+    doc_budget: usize,
+) -> Result<(Vec<String>, Frontmatter)> {
     // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
     // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs で確認)。
     let reader = PdfReader::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}"))?;
     let document = PdfDocument::new(reader);
-    let pages = extract_pages_within_budget(&document, path_hint)?;
+    let pages = extract_pages_within_budget_capped(
+        &document,
+        path_hint,
+        PDF_PAGE_TEXT_MAX_BYTES,
+        doc_budget,
+        PDF_DOC_EXTRACT_TIMEOUT,
+    )?;
     let frontmatter = pdf_metadata_frontmatter(&document, path_hint);
     Ok((pages, frontmatter))
 }
@@ -451,6 +514,7 @@ fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatte
 /// `font_object_cache` ("avoids re-parsing the same font object across pages")
 /// が毎ページ捨てられて遅くなる。crate 内部の `extract_from_document` と同じく
 /// extractor を保持して回す。
+#[cfg(test)]
 fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
     document: &PdfDocument<R>,
     path_hint: &str,
@@ -464,8 +528,9 @@ fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
     )
 }
 
-/// [`extract_pages_within_budget`] の cap 注入版。unit test が小さい cap で
-/// budget 分岐を踏むために分離する (`ooxml::read_zip_entry_capped` と同じ形)。
+/// ページ本文を per-page 上限 + 文書累積 budget + 実時間上限付きで取り出す本体
+/// (cap 注入版)。本番は [`extract_pdf_with_budget`] が parser の budget で呼び、unit test は
+/// 小さい cap で budget 分岐を踏む ([`crate::parser::ooxml`] の test 用の cap 注入版と同じ形)。
 /// 50 MB を実際に展開する fixture を用意せずに済む。
 fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     document: &PdfDocument<R>,
@@ -525,8 +590,7 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
         budget = budget.saturating_add(extracted.text.len());
         if budget > doc_cap {
             return Err(anyhow!(
-                "{path_hint}: extracted text exceeds {doc_cap} bytes across \
-                 {} page(s) (decompression-bomb guard)",
+                "{path_hint}: extracted text exceeds {doc_cap} bytes across {} page(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)",
                 index + 1
             ));
         }
@@ -893,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_pdf_page_chunks_have_heading_and_no_level() {
-        let doc = PdfParser
+        let doc = PdfParser::default()
             .parse_bytes(MINIMAL_PDF, "docs/minimal.pdf", &[])
             .expect("minimal pdf must extract");
         assert_eq!(doc.chunks.len(), 2, "one chunk per non-empty page");
@@ -907,7 +971,7 @@ mod tests {
     #[test]
     fn test_pdf_malformed_bytes_is_err_not_panic() {
         // 壊れた PDF は catch_unwind で Err に正規化され panic しない (edge #6)。
-        let err = PdfParser
+        let err = PdfParser::default()
             .parse_bytes(b"%PDF-1.4 not really a pdf", "x.pdf", &[])
             .expect_err("garbage must be Err");
         let _ = err; // メッセージ内容は crate 依存なので存在のみ assert
@@ -918,7 +982,7 @@ mod tests {
         // text object を一切含まない (Contents ストリームが空の) 1 ページ PDF。
         // minimal.pdf の生成手法を流用した手組み fixture (Task 2.7 で正式化予定)。
         const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/binary/empty_text.pdf");
-        let err = PdfParser
+        let err = PdfParser::default()
             .parse_bytes(EMPTY, "scan.pdf", &[])
             .expect_err("no text layer must be Err");
         assert!(err.to_string().contains("no text layer"));
@@ -969,7 +1033,7 @@ mod tests {
         // test_pdf_encrypted_real_fixture_is_err) と同じ "encrypted or unreadable"
         // 文言を返すことを、この安価な壊れバイト列でも代替検証できる (どちらの
         // 経路でも文言が共通なため)。
-        let err = PdfParser
+        let err = PdfParser::default()
             .parse_bytes(b"%PDF-1.4\n%garbage\nendobj\nendobj\n%%EOF", "enc.pdf", &[])
             .expect_err("broken PDF open path must be Err");
         let msg = err.to_string().to_lowercase();
@@ -985,7 +1049,7 @@ mod tests {
         // correct password before reading objects")。
         const REAL_ENCRYPTED_PDF: &[u8] =
             include_bytes!("../../tests/fixtures/binary/encrypted.pdf");
-        let err = PdfParser
+        let err = PdfParser::default()
             .parse_bytes(REAL_ENCRYPTED_PDF, "docs/encrypted.pdf", &[])
             .expect_err("real encrypted PDF without unlock() must be Err");
         let msg = err.to_string().to_lowercase();
@@ -1026,7 +1090,7 @@ mod tests {
     #[test]
     fn test_pdf_frontmatter_falls_back_to_filename() {
         // metadata の title が無い untitled.pdf は filename 由来 title に fallback。
-        let doc = PdfParser
+        let doc = PdfParser::default()
             .parse_bytes(UNTITLED_PDF, "docs/untitled.pdf", &[])
             .expect("untitled pdf must extract");
         assert_eq!(doc.frontmatter.title.as_deref(), Some("untitled"));
@@ -1042,7 +1106,7 @@ mod tests {
         // hex string, BOM 込み) で "日本語" をエンコードしている。oxidize-pdf
         // の mis-decode (BOM 未検出) を実際に踏んだ上で、正しく復元できるか
         // どうかを確認する end-to-end 回帰テスト。
-        let doc = PdfParser
+        let doc = PdfParser::default()
             .parse_bytes(UTF16_TITLE_PDF, "docs/utf16_title.pdf", &[])
             .expect("utf16 title pdf must extract");
         assert_eq!(doc.frontmatter.title.as_deref(), Some("日本語"));
@@ -1110,7 +1174,7 @@ mod tests {
         // が非空ページ基準の閾値 (50 chars/page) を超えていれば scanned
         // 扱いにしてはいけない (旧ロジックは全ページ数 10 で割るため
         // 221/10=22 < 50 となり誤って scanned Err になっていた)。
-        let doc = PdfParser
+        let doc = PdfParser::default()
             .parse_bytes(MOSTLY_BLANK_PDF, "docs/mostly_blank.pdf", &[])
             .expect("mostly-blank pdf with one dense page must not be classified as scanned");
         assert_eq!(
@@ -1310,7 +1374,7 @@ mod tests {
         // そのときも「化けたものが索引に入らない」という不変条件は変わらない。
         // (4.3.0 = upstream #470 の取り込みで実際に Ok 側へ移った。E2E でも
         // index → search ヒットを実測済 2026-08-12)
-        match PdfParser.parse_bytes(CID_DIRECT_DENSE_PDF, "docs/cid_direct.pdf", &[]) {
+        match PdfParser::default().parse_bytes(CID_DIRECT_DENSE_PDF, "docs/cid_direct.pdf", &[]) {
             Err(err) => {
                 let message = err.to_string();
                 assert!(
@@ -1491,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_kana_label_sheet_mojibake_never_reaches_the_index() {
-        match PdfParser.parse_bytes(CID_KANA_LABELS_PDF, "docs/kana_labels.pdf", &[]) {
+        match PdfParser::default().parse_bytes(CID_KANA_LABELS_PDF, "docs/kana_labels.pdf", &[]) {
             Err(err) => {
                 let message = err.to_string();
                 assert!(
@@ -1556,7 +1620,7 @@ mod tests {
 
     #[test]
     fn test_kana_only_cid_mojibake_never_reaches_the_index() {
-        match PdfParser.parse_bytes(CID_KANA_PDF, "docs/kana.pdf", &[]) {
+        match PdfParser::default().parse_bytes(CID_KANA_PDF, "docs/kana.pdf", &[]) {
             Err(err) => {
                 let message = err.to_string();
                 assert!(
@@ -1623,7 +1687,7 @@ mod tests {
     #[test]
     fn test_pdf_context_is_title_and_page() {
         // minimal.pdf は /Title 入り (Task 2.3 の前提)。context = "<title> > p.1"。
-        let doc = PdfParser
+        let doc = PdfParser::default()
             .parse_bytes(MINIMAL_PDF, "docs/minimal.pdf", &[])
             .expect("minimal pdf must extract");
         let c0 = doc.chunks[0].context.as_deref().unwrap();
@@ -1633,7 +1697,7 @@ mod tests {
     #[test]
     fn test_pdf_context_falls_back_to_filename_title() {
         // untitled.pdf は /Title 無し → filename title ("untitled")
-        let doc = PdfParser
+        let doc = PdfParser::default()
             .parse_bytes(UNTITLED_PDF, "docs/untitled.pdf", &[])
             .expect("untitled pdf must extract");
         assert_eq!(doc.chunks[0].context.as_deref(), Some("untitled > p.1"));
@@ -1653,5 +1717,47 @@ mod tests {
             !SUPPRESS_PANIC_OUTPUT.with(Cell::get),
             "flag must reset to false even when the guarded closure panics"
         );
+    }
+
+    /// feature-61 (AC5): the document text budget is the one the parser was
+    /// built with. MINIMAL_PDF's first page alone is longer than 1 byte.
+    #[test]
+    fn pdf_document_budget_follows_the_parser_it_was_built_with() {
+        let err = PdfParser::with_budget(1)
+            .parse_bytes(MINIMAL_PDF, "budget.pdf", &[])
+            .expect_err("a 1-byte budget refuses the first page");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("decompression-bomb guard") && msg.contains("max_decompressed_size"),
+            "{msg}"
+        );
+
+        // u64::MAX goes through `usize::try_from(..).unwrap_or(usize::MAX)`.
+        let doc = PdfParser::with_budget(u64::MAX)
+            .parse_bytes(MINIMAL_PDF, "budget.pdf", &[])
+            .expect("an unlimited budget extracts every page");
+        assert_eq!(doc.chunks.len(), 2);
+        assert!(
+            PdfParser::default()
+                .parse_bytes(MINIMAL_PDF, "budget.pdf", &[])
+                .is_ok()
+        );
+    }
+
+    /// feature-61 (codex critical): the read path does not take the budget the
+    /// parser was built with. The 1-byte parser that refuses MINIMAL_PDF on the
+    /// index path reads it on the read path, exactly as the default parser does.
+    #[test]
+    fn pdf_read_path_ignores_the_parser_budget() {
+        let tiny = PdfParser::with_budget(1);
+        assert!(tiny.parse_bytes(MINIMAL_PDF, "budget.pdf", &[]).is_err());
+        let read = tiny
+            .parse_bytes_for_read(MINIMAL_PDF, "budget.pdf", &[])
+            .expect("the read path keeps the default budget");
+        let default = PdfParser::default()
+            .parse_bytes(MINIMAL_PDF, "budget.pdf", &[])
+            .unwrap();
+        assert_eq!(read.raw_content, default.raw_content);
+        assert_eq!(read.chunks.len(), default.chunks.len());
     }
 }

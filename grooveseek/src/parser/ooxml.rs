@@ -13,21 +13,45 @@ use quick_xml::reader::Reader;
 
 use super::Frontmatter;
 
-/// zip 内 `name` エントリを丸ごとバイト列で読む。無ければ `Ok(None)`。
-/// `budget` (呼び出し側が文書単位で保持する累積展開済みバイト数) を通じて
-/// 文書全体の解凍量を bound する。詳細は [`read_zip_entry_capped`] 参照
-/// (このラッパーは cap に `super::MAX_RAW_BINARY_BYTES` を固定で使う)。
+/// zip 内 `name` エントリを、cap に [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`] を固定して
+/// 読む (test 専用)。
+///
+/// (feature-61) 本番の読み出しはすべて、parser が構築時に受け取った展開 budget で
+/// [`read_zip_part`] を直接呼ぶ。const の既定で読む経路が本番に 1 つでも残ると、
+/// `[index].max_decompressed_size` を上げてもそこで 50 MiB の判定がもう一度走るため、
+/// この関数は test からしか呼べないようにしてある。
+#[cfg(test)]
 pub(crate) fn read_zip_entry(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     name: &str,
     budget: &mut u64,
 ) -> Result<Option<Vec<u8>>> {
-    read_zip_entry_capped(zip, name, budget, super::MAX_RAW_BINARY_BYTES)
+    read_zip_entry_capped(zip, name, budget, super::DEFAULT_MAX_DECOMPRESSED_BYTES)
 }
 
-/// `read_zip_entry` の cap 注入版。unit test が小さい cap で累積 budget
-/// 超過分岐を突くため分離する (xlsx.rs::parse_workbook_bytes_capped の
-/// cap 注入パターンを踏襲)。
+/// [`read_zip_part`] の test 用入口 (signature は main のまま)。既存 test
+/// (`test_read_zip_entry_capped_rejects_cumulative_budget_over_cap` 等) と feature-61 の AC6 test が
+/// 小さい cap / `u64::MAX` を注入して呼ぶ。警告文の `path_hint` は `"<test>"`。
+#[cfg(test)]
+pub(crate) fn read_zip_entry_capped(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+) -> Result<Option<Vec<u8>>> {
+    read_zip_part(zip, "<test>", name, budget, cap)
+}
+
+/// zip 内 `name` エントリを丸ごとバイト列で読む。無ければ `Ok(None)`。
+///
+/// `cap` は parser が構築時に受け取った展開 budget (`[index].max_decompressed_size`、
+/// feature-61)。`budget` は呼び出し側が文書単位で保持する累積展開済みバイト数で、
+/// これを通じて文書全体の解凍量を bound する。
+///
+/// (feature-61) 1 パートが `cap` を超えて `Ok(None)` になる時は、
+/// [`entry_over_budget_message`] の 1 行を stderr に出す。黙って `None` を返すと、
+/// document.xml が budget を超えた docx は "word/document.xml missing" としか言われず、
+/// pptx の slide は何も言われずに消え、どちらも上げるべきキーが読めないため。
 ///
 /// zip-bomb hardening を 2 レイヤで行う:
 ///
@@ -48,8 +72,9 @@ pub(crate) fn read_zip_entry(
 ///   文書をさらに読み進めるのは危険なため、呼び出し側 (`docx.rs` /
 ///   `pptx.rs` の `parse_bytes`) はこの `Err` を `?` でそのまま伝播し、
 ///   文書全体の parse を諦める。
-fn read_zip_entry_capped(
+pub(crate) fn read_zip_part(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
     name: &str,
     budget: &mut u64,
     cap: u64,
@@ -59,6 +84,7 @@ fn read_zip_entry_capped(
         Err(_) => return Ok(None),
     };
     if file.size() > cap {
+        eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
         return Ok(None);
     }
     let mut buf = Vec::new();
@@ -69,28 +95,38 @@ fn read_zip_entry_capped(
         return Ok(None);
     }
     if buf.len() as u64 > cap {
+        eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
         return Ok(None);
     }
     *budget = budget.saturating_add(buf.len() as u64);
     if *budget > cap {
         bail!(
-            "cumulative decompressed size across zip entries exceeds {cap} bytes \
-             (zip-bomb guard)"
+            "cumulative decompressed size across zip entries exceeds {cap} bytes (zip-bomb guard; raise [index].max_decompressed_size to admit this file)"
         );
     }
     Ok(Some(buf))
 }
 
+/// (feature-61) 1 パートが展開 budget を超えて読み飛ばされる時の警告文。stderr に出るので
+/// ASCII のみ。どのキーを上げれば読まれるかを名指しする。
+pub(crate) fn entry_over_budget_message(path_hint: &str, entry: &str, cap: u64) -> String {
+    format!(
+        "warning: {path_hint}: {entry} exceeds [index].max_decompressed_size ({cap} bytes); skipping this part"
+    )
+}
+
 /// `docProps/core.xml` があれば Frontmatter に map、無ければ filename fallback。
-/// `budget` は `read_zip_entry` に渡す文書単位の累積展開済みバイト数
-/// (呼び出し側が document.xml / slides 等の読み出しと共有する)。累積 cap
-/// 超過時は `Err` を返す (呼び出し側は文書全体の parse を諦める)。
+/// `budget` は文書単位の累積展開済みバイト数 (呼び出し側が document.xml / slides 等の
+/// 読み出しと共有する)、`cap` は parser の展開 budget で、どちらも
+/// [`read_zip_part`] に渡す。累積 cap 超過時は `Err` を返す (呼び出し側は文書
+/// 全体の parse を諦める)。
 pub(crate) fn core_xml_frontmatter(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     path_hint: &str,
     budget: &mut u64,
+    cap: u64,
 ) -> Result<Frontmatter> {
-    match read_zip_entry(zip, "docProps/core.xml", budget)? {
+    match read_zip_part(zip, path_hint, "docProps/core.xml", budget, cap)? {
         Some(bytes) => {
             warn_if_truncated(path_hint, "docProps/core.xml", &bytes);
             Ok(parse_core_xml(&bytes, path_hint))
@@ -481,5 +517,17 @@ mod tests {
             iso_date_prefix("2026-07-19T09:00:00Z"),
             Some("2026-07-19".to_string())
         );
+    }
+
+    /// feature-61: a part skipped for the budget is named, with the key that
+    /// admits it, in one ASCII line.
+    #[test]
+    fn entry_over_budget_message_names_the_part_and_the_key() {
+        let msg = entry_over_budget_message("docs/big.docx", "word/document.xml", 1024);
+        assert_eq!(
+            msg,
+            "warning: docs/big.docx: word/document.xml exceeds [index].max_decompressed_size (1024 bytes); skipping this part"
+        );
+        assert!(msg.is_ascii());
     }
 }

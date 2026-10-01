@@ -109,8 +109,37 @@ max_chunk_chars = 3500
 # in the summary. On, the run still indexes everything and then exits 1. The
 # MCP `rebuild_index` tool answers with an `error` alongside the counts. The
 # watcher ignores this key.
+#
+# Optional: the size caps. `max_binary_file_size` (pdf / docx / xlsx / pptx)
+# and `max_text_file_size` (md / txt) are the largest file, in raw bytes, that
+# `groove index`, `rebuild_index` and the watcher read; a larger one is skipped
+# with a warning. `max_decompressed_size` is how far an .xlsx / .docx / .pptx
+# may inflate in total and how much text a PDF may yield. Each defaults to
+# 50 MiB and takes a byte count, a size with a unit ("300 MiB", "2 GB"; KB, MB,
+# GB and TB count in 1000s, KiB, MiB, GiB and TiB in 1024s; no fractions), or
+# "unlimited". `0` is refused and the message points at "unlimited", because
+# tools disagree on whether 0 means no limit, the default, or nothing at all.
+# A 300 MB workbook needs both `max_binary_file_size` and
+# `max_decompressed_size`: the XML inside inflates to several times the file,
+# and raising the file cap alone keeps the zip-bomb check in place. A value
+# above the default is announced once with a warning: a file is held in memory
+# whole while it is indexed, an allocation failure aborts the process instead
+# of skipping the file, and PDF extraction still stops after 120 s. Lowering a
+# cap leaves documents already indexed in place until `groove index --force`
+# runs or the file shrinks under the cap; an edit that leaves it over the cap
+# keeps the old text searchable. Reads do not follow: `get_document` and
+# `resources/read` stop at 50 MiB for binary formats and 1 MiB for text, so a
+# document indexed past that is searchable but carries no `uri`. Reads also
+# parse with the built-in 50 MiB decompression budget, so while
+# `max_decompressed_size` is above it no binary document carries a `uri` or is
+# offered by `resources/list`; it stays searchable. The watcher
+# reads these three keys; a config found beside a knowledge base cannot set
+# them (see the table below). Reasoning: ADR-0026.
 # [index]
 # fail_on_frontmatter_error = true
+# max_binary_file_size = "unlimited"
+# max_text_file_size = "50 MiB"
+# max_decompressed_size = "16 GiB"
 
 # `groove index` also reads `<kb_path>/groove-schema.toml` when it exists
 # (v1.9.0+). The keys it declares — beyond `title` / `date` / `topic` /
@@ -310,9 +339,10 @@ it as yours:
 
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
-`[watch]`, `[contextual]`, `[index]` — is honoured unchanged. Seven fields
-are restricted, because they decide which code runs, what is read or leaves
-the machine, and who can reach it:
+`[watch]`, `[contextual]`, `[index].fail_on_frontmatter_error` — is honoured
+unchanged. Eight fields are restricted, because they decide which code runs,
+what is read or leaves the machine, how much of a file a run holds in memory,
+and who can reach it:
 
 | Field | From an untrusted config |
 | --- | --- |
@@ -323,6 +353,7 @@ the machine, and who can reach it:
 | `[parsers]` | Ignored with a warning; the default set — Markdown alone — is used. `enabled` decides which parsers run at all, so a config found beside a knowledge base could otherwise switch on the formats with the widest input surface (`pdf`, `xlsx`, `pptx`, `docx`) that the operator had left off, or name a language whose grammar plugin then gets `dlopen`ed. It is the switch `grammar_dir` only aims: no enabled language needs a plugin, and no plugin is looked for. Unlike the two above, an absent key needs no substitute — omitting `[parsers]` already lands on Markdown alone, which is where this rule puts it. `[parsers.code]` goes with it, having no parser left to configure. |
 | `[eval].golden` | Ignored with a warning; `groove eval` and `groove tune` fall back to `<kb_path>/.groove-eval.yml`, and `--golden` still applies. It names the file those commands read, and as an absolute path it can name any file on the machine. The read is bounded (1 MiB) and parsed as YAML, so what a planted path could expose is a bounded read surfaced through a parse error — not code execution — but a config found beside a knowledge base has no business choosing it. Like `[parsers]`, an absent key needs no substitute: the fallback is a constant under the knowledge base the run uses. The other `[eval]` keys are honoured. |
 | `[embedding]` | Ignored with a warning, restoring the built-in FastEmbed provider. An external endpoint receives document chunks while indexing and queries while searching, so only a config named with `--config` (or another trusted location above) may opt in to that outbound traffic. |
+| `[index]` size caps (`max_binary_file_size`, `max_text_file_size`, `max_decompressed_size`) | Ignored with a warning; the built-in 50 MiB caps apply. `rebuild_index` is an MCP tool, so a config planted beside a knowledge base together with one huge file could otherwise make the daemon read that file into memory whole at a moment of a client's choosing, and an allocation failure aborts the process rather than skipping the file. A planted value below the default is dropped as well, since a 1-byte cap would keep every document out of the index. Like `[parsers]`, an absent key needs no substitute: the fallback is a built-in constant. `fail_on_frontmatter_error` is honoured. |
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
 `kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local
