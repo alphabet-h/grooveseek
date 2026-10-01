@@ -195,9 +195,9 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// file is small enough to serve when the read has just proved otherwise is
 /// what makes the resource surface offer something unreadable.
 ///
-/// `key` is the `[index]` key that set `cap` (from [`size_cap_key`]): a size
-/// refusal names it, so the warning says what to raise, the way the
-/// decompression-side messages already do.
+/// The last argument names the `[index]` key that set `cap` (from
+/// [`size_cap_key`]): a size refusal names it, so the warning says what to
+/// raise, the way the decompression-side messages already do.
 fn read_for_index_under(
     full: &Path,
     rel: &str,

@@ -171,8 +171,8 @@ pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 ///
 /// (feature-61) 索引時の上限は `[index].max_binary_file_size` で変えられ、実際に効く値は
 /// [`Registry::limits`] が持つ ([`FileSizeLimits`])。`get_document` / `resources/read`
-/// の読み出し側は索引の設定に連動しない別の定数
-/// ([`crate::server::documents::GET_DOCUMENT_BINARY_MAX_BYTES`]) を使う。名前は ADR-0004 / ADR-0005 と docs が
+/// の読み出し側は索引の設定に連動しない別の定数 ([`crate::server`] の private な
+/// documents module が持つ、バイナリ形式の読み出し上限) を使う。名前は ADR-0004 / ADR-0005 と docs が
 /// 参照しているので変えない。テキスト形式の既定は [`MAX_RAW_TEXT_BYTES`]。
 pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 

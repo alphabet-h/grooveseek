@@ -261,7 +261,8 @@ const RAISED: &str = "[index]\nmax_binary_file_size = \"100 MiB\"\n";
 /// [`grooveseek::parser::MAX_RAW_BINARY_BYTES`].
 const PAST_THE_DEFAULT: u64 = grooveseek::parser::MAX_RAW_BINARY_BYTES + 1;
 
-/// Extend (or create) `path` to `len` bytes without writing them.
+/// Extend (or create) the file at the given path to `len` bytes without
+/// writing them.
 fn grow_to(path: &Path, len: u64) {
     let file = std::fs::OpenOptions::new()
         .create(true)
