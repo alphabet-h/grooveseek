@@ -11,7 +11,27 @@ use quick_xml::reader::Reader;
 
 use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
 
-pub struct PptxParser;
+pub struct PptxParser {
+    /// (feature-61) 文書 1 本の展開後合計の上限 (`[index].max_decompressed_size`)。
+    decompressed_budget: u64,
+}
+
+impl PptxParser {
+    /// (feature-61) 展開 budget を `budget` bytes にした parser。[`super::Registry`] が
+    /// `[index].max_decompressed_size` から作る。
+    pub fn with_budget(budget: u64) -> Self {
+        Self {
+            decompressed_budget: budget,
+        }
+    }
+}
+
+impl Default for PptxParser {
+    /// 展開 budget = [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]。
+    fn default() -> Self {
+        Self::with_budget(super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+}
 
 impl Parser for PptxParser {
     fn extension(&self) -> &'static str {
@@ -32,7 +52,7 @@ impl Parser for PptxParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        parse_bytes_impl(bytes, path_hint)
+        parse_bytes_impl(bytes, path_hint, self.decompressed_budget)
     }
 }
 
@@ -40,7 +60,7 @@ impl Parser for PptxParser {
 // ppt/slides/slideN.xml (+ ppt/notesSlides/notesSlideN.xml) → slide-wise chunks
 // ---------------------------------------------------------------------------
 
-fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
+fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDocument> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("{path_hint}: cannot open pptx zip (corrupt or encrypted): {e}"))?;
 
@@ -51,7 +71,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     let mut budget: u64 = 0;
 
     // frontmatter を先に取得 (context の title に使う。budget は cumulative なので順序自由)
-    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
+    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap)?;
     let title = frontmatter.title.as_deref().unwrap_or("").to_string();
 
     // slide エントリをファイル番号順に集める (zip 内順序非依存。
@@ -68,15 +88,17 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     // 連番 (= 実際のファイル番号ではない) とする。読めない/非標準な zip
     // では file 番号ソートにフォールバックする (index 全体を諦めさせない)。
     let ordered_file_nums =
-        resolve_visible_slide_order(&mut zip, &mut budget, path_hint)?.unwrap_or(slide_nums);
+        resolve_visible_slide_order(&mut zip, &mut budget, cap, path_hint)?.unwrap_or(slide_nums);
 
     let mut chunks = Vec::new();
     for (display_idx, file_n) in ordered_file_nums.into_iter().enumerate() {
         let display_n = display_idx + 1;
-        let slide_xml = match super::ooxml::read_zip_entry(
+        let slide_xml = match super::ooxml::read_zip_part(
             &mut zip,
+            path_hint,
             &format!("ppt/slides/slide{file_n}.xml"),
             &mut budget,
+            cap,
         )? {
             Some(b) => b,
             None => continue,
@@ -93,10 +115,12 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         // が無い slide は notes なしとし、フォールバック heuristic はしない
         // — 誤帰属ゼロを優先する)。notes の対応はスライドの実ファイル番号
         // (`file_n`) で引く (表示順の連番 `display_n` ではない)。
-        let notes_path = super::ooxml::read_zip_entry(
+        let notes_path = super::ooxml::read_zip_part(
             &mut zip,
+            path_hint,
             &format!("ppt/slides/_rels/slide{file_n}.xml.rels"),
             &mut budget,
+            cap,
         )?
         .and_then(|rels_xml| {
             resolve_notes_path(
@@ -106,7 +130,8 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             )
         });
         if let Some(path) = notes_path
-            && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path, &mut budget)?
+            && let Some(notes_xml) =
+                super::ooxml::read_zip_part(&mut zip, path_hint, &path, &mut budget, cap)?
         {
             let notes_text = collect_a_t(&notes_xml, path_hint, &path);
             if !notes_text.trim().is_empty() {
@@ -226,9 +251,11 @@ fn resolve_notes_path(rels_xml: &[u8], path_hint: &str, part: &str) -> Option<St
 fn resolve_visible_slide_order(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     budget: &mut u64,
+    cap: u64,
     path_hint: &str,
 ) -> Result<Option<Vec<usize>>> {
-    let Some(presentation_xml) = super::ooxml::read_zip_entry(zip, "ppt/presentation.xml", budget)?
+    let Some(presentation_xml) =
+        super::ooxml::read_zip_part(zip, path_hint, "ppt/presentation.xml", budget, cap)?
     else {
         return Ok(None);
     };
@@ -237,8 +264,13 @@ fn resolve_visible_slide_order(
         return Ok(None);
     }
 
-    let Some(rels_xml) =
-        super::ooxml::read_zip_entry(zip, "ppt/_rels/presentation.xml.rels", budget)?
+    let Some(rels_xml) = super::ooxml::read_zip_part(
+        zip,
+        path_hint,
+        "ppt/_rels/presentation.xml.rels",
+        budget,
+        cap,
+    )?
     else {
         return Ok(None);
     };
@@ -568,8 +600,8 @@ mod tests {
 
     #[test]
     fn test_pptx_parser_is_binary() {
-        assert!(PptxParser.is_binary());
-        assert_eq!(PptxParser.extension(), "pptx");
+        assert!(PptxParser::default().is_binary());
+        assert_eq!(PptxParser::default().extension(), "pptx");
     }
 
     // NOTE: skeleton 時点の `not_yet_implemented` 固定文言 assert は、本 task で
@@ -578,7 +610,7 @@ mod tests {
     // なることを検証するテストに更新する (controller 事前承認済み)。
     #[test]
     fn test_pptx_parse_bytes_garbage_is_err() {
-        let err = PptxParser
+        let err = PptxParser::default()
             .parse_bytes(b"not a real pptx", "x.pptx", &[])
             .expect_err("garbage bytes must be Err");
         assert!(err.to_string().contains("cannot open pptx zip"));
@@ -586,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_pptx_parse_fallback_wraps_raw_text() {
-        let doc = PptxParser.parse("hello world content here", "x.pptx", &[]);
+        let doc = PptxParser::default().parse("hello world content here", "x.pptx", &[]);
         assert_eq!(doc.chunks.len(), 1);
         assert!(doc.chunks[0].content.contains("hello world"));
     }
@@ -597,7 +629,7 @@ mod tests {
             (Some("概要"), "本文スライド1", Some("発表ノート1")),
             (None, "本文スライド2", None),
         ]);
-        let doc = PptxParser
+        let doc = PptxParser::default()
             .parse_bytes(&bytes, "docs/deck.pptx", &[])
             .unwrap();
         assert_eq!(doc.chunks.len(), 2);
@@ -618,7 +650,9 @@ mod tests {
         let slides: Vec<(Option<&str>, &str, Option<&str>)> =
             (0..11).map(|_| (None, "body", None)).collect();
         let bytes = make_minimal_pptx(&slides);
-        let doc = PptxParser.parse_bytes(&bytes, "d.pptx", &[]).unwrap();
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "d.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 11);
         assert_eq!(doc.chunks[9].heading.as_deref(), Some("Slide 10"));
         assert_eq!(doc.chunks[10].heading.as_deref(), Some("Slide 11"));
@@ -647,7 +681,9 @@ mod tests {
         // `type="ctrTitle"` になる (通常スライドの `type="title"` とは別値)。
         let slide_xml = r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="ctrTitle"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>表紙タイトル</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
         let bytes = make_pptx_single_slide(slide_xml);
-        let doc = PptxParser.parse_bytes(&bytes, "cover.pptx", &[]).unwrap();
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "cover.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 1);
         assert_eq!(
             doc.chunks[0].heading.as_deref(),
@@ -673,7 +709,9 @@ mod tests {
         // flush されない」のいずれかで silent drop される (回帰テスト)。
         let slide_xml = r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>本文</a:t></a:r></a:p></p:txBody></p:sp><p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>セルA</a:t></a:r></a:p></a:txBody></a:tc></a:tr><a:tr><a:tc><a:txBody><a:p><a:r><a:t>セルB</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#;
         let bytes = make_pptx_single_slide(slide_xml);
-        let doc = PptxParser.parse_bytes(&bytes, "table.pptx", &[]).unwrap();
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "table.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 1);
         assert!(
             doc.chunks[0].content.contains("本文"),
@@ -740,7 +778,9 @@ mod tests {
             zip.finish().unwrap();
         }
 
-        let doc = PptxParser.parse_bytes(&buf, "misattr.pptx", &[]).unwrap();
+        let doc = PptxParser::default()
+            .parse_bytes(&buf, "misattr.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 4);
         assert!(
             !doc.chunks[0].content.contains("発表者ノート"),
@@ -807,7 +847,9 @@ mod tests {
             zip.finish().unwrap();
         }
 
-        let doc = PptxParser.parse_bytes(&buf, "reordered.pptx", &[]).unwrap();
+        let doc = PptxParser::default()
+            .parse_bytes(&buf, "reordered.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 2);
         assert_eq!(
             doc.chunks[0].heading.as_deref(),
@@ -861,7 +903,7 @@ mod tests {
             zip.finish().unwrap();
         }
 
-        let doc = PptxParser
+        let doc = PptxParser::default()
             .parse_bytes(&buf, "reordered-rel.pptx", &[])
             .unwrap();
         assert_eq!(doc.chunks.len(), 2);
@@ -887,7 +929,7 @@ mod tests {
         // このテストは実質 test_pptx_slides_sorted_numerically_not_zip_order の
         // fallback 経路が生きていることの明示的な回帰 guard。
         let bytes = make_minimal_pptx(&[(None, "本文A", None), (None, "本文B", None)]);
-        let doc = PptxParser
+        let doc = PptxParser::default()
             .parse_bytes(&bytes, "no-presentation.pptx", &[])
             .unwrap();
         assert_eq!(doc.chunks.len(), 2);
@@ -898,7 +940,7 @@ mod tests {
     #[test]
     fn test_pptx_context_is_title_and_slide_heading() {
         let bytes = make_minimal_pptx(&[(Some("概要"), "本文スライド1", None)]);
-        let doc = PptxParser
+        let doc = PptxParser::default()
             .parse_bytes(&bytes, "docs/deck.pptx", &[])
             .unwrap();
         // filename title ("deck") > "Slide 1: 概要"
@@ -914,7 +956,9 @@ mod tests {
         // として別 event で届ける (docx.rs 同様の回帰テスト)。本文・notes 双方の
         // 経路 (parse_slide_xml / collect_a_t) で "&" が欠落しないことを確認する。
         let bytes = make_minimal_pptx(&[(None, "A&amp;B", Some("N&amp;M"))]);
-        let doc = PptxParser.parse_bytes(&bytes, "e.pptx", &[]).unwrap();
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "e.pptx", &[])
+            .unwrap();
         assert!(
             doc.chunks[0].content.contains("A&B"),
             "slide body entity reference must resolve, got: {:?}",
@@ -925,5 +969,64 @@ mod tests {
             "notes entity reference must resolve, got: {:?}",
             doc.chunks[0].content
         );
+    }
+
+    /// A zip of the given entries, nothing else.
+    fn pptx_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            for (name, body) in entries {
+                zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(body).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// feature-61 (AC5): the slide loop and the core.xml read both count
+    /// against the budget the parser was built with.
+    #[test]
+    fn ooxml_budget_follows_the_pptx_parser_it_was_built_with() {
+        let core_xml = format!(
+            r#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Deck</dc:title><cp:keywords>{}</cp:keywords></cp:coreProperties>"#,
+            "k".repeat(400)
+        );
+        let slide_xml: &[u8] = br#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>slide body</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let bytes = pptx_of(&[
+            ("docProps/core.xml", core_xml.as_bytes()),
+            ("ppt/slides/slide1.xml", slide_xml),
+        ]);
+        let both = (core_xml.len() + slide_xml.len()) as u64;
+
+        // core.xml is read first and fits; the slide takes the total one byte over.
+        let err = PptxParser::with_budget(both - 1)
+            .parse_bytes(&bytes, "deck.pptx", &[])
+            .expect_err("core.xml plus the slide is one byte over the budget");
+        assert!(err.to_string().contains("max_decompressed_size"), "{err}");
+
+        let doc = PptxParser::with_budget(both)
+            .parse_bytes(&bytes, "deck.pptx", &[])
+            .expect("exactly the budget is allowed");
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("Deck"));
+        assert_eq!(doc.chunks.len(), 1);
+
+        // core.xml alone is over a smaller budget: the per-entry check turns it
+        // away and the title falls back to the file name. A core.xml read that
+        // still used the 50 MiB constant would have found "Deck".
+        let small = core_xml.len() as u64 - 1;
+        assert!(
+            slide_xml.len() as u64 <= small,
+            "fixture: the slide must fit the smaller budget"
+        );
+        let doc = PptxParser::with_budget(small)
+            .parse_bytes(&bytes, "deck.pptx", &[])
+            .expect("an entry over the budget is skipped, not an error");
+        assert_eq!(
+            doc.frontmatter.title,
+            crate::parser::txt::derive_title_pub("deck.pptx")
+        );
+        assert_eq!(doc.chunks.len(), 1);
     }
 }

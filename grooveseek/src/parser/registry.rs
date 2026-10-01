@@ -303,8 +303,8 @@ impl Registry {
             let parser: Box<dyn Parser> = match lower.as_str() {
                 "md" => Box::new(MarkdownParser),
                 "txt" => Box::new(TxtParser),
-                "pdf" => Box::new(PdfParser),
-                "xlsx" => Box::new(XlsxParser),
+                "pdf" => Box::new(PdfParser::default()),
+                "xlsx" => Box::new(XlsxParser::default()),
                 // AU-06: `.xls` は無効。`XlsParser` 自体は残してあるが、
                 // ここで registry に載せない = indexing から到達しない。
                 "xls" => anyhow::bail!(
@@ -317,8 +317,8 @@ impl Registry {
                      aborts the process rather than skipping the file. Convert the workbook \
                      to .xlsx, which is read as a stream."
                 ),
-                "docx" => Box::new(DocxParser),
-                "pptx" => Box::new(PptxParser),
+                "docx" => Box::new(DocxParser::default()),
+                "pptx" => Box::new(PptxParser::default()),
                 // (feature-56) The one grammar compiled in. Others are loaded from a plugin
                 // directory, which arrives with the loader.
                 "rs" => {
