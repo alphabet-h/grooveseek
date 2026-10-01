@@ -49,7 +49,7 @@ impl KbCore {
             rel,
             &self.parser_registry,
             GET_DOCUMENT_MAX_BYTES,
-            crate::parser::MAX_RAW_BINARY_BYTES,
+            GET_DOCUMENT_BINARY_MAX_BYTES,
         )
         .into_result()?;
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -60,7 +60,7 @@ impl KbCore {
         let cap = max_bytes_for(
             &self.parser_registry,
             ext,
-            crate::parser::MAX_RAW_BINARY_BYTES,
+            GET_DOCUMENT_BINARY_MAX_BYTES,
             GET_DOCUMENT_MAX_BYTES,
         );
         match crate::links::read_checked(&canonical, cap) {
@@ -213,6 +213,15 @@ impl KbCore {
 /// `get_document` の最大バイト数。1 MiB を超える文書は `fs::read` による
 /// バイト一括読みでのメモリ膨張・レスポンス過大を避けるため拒否する。
 pub(crate) const GET_DOCUMENT_MAX_BYTES: u64 = 1024 * 1024;
+
+/// `get_document` / `resources/read` がバイナリ形式 (pdf / docx / xlsx / pptx) のファイルを
+/// 読む生バイト上限 (50 MiB)。
+///
+/// (feature-61) 索引の既定 ([`crate::parser::MAX_RAW_BINARY_BYTES`]) と同じ数だが、**問いが
+/// 違う**ので連動させない: こちらは MCP の 1 リクエストが握るメモリで、
+/// `[index].max_binary_file_size` を上げても動かない (ADR-0026)。上げて索引した文書は
+/// [`crate::server::ServableRules`] が `uri` を外し (ADR-0005)、read はここで拒否する。
+pub(crate) const GET_DOCUMENT_BINARY_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// get_document がバイナリ形式で応答する抽出テキストの上限 (1 MiB)。超過分は
 /// char 境界で truncate し `DocumentResponse.truncated = true` を立てる (§4.4)。

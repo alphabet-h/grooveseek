@@ -51,7 +51,7 @@ pub(crate) use documents::GET_DOCUMENT_MAX_BYTES;
 // `get_document` does -- which errors say "not there" and which say "could not
 // look" is one question.
 pub(crate) use documents::path_probe_failed;
-use documents::{EXTRACTED_TEXT_MAX_BYTES, max_bytes_for};
+use documents::{EXTRACTED_TEXT_MAX_BYTES, GET_DOCUMENT_BINARY_MAX_BYTES, max_bytes_for};
 
 // Named only by `mod tests`, and again the compiler is what said so: left
 // unconditional, every name below warned as unused in the plain library build.
@@ -4845,6 +4845,69 @@ mod tests {
             rules.allows("big.pdf"),
             "a binary document over the *text* cap is still readable"
         );
+    }
+
+    /// feature-61 (AC8): raising the index caps does not move the read side.
+    /// A binary document indexed past 50 MiB under `"unlimited"` is searchable
+    /// but carries no `uri`, and a read of it is refused at the path check
+    /// (before the handle-bound read in `links::read_checked`).
+    #[test]
+    fn a_document_indexed_past_the_read_cap_is_searchable_without_a_uri() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let unlimited = FileSizeLimits {
+            binary: FileSizeLimit::Unlimited,
+            text: FileSizeLimit::Unlimited,
+            decompressed: FileSizeLimit::Unlimited,
+        };
+        let registry = Registry::from_enabled_with_plugins(
+            &["md".to_string(), "pdf".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            unlimited,
+        )
+        .expect("md + pdf");
+        let fifty = 50 * 1024 * 1024;
+        assert_eq!(GET_DOCUMENT_BINARY_MAX_BYTES, fifty);
+        assert_eq!(
+            max_bytes_for(
+                &registry,
+                "pdf",
+                GET_DOCUMENT_BINARY_MAX_BYTES,
+                GET_DOCUMENT_MAX_BYTES
+            ),
+            fifty,
+            "the read cap does not follow the registry's index caps"
+        );
+
+        let rules = ServableRules::new(
+            &registry,
+            vec![
+                ("huge.pdf".to_string(), GET_DOCUMENT_BINARY_MAX_BYTES + 1),
+                ("edge.pdf".to_string(), GET_DOCUMENT_BINARY_MAX_BYTES),
+            ],
+        );
+        assert!(
+            !rules.allows("huge.pdf"),
+            "a read of this would be refused, so offering it is a broken link"
+        );
+        assert!(rules.allows("edge.pdf"));
+
+        let kb = TempKb::new("f61-read-cap");
+        let huge = std::fs::File::create(kb.path.join("huge.pdf")).unwrap();
+        huge.set_len(GET_DOCUMENT_BINARY_MAX_BYTES + 1).unwrap();
+        drop(huge);
+        match validate_get_document_path(
+            &kb.path,
+            "huge.pdf",
+            &registry,
+            GET_DOCUMENT_MAX_BYTES,
+            GET_DOCUMENT_BINARY_MAX_BYTES,
+        ) {
+            ValidatePathOutcome::NotFound(e) => {
+                assert!(e.error.starts_with("File too large"), "{}", e.error)
+            }
+            other => panic!("a binary file past 50 MiB must be refused: {other:?}"),
+        }
     }
 
     #[test]
