@@ -78,6 +78,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 23. Index only the names the server can open, and ask one predicate for all of them | [en](decisions/0023-index-only-names-the-server-can-open.md) | [ja](decisions/0023-index-only-names-the-server-can-open.ja.md) |
 | 24. Probe the embedding endpoint before a forced rebuild empties the index | [en](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md) | [ja](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md) |
 | 25. Skip inputs the embedding endpoint rejects, and retry the failures that pass | [en](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md) | [ja](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md) |
+| 26. Make the index size caps configurable, spell "no limit" out, and keep the read caps | [en](decisions/0026-configurable-index-size-caps.md) | [ja](decisions/0026-configurable-index-size-caps.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

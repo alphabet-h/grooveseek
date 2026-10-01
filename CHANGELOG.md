@@ -14,6 +14,27 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **The size caps on indexed files are configurable.** `[index].max_binary_file_size` and
+  `[index].max_text_file_size` set the largest file `groove index`, `rebuild_index` and the
+  watcher read, and `[index].max_decompressed_size` sets how far an `.xlsx` / `.docx` / `.pptx`
+  may inflate and how much text a PDF may yield. Each takes a byte count, a size with a unit
+  (`"300 MiB"`, `"2 GB"`) or `"unlimited"`, and each defaults to the previous fixed 50 MiB, so a
+  configuration that does not name them indexes exactly what it did before. The decompression
+  cap is deliberately not tied to the file cap: a 300 MB workbook inflates to several times its
+  size, so admitting it takes both keys, and lifting the file cap alone never switches off the
+  zip-bomb check. `0` is an error that points at `"unlimited"`, because other tools read `0` as
+  "no limit", "default" or "reject everything" depending on the product. A value above the
+  default is announced once with a warning: the file is held in memory whole while it is
+  indexed, and an allocation failure aborts the process rather than skipping the file. What a
+  read returns is unchanged — `get_document` and `resources/read` still stop at 50 MiB for
+  binary formats and 1 MiB for text, so a document indexed past that is searchable but carries
+  no `uri` ([ADR-0005](docs/decisions/0005-record-document-size-in-the-index.md)), and
+  `groove doctor` lists it the way it already lists text over 1 MiB. A config found beside a
+  knowledge base cannot raise any of the three; pass `--config` to accept one that does.
+  See [ADR-0026](docs/decisions/0026-configurable-index-size-caps.md).
+
 ## [1.14.0] - 2026-10-01
 
 ### Security

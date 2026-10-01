@@ -77,6 +77,7 @@ Architecture Decision Record — 何を選び、どの代替案を退け、そ�
 | 23. サーバが開ける名前だけを索引し、その判定を 1 つの述語に集める | [en](decisions/0023-index-only-names-the-server-can-open.md) | [ja](decisions/0023-index-only-names-the-server-can-open.ja.md) |
 | 24. 強制再構築が索引を空にする前に embedding endpoint を試す | [en](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md) | [ja](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md) |
 | 25. embedding endpoint が断った入力は skip し、一時的な失敗は再試行する | [en](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md) | [ja](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md) |
+| 26. 索引のサイズ上限を設定可能にし、無制限は綴らせ、読み出し上限は据え置く | [en](decisions/0026-configurable-index-size-caps.md) | [ja](decisions/0026-configurable-index-size-caps.ja.md) |
 
 ADR-0003 のファイル名は今も `kb-mcpignore` のままです。そこで説明されているファイルは
 現在 `.grooveignore` ですが、**ADR は merge 後に編集しません**。2026-08-17 より前の
