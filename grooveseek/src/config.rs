@@ -251,9 +251,10 @@ fn resolve_embedding_api_key(
         .or_else(|| configured_api_key.filter(|key| !key.trim().is_empty()))
 }
 
-/// `[index]` section (`groove.toml`), #251. Settings that apply to
-/// `groove index` and the MCP `rebuild_index` tool. The watcher reads the three
-/// size caps (feature-61) but not `fail_on_frontmatter_error`.
+/// `[index]` section (`groove.toml`), #251. Settings that apply to a full run,
+/// [`crate::indexer::rebuild_index`], whether `groove index` or the MCP tool
+/// started it. The watcher reads the three size caps (feature-61) but not
+/// `fail_on_frontmatter_error`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexConfig {
@@ -268,8 +269,9 @@ pub struct IndexConfig {
     /// note was saved half-written.
     #[serde(default)]
     pub fail_on_frontmatter_error: bool,
-    /// (feature-61) The largest pdf / docx / xlsx / pptx file `groove index`, `rebuild_index`
-    /// and the watcher read, in raw bytes. `None` is
+    /// (feature-61) The largest pdf / docx / xlsx / pptx file a full run
+    /// ([`crate::indexer::rebuild_index`], from `groove index` or the MCP tool) and the watcher
+    /// read, in raw bytes. `None` is
     /// [`crate::parser::MAX_RAW_BINARY_BYTES`]. Dropped from an untrusted config (R8 in
     /// [`Config::restrict_untrusted`]).
     #[serde(default)]
@@ -1243,7 +1245,7 @@ impl Config {
     ///
     /// (feature-61) `[index]` のサイズ上限は**両分岐**に乗せる。`[parsers]` が無く `[index]` に
     /// 上限だけがある構成で設定が黙って無視されないため。既定を超える上限は、ここで process
-    /// ごとに 1 回 warn する (呼び出し元は `serve` / `index` / `doctor` で各 1 回)。
+    /// ごとに 1 回 warn する (呼び出し元は `groove serve` / `groove index` / `groove doctor` の各コマンドで 1 回ずつ)。
     pub fn build_parser_registry(&self, kb_path: &Path) -> Result<crate::parser::Registry> {
         let limits = self.file_size_limits();
         if crate::parser::should_warn_raised_limits(&limits) {

@@ -100,7 +100,8 @@ impl<'a> ServableRules<'a> {
     /// 拡張子ごとの本当の cap は [`max_bytes_for`] で当てる —
     /// `load_document_blocking` が `read_checked` に渡すのと**同じ chooser** なので、
     /// 提示側と read 側が別々の上限を持つことが構造的に起こらない。
-    /// (feature-61) binary 側の cap は索引の設定に連動しない `GET_DOCUMENT_BINARY_MAX_BYTES`。
+    /// (feature-61) binary 側の cap は索引の設定に連動しない
+    /// [`GET_DOCUMENT_BINARY_MAX_BYTES`]。
     pub(crate) fn new(registry: &'a Registry, rows: Vec<(String, u64)>) -> Self {
         let oversized = rows
             .into_iter()

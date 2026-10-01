@@ -108,7 +108,7 @@ enum WorkbookFormat {
 ///   (巨大セル 1 個で切断すると内容が中途半端になるより、1 行は完全に残す方針)。
 const SHEET_MAX_BYTES: usize = 1024 * 1024;
 
-/// xls 用の抽出入口。`SHEET_MAX_BYTES` と既定の展開 budget を渡す薄い wrapper。
+/// xls 用の抽出入口。[`SHEET_MAX_BYTES`] と既定の展開 budget を渡す薄い wrapper。
 ///
 /// (feature-61) xlsx は [`XlsxParser`] が構築時の budget で
 /// [`parse_workbook_bytes_budgeted`] を直接呼ぶので、ここを通るのは registry から到達しない
@@ -424,12 +424,15 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// 展開量が `cap` 以内」という、言い切れる不変条件にする。
 ///
 /// トレードオフ: `xl/media/*` の画像など calamine が読まないパートも budget
-/// に乗るため、「展開後の合計が cap を超える画像だらけの xlsx」は skip される。
-/// raw 入力自体が既に `MAX_RAW_BINARY_BYTES` で頭打ちで、画像は圧縮済み
-/// (= 展開してもほぼ 1:1) なので、該当するのは raw cap 付近かつ中身の大半が
-/// 画像という稀なファイルに限られる。名前ベースの穴を残すより、この誤検知を
-/// 受け入れる方を選ぶ (skip は理由付きの warn として出るので silent failure
-/// ではない)。
+/// に乗る。つまり画像も `[index].max_decompressed_size` に数えるので、
+/// 「展開後の合計が cap を超える画像だらけの xlsx」は skip される。画像は
+/// 圧縮済み (= 展開してもほぼ 1:1) なので、展開後の合計はおおむねファイルの
+/// 大きさ以上になる。(feature-61) raw の上限は `[index].max_binary_file_size`
+/// で展開 budget より大きくできるため、これは稀な場合ではない: ファイル側の
+/// 上限だけを上げた運用者は、画像の多い workbook で展開側のメッセージを見る
+/// ことになり、`max_decompressed_size` も上げる必要がある。名前ベースの穴を
+/// 残すより、この誤検知を受け入れる方を選ぶ (skip は理由付きの warn として
+/// 出るので silent failure ではない)。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -1197,7 +1200,7 @@ mod tests {
         );
     }
 
-    /// feature-61 (AC5): `xlsx_frontmatter` swallows a core.xml error, so the
+    /// feature-61 (AC5): [`xlsx_frontmatter`] swallows a core.xml error, so the
     /// budget is observed through the title instead: core.xml one byte over the
     /// budget falls back to the file name, exactly the budget reads it.
     #[test]

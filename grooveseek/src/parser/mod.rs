@@ -171,8 +171,8 @@ pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 ///
 /// (feature-61) 索引時の上限は `[index].max_binary_file_size` で変えられ、実際に効く値は
 /// [`Registry::limits`] が持つ ([`FileSizeLimits`])。`get_document` / `resources/read`
-/// の読み出し側は索引の設定に連動しない別の定数 ([`crate::server`] の
-/// `GET_DOCUMENT_BINARY_MAX_BYTES`) を使う。名前は ADR-0004 / ADR-0005 と docs が
+/// の読み出し側は索引の設定に連動しない別の定数
+/// ([`crate::server::documents::GET_DOCUMENT_BINARY_MAX_BYTES`]) を使う。名前は ADR-0004 / ADR-0005 と docs が
 /// 参照しているので変えない。テキスト形式の既定は [`MAX_RAW_TEXT_BYTES`]。
 pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -221,7 +221,7 @@ impl FileSizeLimit {
     /// ここだけ**で、他所で `== u64::MAX` を判定しない (sentinel を散らすと、同じ値が場所に
     /// よって別の意味を持ち始める)。消費側はすべて `len > cap`、`cap.saturating_add(1)`、
     /// `cap.saturating_sub(total)` で比べるので、`u64::MAX` は比較が偽になるだけで
-    /// overflow しない ([`crate::links::read_checked`]、[`ooxml`] の `read_zip_part`、
+    /// overflow しない ([`crate::links::read_checked`]、[`crate::parser::ooxml::read_zip_part`]、
     /// [`xlsx`] の pre-flight)。
     pub fn cap_bytes(&self) -> u64 {
         match self {
@@ -242,7 +242,7 @@ impl std::fmt::Display for FileSizeLimit {
 
 /// [`FileSizeLimit`] の TOML 上の書き方 3 種。
 ///
-/// [`FileSizeLimit`] 自体を untagged にしないのは、untagged だと [`TryFrom`] のエラーが
+/// [`FileSizeLimit`] 自体を untagged にしないのは、untagged だと `TryFrom` のエラーが
 /// "did not match any variant" に潰れて案内文が消えるため。`Int` を `i64` で受けるのは
 /// 負値を自分の言葉で断るため (`u64` だと serde 段の型エラーになる)、`Float` を受けるのは
 /// `1.5` に「小数は受けない」と答えるため。
@@ -943,7 +943,7 @@ mod tests {
     // feature-61: [index] size caps
     // -----------------------------------------------------------------------
 
-    /// One `FileSizeLimit` behind a key, so the values go through serde the way
+    /// One [`FileSizeLimit`] behind a key, so the values go through serde the way
     /// `[index]` puts them through it.
     #[derive(Debug, serde::Deserialize)]
     struct OneLimit {

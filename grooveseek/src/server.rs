@@ -4849,8 +4849,8 @@ mod tests {
 
     /// feature-61 (AC8): raising the index caps does not move the read side.
     /// A binary document indexed past 50 MiB under `"unlimited"` is searchable
-    /// but carries no `uri`, and a read of it is refused at the path check
-    /// (before the handle-bound read in `links::read_checked`).
+    /// but carries no URI, and a read of it is refused at the path check
+    /// (before the handle-bound read in [`crate::links::read_checked`]).
     #[test]
     fn a_document_indexed_past_the_read_cap_is_searchable_without_a_uri() {
         use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};

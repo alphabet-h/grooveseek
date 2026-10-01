@@ -125,8 +125,9 @@ max_chunk_chars = 3500
 # above the default is announced once with a warning: a file is held in memory
 # whole while it is indexed, an allocation failure aborts the process instead
 # of skipping the file, and PDF extraction still stops after 120 s. Lowering a
-# cap leaves documents already indexed in place until they change or
-# `groove index --force` runs. Reads do not follow: `get_document` and
+# cap leaves documents already indexed in place until `groove index --force`
+# runs or the file shrinks under the cap; an edit that leaves it over the cap
+# keeps the old text searchable. Reads do not follow: `get_document` and
 # `resources/read` stop at 50 MiB for binary formats and 1 MiB for text, so a
 # document indexed past that is searchable but carries no `uri`. The watcher
 # reads these three keys; a config found beside a knowledge base cannot set

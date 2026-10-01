@@ -976,7 +976,7 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                  document dropped from the index)"
             );
         }
-        // (BU-20) The reason is already on stderr from `read_for_index`; this
+        // (BU-20) The reason is already on stderr from `read_for_index_under`; this
         // line says what happened to the document, which the reason does not.
         Ok(indexer::RenameOutcome::RenamedButRefused) => {
             wdiag!(

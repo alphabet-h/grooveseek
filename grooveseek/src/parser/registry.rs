@@ -259,7 +259,8 @@ pub struct Registry {
     code_max_chunk_chars: Option<usize>,
     /// (feature-61) The `[index]` size caps this registry was built with.
     ///
-    /// Kept here for the same reason as `code_max_chunk_chars`: the decompression budget is
+    /// Kept here for the same reason as [`Registry::code_max_chunk_chars`]: the decompression
+    /// budget is
     /// baked into the binary parsers when they are built, and the indexer reads the two raw
     /// caps from here ([`Registry::limits`]) rather than from the constants, so one registry
     /// is the one answer to "how much of a file does this run read".
@@ -297,9 +298,9 @@ impl Registry {
     /// that have no configuration to hand. There used to be a middle rung taking only `code`;
     /// it had no caller but [`Self::from_enabled`] and was folded into this one.
     ///
-    /// (feature-61) `limits` are the `[index]` size caps: the binary parsers are built with
-    /// `limits.decompressed` as their decompression budget, and [`Self::limits`] hands the raw
-    /// caps to the indexer.
+    /// (feature-61) The last argument is the `[index]` size caps: the binary parsers are built
+    /// with its [`FileSizeLimits::decompressed`] as their decompression budget, and
+    /// [`Self::limits`] hands the raw caps to the indexer.
     pub fn from_enabled_with_plugins(
         ids: &[String],
         code: &CodeParsersConfig,
@@ -396,8 +397,8 @@ impl Registry {
     }
 
     /// (feature-61) [`Self::defaults`] with the `[index]` size caps a configuration set, for a
-    /// configuration with no `[parsers]` section (`Config::build_parser_registry`'s `None`
-    /// arm). Built through [`Self::from_enabled_with_plugins`] so there is one way a registry
+    /// configuration with no `[parsers]` section (the `None` arm of
+    /// [`crate::config::Config::build_parser_registry`]). Built through [`Self::from_enabled_with_plugins`] so there is one way a registry
     /// is put together.
     pub fn defaults_with_limits(limits: FileSizeLimits) -> Self {
         Self::from_enabled_with_plugins(

@@ -7,13 +7,17 @@
 //! [`grooveseek::indexer::reindex_single_file`] and
 //! [`grooveseek::indexer::rename_single_file`] in-process against
 //! [`crate::common::embed_mock`], each test body in a hermetic child of this
-//! test binary for the reason `index_progress_callback.rs` gives. The helper
-//! that starts the child is a copy of the one in `index_cancel.rs`: moving it
-//! into `common` would mean editing the existing tests of both files.
+//! test binary for the reason the progress-callback tests give. The helper
+//! that starts the child is a copy of the one in the cancellation tests:
+//! moving it into the shared test helpers would mean editing the existing
+//! tests of both.
 //!
-//! The caps are lowered below the fixture rather than raised above 50 MiB: a
-//! registry that ignored `[index]` would admit the 1 KB fixture under the
-//! default, so a skip is only possible if the configured value was read.
+//! Most of the caps here are lowered below the fixture rather than raised
+//! above 50 MiB: a registry that ignored `[index]` would admit the 1 KB
+//! fixture under the default, so a skip is only possible if the configured
+//! value was read. A lowered cap is caught before the file is opened, though,
+//! so the check made on the handle the bytes are read from is pinned the other
+//! way round: a raised cap, and a sparse file one byte past the default.
 
 mod common;
 
@@ -86,7 +90,8 @@ impl Fixture {
         }
     }
 
-    /// A config that enables PDF, embeds through the mock, and appends `index`.
+    /// A config that enables PDF, embeds through the mock, and ends with the
+    /// `[index]` text it is handed.
     fn config(&self, name: &str, index: &str) -> Config {
         let path = self.layout.root().join(name);
         let toml = format!(
@@ -97,7 +102,8 @@ impl Fixture {
         Config::load_from(&path).expect("load groove.toml")
     }
 
-    /// The knowledge base the way `rebuild_index` sees it: canonical.
+    /// The knowledge base the way [`grooveseek::indexer::rebuild_index`] sees
+    /// it: canonical.
     fn kb(&self) -> PathBuf {
         self.layout.kb().canonicalize().expect("canonical kb")
     }
@@ -184,9 +190,10 @@ fn a_lowered_binary_cap_skips_a_file_in_the_full_run() {
     assert_eq!(fx.paths(), vec!["a.md".to_string(), "doc.pdf".to_string()]);
 }
 
-/// AC4, watcher: `reindex_single_file` (create / modify) and
-/// `rename_single_file` take their caps from the registry they are handed.
-/// The rename is pinned on `RenameOutcome::RenamedSizeCapped`.
+/// AC4, watcher: [`grooveseek::indexer::reindex_single_file`] (create /
+/// modify) and [`grooveseek::indexer::rename_single_file`] take their caps
+/// from the registry they are handed. The rename is pinned on
+/// [`grooveseek::indexer::RenameOutcome::RenamedSizeCapped`].
 #[test]
 fn the_watcher_and_rename_paths_read_the_cap_from_the_registry() {
     if run_in_hermetic_child("the_watcher_and_rename_paths_read_the_cap_from_the_registry") {
@@ -245,4 +252,175 @@ fn the_watcher_and_rename_paths_read_the_cap_from_the_registry() {
     )
     .expect("rename");
     assert_eq!(outcome, RenameOutcome::Renamed);
+}
+
+/// A binary cap above the default, with room for [`PAST_THE_DEFAULT`].
+const RAISED: &str = "[index]\nmax_binary_file_size = \"100 MiB\"\n";
+
+/// One byte past the 50 MiB default,
+/// [`grooveseek::parser::MAX_RAW_BINARY_BYTES`].
+const PAST_THE_DEFAULT: u64 = grooveseek::parser::MAX_RAW_BINARY_BYTES + 1;
+
+/// Extend (or create) `path` to `len` bytes without writing them.
+fn grow_to(path: &Path, len: u64) {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open the file to grow");
+    file.set_len(len).expect("grow the file");
+}
+
+/// [`run_in_hermetic_child`], for a test whose assertion is on what the child
+/// wrote to stderr: `Some(stderr)` in the parent, after the same checks that
+/// the child passed exactly one test, and `None` in the child, which then runs
+/// the body. A copy rather than a change to that helper, which the existing
+/// tests call.
+fn stderr_of_hermetic_child(name: &str) -> Option<String> {
+    if std::env::var_os(HERMETIC_CHILD).is_some() {
+        return None;
+    }
+    let cache = TempRoot::new("groove-f61-fastembed");
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(HERMETIC_CHILD, "1");
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("run the test in a child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "{name} failed in the child:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the child ran no test named {name}:\n{stdout}\n{stderr}"
+    );
+    assert_dir_empty(cache.path());
+    Some(stderr)
+}
+
+/// AC4 on the handle, watcher side. A lowered cap is caught by the stat check
+/// before the file is opened, so the tests above never reach the second check,
+/// the one made on the handle the bytes are read from. Under a raised cap the
+/// stat check passes and that read is the only check left: a file one byte past
+/// the 50 MiB default has to get through it on create / modify and on rename.
+/// Whether the zeros then parse as a PDF does not matter here; being refused
+/// for their size does.
+#[test]
+fn a_raised_binary_cap_admits_a_file_past_the_default_on_the_watcher_paths() {
+    if run_in_hermetic_child(
+        "a_raised_binary_cap_admits_a_file_past_the_default_on_the_watcher_paths",
+    ) {
+        return;
+    }
+    let fx = Fixture::new("groove-f61-raised-watcher");
+    let raised = fx.config("raised.toml", RAISED);
+    let registry = fx.registry(&raised);
+    let kb = fx.kb();
+    let (db, mut embedder) = fx.open(&raised);
+
+    // Create / modify: both reads (the hash read and the one that parses)
+    // are made under the registry's cap.
+    grow_to(&kb.join("big.pdf"), PAST_THE_DEFAULT);
+    let result =
+        reindex_single_file(&db, &mut embedder, &kb, "big.pdf", None, &registry).expect("reindex");
+    assert!(
+        !matches!(
+            result,
+            SingleResult::Refused
+                | SingleResult::Skipped {
+                    reason: "file too large",
+                    ..
+                }
+        ),
+        "a file under the raised cap was turned away for its size: {result:?}"
+    );
+
+    // Rename: a row to move, then the file grows past the default under its
+    // new name, so the rename has to read it to see the content changed.
+    fx.write_pdf("small.pdf");
+    let indexed = reindex_single_file(&db, &mut embedder, &kb, "small.pdf", None, &registry)
+        .expect("reindex");
+    assert!(
+        matches!(indexed, SingleResult::Updated { .. }),
+        "{indexed:?}"
+    );
+    std::fs::rename(kb.join("small.pdf"), kb.join("grown.pdf")).expect("rename on disk");
+    grow_to(&kb.join("grown.pdf"), PAST_THE_DEFAULT);
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "small.pdf",
+        "grown.pdf",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert!(
+        !matches!(
+            outcome,
+            RenameOutcome::RenamedSizeCapped
+                | RenameOutcome::RenamedSizeCappedAndDropped
+                | RenameOutcome::RenamedButRefused
+                | RenameOutcome::RenamedButRefusedAndDropped
+        ),
+        "a file under the raised cap was turned away for its size: {outcome:?}"
+    );
+}
+
+/// AC4 on the handle, full-run side: the scan reads the file it hashes off a
+/// handle too, and so does the parse after it. A refusal at either is a skip
+/// like a parse failure is, so the counts cannot tell them apart; what tells
+/// them apart is the line on stderr, which names a size only for a refusal.
+#[test]
+fn a_raised_binary_cap_admits_a_file_past_the_default_in_the_full_run() {
+    const NAME: &str = "a_raised_binary_cap_admits_a_file_past_the_default_in_the_full_run";
+    if let Some(stderr) = stderr_of_hermetic_child(NAME) {
+        let sized: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("big.pdf"))
+            .filter(|l| l.contains("too large") || l.contains("byte limit"))
+            .collect();
+        assert!(
+            sized.is_empty(),
+            "a file under the raised cap was turned away for its size: {sized:?}\n{stderr}"
+        );
+        return;
+    }
+    let fx = Fixture::new("groove-f61-raised-rebuild");
+    grow_to(&fx.layout.kb().join("big.pdf"), PAST_THE_DEFAULT);
+    let raised = fx.config("raised.toml", RAISED);
+    let result = fx.rebuild(&raised).expect("run");
+    assert_eq!(
+        result.updated + result.skipped,
+        1,
+        "the scan saw big.pdf and nothing else: {result:?}"
+    );
+}
+
+/// A size skip names the key that would admit the file, the way the
+/// decompression-side messages already do, so the operator is not left to
+/// guess which of the three caps applied.
+#[test]
+fn a_size_skip_names_the_key_that_admits_the_file() {
+    const NAME: &str = "a_size_skip_names_the_key_that_admits_the_file";
+    if let Some(stderr) = stderr_of_hermetic_child(NAME) {
+        let skip = stderr
+            .lines()
+            .find(|l| l.contains("Skipping doc.pdf") && l.contains("file too large"))
+            .unwrap_or_else(|| panic!("no size skip for doc.pdf on stderr:\n{stderr}"));
+        assert!(
+            skip.ends_with("; raise [index].max_binary_file_size to admit it"),
+            "{skip}"
+        );
+        return;
+    }
+    let fx = Fixture::new("groove-f61-skip-hint");
+    fx.write_pdf("doc.pdf");
+    let capped = fx.config("capped.toml", LOWERED);
+    let result = fx.rebuild(&capped).expect("run");
+    assert_eq!(result.skipped, 1, "{result:?}");
 }

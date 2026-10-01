@@ -130,9 +130,11 @@ changing anything for a configuration that does not ask for it.
   purpose.** A document indexed past the read cap is reported as
   `larger-than-a-read-returns` (Warning, exit 1), the same treatment text over
   1 MiB already gets.
-- **Lowering a cap keeps what was indexed under the higher one** until the
-  file changes or `groove index --force` runs, because the scan's size skip
-  protects existing rows rather than deleting them.
+- **Lowering a cap keeps what was indexed under the higher one** until
+  `groove index --force` runs or the file shrinks under the cap, because the
+  scan's size skip protects existing rows rather than deleting them. An edit
+  that leaves the file over the cap keeps the old text searchable: the watcher
+  records only the new size, and the next scan skips the file again.
 - **The per-sheet and per-page text caps (1 MiB) are unchanged**, so a large
   workbook is indexed one truncated chunk per sheet. Raising them needs chunks
   smaller than a sheet first.

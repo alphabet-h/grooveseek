@@ -153,7 +153,8 @@ const PDF_DOC_TEXT_MAX_BYTES: usize = super::DEFAULT_MAX_DECOMPRESSED_BYTES as u
 /// `StackSafeContext` の timeout は抽出経路から使われていないので、
 /// ここで実時間を見るしかない。
 ///
-/// 残余の大きさは有界ではある: 入力は `MAX_RAW_BINARY_BYTES` (50 MB) で、
+/// 残余の大きさは有界ではある (既定の raw 上限での計算): 入力は
+/// [`crate::parser::MAX_RAW_BINARY_BYTES`] (50 MB) で、
 /// DEFLATE の理論最大比が ~1032:1 なので累積展開量は高々 ~51 GB、
 /// 300 MB/s 程度の実効速度で ~170 秒。この上限はそれを 120 秒に切り下げる。
 ///
@@ -456,8 +457,8 @@ fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatte
     extract_pdf_with_budget(bytes, path_hint, PDF_DOC_TEXT_MAX_BYTES)
 }
 
-/// [`PdfParser`] の抽出本体。上の doc の `extract_pdf` (test 専用、既定 budget の wrapper)
-/// と同じ処理を、parser が構築時に受け取った文書テキスト budget (`doc_budget`) で行う
+/// [`PdfParser`] の抽出本体。上の doc を持つ、この module の test 専用 wrapper (既定 budget
+/// で呼ぶもの) と同じ処理を、parser が構築時に受け取った文書テキスト budget (`doc_budget`) で行う
 /// (feature-61)。
 fn extract_pdf_with_budget(
     bytes: &[u8],
@@ -512,7 +513,7 @@ fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
 
 /// ページ本文を per-page 上限 + 文書累積 budget + 実時間上限付きで取り出す本体
 /// (cap 注入版)。本番は [`extract_pdf_with_budget`] が parser の budget で呼び、unit test は
-/// 小さい cap で budget 分岐を踏む (`ooxml::read_zip_entry_capped` と同じ形)。
+/// 小さい cap で budget 分岐を踏む ([`crate::parser::ooxml`] の test 用の cap 注入版と同じ形)。
 /// 50 MB を実際に展開する fixture を用意せずに済む。
 fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     document: &PdfDocument<R>,

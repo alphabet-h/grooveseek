@@ -220,7 +220,7 @@ pub(crate) const GET_DOCUMENT_MAX_BYTES: u64 = 1024 * 1024;
 /// (feature-61) 索引の既定 ([`crate::parser::MAX_RAW_BINARY_BYTES`]) と同じ数だが、**問いが
 /// 違う**ので連動させない: こちらは MCP の 1 リクエストが握るメモリで、
 /// `[index].max_binary_file_size` を上げても動かない (ADR-0026)。上げて索引した文書は
-/// [`crate::server::ServableRules`] が `uri` を外し (ADR-0005)、read はここで拒否する。
+/// [`crate::server::ServableRules`] が URI を外し (ADR-0005)、read はここで拒否する。
 pub(crate) const GET_DOCUMENT_BINARY_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// get_document がバイナリ形式で応答する抽出テキストの上限 (1 MiB)。超過分は
