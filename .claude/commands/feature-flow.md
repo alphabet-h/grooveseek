@@ -175,6 +175,15 @@ cycle 完了時に必ず:
 (skill は同 session 内で反映される)。`/clear` は background task を止めないので、下の leak 確認が効く:
 
 1. **handoff doc を即時 write**: `.dev/knowledge/session-<YYYY-MM-DD>-<topic>-handoff.md`
+   - **書く前に鎖の末端を取る** (`powershell -NoProfile -File .dev/tools/handoff_tail.ps1`、stdout の 1 行)。それが直前の
+     handoff で、**型もそれ** — 開いて同じ節立て (frontmatter の title / date / tags、`## ★ 次にやること`、今日やったこと、
+     閉じる直前の状態、guard、環境の罠、kuriya) で書く。**session を `/next-work` から始めていない時ほど必要** —
+     その場合は `.dev/README.md` の handoff の段落も読んでいない
+   - **冒頭 (title の次の段落) に `前の handoff: [[<その末端の basename>]]`**。これが無いと末端が 2 本になり、次 session の
+     `/next-work` が Phase 0 で止まる (2026-10-02 に実際に止まった)
+   - **前 handoff の「★ 次にやること」のうち生きている項目を写す** (期日つきのものは必ず)。この session が触っていない軸の
+     項目も、新 handoff が末端になった瞬間に前 handoff からは読まれなくなる。写さないなら「本体は前 handoff のまま」と書く
+     (`/next-work` はその文言で 1 本遡る)
    - 現状の git state (`git log --oneline -5`)
    - 完了済 phase / 進行中 phase / 未着手 phase
    - 重要な constraint / pattern (`CLAUDE.local.md` 規約、subagent prompt の `.dev/` untracked 注意、codex review loop 規約)
@@ -183,7 +192,12 @@ cycle 完了時に必ず:
    - 完了基準 checklist
    - background task leak の確認 (`run_in_background` の polling が残っていないか)
    - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。**handoff のたびに、その場で測る**: 報告モード (`powershell -NoProfile -File .dev/tools/disk-sweep.ps1`、何も消さない) を打ち、空きと `target` の TOTAL を書いて user にも伝える。**SessionStart の値で済ませない、`LOW` が出ていたかどうかで分岐もしない** — あれは session の始めの値で、`/full-audit` や `--ignored` の test や cross build を挟めば、始めは閾値より上でも閉じる時には割っている。release を切った session は Phase 7 step 7 でも測っているが、その後に build していればそれも古いので、ここでも測る。**`.dev/tools/disk-sweep.ps1` が無い checkout (前提の節) では測れない** — handoff は止めず、この項に「disk: 未計測 (script なし)」と書く。PowerShell を手で組んで代用しない、「クリーンアップした」とも書かない (Phase 7 step 7 にも同じ句がある)。消すのは user が `/disk-sweep apply` と打った時だけで、controller からは測るところまで。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
-2. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
+2. **kuriya の goal を新 handoff に向け、鎖を確かめる**。goal (handoff の path を body に持つ item。番号と運用は
+   `.dev/README.md` の handoff の段落) を `mcp__kuriya__update` で新 path + state + next に差し替える — `/next-work` は
+   goal の body と末端の path を突き合わせ、食い違うと止まる。kuriya 未接続なら handoff に「goal 未更新」と書く。
+   続けて、もう一度 `powershell -NoProfile -File .dev/tools/handoff_tail.ps1` を打ち、**exit 0 で新 handoff の path 1 行**が
+   返ることを見る (2 行返る = step 1 の `前の handoff:` を書き忘れている)
+3. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
    無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
    ```bash
    case "$(git -C .dev rev-parse --show-toplevel)" in
@@ -191,12 +205,16 @@ cycle 完了時に必ず:
      *) echo "ABORT: .dev is not its own repository; see the preconditions" >&2; exit 1 ;;
    esac
    ```
-3. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
+   `.dev` の pre-push hook (`.dev/tools/hooks/pre-push`) が step 2 と同じ script を打ち、末端が 1 本でなければ push を
+   止める。**止まったら handoff に marker を足して push し直す。`--no-verify` で迂回しない** — 迂回した push は次 session の
+   入口をそのまま塞ぐ
+4. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
 
 context が切り替わったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
-handoff doc の型は `.dev/knowledge/session-2026-08-22-handoff-after-stderr-ascii.md` (★次にやること /
-main の状態 (実測) / 残っているもの / 測って分かったこと / 環境の罠 / 台帳 / 起票済み)。
+handoff doc の型は**固定の 1 本ではなく、鎖の末端 (= 直前の handoff)**。型の file 名をここに書かない — 規約が変わっても
+古い型を指し続けるからで、2026-10-02 まで名指ししていた 2026-08-22 の handoff は `前の handoff:` の規約
+(2026-08-25〜、`.dev/README.md`) より古く、それだけをなぞった handoff が鎖を切った。
 
 ## 介入ポイント以外でユーザを巻き込まない原則
 
