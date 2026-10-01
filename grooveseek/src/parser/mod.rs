@@ -560,6 +560,34 @@ pub trait Parser: Send + Sync {
         Ok(self.parse(s, path_hint, exclude_headings))
     }
 
+    /// The read path's implementation point: what `get_document` and
+    /// `resources/read` parse with, as opposed to the index.
+    ///
+    /// (feature-61) The read path parses with the built-in default
+    /// decompression budget ([`DEFAULT_MAX_DECOMPRESSED_BYTES`]) regardless of
+    /// `[index].max_decompressed_size`, because one MCP request must stay
+    /// bounded whatever the index is allowed to inflate (ADR-0026). Its raw-size
+    /// sibling, the binary read cap, lives in [`crate::server`].
+    ///
+    /// The default delegates to [`Parser::parse_bytes_inner`], which is right
+    /// for every parser whose parse does not depend on a construction-time
+    /// budget. A parser whose [`Parser::parse_bytes_inner`] does depend on one
+    /// overrides this to pass the default budget instead.
+    ///
+    /// **Callers go through [`ParserExt::parse_bytes_for_read`]**, for the same
+    /// panic isolation as [`ParserExt::parse_bytes`]. The `_inner` suffix is
+    /// load-bearing, as on [`Parser::parse_bytes_inner`]: on a `dyn Parser` a
+    /// [`Parser`] method shadows a [`ParserExt`] method of the same name, so a
+    /// shared name would route reads around the panic guard.
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        self.parse_bytes_inner(bytes, path_hint, exclude_headings)
+    }
+
     /// バイナリ形式 parser は `true` を返す (default `false`)。
     /// get_document の cap 分類 (§4.4) と quality filter 免除 (§4.8) の判定に使う。
     fn is_binary(&self) -> bool {
@@ -592,6 +620,16 @@ pub trait ParserExt {
         path_hint: &str,
         exclude_headings: &[&str],
     ) -> Result<ParsedDocument>;
+
+    /// The read path's entry (`get_document` / `resources/read`): parses with
+    /// the default decompression budget ([`Parser::parse_bytes_for_read_inner`]) and
+    /// normalises a panic to a per-file `Err` like [`ParserExt::parse_bytes`].
+    fn parse_bytes_for_read(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument>;
 }
 
 impl<T: Parser + ?Sized> ParserExt for T {
@@ -603,6 +641,17 @@ impl<T: Parser + ?Sized> ParserExt for T {
     ) -> Result<ParsedDocument> {
         panic_guard::catch_parser_panic(path_hint, self.id(), || {
             self.parse_bytes_inner(bytes, path_hint, exclude_headings)
+        })
+    }
+
+    fn parse_bytes_for_read(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        panic_guard::catch_parser_panic(path_hint, self.id(), || {
+            self.parse_bytes_for_read_inner(bytes, path_hint, exclude_headings)
         })
     }
 }

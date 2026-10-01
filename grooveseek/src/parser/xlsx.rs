@@ -57,6 +57,24 @@ impl Parser for XlsxParser {
             self.decompressed_budget,
         )
     }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    /// Same parse as [`super::Parser::parse_bytes_inner`], other budget.
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        _exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_workbook_bytes_budgeted(
+            bytes,
+            path_hint,
+            WorkbookFormat::Xlsx,
+            SHEET_MAX_BYTES,
+            super::DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+    }
 }
 
 impl Parser for XlsParser {
@@ -1198,6 +1216,20 @@ mod tests {
                 .parse_bytes(&bytes, "x.xlsx", &[])
                 .is_ok()
         );
+    }
+
+    /// feature-61 (codex critical): the read path does not take the budget the
+    /// parser was built with -- the 5-byte parser whose preflight refuses the
+    /// archive on the index path reads it on the read path.
+    #[test]
+    fn xlsx_read_path_ignores_the_parser_budget() {
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+        let tiny = XlsxParser::with_budget(5);
+        assert!(tiny.parse_bytes(&bytes, "x.xlsx", &[]).is_err());
+        let read = tiny
+            .parse_bytes_for_read(&bytes, "x.xlsx", &[])
+            .expect("the read path keeps the default budget");
+        assert_eq!(read.chunks.len(), 1);
     }
 
     /// feature-61 (AC5): [`xlsx_frontmatter`] swallows a core.xml error, so the

@@ -576,7 +576,8 @@ pub(crate) fn validate_get_document_path(
     ValidatePathOutcome::Found(canonical)
 }
 
-/// `get_document` ツール用に、拡張子に対応する Parser で `parse_bytes` を呼び、
+/// `get_document` ツール用に、拡張子に対応する Parser で
+/// [`crate::parser::ParserExt::parse_bytes_for_read`] を呼び、
 /// frontmatter + 抽出テキストから DocumentResponse を組む。抽出失敗 (不正 UTF-8 /
 /// 暗号化 PDF 等) は `Err` にして handler が既存のエラー応答形式へ流す。
 /// 登録されていない拡張子はフォールバックで Markdown parser を使う (pre-feature-20 挙動)。
@@ -586,8 +587,12 @@ pub(super) fn build_document_response(
     ext: &str,
     bytes: &[u8],
 ) -> anyhow::Result<DocumentResponse> {
+    // (feature-61) The read entry, not the index one: the registry's parsers
+    // carry `[index].max_decompressed_size`, and one MCP request stays under
+    // the built-in decompression budget whatever the index may inflate
+    // (ADR-0026). Its raw-side sibling is `GET_DOCUMENT_BINARY_MAX_BYTES`.
     let parsed = match registry.by_extension(ext) {
-        Some(p) => p.parse_bytes(bytes, path_hint, &[])?,
+        Some(p) => p.parse_bytes_for_read(bytes, path_hint, &[])?,
         None => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| anyhow::anyhow!("{path_hint}: not valid UTF-8: {e}"))?;

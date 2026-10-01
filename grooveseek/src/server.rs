@@ -4910,6 +4910,91 @@ mod tests {
         }
     }
 
+    /// feature-61 (codex critical): raising `[index].max_decompressed_size`
+    /// does not move the read side either. A small docx whose parts inflate
+    /// past the built-in budget is indexed under `"unlimited"`, but a read of it
+    /// through the same registry is refused by the default budget -- the
+    /// decompression sibling of [`GET_DOCUMENT_BINARY_MAX_BYTES`].
+    #[test]
+    fn a_read_keeps_the_default_decompression_budget_when_the_index_is_unlimited() {
+        use crate::parser::{
+            CodeParsersConfig, DEFAULT_MAX_DECOMPRESSED_BYTES, FileSizeLimit, FileSizeLimits,
+            ParserExt,
+        };
+        use std::io::Write as _;
+        let registry = Registry::from_enabled_with_plugins(
+            &["md".to_string(), "docx".to_string()],
+            &CodeParsersConfig::default(),
+            None,
+            FileSizeLimits {
+                decompressed: FileSizeLimit::Unlimited,
+                ..FileSizeLimits::default()
+            },
+        )
+        .expect("md + docx");
+
+        // word/document.xml is exactly the default budget (each part is allowed
+        // up to it), and core.xml then takes the per-document total past it.
+        let head = concat!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t>inflated body</w:t></w:r></w:p>"#
+        );
+        let tail = "</w:body></w:document>";
+        let budget = usize::try_from(DEFAULT_MAX_DECOMPRESSED_BYTES).unwrap();
+        let mut doc_xml = String::with_capacity(budget);
+        doc_xml.push_str(head);
+        doc_xml.extend(std::iter::repeat_n(' ', budget - head.len() - tail.len()));
+        doc_xml.push_str(tail);
+        assert_eq!(doc_xml.len(), budget);
+        let core_xml: &[u8] = br#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Bomb</dc:title></cp:coreProperties>"#;
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let opt = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("word/document.xml", opt).unwrap();
+            zip.write_all(doc_xml.as_bytes()).unwrap();
+            zip.start_file("docProps/core.xml", opt).unwrap();
+            zip.write_all(core_xml).unwrap();
+            zip.finish().unwrap();
+        }
+        drop(doc_xml);
+
+        let kb = TempKb::new("f61-read-budget");
+        let file = kb.path.join("bomb.docx");
+        std::fs::write(&file, &bytes).unwrap();
+        // The raw read cap admits it: what refuses it has to be the budget.
+        let cap = max_bytes_for(
+            &registry,
+            "docx",
+            GET_DOCUMENT_BINARY_MAX_BYTES,
+            GET_DOCUMENT_MAX_BYTES,
+        );
+        assert!((bytes.len() as u64) < cap, "fixture: {} bytes", bytes.len());
+        let crate::links::Content::Bytes(read) = crate::links::read_checked(&file, cap).unwrap()
+        else {
+            panic!("the raw read cap must admit the fixture");
+        };
+
+        let err = build_document_response(&registry, "bomb.docx", "docx", &read)
+            .expect_err("the read path must keep the default decompression budget");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_decompressed_size")
+                && msg.contains(&DEFAULT_MAX_DECOMPRESSED_BYTES.to_string()),
+            "{msg}"
+        );
+
+        // The index path through the same registry follows `[index]`.
+        let indexed = registry
+            .by_extension("docx")
+            .unwrap()
+            .parse_bytes(&read, "bomb.docx", &[])
+            .expect("the index path admits it under \"unlimited\"");
+        assert_eq!(indexed.frontmatter.title.as_deref(), Some("Bomb"));
+        assert!(indexed.raw_content.contains("inflated body"));
+    }
+
     #[test]
     fn an_unrecorded_size_is_not_read_as_too_large() {
         let registry = md_and_pdf_registry();

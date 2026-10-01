@@ -399,41 +399,58 @@ impl Parser for PdfParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        // 32-bit では usize に収まらない budget は usize::MAX (= 実質無制限) に倒す。
-        let doc_budget = usize::try_from(self.decompressed_budget).unwrap_or(usize::MAX);
-        let (pages, frontmatter) = extract_pdf_with_budget(bytes, path_hint, doc_budget)?;
-        reject_unindexable_pages(&pages, path_hint)?;
-
-        let title = frontmatter.title.as_deref().unwrap_or("");
-        let mut chunks = Vec::new();
-        for (i, page_text) in pages.iter().enumerate() {
-            let content = post_process(page_text);
-            if content.trim().is_empty() {
-                continue; // 空ページは chunk を作らない
-            }
-            let heading = format!("p.{}", i + 1);
-            let context = super::build_context(&[title, &heading]);
-            chunks.push(super::Chunk {
-                index: chunks.len(),
-                heading: Some(heading),
-                level: None,
-                content,
-                context,
-                line_range: None,
-                symbol_kind: None,
-            });
-        }
-
-        // frontmatter は extract_pdf が同じ PdfDocument から抽出済み (§4.5)。
-        let raw_content = super::join_chunk_bodies(&chunks);
-
-        Ok(ParsedDocument {
-            frontmatter,
-            chunks,
-            raw_content,
-            frontmatter_error: None,
-        })
+        parse_with_budget(bytes, path_hint, self.decompressed_budget)
     }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        _exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_with_budget(bytes, path_hint, super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+}
+
+/// The one PDF parse; the two [`super::Parser`] entries differ only in the
+/// document text budget they pass.
+fn parse_with_budget(bytes: &[u8], path_hint: &str, budget: u64) -> Result<ParsedDocument> {
+    // 32-bit では usize に収まらない budget は usize::MAX (= 実質無制限) に倒す。
+    let doc_budget = usize::try_from(budget).unwrap_or(usize::MAX);
+    let (pages, frontmatter) = extract_pdf_with_budget(bytes, path_hint, doc_budget)?;
+    reject_unindexable_pages(&pages, path_hint)?;
+
+    let title = frontmatter.title.as_deref().unwrap_or("");
+    let mut chunks = Vec::new();
+    for (i, page_text) in pages.iter().enumerate() {
+        let content = post_process(page_text);
+        if content.trim().is_empty() {
+            continue; // 空ページは chunk を作らない
+        }
+        let heading = format!("p.{}", i + 1);
+        let context = super::build_context(&[title, &heading]);
+        chunks.push(super::Chunk {
+            index: chunks.len(),
+            heading: Some(heading),
+            level: None,
+            content,
+            context,
+            line_range: None,
+            symbol_kind: None,
+        });
+    }
+
+    // frontmatter は extract_pdf が同じ PdfDocument から抽出済み (§4.5)。
+    let raw_content = super::join_chunk_bodies(&chunks);
+
+    Ok(ParsedDocument {
+        frontmatter,
+        chunks,
+        raw_content,
+        frontmatter_error: None,
+    })
 }
 
 /// oxidize-pdf でページ本文 (`Vec<String>`, 1 要素 = 1 ページ) + metadata frontmatter
@@ -1725,5 +1742,22 @@ mod tests {
                 .parse_bytes(MINIMAL_PDF, "budget.pdf", &[])
                 .is_ok()
         );
+    }
+
+    /// feature-61 (codex critical): the read path does not take the budget the
+    /// parser was built with. The 1-byte parser that refuses MINIMAL_PDF on the
+    /// index path reads it on the read path, exactly as the default parser does.
+    #[test]
+    fn pdf_read_path_ignores_the_parser_budget() {
+        let tiny = PdfParser::with_budget(1);
+        assert!(tiny.parse_bytes(MINIMAL_PDF, "budget.pdf", &[]).is_err());
+        let read = tiny
+            .parse_bytes_for_read(MINIMAL_PDF, "budget.pdf", &[])
+            .expect("the read path keeps the default budget");
+        let default = PdfParser::default()
+            .parse_bytes(MINIMAL_PDF, "budget.pdf", &[])
+            .unwrap();
+        assert_eq!(read.raw_content, default.raw_content);
+        assert_eq!(read.chunks.len(), default.chunks.len());
     }
 }

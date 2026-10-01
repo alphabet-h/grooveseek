@@ -103,7 +103,11 @@ changing anything for a configuration that does not ask for it.
   `file too large`. The two keys are told apart on stderr.
 - The read side keeps 50 MiB under a name of its own,
   `GET_DOCUMENT_BINARY_MAX_BYTES`, so the same number answering a different
-  question is not mistaken for the index default.
+  question is not mistaken for the index default. Reads also keep the built-in
+  decompression budget whatever `max_decompressed_size` says: `get_document`
+  and `resources/read` parse through `parse_bytes_for_read`, which the four
+  binary parsers answer with the default budget rather than the one they were
+  built with, so one MCP request stays as bounded as it was.
 - A value above the default is announced once per process with a warning:
   the file is held in memory whole, an allocation failure aborts the process,
   PDF extraction still stops after 120 s, and with `"unlimited"` memory use is
@@ -130,6 +134,11 @@ changing anything for a configuration that does not ask for it.
   purpose.** A document indexed past the read cap is reported as
   `larger-than-a-read-returns` (Warning, exit 1), the same treatment text over
   1 MiB already gets.
+- **A document that inflates past 50 MiB is searchable but not fully
+  readable.** Indexed under a raised `max_decompressed_size`, it still carries
+  a `uri` (what is on offer is decided by raw size alone), but a read of it is
+  refused with the decompression message, or comes back without the parts that
+  are over the budget on their own.
 - **Lowering a cap keeps what was indexed under the higher one** until
   `groove index --force` runs or the file shrinks under the cap, because the
   scan's size skip protects existing rows rather than deleting them. An edit
@@ -149,7 +158,8 @@ changing anything for a configuration that does not ask for it.
   read), `grooveseek/src/config.rs` (the keys, both registry arms, the
   untrusted rule), `grooveseek/src/indexer.rs` and
   `grooveseek/tests/index_size_caps.rs` (the three read paths), and
-  `grooveseek/src/server.rs` (the read side does not move).
+  `grooveseek/src/server.rs` (the read side does not move, its raw cap and its
+  decompression budget alike).
 
 ## References
 

@@ -87,7 +87,10 @@
   同じく名指しする。raw の上限による skip はこれまでどおり `file too large` と言う。
   stderr でどちらのキーかが区別できる。
 - 読み出し側は 50 MiB を独自の名前 `GET_DOCUMENT_BINARY_MAX_BYTES` で持ち、同じ数が別の
-  問いに答えていることを、索引の既定値と取り違えさせない。
+  問いに答えていることを、索引の既定値と取り違えさせない。読み出しは展開 budget も
+  `max_decompressed_size` に関わらず組み込みの値のまま: `get_document` と `resources/read` は
+  `parse_bytes_for_read` を通して parse し、4 つのバイナリ parser はそこで構築時の budget では
+  なく既定の budget を使うので、MCP の 1 リクエストはこれまでどおり bound される。
 - 既定を超える値は process ごとに 1 回警告する: ファイルはまるごとメモリに持たれ、確保の
   失敗は process を abort し、PDF の抽出は 120 秒で打ち切られ、`"unlimited"` ではメモリ
   使用量は KB に置かれたファイルだけで決まる。
@@ -109,6 +112,9 @@
 - **意図して上限を上げた KB では `groove doctor` が黄色のまま**になる。読み出し上限を超えて
   索引された文書は `larger-than-a-read-returns` (Warning、exit 1) として報告される — 1 MiB を
   超えるテキストが既に受けているのと同じ扱い。
+- **展開後が 50 MiB を超える文書は、検索には出るが全体は読めない。** 上げた
+  `max_decompressed_size` で索引されると `uri` は付いたまま (提供するかは raw の大きさだけで
+  決まる) だが、読み出しは展開の文言で拒否されるか、単独で budget を超えるパートを欠いて返る。
 - **上限を下げても、高い上限で索引したものは残る**。`groove index --force` を打つか、
   ファイルが上限の下まで縮むまで。scan の size skip は既存の行を消さずに保護するため。
   上限を超えたままの編集では古いテキストが検索に出続ける: watcher は新しい大きさだけを記録し、
@@ -125,7 +131,7 @@
   `registry.rs` (budget がそれぞれの読み出しに届く)、`grooveseek/src/config.rs` (キー、
   registry の両分岐、信頼しない設定の規則)、`grooveseek/src/indexer.rs` と
   `grooveseek/tests/index_size_caps.rs` (3 つの読み出し経路)、`grooveseek/src/server.rs`
-  (読み出し側は動かない)。
+  (読み出し側は動かない。raw の上限も展開 budget も)。
 
 ## 参考
 

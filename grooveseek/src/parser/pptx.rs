@@ -54,6 +54,18 @@ impl Parser for PptxParser {
     ) -> Result<ParsedDocument> {
         parse_bytes_impl(bytes, path_hint, self.decompressed_budget)
     }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    /// Same parse as [`super::Parser::parse_bytes_inner`], other `cap`.
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        _exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_bytes_impl(bytes, path_hint, super::DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,5 +1040,29 @@ mod tests {
             crate::parser::txt::derive_title_pub("deck.pptx")
         );
         assert_eq!(doc.chunks.len(), 1);
+    }
+
+    /// feature-61 (codex critical): the read path does not take the budget the
+    /// parser was built with -- a 1-byte parser reads the deck on the read path
+    /// as the default parser would, title included.
+    #[test]
+    fn pptx_read_path_ignores_the_parser_budget() {
+        let slide_xml: &[u8] = br#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>slide body</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let core_xml: &[u8] = br#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Deck</dc:title></cp:coreProperties>"#;
+        let bytes = pptx_of(&[
+            ("docProps/core.xml", core_xml),
+            ("ppt/slides/slide1.xml", slide_xml),
+        ]);
+        let tiny = PptxParser::with_budget(1);
+        let index = tiny.parse_bytes(&bytes, "deck.pptx", &[]).unwrap();
+        assert!(
+            index.chunks.is_empty(),
+            "the 1-byte budget skips every part"
+        );
+        let read = tiny
+            .parse_bytes_for_read(&bytes, "deck.pptx", &[])
+            .expect("the read path keeps the default budget");
+        assert_eq!(read.frontmatter.title.as_deref(), Some("Deck"));
+        assert_eq!(read.chunks.len(), 1);
     }
 }

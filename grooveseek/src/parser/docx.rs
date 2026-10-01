@@ -48,36 +48,55 @@ impl Parser for DocxParser {
         path_hint: &str,
         exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
-            anyhow!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}")
-        })?;
-        // 文書単位の累積展開済みバイト数。word/document.xml + docProps/core.xml
-        // の両読み出しで共有し、累積が cap を超えたら Err にする (codex P2,
-        // PR #70 round 2 zip-bomb hardening: 個々のエントリが cap 未満でも
-        // 積算で無制限に膨らむのを防ぐ)。
-        let mut budget: u64 = 0;
-        let cap = self.decompressed_budget;
-        let doc_xml = super::ooxml::read_zip_part(
-            &mut zip,
-            path_hint,
-            "word/document.xml",
-            &mut budget,
-            cap,
-        )?
-        .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
-        // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
-        let frontmatter =
-            super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap)?;
-        super::ooxml::warn_if_truncated(path_hint, "word/document.xml", &doc_xml);
-        let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
-        let raw_content = super::join_chunk_bodies(&chunks);
-        Ok(ParsedDocument {
-            frontmatter,
-            chunks,
-            raw_content,
-            frontmatter_error: None,
-        })
+        parse_with_budget(bytes, path_hint, exclude_headings, self.decompressed_budget)
     }
+
+    /// (feature-61) The read path keeps the built-in budget whatever `[index]`
+    /// set this parser up with ([`super::Parser::parse_bytes_for_read_inner`]).
+    fn parse_bytes_for_read_inner(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        parse_with_budget(
+            bytes,
+            path_hint,
+            exclude_headings,
+            super::DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+    }
+}
+
+/// The one docx parse; the two [`super::Parser`] entries differ only in the
+/// decompression budget they pass as `cap`.
+fn parse_with_budget(
+    bytes: &[u8],
+    path_hint: &str,
+    exclude_headings: &[&str],
+    cap: u64,
+) -> Result<ParsedDocument> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| anyhow!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}"))?;
+    // 文書単位の累積展開済みバイト数。word/document.xml + docProps/core.xml
+    // の両読み出しで共有し、累積が cap を超えたら Err にする (codex P2,
+    // PR #70 round 2 zip-bomb hardening: 個々のエントリが cap 未満でも
+    // 積算で無制限に膨らむのを防ぐ)。
+    let mut budget: u64 = 0;
+    let doc_xml =
+        super::ooxml::read_zip_part(&mut zip, path_hint, "word/document.xml", &mut budget, cap)?
+            .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
+    // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
+    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap)?;
+    super::ooxml::warn_if_truncated(path_hint, "word/document.xml", &doc_xml);
+    let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
+    let raw_content = super::join_chunk_bodies(&chunks);
+    Ok(ParsedDocument {
+        frontmatter,
+        chunks,
+        raw_content,
+        frontmatter_error: None,
+    })
 }
 
 // ---------------------------------------------------------------------------

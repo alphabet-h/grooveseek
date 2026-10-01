@@ -1117,4 +1117,73 @@ mod tests {
             }
         }
     }
+
+    /// feature-61 (codex critical): the read entry of **every** binary parser
+    /// the registry can build ignores the budget it was built with. Built from
+    /// [`KNOWN_IDS`], so a binary format added later lands here and fails until
+    /// it has a fixture -- which is the point: a parser that carries a
+    /// construction-time budget and does not override
+    /// [`crate::parser::Parser::parse_bytes_for_read_inner`] leaks `[index]`
+    /// into MCP reads.
+    #[test]
+    fn every_binary_parser_reads_with_the_default_budget() {
+        use crate::parser::ParserExt;
+        use std::io::Write;
+
+        fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                for (name, body) in entries {
+                    zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(body).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            buf
+        }
+
+        let ten: &[u8] = b"0123456789";
+        let fixture = |ext: &str| -> Vec<u8> {
+            match ext {
+                "docx" => zip_of(&[("word/document.xml", ten), ("docProps/core.xml", ten)]),
+                "pptx" => zip_of(&[("docProps/core.xml", ten), ("ppt/slides/slide1.xml", ten)]),
+                "xlsx" => zip_of(&[("a.xml", ten), ("b.xml", ten)]),
+                "pdf" => include_bytes!("../../tests/fixtures/binary/minimal.pdf").to_vec(),
+                other => panic!("add a fixture for the binary format {other:?}"),
+            }
+        };
+        let ids: Vec<String> = KNOWN_IDS.iter().map(|s| s.to_string()).collect();
+        let tight = FileSizeLimits {
+            decompressed: crate::parser::FileSizeLimit::Bytes(15),
+            ..FileSizeLimits::default()
+        };
+        let tight =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, tight)
+                .expect("every known parser");
+
+        let binary = tight.binary_extensions();
+        assert!(!binary.is_empty());
+        for ext in binary {
+            let bytes = fixture(ext);
+            let hint = format!("budget.{ext}");
+            let parser = tight.by_extension(ext).expect("registered");
+            let index = parser
+                .parse_bytes(&bytes, &hint, &[])
+                .expect_err("15 bytes is under what this document inflates to");
+            assert!(
+                index.to_string().contains("max_decompressed_size"),
+                "{ext}: {index}"
+            );
+            // Not a real workbook, so the read may still fail -- but never for
+            // the 15-byte budget the index side was given.
+            if let Err(e) = parser.parse_bytes_for_read(&bytes, &hint, &[]) {
+                assert!(
+                    !e.to_string().contains("max_decompressed_size"),
+                    "{ext}: the read path took the index budget: {e}"
+                );
+            }
+        }
+    }
 }
