@@ -235,7 +235,8 @@ impl StyleTable {
     /// the break would end a `w:basedOn` walk early and call "body" a paragraph the spelling
     /// rule calls a heading, and nothing in the result would show which. The root is the
     /// first element -- a declaration, a comment or a byte-order mark before it is not -- and
-    /// it has to be `w:styles` and to close before the input ends.
+    /// it has to be `w:styles` and to close before the input ends. An attribute quick-xml
+    /// rejects, on any element of the part, is an XML error too ([`StylesWalk::element`]).
     ///
     /// Only the root's direct `<w:style>` children are styles, and of each only its own
     /// `w:type` / `w:styleId`, its direct `w:name` / `w:basedOn` and the `w:outlineLvl`
@@ -341,7 +342,14 @@ struct PendingStyle {
 
 impl StylesWalk {
     /// A `Start` (`opens`) or `Empty` element, met with [`Self::depth`] elements open.
+    ///
+    /// Every attribute of every element is checked first, the ones the walk does not read
+    /// included (`w:rPr`, `w:latentStyles`, `w:docDefaults` and the rest): an attribute
+    /// quick-xml rejects anywhere makes the part not wholly readable.
     fn element(&mut self, e: &BytesStart, opens: bool) -> Result<(), StylesUnusable> {
+        for attr in e.attributes() {
+            attr.map_err(|err| StylesUnusable::Xml(err.to_string()))?;
+        }
         let qname = e.name();
         let name = super::ooxml_local(qname.as_ref());
         let depth = self.depth;
@@ -362,8 +370,8 @@ impl StylesWalk {
         match depth {
             1 if name == b"style" => {
                 let style = PendingStyle {
-                    id: attr_value(e, b"styleId").map(|v| style_id_key(&v)),
-                    paragraph: attr_value(e, b"type").is_none_or(|t| t == b"paragraph"),
+                    id: attr_value(e, b"styleId")?.map(|v| style_id_key(&v)),
+                    paragraph: attr_value(e, b"type")?.is_none_or(|t| t == b"paragraph"),
                     ..PendingStyle::default()
                 };
                 if opens {
@@ -380,10 +388,10 @@ impl StylesWalk {
                     match name {
                         b"name" if !style.name_read => {
                             style.name_read = true;
-                            style.def.name = attr_value(e, b"val").and_then(|v| style_name(&v));
+                            style.def.name = attr_value(e, b"val")?.and_then(|v| style_name(&v));
                         }
                         b"basedOn" if style.def.based_on.is_none() => {
-                            style.def.based_on = attr_value(e, b"val").map(|v| style_id_key(&v));
+                            style.def.based_on = attr_value(e, b"val")?.map(|v| style_id_key(&v));
                         }
                         _ => {}
                     }
@@ -393,7 +401,7 @@ impl StylesWalk {
                 if let Some(style) = self.current.as_mut()
                     && style.def.outline_lvl.is_none()
                 {
-                    style.def.outline_lvl = attr_value(e, b"val").and_then(|v| outline_level(&v));
+                    style.def.outline_lvl = attr_value(e, b"val")?.and_then(|v| outline_level(&v));
                 }
             }
             _ => {}
@@ -446,11 +454,20 @@ impl StylesWalk {
 
 /// The value of `e`'s attribute whose local name is `local`, as written (entities not
 /// resolved), or `None` when it has none.
-fn attr_value(e: &BytesStart, local: &[u8]) -> Option<Vec<u8>> {
-    e.attributes()
-        .flatten()
-        .find(|a| super::ooxml_local(a.key.as_ref()) == local)
-        .map(|a| a.value.into_owned())
+///
+/// Every attribute of `e` is read, not only up to the one asked for, and an attribute
+/// quick-xml rejects -- a name given twice, a value without quotes -- is a
+/// [`StylesUnusable::Xml`], so [`StyleTable::parse`] drops the whole part rather than read a
+/// style from a tag it could not read.
+fn attr_value(e: &BytesStart, local: &[u8]) -> Result<Option<Vec<u8>>, StylesUnusable> {
+    let mut found = None;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|err| StylesUnusable::Xml(err.to_string()))?;
+        if found.is_none() && super::ooxml_local(attr.key.as_ref()) == local {
+            found = Some(attr.value.into_owned());
+        }
+    }
+    Ok(found)
 }
 
 /// A style ID as the table compares it: the attribute's value with its XML entities resolved
@@ -2107,6 +2124,71 @@ mod tests {
                 "({case})"
             );
         }
+    }
+
+    /// feature-62 (R2.3, codex review): a `<w:style>` whose attribute quick-xml rejects -- here
+    /// `w:type` given twice -- makes the whole part unusable, so the well-formed style `1`
+    /// before it is not used and every paragraph falls back to the spelling rule. The reader
+    /// itself does not err on the tag; only the attribute iterator does. The one stderr line
+    /// for an unusable part is the CLI integration test C2's to observe (in the
+    /// `index_docx_heading_policy` test crate), as for T13.
+    #[test]
+    fn a_styles_part_with_a_malformed_attribute_is_not_used() {
+        let heading_1 = paragraph_style("1", Some("heading 1"), None, None);
+        let part = |second_type: &str| {
+            format!(
+                r#"<w:styles xmlns:w="{W_NS}">{heading_1}<w:style w:type="paragraph"{second_type} w:styleId="2"><w:name w:val="heading 2"/></w:style></w:styles>"#
+            )
+        };
+        let duplicated = part(r#" w:type="paragraph""#);
+        let clean = part("");
+        assert!(
+            !quick_xml_errs(duplicated.as_bytes()),
+            "premise: the reader reaches Eof; only the attributes err"
+        );
+
+        assert!(matches!(
+            StyleTable::parse(duplicated.as_bytes()),
+            Err(StylesUnusable::Xml(_))
+        ));
+        assert_eq!(level_with(Some(duplicated.as_bytes()), "1"), None);
+        assert_eq!(level_with(Some(duplicated.as_bytes()), "Heading1"), Some(2));
+
+        let table =
+            StyleTable::parse(clean.as_bytes()).expect("without the duplicate it is usable");
+        assert_eq!(verdict_for(&table, "1"), StyleVerdict::Heading(2));
+        assert_eq!(level_with(Some(clean.as_bytes()), "1"), Some(2));
+    }
+
+    /// feature-62 (R2.3, codex review): the same holds for an element the walk never reads --
+    /// here a `w:lsdException` under `w:latentStyles` with `w:name` given twice. The heading
+    /// style itself is well-formed, and still the part is not used.
+    #[test]
+    fn a_malformed_attribute_anywhere_in_the_styles_part_is_not_used() {
+        let heading_1 = paragraph_style("1", Some("heading 1"), None, None);
+        let part = |second_name: &str| {
+            format!(
+                r#"<w:styles xmlns:w="{W_NS}"><w:latentStyles w:defQFormat="0"><w:lsdException w:name="Normal"{second_name} w:qFormat="1"/></w:latentStyles>{heading_1}</w:styles>"#
+            )
+        };
+        let duplicated = part(r#" w:name="Normal""#);
+        let clean = part("");
+        assert!(
+            !quick_xml_errs(duplicated.as_bytes()),
+            "premise: the reader reaches Eof; only the attributes err"
+        );
+
+        assert!(matches!(
+            StyleTable::parse(duplicated.as_bytes()),
+            Err(StylesUnusable::Xml(_))
+        ));
+        assert_eq!(level_with(Some(duplicated.as_bytes()), "1"), None);
+        assert_eq!(level_with(Some(duplicated.as_bytes()), "Heading1"), Some(2));
+
+        let table =
+            StyleTable::parse(clean.as_bytes()).expect("without the duplicate it is usable");
+        assert_eq!(verdict_for(&table, "1"), StyleVerdict::Heading(2));
+        assert_eq!(level_with(Some(clean.as_bytes()), "1"), Some(2));
     }
 
     type Section = (Option<String>, Option<u8>, String, Option<String>);
