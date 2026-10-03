@@ -348,3 +348,71 @@ fn broken_or_oversized_styles_parts_are_named_on_stderr() {
     );
     assert_dir_empty(&fx.cache);
 }
+
+/// feature-62 PR-B: an index whose `.docx` rows were split by the style-ID spelling re-reads
+/// each unchanged `.docx` once, through `groove index`, and records that it has (ADR-0028).
+/// "Rewriting" a row here means an UPDATE of `chunks.heading` or `chunks.context_text` in the
+/// index: the embeddings and full-text rows are left as they are, so a run that does not
+/// re-read the document leaves the rewrite visible. Every test removes the policy key itself
+/// before the run it is about, so it holds whether or not an earlier run recorded the key.
+mod reread_pass {
+    use super::*;
+    use rusqlite::Connection;
+
+    const POLICY_KEY: &str = "docx_heading_policy";
+
+    fn db(fx: &Fixture) -> Connection {
+        Connection::open(fx.layout.root().join(".groove.db")).expect("open the index")
+    }
+
+    fn delete_meta(fx: &Fixture, key: &str) {
+        db(fx)
+            .execute("DELETE FROM index_meta WHERE key = ?1", [key])
+            .expect("delete an index_meta key");
+    }
+
+    /// One text column of `rel`'s chunks, in chunk order.
+    fn column(fx: &Fixture, rel: &str, name: &str) -> Vec<Option<String>> {
+        let conn = db(fx);
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT c.{name} FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = ?1 ORDER BY c.chunk_index"
+            ))
+            .expect("prepare");
+        stmt.query_map([rel], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    }
+
+    /// Rewrite the context of every chunk of `rel` to `context`.
+    fn set_contexts(fx: &Fixture, rel: &str, context: &str) {
+        db(fx)
+            .execute(
+                "UPDATE chunks SET context_text = ?1 WHERE document_id = (SELECT id FROM documents WHERE path = ?2)",
+                [context, rel],
+            )
+            .expect("rewrite contexts");
+    }
+
+    fn contexts(fx: &Fixture, rel: &str) -> Vec<Option<String>> {
+        column(fx, rel, "context_text")
+    }
+
+    /// feature-62 I1s (AC23): under Static mode a changed context alone makes the re-read
+    /// rewrite the document.
+    #[test]
+    fn a_static_index_compares_the_context_when_it_rereads_a_docx() {
+        let fx = docx_kb("groove-f62-i1s");
+        configure(&fx, "", MD_AND_DOCX, "[contextual]\nenabled = true\n");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        index_stderr(&fx);
+        let written = contexts(&fx, "quarry.docx");
+        set_contexts(&fx, "quarry.docx", "Rewritten context");
+        delete_meta(&fx, POLICY_KEY);
+
+        let second = index_stderr(&fx);
+        assert!(second.contains("(1 updated, "), "{second}");
+        assert_eq!(contexts(&fx, "quarry.docx"), written);
+    }
+}

@@ -977,6 +977,11 @@ pub fn rebuild_index(
     // unchanged Markdown document once; `--force` re-parses everything anyway.
     let refresh_frontmatter =
         !force && db.read_frontmatter_policy()?.as_deref() != Some(FRONTMATTER_POLICY);
+    // (feature-62) The same kind of generation for `.docx`: an index whose `.docx` rows were
+    // split before headings were read from `word/styles.xml` re-reads each unchanged one once
+    // ([`DOCX_HEADING_POLICY`], ADR-0028). `--force` re-parses everything anyway.
+    let refresh_docx =
+        !force && db.read_docx_heading_policy()?.as_deref() != Some(DOCX_HEADING_POLICY);
 
     // (feature-58) The keys the schema declares are what `document_fields` holds.
     // `schema` was already loaded above, before the destructive reset, from the
@@ -1188,6 +1193,15 @@ pub fn rebuild_index(
         Err(e) => tracing::warn!("failed to record document sizes: {e}"),
     }
 
+    // (feature-62) Which unchanged `.docx` documents the one-time pass re-reads: decided once,
+    // after the renames above, since a renamed row is under its new path now.
+    let mut rereads: HashSet<String> = HashSet::new();
+    for entry in &disk_entries {
+        if rereads_unchanged_docx(refresh_docx, db, registry, entry, &renamed_new_paths)? {
+            rereads.insert(entry.rel.clone());
+        }
+    }
+
     // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
     // embedder rather than counted from `Updated`, which a metadata-only update also
     // returns. MCP holds the embedder's lock for the whole run (`server.rs`), so no
@@ -1240,6 +1254,8 @@ pub fn rebuild_index(
         // させ、他の unchanged file の hash fast path はそのまま活かす。
         let mode = if force || renamed_new_paths.contains(&entry.rel) {
             Reindex::Force
+        } else if rereads.contains(&entry.rel) {
+            Reindex::Reparse
         } else {
             Reindex::Incremental {
                 check_frontmatter: refresh_frontmatter,
@@ -1546,6 +1562,10 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
 ///
 /// A changed file whose new chunks match keeps its embeddings and has only its metadata
 /// rewritten ([`index_single_disk_entry`]).
+///
+/// (feature-62) The one-time `.docx` pass ([`Reindex::Reparse`]) asks the same question of
+/// an unchanged document it re-read: matching chunks mean the row already splits the way the
+/// new heading rule does (AGENTS.md "One question gets one implementation").
 fn stored_chunks_match(
     db: &Database,
     rel: &str,
@@ -1582,6 +1602,10 @@ fn stored_chunks_match(
 /// as "not read" -- the ones that return before the parser runs, and
 /// [`SKIPPED_EMBED_REJECTED`], which parsed the file but wrote nothing from it; this one
 /// counts as read only when the bytes parsed are the bytes the retained row holds.
+///
+/// (feature-62) Under [`Reindex::Reparse`] it also means the row is gone: the document the old
+/// heading rule split has nothing to index under the new one, and [`index_single_disk_entry`]
+/// drops the row, the way `--force` would leave none.
 const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
 
 /// The [`SingleResult::Skipped`] reason for a file whose input the embedding endpoint
@@ -1603,6 +1627,9 @@ const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
 /// index: only such a file can come back later with a matching hash and slip past the check
 /// for good, and the hash is what says whether the bytes that were read this run are the ones
 /// the row was written from.
+///
+/// (feature-62) The one-time `.docx` pass asks it with `"docx"`, for which rows it re-reads
+/// ([`rereads_unchanged_docx`]).
 fn indexed_hash_for(
     db: &Database,
     registry: &Registry,
@@ -1620,6 +1647,28 @@ fn indexed_hash_for(
         return Ok(None);
     }
     db.get_document_hash(rel)
+}
+
+/// (feature-62) Whether [`rebuild_index`] re-reads `entry` in the one-time `.docx` pass
+/// ([`Reindex::Reparse`]): the pass is running (`refresh_docx`), the entry is not already
+/// re-read by force (`renamed_new_paths`: a rename under Static mode, or one across parsers),
+/// and the index holds a `.docx` row for it whose hash is the scan's. A `.docx` whose content
+/// changed is left to the ordinary path, which writes its new hash and metadata.
+///
+/// The one predicate the per-document mode comes from; [`rebuild_index`] asks it once per
+/// entry and keeps the answer.
+fn rereads_unchanged_docx(
+    refresh_docx: bool,
+    db: &Database,
+    registry: &Registry,
+    entry: &DiskEntry,
+    renamed_new_paths: &HashSet<String>,
+) -> Result<bool> {
+    if !refresh_docx || renamed_new_paths.contains(&entry.rel) {
+        return Ok(false);
+    }
+    let row = indexed_hash_for(db, registry, &entry.rel, "docx")?;
+    Ok(row.is_some_and(|row| row == entry.hash))
 }
 
 /// How [`index_single_disk_entry`] treats a file whose content hash the index
@@ -1645,6 +1694,12 @@ enum Reindex {
         check_frontmatter: bool,
         refresh_fields: bool,
     },
+    /// (feature-62) Read and parse a file whose hash matches: the one-time `.docx` pass of
+    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`]). Unlike [`Reindex::Incremental`], a matching
+    /// hash does not return early; unlike [`Reindex::Force`], chunks that still match the row's
+    /// are neither re-embedded nor written. Chunks that differ are written the ordinary way, and
+    /// no chunks at all drop the row, since `--force` would leave none.
+    Reparse,
 }
 
 /// 単一 DiskEntry を index する内部関数。
@@ -1679,12 +1734,15 @@ fn index_single_disk_entry(
     row_dropped_unless_updated: bool,
 ) -> Result<SingleResult> {
     let force = mode == Reindex::Force;
+    // (feature-62) A re-read the one-time docx pass asked for: past the fast path below, but
+    // not a forced one.
+    let reparse = mode == Reindex::Reparse;
     let (refresh_frontmatter, refresh_fields) = match mode {
         Reindex::Incremental {
             check_frontmatter,
             refresh_fields,
         } => (check_frontmatter, refresh_fields),
-        Reindex::Force => (false, false),
+        Reindex::Force | Reindex::Reparse => (false, false),
     };
     // (AV-12) Every path that can put a document into an index arrives here, which is why the
     // chunking policy is resolved here rather than at each caller: the first attempt covered
@@ -1719,6 +1777,7 @@ fn index_single_disk_entry(
         });
     };
     let unchanged = !force
+        && !reparse
         && db
             .get_document_hash(&entry.rel)?
             .is_some_and(|existing| existing == entry.hash);
@@ -1793,6 +1852,16 @@ fn index_single_disk_entry(
         );
     }
 
+    // (feature-62) The pass re-reads a file because the scan's hash matched its row. Bytes that
+    // are not those bytes say nothing about the row -- the reason the frontmatter check below
+    // gives (#251, codex P2 round 5) -- so the row is left for the next run.
+    if reparse && sha256_hex_bytes(&bytes) != entry.hash {
+        return Ok(SingleResult::Skipped {
+            reason: SKIPPED_CHANGED_DURING_READ,
+            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        });
+    }
+
     let (category, topic) = extract_category_topic(&entry.rel);
 
     // (#251) The upgrade check: the content is what the index already holds, so the only
@@ -1848,6 +1917,13 @@ fn index_single_disk_entry(
     }
 
     if parsed.chunks.is_empty() {
+        // (feature-62) Under the new heading rule this document has nothing to index -- say
+        // `exclude_headings` now covers every section. The row was written by the old rule and
+        // `--force` would leave none, so it goes, the way `settle_cross_parser_rename` settles
+        // a row the new parser has nothing for. The caller still counts a skip.
+        if reparse {
+            db.delete_document(&entry.rel)?;
+        }
         return Ok(SingleResult::Skipped {
             reason: SKIPPED_NO_CHUNKS,
             frontmatter_unparsed: parsed.frontmatter_error.is_some(),
@@ -1871,6 +1947,12 @@ fn index_single_disk_entry(
     // 不要になったため撤去した。Off モードは context を embed/保存しないため、
     // 従来通り (heading, content) のみで比較する (挙動不変)。
     let chunks_unchanged = stored_chunks_match(db, &entry.rel, &parsed.chunks, context_mode);
+
+    // (feature-62) The pass found the row already split the way this parser splits it: nothing
+    // to write, and the hash already matches.
+    if reparse && chunks_unchanged {
+        return Ok(SingleResult::Unchanged);
+    }
 
     if !force && chunks_unchanged {
         let tx = db.begin_transaction()?;
@@ -2871,6 +2953,17 @@ pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
 /// [`rebuild_index`] would never read them again. The value is a generation, like
 /// [`CODE_CHUNK_POLICY`]: it changes when what the parser writes changes.
 pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
+
+/// (feature-62) Recorded in `index_meta.docx_heading_policy` once every `.docx` row of the
+/// index has been looked at by a build that reads `.docx` headings from `word/styles.xml`
+/// (ADR-0027).
+///
+/// Absence means "not looked at yet": an index written before that rule holds `.docx` rows
+/// split by the style-ID spelling, with a matching content hash, and the unchanged fast path
+/// in [`rebuild_index`] would never read them again. A generation, like
+/// [`FRONTMATTER_POLICY`], and a key of its own, since the two passes cover different files and
+/// do different work (ADR-0028).
+pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
 
 /// Where [`index_single_disk_entry`] gets the declared-field set from (feature-58; codex P2
 /// round 9 / 12 on PR #291, local Codex after round 12).
@@ -6398,6 +6491,253 @@ mod tests {
             .forced_rebuild_rejections_message(REJECTIONS_NAMED_ON_SERVER_STDERR)
             .contains("1 file(s) during a forced rebuild (each named on the server's stderr)"),
             "{message}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-62: the one-time .docx pass
+    // -----------------------------------------------------------------------
+
+    /// A registry that reads Markdown and docx.
+    fn docx_registry() -> Registry {
+        Registry::from_enabled(&["md".into(), "docx".into()]).unwrap()
+    }
+
+    /// An index with two-dimensional vectors, matching [`unreachable_embedder`].
+    fn reparse_db() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("test-model", 2).unwrap();
+        db
+    }
+
+    /// An embedder that is never reached: these tests take paths that embed nothing, and one
+    /// that did would fail on the closed port rather than download a model.
+    fn unreachable_embedder() -> Embedder {
+        let config = crate::embedder::OpenAiCompatibleConfig::new(
+            "http://127.0.0.1:1/v1/embeddings".to_string(),
+            "query-model".to_string(),
+            "document-model".to_string(),
+            2,
+            false,
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("a valid OpenAI-compatible config");
+        Embedder::with_settings(crate::embedder::EmbeddingSettings::openai_compatible(
+            config,
+        ))
+        .expect("building the provider makes no request")
+    }
+
+    /// Write `bytes` to `dir/rel` and return the entry the scan would hand the loop for it.
+    fn docx_entry(dir: &std::path::Path, rel: &str, bytes: &[u8]) -> DiskEntry {
+        let full = dir.join(rel);
+        std::fs::write(&full, bytes).unwrap();
+        DiskEntry {
+            rel: rel.to_string(),
+            hash: sha256_hex_bytes(bytes),
+            full,
+            size: bytes.len() as u64,
+        }
+    }
+
+    /// The chunks the registry's docx parser makes of `bytes`, under the default exclusions
+    /// [`index_single_disk_entry`] uses when none are configured.
+    fn parse_docx(registry: &Registry, rel: &str, bytes: &[u8]) -> Vec<crate::parser::Chunk> {
+        use crate::parser::ParserExt;
+        registry
+            .by_extension("docx")
+            .unwrap()
+            .parse_bytes(bytes, rel, crate::parser::DEFAULT_EXCLUDED_HEADINGS)
+            .unwrap()
+            .chunks
+    }
+
+    /// A row for `rel` holding `chunks` under `content_hash`.
+    fn write_row(db: &Database, rel: &str, content_hash: &str, chunks: &[crate::parser::Chunk]) {
+        let id = db
+            .upsert_document(rel, None, None, None, None, &[], None, content_hash, 1)
+            .unwrap();
+        for (i, c) in chunks.iter().enumerate() {
+            db.insert_chunk(
+                id,
+                i as i32,
+                c.heading.as_deref(),
+                c.level,
+                &c.content,
+                c.context.as_deref(),
+                &[0.6_f32, 0.8],
+                1.0,
+            )
+            .unwrap();
+        }
+    }
+
+    /// [`index_single_disk_entry`] on `entry` in `mode`, under Off mode with no declared
+    /// fields, through [`unreachable_embedder`].
+    fn reindex(
+        db: &Database,
+        registry: &Registry,
+        entry: &DiskEntry,
+        mode: Reindex,
+    ) -> SingleResult {
+        let mut embedder = unreachable_embedder();
+        index_single_disk_entry(
+            db,
+            &mut embedder,
+            entry,
+            None,
+            registry,
+            mode,
+            ContextMode::Off,
+            DeclaredSet::Known {
+                list: &[],
+                pass: None,
+                generation: "[]",
+            },
+            false,
+        )
+        .unwrap()
+    }
+
+    /// feature-62 (R4.3 5, J9): a re-read whose chunks match the row's writes nothing and
+    /// reports the document unchanged, so it is not re-embedded and not counted as updated.
+    #[test]
+    fn a_reparse_whose_chunks_match_writes_nothing_and_reports_unchanged() {
+        use crate::parser::docx::fixture::{PStyle, numeric_heading_docx};
+        let dir = mk_tmp("f62-reparse-match");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let bytes = numeric_heading_docx(PStyle::Empty);
+        let entry = docx_entry(&dir.0, "quarry.docx", &bytes);
+        let chunks = parse_docx(&registry, "quarry.docx", &bytes);
+        write_row(&db, "quarry.docx", &entry.hash, &chunks);
+
+        assert_eq!(
+            reindex(&db, &registry, &entry, Reindex::Reparse),
+            SingleResult::Unchanged
+        );
+        assert_eq!(
+            db.get_document_hash("quarry.docx").unwrap(),
+            Some(entry.hash.clone())
+        );
+    }
+
+    /// feature-62 (R4.3 4, J17): a re-read that leaves nothing to index drops the row, the
+    /// way `--force` leaves none; an ordinary change that leaves nothing keeps it, as before.
+    #[test]
+    fn a_reparse_that_leaves_no_chunks_drops_the_row_and_an_ordinary_change_keeps_it() {
+        use crate::parser::docx::fixture::{document_xml_from_body, docx_with_parts};
+        let dir = mk_tmp("f62-reparse-empty");
+        let registry = docx_registry();
+        let empty_doc = document_xml_from_body("");
+        let bytes = docx_with_parts(&[("word/document.xml", empty_doc.as_bytes())]);
+        let entry = docx_entry(&dir.0, "hollow.docx", &bytes);
+        let old = [crate::parser::Chunk {
+            heading: Some("Written by the old rule".to_string()),
+            level: None,
+            content: "a body the new rule no longer yields".to_string(),
+            ..Default::default()
+        }];
+        let no_chunks = SingleResult::Skipped {
+            reason: SKIPPED_NO_CHUNKS,
+            frontmatter_unparsed: false,
+        };
+
+        let db = reparse_db();
+        write_row(&db, "hollow.docx", &entry.hash, &old);
+        assert_eq!(reindex(&db, &registry, &entry, Reindex::Reparse), no_chunks);
+        assert_eq!(
+            db.get_document_hash("hollow.docx").unwrap(),
+            None,
+            "the row is dropped"
+        );
+
+        let db = reparse_db();
+        write_row(&db, "hollow.docx", "hash-of-earlier-bytes", &old);
+        let ordinary = Reindex::Incremental {
+            check_frontmatter: false,
+            refresh_fields: false,
+        };
+        assert_eq!(reindex(&db, &registry, &entry, ordinary), no_chunks);
+        assert_eq!(
+            db.get_document_hash("hollow.docx").unwrap().as_deref(),
+            Some("hash-of-earlier-bytes"),
+            "a changed file that yields nothing keeps its row, as before"
+        );
+    }
+
+    /// feature-62 (R4.3 3, J10): a re-read whose bytes are not the ones the scan hashed says
+    /// nothing about the row, so it is a skip and the row is left alone.
+    #[test]
+    fn a_reparse_of_bytes_that_changed_since_the_scan_is_a_skip() {
+        use crate::parser::docx::fixture::{PStyle, numeric_heading_docx};
+        let dir = mk_tmp("f62-reparse-race");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let bytes = numeric_heading_docx(PStyle::Empty);
+        let entry = docx_entry(&dir.0, "quarry.docx", &bytes);
+        let scanned = DiskEntry {
+            hash: "hash-the-scan-saw".to_string(),
+            ..entry
+        };
+        write_row(&db, "quarry.docx", &scanned.hash, &[]);
+        assert_eq!(
+            reindex(&db, &registry, &scanned, Reindex::Reparse),
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.get_document_hash("quarry.docx").unwrap().as_deref(),
+            Some("hash-the-scan-saw")
+        );
+    }
+
+    /// feature-62 (R4.3, Review Focus 2): the pass re-reads a `.docx` by its parser, not its
+    /// spelling, only when its row's hash is the scan's, and never one a rename already forces.
+    #[test]
+    fn rereads_unchanged_docx_reads_the_parser_not_the_spelling() {
+        let db = Database::open_in_memory().unwrap();
+        let registry = docx_registry();
+        for (rel, hash) in [
+            ("upper.DOCX", "h-upper"),
+            ("edited.docx", "h-old"),
+            ("note.md", "h-note"),
+            ("moved.docx", "h-moved"),
+        ] {
+            db.upsert_document(rel, None, None, None, None, &[], None, hash, 1)
+                .unwrap();
+        }
+        let none: HashSet<String> = HashSet::new();
+        let renamed: HashSet<String> = ["moved.docx".to_string()].into_iter().collect();
+        let asks = |rel: &str, hash: &str, refresh: bool, forced: &HashSet<String>| {
+            let entry = mk_entry(rel, hash);
+            rereads_unchanged_docx(refresh, &db, &registry, &entry, forced).unwrap()
+        };
+        assert!(
+            asks("upper.DOCX", "h-upper", true, &none),
+            "upper case is a docx too"
+        );
+        assert!(
+            !asks("edited.docx", "h-new", true, &none),
+            "a changed file takes the ordinary path"
+        );
+        assert!(
+            !asks("note.md", "h-note", true, &none),
+            "Markdown is not this pass's"
+        );
+        assert!(
+            !asks("fresh.docx", "h-fresh", true, &none),
+            "no row, nothing to re-read"
+        );
+        assert!(asks("moved.docx", "h-moved", true, &none));
+        assert!(
+            !asks("moved.docx", "h-moved", true, &renamed),
+            "a forced rename is re-read already"
+        );
+        assert!(
+            !asks("upper.DOCX", "h-upper", false, &none),
+            "the pass is not running"
         );
     }
 }
