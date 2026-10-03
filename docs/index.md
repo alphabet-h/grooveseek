@@ -80,6 +80,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 25. Skip inputs the embedding endpoint rejects, and retry the failures that pass | [en](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md) | [ja](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md) |
 | 26. Make the index size caps configurable, spell "no limit" out, and keep the read caps | [en](decisions/0026-configurable-index-size-caps.md) | [ja](decisions/0026-configurable-index-size-caps.ja.md) |
 | 27. Detect docx headings from style names and their basedOn chain | [en](decisions/0027-detect-docx-headings-from-style-names.md) | [ja](decisions/0027-detect-docx-headings-from-style-names.ja.md) |
+| 28. Re-read unchanged docx once and settle each row | [en](decisions/0028-reread-unchanged-docx-once-per-index.md) | [ja](decisions/0028-reread-unchanged-docx-once-per-index.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and
