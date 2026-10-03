@@ -359,8 +359,22 @@ mod reread_pass {
     use super::*;
     use crate::common::embed_cli::note;
     use crate::common::embed_mock::DOC_MODEL;
+    use crate::common::embed_mock::hermetic;
+    use crate::common::temp::TempRoot;
+    use grooveseek::config::Config;
+    use grooveseek::db::{ContextMode, Database};
+    use grooveseek::embedder::Embedder;
+    use grooveseek::indexer::progress::{
+        CancelToken, ProgressEvent, ProgressMode, ProgressReporter,
+    };
+    use grooveseek::indexer::{
+        IndexResult, SingleResult, load_declared_schema, rebuild_index, reindex_single_file,
+    };
     use rusqlite::{Connection, OptionalExtension};
     use sha2::{Digest, Sha256};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     const POLICY_KEY: &str = "docx_heading_policy";
     const NOTICE: &str = "Re-reading 1 unchanged .docx document(s) once:";
@@ -793,6 +807,290 @@ mod reread_pass {
             "groove-f62-i3b",
             "[index]\nmax_decompressed_size = 100\n",
             "parse failed",
+        );
+    }
+
+    /// Set on the child [`run_in_hermetic_child`] starts, so the child runs the test body.
+    const HERMETIC_CHILD: &str = "GROOVE_F62_HERMETIC_CHILD";
+
+    /// Run the test `name` (with its module path) again in a child of this test binary under
+    /// the environment [`crate::common::embed_mock::hermetic`] pins, the way the cancellation
+    /// tests do; a copy of their helper, since moving it would edit those tests (D7). `true` in
+    /// the parent, after the child passed exactly one test; `false` in the child.
+    fn run_in_hermetic_child(name: &str) -> bool {
+        if std::env::var_os(HERMETIC_CHILD).is_some() {
+            return false;
+        }
+        let cache = TempRoot::new("groove-f62-fastembed");
+        let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+        cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(HERMETIC_CHILD, "1");
+        hermetic(&mut cmd, cache.path());
+        let out = cmd.output().expect("run the test in a child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} failed in the child:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child ran no test named {name}:\n{stdout}\n{stderr}"
+        );
+        assert_dir_empty(cache.path());
+        true
+    }
+
+    /// The index and the embedder under `cfg`, opened the way `groove index` opens them.
+    fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
+        let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
+        let db_path = grooveseek::resolve_db_path(fx.kb());
+        let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
+        db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
+            .expect("embedding meta");
+        let embedder = Embedder::with_settings(embedding).expect("build the embedder");
+        (db, embedder)
+    }
+
+    /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
+    /// `groove index` wires it, reporting to `progress`.
+    fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
+        let kb = fx.kb();
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(kb).expect("parser registry");
+        let schema = load_declared_schema(kb).expect("groove-schema.toml");
+        let (db, mut embedder) = open_in_process(fx, &cfg);
+        rebuild_index(
+            &db,
+            &mut embedder,
+            kb,
+            schema,
+            false,
+            cfg.exclude_headings.as_deref(),
+            &cfg.resolve_exclude_dirs(),
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+    }
+
+    /// `len` bytes deflate cannot shrink, so a part made of them keeps a docx's file size up.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state: u32 = 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// feature-62 I6 (AC30, I-4): a cancelled run records no policy and marks no row, though a
+    /// document it could not parse and one the scan skipped were both met before the stop;
+    /// the next run marks both and records the policy. A run that wrote the placeholder inside
+    /// the loop or right after the scan would fail the first half. Stopped after the second
+    /// document event, by the check before the third document (C3).
+    #[test]
+    fn a_cancelled_run_leaves_the_docx_policy_and_hashes_untouched() {
+        if run_in_hermetic_child(
+            "reread_pass::a_cancelled_run_leaves_the_docx_policy_and_hashes_untouched",
+        ) {
+            return;
+        }
+        a_cancelled_run_records_nothing("groove-f62-i6", 2);
+    }
+
+    /// feature-62 I6 at C4 -- a pin stronger than spec AC30, which stops the run inside the
+    /// loop only: stopped after the third and last document event, the run passes no check
+    /// inside the loop and stops at the one after it (C4), before the deletion sweep. A run that
+    /// recorded the policy or the placeholders after the loop but before that check would fail.
+    #[test]
+    fn a_run_cancelled_after_its_last_document_records_nothing_either() {
+        if run_in_hermetic_child(
+            "reread_pass::a_run_cancelled_after_its_last_document_records_nothing_either",
+        ) {
+            return;
+        }
+        a_cancelled_run_records_nothing("groove-f62-i6c4", 3);
+    }
+
+    /// I6: a knowledge base of (i) two readable `.docx`, (ii) one that walks first and fails to
+    /// parse under the run's budget and (iii) one the scan skips under the run's file cap,
+    /// first indexed under the default caps; then a run under the lower caps whose callback
+    /// sets the cancel token after its `cancel_at`-th document event (the documents report, in
+    /// walk order, a-bloat as unchanged and b-one and c-two as indexed); then an ordinary run.
+    fn a_cancelled_run_records_nothing(prefix: &str, cancel_at: usize) {
+        const BIN_CAP: usize = 65_536;
+        const DEC_CAP: usize = 16_384;
+        let fx = docx_kb(prefix);
+
+        // (ii) Walked first, and over the run's budget on word/document.xml alone.
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        // (i) Two documents that fit both of the run's caps.
+        let one = numeric_heading_docx("Ledger", &[]);
+        let two = numeric_heading_docx("Vellum", &[]);
+        // (iii) Over the run's file cap: a picture no part reads, too random to compress.
+        let picture = incompressible(BIN_CAP + 1);
+        let huge = numeric_heading_docx("Quarto", &[("word/media/image1.bin", picture.as_slice())]);
+        let whole = numeric_heading_document_xml().len()
+            + styles_xml(&word2010_ja_styles()).len()
+            + core_xml("Vellum").len();
+        assert!(
+            whole <= DEC_CAP && one.len() < BIN_CAP && two.len() < BIN_CAP,
+            "fixture: (i) fits both caps"
+        );
+        assert!(
+            bloat.len() < BIN_CAP && huge.len() > BIN_CAP,
+            "fixture: (ii) and (iii)"
+        );
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-one.docx", &one);
+        write_bytes(&fx, "c-two.docx", &two);
+        write_bytes(&fx, "z-huge.docx", &huge);
+
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the first run, under the default caps");
+        let (bloat_hash, huge_hash) = (sha256_hex(&bloat), sha256_hex(&huge));
+        assert_eq!(content_hash(&fx, "a-bloat.docx"), Some(bloat_hash.clone()));
+        assert_eq!(content_hash(&fx, "z-huge.docx"), Some(huge_hash.clone()));
+
+        delete_meta(&fx, POLICY_KEY);
+        set_headings(&fx, "b-one.docx", "Rewritten");
+        set_headings(&fx, "c-two.docx", "Rewritten");
+        let caps = format!(
+            "[index]\nmax_binary_file_size = {BIN_CAP}\nmax_decompressed_size = {DEC_CAP}\n"
+        );
+        configure(&fx, "", MD_AND_DOCX, &caps);
+
+        // Stop after the `cancel_at`-th document event: 2 stops at the check before c-two.docx
+        // (C3), 3 at the check after the loop (C4).
+        let token = CancelToken::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (stop, count) = (token.clone(), Arc::clone(&seen));
+        let reporter = ProgressReporter::with_callback(Box::new(move |ev| {
+            let document = matches!(
+                ev,
+                ProgressEvent::Indexed { .. } | ProgressEvent::Unchanged { .. }
+            );
+            if document && count.fetch_add(1, Ordering::SeqCst) + 1 == cancel_at {
+                stop.cancel();
+            }
+        }))
+        .with_cancel(token);
+        let result = rebuild_in_process(&fx, reporter).expect("a cancelled run returns Ok");
+        assert!(result.cancelled, "{result:?}");
+        assert_eq!(
+            meta(&fx, POLICY_KEY),
+            None,
+            "a cancelled run records no policy"
+        );
+        assert_eq!(
+            content_hash(&fx, "a-bloat.docx"),
+            Some(bloat_hash),
+            "nothing is marked before the sweep"
+        );
+        assert_eq!(content_hash(&fx, "z-huge.docx"), Some(huge_hash));
+
+        let result = rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the next run");
+        assert!(!result.cancelled, "{result:?}");
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        assert_eq!(content_hash(&fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(content_hash(&fx, "z-huge.docx").as_deref(), Some(AWAITING));
+        assert_eq!(
+            headings(&fx, "c-two.docx"),
+            expected_headings(),
+            "the document the stop came before is settled now"
+        );
+    }
+
+    /// feature-62 I7 (AC31): the shape desktop sees -- a callback reporter, `force=false` --
+    /// hears `Indexed` for a re-split document and `Unchanged` for one that matched.
+    #[test]
+    fn a_resplit_docx_reports_indexed_and_a_matching_one_reports_unchanged() {
+        if run_in_hermetic_child(
+            "reread_pass::a_resplit_docx_reports_indexed_and_a_matching_one_reports_unchanged",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f62-i7");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        write_bytes(&fx, "vellum.docx", &numeric_heading_docx("Vellum", &[]));
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        delete_meta(&fx, POLICY_KEY);
+
+        let log: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let reporter = ProgressReporter::with_callback(Box::new(move |ev| {
+            let seen = match ev {
+                ProgressEvent::Indexed { rel, .. } => Some((rel.to_string(), "indexed")),
+                ProgressEvent::Unchanged { rel, .. } => Some((rel.to_string(), "unchanged")),
+                _ => None,
+            };
+            if let Some(seen) = seen {
+                sink.lock().expect("log").push(seen);
+            }
+        }));
+        rebuild_in_process(&fx, reporter).expect("second run");
+        assert_eq!(
+            *log.lock().expect("log"),
+            vec![
+                ("quarry.docx".to_string(), "indexed"),
+                ("vellum.docx".to_string(), "unchanged"),
+            ]
+        );
+    }
+
+    /// feature-62 I9 (AC33, J13): the watcher reads a changed docx by the new rule and runs no
+    /// pass over an unchanged one, even with the policy absent.
+    #[test]
+    fn the_watcher_splits_a_changed_docx_and_leaves_an_unchanged_one_alone() {
+        if run_in_hermetic_child(
+            "reread_pass::the_watcher_splits_a_changed_docx_and_leaves_an_unchanged_one_alone",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f62-i9");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        let draft = document_xml(&[(None, PREFACE)]);
+        write_bytes(
+            &fx,
+            "draft.docx",
+            &docx(&[("word/document.xml", draft.as_bytes())]),
+        );
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+        let kb = fx.kb().canonicalize().expect("canonical kb");
+        let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+        write_bytes(&fx, "draft.docx", &numeric_heading_docx("Draft", &[]));
+        let changed = reindex_single_file(&db, &mut embedder, &kb, "draft.docx", None, &registry)
+            .expect("reindex the changed document");
+        assert_eq!(
+            changed,
+            SingleResult::Updated {
+                chunks: 4,
+                frontmatter_unparsed: false
+            }
+        );
+
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        delete_meta(&fx, POLICY_KEY);
+        let unchanged =
+            reindex_single_file(&db, &mut embedder, &kb, "quarry.docx", None, &registry)
+                .expect("reindex the unchanged document");
+        assert_eq!(unchanged, SingleResult::Unchanged);
+        assert_eq!(
+            headings(&fx, "quarry.docx")[1].as_deref(),
+            Some("Rewritten")
         );
     }
 }
