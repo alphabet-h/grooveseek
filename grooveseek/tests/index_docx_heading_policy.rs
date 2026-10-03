@@ -357,9 +357,12 @@ fn broken_or_oversized_styles_parts_are_named_on_stderr() {
 /// before the run it is about, so it holds whether or not an earlier run recorded the key.
 mod reread_pass {
     use super::*;
-    use rusqlite::Connection;
+    use crate::common::embed_mock::DOC_MODEL;
+    use rusqlite::{Connection, OptionalExtension};
+    use sha2::{Digest, Sha256};
 
     const POLICY_KEY: &str = "docx_heading_policy";
+    const NOTICE: &str = "Re-reading 1 unchanged .docx document(s) once:";
 
     fn db(fx: &Fixture) -> Connection {
         Connection::open(fx.layout.root().join(".groove.db")).expect("open the index")
@@ -399,6 +402,45 @@ mod reread_pass {
         column(fx, rel, "context_text")
     }
 
+    /// Rewrite every non-empty heading of `rel`'s chunks to `heading`.
+    fn set_headings(fx: &Fixture, rel: &str, heading: &str) {
+        db(fx)
+            .execute(
+                "UPDATE chunks SET heading = ?1 WHERE heading IS NOT NULL AND document_id = (SELECT id FROM documents WHERE path = ?2)",
+                [heading, rel],
+            )
+            .expect("rewrite headings");
+    }
+
+    fn headings(fx: &Fixture, rel: &str) -> Vec<Option<String>> {
+        column(fx, rel, "heading")
+    }
+
+    /// The headings of the AC1 document's chunks, preface first.
+    fn expected_headings() -> Vec<Option<String>> {
+        vec![
+            None,
+            Some(H_FIRST.to_string()),
+            Some(H_NESTED.to_string()),
+            Some(H_SECOND.to_string()),
+        ]
+    }
+
+    fn content_hash(fx: &Fixture, rel: &str) -> Option<String> {
+        db(fx)
+            .query_row(
+                "SELECT content_hash FROM documents WHERE path = ?1",
+                [rel],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("read content_hash")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     /// feature-62 I1s (AC23): under Static mode a changed context alone makes the re-read
     /// rewrite the document.
     #[test]
@@ -414,5 +456,71 @@ mod reread_pass {
         let second = index_stderr(&fx);
         assert!(second.contains("(1 updated, "), "{second}");
         assert_eq!(contexts(&fx, "quarry.docx"), written);
+    }
+
+    /// I2 / I2s: a re-read whose sections match is announced, counted as nothing, embeds
+    /// nothing, and leaves the real hash.
+    fn a_matching_reread_embeds_nothing(prefix: &str, tables: &str) {
+        let fx = docx_kb(prefix);
+        configure(&fx, "", MD_AND_DOCX, tables);
+        let bytes = numeric_heading_docx(TITLE, &[]);
+        write_bytes(&fx, "quarry.docx", &bytes);
+        index_stderr(&fx);
+        delete_meta(&fx, POLICY_KEY);
+
+        let before = fx.mock.requests().len();
+        let second = index_stderr(&fx);
+        assert!(second.contains(NOTICE), "{second}");
+        assert!(second.contains("(0 updated, "), "{second}");
+        assert!(
+            fx.requests_since(before)
+                .iter()
+                .all(|r| r.model() != Some(DOC_MODEL)),
+            "nothing was re-embedded"
+        );
+        assert_eq!(
+            content_hash(&fx, "quarry.docx"),
+            Some(sha256_hex(&bytes)),
+            "the hash is the bytes', not a placeholder"
+        );
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-62 I2 (AC22): Off mode.
+    #[test]
+    fn an_unchanged_docx_whose_sections_match_is_not_re_embedded() {
+        a_matching_reread_embeds_nothing("groove-f62-i2", "");
+    }
+
+    /// feature-62 I2s (AC22): Static mode, whose comparison includes the context.
+    #[test]
+    fn an_unchanged_docx_whose_sections_match_is_not_re_embedded_in_static_mode() {
+        a_matching_reread_embeds_nothing("groove-f62-i2s", "[contextual]\nenabled = true\n");
+    }
+
+    /// feature-62 (R4.6, J25, Review Focus 3): `--quiet` promises start, `Found` and
+    /// `Done in` lines, so the notice stays off; the pass re-reads all the same.
+    #[test]
+    fn the_reread_notice_stays_off_under_quiet() {
+        let fx = docx_kb("groove-f62-quiet");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        index_stderr(&fx);
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        delete_meta(&fx, POLICY_KEY);
+
+        let out = fx
+            .cmd()
+            .args(["index", "--quiet", "--kb-path"])
+            .arg(fx.kb())
+            .output()
+            .expect("spawn groove index --quiet");
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(
+            headings(&fx, "quarry.docx"),
+            expected_headings(),
+            "the pass ran under --quiet too"
+        );
     }
 }

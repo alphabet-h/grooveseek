@@ -1201,6 +1201,11 @@ pub fn rebuild_index(
             rereads.insert(entry.rel.clone());
         }
     }
+    // Announced before the loop, so a run that takes long re-embedding says why even if it is
+    // stopped.
+    if !rereads.is_empty() {
+        progress.announce(&docx_reread_notice(rereads.len()));
+    }
 
     // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
     // embedder rather than counted from `Updated`, which a metadata-only update also
@@ -1655,8 +1660,8 @@ fn indexed_hash_for(
 /// and the index holds a `.docx` row for it whose hash is the scan's. A `.docx` whose content
 /// changed is left to the ordinary path, which writes its new hash and metadata.
 ///
-/// The one predicate the per-document mode comes from; [`rebuild_index`] asks it once per
-/// entry and keeps the answer.
+/// The one predicate both the per-document mode and the count in [`docx_reread_notice`] come
+/// from; [`rebuild_index`] asks it once per entry and keeps the answer.
 fn rereads_unchanged_docx(
     refresh_docx: bool,
     db: &Database,
@@ -1669,6 +1674,15 @@ fn rereads_unchanged_docx(
     }
     let row = indexed_hash_for(db, registry, &entry.rel, "docx")?;
     Ok(row.is_some_and(|row| row == entry.hash))
+}
+
+/// (feature-62) The line the one-time `.docx` pass writes before the document loop, through
+/// [`progress::ProgressReporter::announce`], so a run that takes long re-embedding says why even
+/// if it is stopped. ASCII only.
+fn docx_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .docx document(s) once: headings now come from word/styles.xml; only documents whose sections change are re-embedded"
+    )
 }
 
 /// How [`index_single_disk_entry`] treats a file whose content hash the index
@@ -6739,5 +6753,16 @@ mod tests {
             !asks("upper.DOCX", "h-upper", false, &none),
             "the pass is not running"
         );
+    }
+
+    /// feature-62 (R4.6): the notice names the count and is ASCII, since it goes to stderr.
+    #[test]
+    fn the_reread_notice_counts_the_documents_in_ascii() {
+        let notice = docx_reread_notice(3);
+        assert_eq!(
+            notice,
+            "Re-reading 3 unchanged .docx document(s) once: headings now come from word/styles.xml; only documents whose sections change are re-embedded"
+        );
+        assert!(notice.is_ascii());
     }
 }
