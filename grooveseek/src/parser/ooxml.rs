@@ -628,4 +628,101 @@ mod tests {
         );
         assert!(msg.is_ascii());
     }
+
+    /// feature-62 (R2.2): an optional part left out because it would take the document past
+    /// its budget is named with the key and with what the document loses, in one ASCII line.
+    #[test]
+    fn part_past_document_budget_message_names_the_part_the_key_and_the_loss() {
+        let msg = part_past_document_budget_message(
+            "docs/q.docx",
+            "word/styles.xml",
+            4096,
+            "headings fall back to style IDs",
+        );
+        assert_eq!(
+            msg,
+            "warning: docs/q.docx: word/styles.xml would take the document past [index].max_decompressed_size (4096 bytes); skipping this part, headings fall back to style IDs"
+        );
+        assert!(msg.is_ascii());
+    }
+
+    /// The `forge_declared_uncompressed_size` of the xlsx tests, copied rather than moved so
+    /// that module's tests stay as they are: rewrites the uncompressed size the zip declares
+    /// for the entry whose real size is `real`, in the local file header (+22) and the central
+    /// directory header (+24), and leaves the CRC as it was.
+    fn forge_declared_size(zip_bytes: &[u8], real: u32, fake: u32) -> Vec<u8> {
+        let mut data = zip_bytes.to_vec();
+        let mut patched = 0;
+        for (magic, offset) in [(b"PK\x03\x04", 22usize), (b"PK\x01\x02", 24usize)] {
+            let mut i = 0;
+            while i + offset + 4 <= data.len() {
+                if &data[i..i + 4] == magic
+                    && u32::from_le_bytes(data[i + offset..i + offset + 4].try_into().unwrap())
+                        == real
+                {
+                    data[i + offset..i + offset + 4].copy_from_slice(&fake.to_le_bytes());
+                    patched += 1;
+                }
+                i += 1;
+            }
+        }
+        assert_eq!(
+            patched, 2,
+            "expected to patch the local + central header size fields"
+        );
+        data
+    }
+
+    /// feature-62 T15b (AC15 (c)): an optional part that declares less than what is left of
+    /// the document's budget but holds more is left out and charges nothing; a part that fits
+    /// is read and charged. The forged part is larger than what is left (1014 bytes) and no
+    /// larger than the cap (1024), so only a read bounded by what is left refuses it before
+    /// it is charged: one bounded by the cap would read all of it, charge it, and fail the
+    /// total. zip 8 does not stop at the declared size when it inflates
+    /// (`grooveseek/src/parser/xlsx.rs:764-766` measures it).
+    #[test]
+    fn a_forged_optional_part_is_skipped_without_charging_the_budget() {
+        const REAL: u32 = 1020;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("first.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap();
+            zip.start_file("forged.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.start_file("fits.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"<fits/>").unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_size(&buf, REAL, 1);
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+        assert_eq!(
+            archive.by_name("forged.xml").unwrap().size(),
+            1,
+            "premise: the forged part declares 1 byte"
+        );
+
+        let cap: u64 = 1024;
+        let mut budget: u64 = 0;
+        let first = read_zip_entry_capped(&mut archive, "first.bin", &mut budget, cap).unwrap();
+        assert_eq!(first, Some(b"0123456789".to_vec()));
+        assert_eq!(budget, 10);
+        assert!(
+            u64::from(REAL) > cap - budget && u64::from(REAL) <= cap,
+            "premise: the forged part is over what is left and within the cap"
+        );
+
+        let forged_part =
+            read_optional_zip_part(&mut archive, "<test>", "forged.xml", &mut budget, cap, "-");
+        assert_eq!(forged_part, None);
+        assert_eq!(budget, 10, "a part left out charges nothing");
+
+        let fits =
+            read_optional_zip_part(&mut archive, "<test>", "fits.xml", &mut budget, cap, "-");
+        assert_eq!(fits, Some(b"<fits/>".to_vec()));
+        assert_eq!(budget, 17);
+    }
 }

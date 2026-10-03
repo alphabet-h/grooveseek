@@ -1651,4 +1651,123 @@ mod tests {
             assert_eq!(heading_number(s), None, "{s:?}");
         }
     }
+
+    /// feature-62 (R2.3): the stderr line for a styles part that is not used names the part,
+    /// the reason and the fallback, ASCII only.
+    #[test]
+    fn unreadable_styles_message_names_the_part_the_reason_and_the_fallback() {
+        assert_eq!(
+            unreadable_styles_message("docs/q.docx", &StylesUnusable::Unclosed(2)),
+            "warning: docs/q.docx: word/styles.xml is not a readable styles part (ended with 2 element(s) still open); headings fall back to style IDs"
+        );
+        let reasons = [
+            (StylesUnusable::Xml("bad".to_string()), "(XML error: bad)"),
+            (StylesUnusable::NoRoot, "(no root element)"),
+            (
+                StylesUnusable::RootNotStyles,
+                "(root element is not w:styles)",
+            ),
+        ];
+        for (reason, said) in reasons {
+            let msg = unreadable_styles_message("q.docx", &reason);
+            assert!(msg.contains(said), "{msg}");
+            assert!(msg.is_ascii(), "{msg}");
+        }
+    }
+
+    /// The paragraph text whose level the probe documents report.
+    const PROBE: &str = "Quince marker";
+    const OPENING: &str = "opening paragraph of plain prose";
+    const CLOSING: &str = "closing paragraph of plain prose";
+
+    /// A document whose paragraph styled `pstyle` ([`PROBE`]) sits between two body
+    /// paragraphs, with `styles` as its `word/styles.xml` when given and no core.xml. Returns
+    /// the bytes and the length of its `word/document.xml`, for the budget tests.
+    fn probe_docx(styles: Option<&[u8]>, pstyle: &str) -> (Vec<u8>, usize) {
+        let doc = document_xml(
+            &[(None, OPENING), (Some(pstyle), PROBE), (None, CLOSING)],
+            PStyle::Empty,
+        );
+        let mut parts: Vec<(&str, &[u8])> = vec![("word/document.xml", doc.as_bytes())];
+        if let Some(styles) = styles {
+            parts.push(("word/styles.xml", styles));
+        }
+        (docx_with_parts(&parts), doc.len())
+    }
+
+    /// The level [`PROBE`] was given, or `None` when it stayed body text -- checking that a
+    /// heading's text left the body and body text stayed in it.
+    fn level_of(doc: &ParsedDocument) -> Option<u8> {
+        match doc
+            .chunks
+            .iter()
+            .find(|c| c.heading.as_deref() == Some(PROBE))
+        {
+            Some(chunk) => {
+                assert!(!doc.raw_content.contains(PROBE), "{:?}", doc.raw_content);
+                chunk.level
+            }
+            None => {
+                assert!(doc.raw_content.contains(PROBE), "{:?}", doc.raw_content);
+                None
+            }
+        }
+    }
+
+    /// feature-62 T14 (AC14): a styles part larger than the decompression budget on its own is
+    /// left out like any part over it, and the document is read with the spelling rule.
+    #[test]
+    fn a_styles_part_over_the_per_entry_cap_falls_back() {
+        let styles = styles_xml(&word2010_ja_styles());
+        for (pstyle, want) in [("1", None), ("Heading1", Some(2))] {
+            let (bytes, doc_len) = probe_docx(Some(styles.as_bytes()), pstyle);
+            let cap = (doc_len + 64) as u64;
+            assert!(
+                styles.len() as u64 > cap,
+                "fixture: styles.xml alone is over the cap"
+            );
+            let doc = DocxParser::with_budget(cap)
+                .parse_bytes(&bytes, "probe.docx", &[])
+                .expect("a part over the cap is skipped, not fatal");
+            assert_eq!(level_of(&doc), want, "{pstyle}");
+        }
+    }
+
+    /// feature-62 T15 (AC15 (a)(b)): styles.xml counts toward the document's budget after
+    /// document.xml; exactly the budget is read, one byte short is skipped -- the document is
+    /// still read, by the spelling rule -- rather than failing it.
+    #[test]
+    fn a_styles_part_that_would_exceed_the_document_budget_is_skipped() {
+        let styles = styles_xml(&word2010_ja_styles());
+
+        let (bytes, doc_len) = probe_docx(Some(styles.as_bytes()), "1");
+        let both = (doc_len + styles.len()) as u64;
+        let doc = DocxParser::with_budget(both)
+            .parse_bytes(&bytes, "probe.docx", &[])
+            .expect("exactly the budget is allowed");
+        assert_eq!(level_of(&doc), Some(2), "(a) styles.xml read");
+
+        assert!(
+            (styles.len() as u64) < both - 1,
+            "fixture: styles.xml alone fits the cap, so only the total can refuse it"
+        );
+        let doc = DocxParser::with_budget(both - 1)
+            .parse_bytes(&bytes, "probe.docx", &[])
+            .expect("styles.xml is skipped, the document is not");
+        assert_eq!(
+            level_of(&doc),
+            None,
+            "(b) the spelling `1` is not a heading"
+        );
+
+        let (bytes, doc_len) = probe_docx(Some(styles.as_bytes()), "Heading1");
+        let doc = DocxParser::with_budget((doc_len + styles.len() - 1) as u64)
+            .parse_bytes(&bytes, "probe.docx", &[])
+            .expect("styles.xml is skipped, the document is not");
+        assert_eq!(
+            level_of(&doc),
+            Some(2),
+            "(b) the spelling `Heading1` still is"
+        );
+    }
 }
