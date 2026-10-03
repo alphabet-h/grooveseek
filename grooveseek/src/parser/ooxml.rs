@@ -79,6 +79,65 @@ pub(crate) fn read_zip_part(
     budget: &mut u64,
     cap: u64,
 ) -> Result<Option<Vec<u8>>> {
+    read_zip_part_within(zip, path_hint, name, budget, cap, OverDocumentBudget::Fail)
+}
+
+/// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
+/// `None` when it is missing, cannot be read, is over `cap` on its own (named with
+/// [`entry_over_budget_message`]) or is larger than what is left of the document's budget
+/// (named with [`part_past_document_budget_message`], which ends with `skipped_means`). It is
+/// never an `Err`, so a document whose other parts fit is still read.
+///
+/// The part is inflated only up to what is left of the budget plus one byte, so a part that
+/// declares less than it holds costs no more than that, and a part left out adds nothing to
+/// `budget`. A document whose required parts fit `cap` therefore inflates at most `cap + 1`
+/// bytes in all.
+pub(crate) fn read_optional_zip_part(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+    skipped_means: &str,
+) -> Option<Vec<u8>> {
+    // The one `Err` [`read_zip_part_within`] returns is the total passing `cap`, which the
+    // `Skip` arm never lets happen.
+    read_zip_part_within(
+        zip,
+        path_hint,
+        name,
+        budget,
+        cap,
+        OverDocumentBudget::Skip { skipped_means },
+    )
+    .ok()
+    .flatten()
+}
+
+/// What [`read_zip_part_within`] does with a part that would take the document past its
+/// decompression budget.
+#[derive(Clone, Copy)]
+enum OverDocumentBudget<'a> {
+    /// Fail the document ([`read_zip_part`]): the part is one it cannot do without.
+    Fail,
+    /// Leave the part out, say so on stderr ending with `skipped_means`, and go on
+    /// ([`read_optional_zip_part`]).
+    Skip { skipped_means: &'a str },
+}
+
+/// (feature-62) The one read of a zip part under a document's decompression budget, behind
+/// [`read_zip_part`] and [`read_optional_zip_part`] (AGENTS.md "One question gets one
+/// implementation"): they differ only in `over`. The zip-bomb layers are the ones
+/// [`read_zip_part`]'s doc describes; under [`OverDocumentBudget::Skip`] the bound is what is
+/// left of the budget rather than `cap`.
+fn read_zip_part_within(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+    over: OverDocumentBudget<'_>,
+) -> Result<Option<Vec<u8>>> {
     let mut file = match zip.by_name(name) {
         Ok(f) => f,
         Err(_) => return Ok(None),
@@ -87,15 +146,40 @@ pub(crate) fn read_zip_part(
         eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
         return Ok(None);
     }
+    // How far this part may inflate: `cap` for a part the document cannot do without (the
+    // total is checked after the read), what is left of the budget for one it can (so it
+    // never takes the total past `cap`).
+    let bound = match over {
+        OverDocumentBudget::Fail => cap,
+        OverDocumentBudget::Skip { skipped_means } => {
+            let remaining = cap.saturating_sub(*budget);
+            if file.size() > remaining {
+                eprintln!(
+                    "{}",
+                    part_past_document_budget_message(path_hint, name, cap, skipped_means)
+                );
+                return Ok(None);
+            }
+            remaining
+        }
+    };
     let mut buf = Vec::new();
-    // cap+1 まで読めれば「申告 size が嘘だった (cap を実際は超えている)」と
-    // 判定できる。ちょうど cap バイトのエントリは正常に許可する。
-    let limit = cap.saturating_add(1);
+    // bound+1 まで読めれば「申告 size が嘘だった (bound を実際は超えている)」と
+    // 判定できる。ちょうど bound バイトのエントリは正常に許可する。
+    let limit = bound.saturating_add(1);
     if (&mut file).take(limit).read_to_end(&mut buf).is_err() {
         return Ok(None);
     }
-    if buf.len() as u64 > cap {
-        eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
+    if buf.len() as u64 > bound {
+        match over {
+            OverDocumentBudget::Fail => {
+                eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
+            }
+            OverDocumentBudget::Skip { skipped_means } => eprintln!(
+                "{}",
+                part_past_document_budget_message(path_hint, name, cap, skipped_means)
+            ),
+        }
         return Ok(None);
     }
     *budget = budget.saturating_add(buf.len() as u64);
@@ -112,6 +196,20 @@ pub(crate) fn read_zip_part(
 pub(crate) fn entry_over_budget_message(path_hint: &str, entry: &str, cap: u64) -> String {
     format!(
         "warning: {path_hint}: {entry} exceeds [index].max_decompressed_size ({cap} bytes); skipping this part"
+    )
+}
+
+/// (feature-62) The warning for a part [`read_optional_zip_part`] leaves out because it would
+/// take the document past its decompression budget. ASCII only, naming the same key as
+/// [`entry_over_budget_message`]; `skipped_means` says what the document loses.
+pub(crate) fn part_past_document_budget_message(
+    path_hint: &str,
+    entry: &str,
+    cap: u64,
+    skipped_means: &str,
+) -> String {
+    format!(
+        "warning: {path_hint}: {entry} would take the document past [index].max_decompressed_size ({cap} bytes); skipping this part, {skipped_means}"
     )
 }
 
