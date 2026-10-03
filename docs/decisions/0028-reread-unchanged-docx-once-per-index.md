@@ -49,8 +49,9 @@ the catch-up open for every other one.
 
 ## Decision
 
-- While `docx_heading_policy` is not `styles-name-basedon`, `rebuild_index`
-  (not `--force`) re-reads every `.docx` whose row's hash is the scan's
+- While `docx_heading_policy` is not `styles-name-basedon`, every index run
+  that is not `--force` (`groove index`, the MCP `rebuild_index` tool, the
+  desktop's call) re-reads every `.docx` whose row's hash is the scan's
   (`Reindex::Reparse`): matching chunks are left as they are and nothing is
   re-embedded; chunks that differ are written the ordinary way; no chunks at all
   remove the row, which is counted as skipped, the way `--force` would leave

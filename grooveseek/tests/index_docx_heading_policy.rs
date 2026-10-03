@@ -474,7 +474,7 @@ mod reread_pass {
         content_hash(fx, rel).is_some()
     }
 
-    /// The `path` of every hit.
+    /// The "path" field of every hit.
     fn hit_paths(hits: &serde_json::Value) -> Vec<String> {
         hits.get("results")
             .and_then(|r| r.as_array())
@@ -853,7 +853,7 @@ mod reread_pass {
     }
 
     /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
-    /// `groove index` wires it, reporting to `progress`.
+    /// `groove index` wires it, reporting to the reporter it is handed.
     fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
         let kb = fx.kb();
         let cfg = Config::load_from(&fx.config).expect("load groove.toml");
@@ -995,6 +995,13 @@ mod reread_pass {
             "nothing is marked before the sweep"
         );
         assert_eq!(content_hash(&fx, "z-huge.docx"), Some(huge_hash));
+        if cancel_at < 3 {
+            assert_eq!(
+                headings(&fx, "c-two.docx")[1].as_deref(),
+                Some("Rewritten"),
+                "C3 stops inside the loop, before c-two.docx is re-read"
+            );
+        }
 
         let result = rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
             .expect("the next run");
@@ -1088,6 +1095,7 @@ mod reread_pass {
             reindex_single_file(&db, &mut embedder, &kb, "quarry.docx", None, &registry)
                 .expect("reindex the unchanged document");
         assert_eq!(unchanged, SingleResult::Unchanged);
+        assert_eq!(meta(&fx, POLICY_KEY), None, "the watcher records no policy");
         assert_eq!(
             headings(&fx, "quarry.docx")[1].as_deref(),
             Some("Rewritten")

@@ -42,8 +42,8 @@ run で — 正しく分かれている文書を再 embedding せず、読めな
 
 ## 決定
 
-- `docx_heading_policy` が `styles-name-basedon` でない間、`rebuild_index` (`--force` でない) は、
-  行の hash が走査の hash と一致する `.docx` を読み直す (`Reindex::Reparse`): chunk が
+- `docx_heading_policy` が `styles-name-basedon` でない間、`--force` でない索引 run はどれも
+  (`groove index`、MCP の `rebuild_index` tool、desktop の呼び出し)、行の hash が走査の hash と一致する `.docx` を読み直す (`Reindex::Reparse`): chunk が
   一致すればそのままで再 embedding しない、違えば普通の経路で書く、chunk が 1 つも無ければ行を
   消して skip に数える (`--force` なら行が残らないのと同じ)。内容の変わった `.docx` は普通の経路、
   既に強制されている rename は強制のまま。

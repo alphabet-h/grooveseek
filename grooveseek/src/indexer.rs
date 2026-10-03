@@ -1667,6 +1667,10 @@ const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 /// the bytes it read are not the bytes the scan hashed: the file was swapped between the
 /// two reads, so nothing about the retained row has been learned, and the skip keeps the
 /// check pending for the next run (codex P2, round 5).
+///
+/// (feature-62) The one-time `.docx` pass returns it too, and there it means something else:
+/// for a [`Reindex::Reparse`] entry the skip leaves the row unsettled, so the end-of-run step
+/// gives it [`HASH_AWAITING_REPARSE`].
 const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
 
 /// The stored content hash of `rel` when the parser the registry would hand it is the one for
@@ -3030,7 +3034,8 @@ pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
 /// by the endpoint, or changed under the read. No file hashes to it -- a SHA-256 here is 64
 /// lowercase hex digits ([`sha256_hex_bytes`]) -- so the unchanged fast path never matches it,
 /// and every later run reads the file the way it reads a changed one until it can be indexed.
-/// Nothing reads the value for anything else (ADR-0028 lists who reads `content_hash`).
+/// Rename detection and the evaluation corpus digest also read the hash; ADR-0028 records the
+/// decision.
 pub(crate) const HASH_AWAITING_REPARSE: &str = "awaiting-reparse";
 
 /// Where [`index_single_disk_entry`] gets the declared-field set from (feature-58; codex P2
