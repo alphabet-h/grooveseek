@@ -62,7 +62,7 @@ run で — 正しく分かれている文書を再 embedding せず、読めな
 - 待ち hash の `.docx` が後の run で chunk を 1 つも返さない場合、その行は旧 chunk を保ったまま毎 run 読み直される。内容が変わった file が chunk を返さない時の今の挙動と同じである。chunk を返さない行を削除するのは見直し pass 自身の読み直しだけで、変更された file の経路を揃えるのは全形式の挙動変更なので本 ADR の範囲外とする。
 - **印を付けた文書を移動すると**、rename ではなく新規 + 削除になる (rename の検出は hash の一致で
   見るため)。
-- **評価の corpus digest は 1 回変わる** (印を書いた run)。digest が content hash を含むため。
+- **評価の corpus digest は、印を書くだけの run では動かない。** digest が含むのは chunk の行 (path、index、heading、content、context) で content hash ではないため、見直し pass が chunk を書き直すか消した時だけ変わる。
 - **daemon は先に再起動する。** `groove serve` は起動時に索引せず、watcher は変わったファイルしか
   読まないので、新しい版の daemon は `rebuild_index` を 1 回待つ。前の版のままの daemon は、key の
   記録後も編集された `.docx` を旧規則で書き続け、それは `--force` でしか戻らない。downgrade も同じ。

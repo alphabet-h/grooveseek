@@ -3034,7 +3034,7 @@ pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
 /// by the endpoint, or changed under the read. No file hashes to it -- a SHA-256 here is 64
 /// lowercase hex digits ([`sha256_hex_bytes`]) -- so the unchanged fast path never matches it,
 /// and every later run reads the file the way it reads a changed one until it can be indexed.
-/// Rename detection and the evaluation corpus digest also read the hash; ADR-0028 records the
+/// Rename detection also reads the hash; ADR-0028 records the
 /// decision.
 pub(crate) const HASH_AWAITING_REPARSE: &str = "awaiting-reparse";
 

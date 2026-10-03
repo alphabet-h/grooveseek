@@ -75,8 +75,9 @@ the catch-up open for every other one.
 - A marked `.docx` that parses to no chunks on a later run keeps its old chunks and is read again on every run, the way any changed file that yields no chunks does today. Only the pass's own re-read removes a row that yields no chunks; aligning the changed-file path is a behaviour change for every format and is out of scope here.
 - **A marked document that is moved** is a new file and a deletion, not a
   rename, because rename detection matches hashes.
-- **The evaluation corpus digest changes once**, on the run that writes marks,
-  because it covers content hashes.
+- **The evaluation corpus digest does not move on the run that only writes marks.**
+  It covers chunk rows (path, index, heading, content, context), not content
+  hashes, so it changes only when the pass rewrites or removes chunks.
 - **A daemon must be restarted first.** `groove serve` does not index at
   start-up and its watcher reads only files that change, so a daemon on the
   new version waits for one `rebuild_index`; a daemon still on the previous
