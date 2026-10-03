@@ -14,6 +14,26 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **`.docx` headings are read from the document's styles, not from the spelling of the style ID.**
+  A paragraph's `<w:pStyle>` names a style by an ID the writing application chooses, and Word in
+  Japanese (and other languages) writes IDs such as `1`, so every heading in such a document was
+  read as body text and the whole document became one chunk. groove now looks the ID up in
+  `word/styles.xml` and treats a paragraph as a heading when its style is named `heading N`, or is
+  based on such a style, unless a derived style resets its outline level to body text (as Word's
+  "TOC Heading" does); a custom style based on a heading style is therefore a heading too, so some
+  documents written in English Word split where they did not before. When `word/styles.xml` is
+  missing, malformed (the whole part is then ignored, not the part of it that parsed), larger than
+  `[index].max_decompressed_size` on its own, or would take the document past that limit together
+  with the parts already read, every paragraph of the document is read as before, as is a paragraph
+  whose style ID that file does not define. Each of those four states of the file but the first is
+  named in a warning. In the other direction, a document whose paragraph style IDs are spelled
+  `Heading1` .. but whose styles are not headings (not named `heading N`, nor based on such a style)
+  is now read as body text where it used to split. A heading's text now sits in the chunk's heading rather than its body, so it no longer appears in
+  `get_document`'s content for these documents, as was already the case for documents with
+  `Heading1`-style IDs. See [ADR-0027](docs/decisions/0027-detect-docx-headings-from-style-names.md).
+
 ## [1.15.0] - 2026-10-02
 
 ### Added

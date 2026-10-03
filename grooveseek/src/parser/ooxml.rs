@@ -79,6 +79,65 @@ pub(crate) fn read_zip_part(
     budget: &mut u64,
     cap: u64,
 ) -> Result<Option<Vec<u8>>> {
+    read_zip_part_within(zip, path_hint, name, budget, cap, OverDocumentBudget::Fail)
+}
+
+/// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
+/// `None` when it is missing, cannot be read, is over `cap` on its own (named with
+/// [`entry_over_budget_message`]) or is larger than what is left of the document's budget
+/// (named with [`part_past_document_budget_message`], which ends with `skipped_means`). It is
+/// never an `Err`, so a document whose other parts fit is still read.
+///
+/// The part is inflated only up to what is left of the budget plus one byte, so a part that
+/// declares less than it holds costs no more than that, and a part left out adds nothing to
+/// `budget`. A document whose required parts fit `cap` therefore inflates at most `cap + 1`
+/// bytes in all.
+pub(crate) fn read_optional_zip_part(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+    skipped_means: &str,
+) -> Option<Vec<u8>> {
+    // The one `Err` [`read_zip_part_within`] returns is the total passing `cap`, which the
+    // `Skip` arm never lets happen.
+    read_zip_part_within(
+        zip,
+        path_hint,
+        name,
+        budget,
+        cap,
+        OverDocumentBudget::Skip { skipped_means },
+    )
+    .ok()
+    .flatten()
+}
+
+/// What [`read_zip_part_within`] does with a part that would take the document past its
+/// decompression budget.
+#[derive(Clone, Copy)]
+enum OverDocumentBudget<'a> {
+    /// Fail the document ([`read_zip_part`]): the part is one it cannot do without.
+    Fail,
+    /// Leave the part out, say so on stderr ending with `skipped_means`, and go on
+    /// ([`read_optional_zip_part`]).
+    Skip { skipped_means: &'a str },
+}
+
+/// (feature-62) The one read of a zip part under a document's decompression budget, behind
+/// [`read_zip_part`] and [`read_optional_zip_part`] (AGENTS.md "One question gets one
+/// implementation"): they differ only in `over`. The zip-bomb layers are the ones
+/// [`read_zip_part`]'s doc describes; under [`OverDocumentBudget::Skip`] the bound is what is
+/// left of the budget rather than `cap`.
+fn read_zip_part_within(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+    over: OverDocumentBudget<'_>,
+) -> Result<Option<Vec<u8>>> {
     let mut file = match zip.by_name(name) {
         Ok(f) => f,
         Err(_) => return Ok(None),
@@ -87,15 +146,40 @@ pub(crate) fn read_zip_part(
         eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
         return Ok(None);
     }
+    // How far this part may inflate: `cap` for a part the document cannot do without (the
+    // total is checked after the read), what is left of the budget for one it can (so it
+    // never takes the total past `cap`).
+    let bound = match over {
+        OverDocumentBudget::Fail => cap,
+        OverDocumentBudget::Skip { skipped_means } => {
+            let remaining = cap.saturating_sub(*budget);
+            if file.size() > remaining {
+                eprintln!(
+                    "{}",
+                    part_past_document_budget_message(path_hint, name, cap, skipped_means)
+                );
+                return Ok(None);
+            }
+            remaining
+        }
+    };
     let mut buf = Vec::new();
-    // cap+1 まで読めれば「申告 size が嘘だった (cap を実際は超えている)」と
-    // 判定できる。ちょうど cap バイトのエントリは正常に許可する。
-    let limit = cap.saturating_add(1);
+    // bound+1 まで読めれば「申告 size が嘘だった (bound を実際は超えている)」と
+    // 判定できる。ちょうど bound バイトのエントリは正常に許可する。
+    let limit = bound.saturating_add(1);
     if (&mut file).take(limit).read_to_end(&mut buf).is_err() {
         return Ok(None);
     }
-    if buf.len() as u64 > cap {
-        eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
+    if buf.len() as u64 > bound {
+        match over {
+            OverDocumentBudget::Fail => {
+                eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
+            }
+            OverDocumentBudget::Skip { skipped_means } => eprintln!(
+                "{}",
+                part_past_document_budget_message(path_hint, name, cap, skipped_means)
+            ),
+        }
         return Ok(None);
     }
     *budget = budget.saturating_add(buf.len() as u64);
@@ -112,6 +196,20 @@ pub(crate) fn read_zip_part(
 pub(crate) fn entry_over_budget_message(path_hint: &str, entry: &str, cap: u64) -> String {
     format!(
         "warning: {path_hint}: {entry} exceeds [index].max_decompressed_size ({cap} bytes); skipping this part"
+    )
+}
+
+/// (feature-62) The warning for a part [`read_optional_zip_part`] leaves out because it would
+/// take the document past its decompression budget. ASCII only, naming the same key as
+/// [`entry_over_budget_message`]; `skipped_means` says what the document loses.
+pub(crate) fn part_past_document_budget_message(
+    path_hint: &str,
+    entry: &str,
+    cap: u64,
+    skipped_means: &str,
+) -> String {
+    format!(
+        "warning: {path_hint}: {entry} would take the document past [index].max_decompressed_size ({cap} bytes); skipping this part, {skipped_means}"
     )
 }
 
@@ -529,5 +627,103 @@ mod tests {
             "warning: docs/big.docx: word/document.xml exceeds [index].max_decompressed_size (1024 bytes); skipping this part"
         );
         assert!(msg.is_ascii());
+    }
+
+    /// feature-62 (R2.2): an optional part left out because it would take the document past
+    /// its budget is named with the key and with what the document loses, in one ASCII line.
+    #[test]
+    fn part_past_document_budget_message_names_the_part_the_key_and_the_loss() {
+        let msg = part_past_document_budget_message(
+            "docs/q.docx",
+            "word/styles.xml",
+            4096,
+            "headings fall back to style IDs",
+        );
+        assert_eq!(
+            msg,
+            "warning: docs/q.docx: word/styles.xml would take the document past [index].max_decompressed_size (4096 bytes); skipping this part, headings fall back to style IDs"
+        );
+        assert!(msg.is_ascii());
+    }
+
+    /// The `forge_declared_uncompressed_size` of the xlsx tests ([`crate::parser::xlsx`]),
+    /// copied rather than moved so that module's tests stay as they are: rewrites the uncompressed size the zip declares
+    /// for the entry whose real size is `real`, in the local file header (+22) and the central
+    /// directory header (+24), and leaves the CRC as it was.
+    fn forge_declared_size(zip_bytes: &[u8], real: u32, fake: u32) -> Vec<u8> {
+        let mut data = zip_bytes.to_vec();
+        let mut patched = 0;
+        for (magic, offset) in [(b"PK\x03\x04", 22usize), (b"PK\x01\x02", 24usize)] {
+            let mut i = 0;
+            while i + offset + 4 <= data.len() {
+                if &data[i..i + 4] == magic
+                    && u32::from_le_bytes(data[i + offset..i + offset + 4].try_into().unwrap())
+                        == real
+                {
+                    data[i + offset..i + offset + 4].copy_from_slice(&fake.to_le_bytes());
+                    patched += 1;
+                }
+                i += 1;
+            }
+        }
+        assert_eq!(
+            patched, 2,
+            "expected to patch the local + central header size fields"
+        );
+        data
+    }
+
+    /// feature-62 T15b (AC15 (c)): an optional part that declares less than what is left of
+    /// the document's budget but holds more is left out and charges nothing; a part that fits
+    /// is read and charged. The forged part is larger than what is left (1014 bytes) and no
+    /// larger than the cap (1024), so only a read bounded by what is left refuses it before
+    /// it is charged: one bounded by the cap would read all of it, charge it, and fail the
+    /// total. zip 8 does not stop at the declared size when it inflates (the xlsx parser's
+    /// tests, in [`crate::parser::xlsx`], measure it with their
+    /// `forge_declared_uncompressed_size` helper).
+    #[test]
+    fn a_forged_optional_part_is_skipped_without_charging_the_budget() {
+        const REAL: u32 = 1020;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("first.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap();
+            zip.start_file("forged.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.start_file("fits.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"<fits/>").unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_size(&buf, REAL, 1);
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+        assert_eq!(
+            archive.by_name("forged.xml").unwrap().size(),
+            1,
+            "premise: the forged part declares 1 byte"
+        );
+
+        let cap: u64 = 1024;
+        let mut budget: u64 = 0;
+        let first = read_zip_entry_capped(&mut archive, "first.bin", &mut budget, cap).unwrap();
+        assert_eq!(first, Some(b"0123456789".to_vec()));
+        assert_eq!(budget, 10);
+        assert!(
+            u64::from(REAL) > cap - budget && u64::from(REAL) <= cap,
+            "premise: the forged part is over what is left and within the cap"
+        );
+
+        let forged_part =
+            read_optional_zip_part(&mut archive, "<test>", "forged.xml", &mut budget, cap, "-");
+        assert_eq!(forged_part, None);
+        assert_eq!(budget, 10, "a part left out charges nothing");
+
+        let fits =
+            read_optional_zip_part(&mut archive, "<test>", "fits.xml", &mut budget, cap, "-");
+        assert_eq!(fits, Some(b"<fits/>".to_vec()));
+        assert_eq!(budget, 17);
     }
 }
