@@ -124,8 +124,10 @@ const STYLES_SKIPPED_MEANS: &str = "headings fall back to style IDs";
 /// `word/styles.xml` as a [`StyleTable`], or `None` when the document has no usable one: the
 /// part is missing, over the decompression budget on its own, would take the document past
 /// it ([`super::ooxml::read_optional_zip_part`]), or is not readable as a styles part
-/// ([`StyleTable::parse`]). Each case but a missing part is named on stderr in one line. With
-/// `None` every paragraph's heading is decided by its style ID's spelling, as before.
+/// ([`StyleTable::parse`]). Each case but a missing part is named on stderr in one line; a part
+/// the zip layer cannot open or inflate falls back the same way without a line, as
+/// [`super::ooxml::read_zip_part`] always has. With `None` every paragraph's heading is decided
+/// by its style ID's spelling, as before.
 fn read_style_table(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     path_hint: &str,
@@ -338,7 +340,7 @@ struct PendingStyle {
 }
 
 impl StylesWalk {
-    /// A `Start` (`opens`) or `Empty` element, met with `self.depth` elements open.
+    /// A `Start` (`opens`) or `Empty` element, met with [`Self::depth`] elements open.
     fn element(&mut self, e: &BytesStart, opens: bool) -> Result<(), StylesUnusable> {
         let qname = e.name();
         let name = super::ooxml_local(qname.as_ref());
@@ -729,9 +731,10 @@ fn heading_level_from_attr(e: &BytesStart, styles: Option<&StyleTable>) -> Optio
     None
 }
 
-/// (feature-62) docx bytes for the unit tests of this parser, of `crate::server` and of
-/// `crate::indexer`, so the three build a document one way. The integration tests under
-/// `grooveseek/tests/` cannot reach a `cfg(test)` module and carry a copy of their own.
+/// (feature-62) docx bytes for the unit tests of this parser, of [`crate::server`] and of
+/// [`crate::indexer`], so the three build a document one way. The integration tests (separate
+/// test crates under the crate's tests directory) cannot reach a `cfg(test)` module and carry
+/// a copy of their own.
 #[cfg(test)]
 pub(crate) mod fixture {
     use std::io::Write;
@@ -1433,7 +1436,7 @@ mod tests {
 
     /// Whether quick-xml itself reports an error anywhere in `xml`: the premise the
     /// broken-part tests fix before they rely on it, the way
-    /// `test_docx_unclosed_root_at_eof_is_detected_as_truncation` does.
+    /// [`test_docx_unclosed_root_at_eof_is_detected_as_truncation`] does.
     fn quick_xml_errs(xml: &[u8]) -> bool {
         let mut reader = Reader::from_reader(xml);
         let mut buf = Vec::new();
@@ -1622,7 +1625,7 @@ mod tests {
 
     /// feature-62 T19 (AC18): one reading of a heading number, shared by style names and by
     /// the style-ID spelling the fallback reads. The chunk level that cannot overflow is pinned
-    /// next to `heading_digits`.
+    /// next to [`heading_digits`].
     #[test]
     fn heading_number_reads_names_the_way_the_style_id_rule_did() {
         let headings: &[(&str, u8)] = &[
@@ -2074,7 +2077,8 @@ mod tests {
     /// feature-62 T13 (AC13): the other ways a styles part is not used -- (a) a tag cut short,
     /// (b) no element, (c) a root other than `w:styles` -- fall back for every paragraph, and
     /// the parse still succeeds; (d) `<w:styles/>` is usable and holds nothing, which reads the
-    /// same (the stderr line tells them apart, `grooveseek/tests/index_docx_heading_policy.rs`).
+    /// same (the stderr line tells them apart, which the CLI integration test C2 in the
+    /// `index_docx_heading_policy` test crate pins).
     #[test]
     fn a_broken_styles_part_falls_back_for_every_paragraph() {
         let heading_1 = paragraph_style("1", Some("heading 1"), None, None);

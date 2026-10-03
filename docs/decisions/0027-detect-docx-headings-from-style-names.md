@@ -79,8 +79,10 @@ document without usable styles gets.
   body text.
 - A style ID the table does not hold, and every paragraph of a document whose
   styles part is missing, malformed, over the budget on its own or skipped for
-  the total, is decided by the spelling, as before. Each of those cases but a
-  missing part is named on stderr in one line.
+  the total, is decided by the spelling, as before. Each malformed state of the
+  part and each budget case is named on stderr in one line. A part the zip
+  layer cannot open or inflate falls back the same way without a line, as
+  `read_zip_part` always has.
 - An outline level never makes a heading by itself, neither a style's nor one
   written on the paragraph.
 - The index and `get_document` parse through the same function, each under its

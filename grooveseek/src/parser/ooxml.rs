@@ -646,8 +646,8 @@ mod tests {
         assert!(msg.is_ascii());
     }
 
-    /// The `forge_declared_uncompressed_size` of the xlsx tests, copied rather than moved so
-    /// that module's tests stay as they are: rewrites the uncompressed size the zip declares
+    /// The `forge_declared_uncompressed_size` of the xlsx tests ([`crate::parser::xlsx`]),
+    /// copied rather than moved so that module's tests stay as they are: rewrites the uncompressed size the zip declares
     /// for the entry whose real size is `real`, in the local file header (+22) and the central
     /// directory header (+24), and leaves the CRC as it was.
     fn forge_declared_size(zip_bytes: &[u8], real: u32, fake: u32) -> Vec<u8> {
@@ -678,8 +678,9 @@ mod tests {
     /// is read and charged. The forged part is larger than what is left (1014 bytes) and no
     /// larger than the cap (1024), so only a read bounded by what is left refuses it before
     /// it is charged: one bounded by the cap would read all of it, charge it, and fail the
-    /// total. zip 8 does not stop at the declared size when it inflates
-    /// (`grooveseek/src/parser/xlsx.rs:764-766` measures it).
+    /// total. zip 8 does not stop at the declared size when it inflates (the xlsx parser's
+    /// tests, in [`crate::parser::xlsx`], measure it with their
+    /// `forge_declared_uncompressed_size` helper).
     #[test]
     fn a_forged_optional_part_is_skipped_without_charging_the_budget() {
         const REAL: u32 = 1020;

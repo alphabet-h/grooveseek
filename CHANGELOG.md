@@ -28,7 +28,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `[index].max_decompressed_size` on its own, or would take the document past that limit together
   with the parts already read, every paragraph of the document is read as before, as is a paragraph
   whose style ID that file does not define. Each of those four states of the file but the first is
-  named in a warning. A heading's text now sits in the chunk's heading rather than its body, so it no longer appears in
+  named in a warning. In the other direction, a document whose paragraph style IDs are spelled
+  `Heading1` .. but whose styles are not headings (not named `heading N`, nor based on such a style)
+  is now read as body text where it used to split. A heading's text now sits in the chunk's heading rather than its body, so it no longer appears in
   `get_document`'s content for these documents, as was already the case for documents with
   `Heading1`-style IDs. See [ADR-0027](docs/decisions/0027-detect-docx-headings-from-style-names.md).
 

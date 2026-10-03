@@ -4996,7 +4996,7 @@ mod tests {
         assert!(indexed.raw_content.contains("inflated body"));
     }
 
-    /// feature-62 T17 (AC16): `get_document`'s content for a document whose headings use
+    /// feature-62 T17 (AC16): [`get_document`](KbServer::get_document)'s content for a document whose headings use
     /// numeric style IDs holds every body word and no heading word -- the read side resolves
     /// `word/styles.xml` the way the index does, so a heading's text is the chunk's heading
     /// and not part of the content.
