@@ -1101,4 +1101,96 @@ mod reread_pass {
             Some("Rewritten")
         );
     }
+
+    /// feature-62 spec I-1 / the single transaction of R4.4: the placeholder over the rows the
+    /// pass could not settle and the policy key land together or not at all. A trigger on the
+    /// index makes the write of the key fail after the placeholder was staged, so
+    /// [`grooveseek::indexer::rebuild_index`] returns an error; the key is absent and every row
+    /// keeps its own hash and chunks. Once the trigger is dropped, the next run records the
+    /// key and the placeholder together. A run that committed between the two writes would
+    /// leave the placeholder behind and fail the first half.
+    #[test]
+    fn a_failed_final_settlement_leaves_neither_the_marks_nor_the_key() {
+        if run_in_hermetic_child(
+            "reread_pass::a_failed_final_settlement_leaves_neither_the_marks_nor_the_key",
+        ) {
+            return;
+        }
+        const DEC_CAP: usize = 16_384;
+        const TRIGGER: &str = "CREATE TRIGGER inject_policy_failure BEFORE INSERT ON index_meta WHEN NEW.key = 'docx_heading_policy' BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END;";
+        let fx = docx_kb("groove-f62-i1tx");
+
+        // Over the second run's budget on word/document.xml alone, so that run cannot settle it.
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        // Fits the second run's budget, so that run reads it and finds its sections unchanged.
+        let tidy = numeric_heading_docx("Ledger", &[]);
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-tidy.docx", &tidy);
+
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the first run, under the default caps");
+        let (bloat_hash, tidy_hash) = (sha256_hex(&bloat), sha256_hex(&tidy));
+        assert_eq!(content_hash(&fx, "a-bloat.docx"), Some(bloat_hash.clone()));
+        assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash.clone()));
+        let (bloat_chunks, tidy_chunks) = (
+            column(&fx, "a-bloat.docx", "content"),
+            column(&fx, "b-tidy.docx", "content"),
+        );
+        assert!(!bloat_chunks.is_empty() && !tidy_chunks.is_empty());
+        delete_meta(&fx, POLICY_KEY);
+        configure(
+            &fx,
+            "",
+            MD_AND_DOCX,
+            &format!("[index]\nmax_decompressed_size = {DEC_CAP}\n"),
+        );
+
+        // The key is written with INSERT OR REPLACE; a BEFORE INSERT trigger fires for it.
+        {
+            let conn = db(&fx);
+            conn.execute_batch(TRIGGER).expect("create the trigger");
+            let probe = conn
+                .execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_heading_policy', 'probe')",
+                    [],
+                )
+                .expect_err("the trigger stops INSERT OR REPLACE");
+            assert!(
+                probe.to_string().contains("injected policy failure"),
+                "{probe}"
+            );
+        }
+        assert_eq!(meta(&fx, POLICY_KEY), None, "the probe left no key");
+
+        let err = rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect_err("the run whose key cannot be written fails");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("injected policy failure"), "{chain}");
+        assert_eq!(meta(&fx, POLICY_KEY), None, "the failed run records no key");
+        let after = content_hash(&fx, "a-bloat.docx");
+        assert_ne!(after.as_deref(), Some(AWAITING), "the mark was rolled back");
+        assert_eq!(
+            after,
+            Some(bloat_hash),
+            "the unsettled row keeps its own hash"
+        );
+        assert_eq!(column(&fx, "a-bloat.docx", "content"), bloat_chunks);
+        assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash.clone()));
+        assert_eq!(column(&fx, "b-tidy.docx", "content"), tidy_chunks);
+        assert!(has_row(&fx, "a-bloat.docx") && has_row(&fx, "b-tidy.docx"));
+
+        db(&fx)
+            .execute_batch("DROP TRIGGER inject_policy_failure;")
+            .expect("drop the trigger");
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the run after the trigger is gone");
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        assert_eq!(content_hash(&fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash));
+    }
 }
