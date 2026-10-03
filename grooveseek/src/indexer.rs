@@ -550,7 +550,7 @@ fn detect_renames(
 /// parsers: `document_fields`, `title`, and `tags` all came from whichever
 /// parser last read the file, and a `.txt` renamed to `.md` (or back) with the
 /// same bytes needs the *other* parser's reading, not none. [`Registry::by_extension`]
-/// (case-insensitive, same lookup [`indexed_markdown_hash`] and the rename
+/// (case-insensitive, same lookup [`indexed_hash_for`] and the rename
 /// code already use) resolving to `None` on one side and `Some` on the other
 /// counts as a crossing too -- an unregistered extension has no parser at
 /// all, which is as different from any registered one as two registered
@@ -1206,7 +1206,7 @@ pub fn rebuild_index(
     let mut refresh_pending = false;
     if refresh_any {
         for rel in &skipped_paths {
-            if indexed_markdown_hash(db, registry, rel)?.is_some() {
+            if indexed_hash_for(db, registry, rel, "md")?.is_some() {
                 refresh_pending = true;
                 break;
             }
@@ -1314,7 +1314,7 @@ pub fn rebuild_index(
                 // bytes can come back, match the retained hash, and hide behind the fast
                 // path for good (codex P2, rounds 3 and 4).
                 if refresh_any
-                    && let Some(row_hash) = indexed_markdown_hash(db, registry, &entry.rel)?
+                    && let Some(row_hash) = indexed_hash_for(db, registry, &entry.rel, "md")?
                     && (reason != SKIPPED_NO_CHUNKS || row_hash != entry.hash)
                 {
                     refresh_pending = true;
@@ -1325,7 +1325,7 @@ pub fn rebuild_index(
             // does: the file is not indexed and the reason is already on stderr.
             SingleResult::Refused => {
                 tally.skipped += 1;
-                if refresh_any && indexed_markdown_hash(db, registry, &entry.rel)?.is_some() {
+                if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
                     refresh_pending = true;
                 }
                 progress.report_unchanged(&entry.rel);
@@ -1539,6 +1539,44 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
     }
 }
 
+/// Whether the chunks the index holds for `rel` are `chunks`, compared the way `context_mode`
+/// embeds them: heading and content under [`ContextMode::Off`], and the context too under
+/// [`ContextMode::Static`], which embeds it. The level is not compared. `false` when the index
+/// holds no chunk for `rel`, or the read fails.
+///
+/// A changed file whose new chunks match keeps its embeddings and has only its metadata
+/// rewritten ([`index_single_disk_entry`]).
+fn stored_chunks_match(
+    db: &Database,
+    rel: &str,
+    chunks: &[crate::parser::Chunk],
+    context_mode: ContextMode,
+) -> bool {
+    if context_mode == ContextMode::Static {
+        db.chunk_texts_with_context_for_path(rel)
+            .map(|existing| {
+                !existing.is_empty()
+                    && existing.len() == chunks.len()
+                    && existing.iter().zip(chunks).all(|((eh, ec, ectx), c)| {
+                        eh.as_deref() == c.heading.as_deref()
+                            && *ec == c.content
+                            && ectx.as_deref() == c.context.as_deref()
+                    })
+            })
+            .unwrap_or(false)
+    } else {
+        db.chunk_texts_for_path(rel)
+            .map(|existing| {
+                !existing.is_empty()
+                    && existing.len() == chunks.len()
+                    && existing.iter().zip(chunks).all(|((eh, ec), c)| {
+                        eh.as_deref() == c.heading.as_deref() && *ec == c.content
+                    })
+            })
+            .unwrap_or(false)
+    }
+}
+
 /// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed and
 /// counts as having read it. The one-time frontmatter check (#251) treats every other skip
 /// as "not read" -- the ones that return before the parser runs, and
@@ -1557,21 +1595,28 @@ const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 /// check pending for the next run (codex P2, round 5).
 const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
 
-/// The stored content hash of `rel` when it is a Markdown file -- by the parser the
-/// registry would hand it, so `.MD` counts -- that the index already holds a row for;
-/// `None` otherwise. The one-time frontmatter check (#251) asks this about every file it
-/// did not index: only such a file can come back later with a matching hash and slip past
-/// the check for good, and the hash is what says whether the bytes that were read this
-/// run are the ones the row was written from.
-fn indexed_markdown_hash(db: &Database, registry: &Registry, rel: &str) -> Result<Option<String>> {
+/// The stored content hash of `rel` when the parser the registry would hand it is the one for
+/// `extension` -- by the parser, not the spelling, so `.MD` counts as `"md"` -- and the index
+/// already holds a row for it; `None` otherwise.
+///
+/// The one-time frontmatter check (#251) asks this with `"md"` about every file it did not
+/// index: only such a file can come back later with a matching hash and slip past the check
+/// for good, and the hash is what says whether the bytes that were read this run are the ones
+/// the row was written from.
+fn indexed_hash_for(
+    db: &Database,
+    registry: &Registry,
+    rel: &str,
+    extension: &str,
+) -> Result<Option<String>> {
     let ext = Path::new(rel)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    let is_markdown = registry
+    let parsed_by_it = registry
         .by_extension(ext)
-        .is_some_and(|p| p.extension() == "md");
-    if !is_markdown {
+        .is_some_and(|p| p.extension() == extension);
+    if !parsed_by_it {
         return Ok(None);
     }
     db.get_document_hash(rel)
@@ -1825,35 +1870,7 @@ fn index_single_disk_entry(
     // より専用 title_unchanged gate と冗長な `get_document_title` SELECT は
     // 不要になったため撤去した。Off モードは context を embed/保存しないため、
     // 従来通り (heading, content) のみで比較する (挙動不変)。
-    let chunks_unchanged = if context_mode == ContextMode::Static {
-        db.chunk_texts_with_context_for_path(&entry.rel)
-            .map(|existing| {
-                !existing.is_empty()
-                    && existing.len() == parsed.chunks.len()
-                    && existing
-                        .iter()
-                        .zip(parsed.chunks.iter())
-                        .all(|((eh, ec, ectx), c)| {
-                            eh.as_deref() == c.heading.as_deref()
-                                && *ec == c.content
-                                && ectx.as_deref() == c.context.as_deref()
-                        })
-            })
-            .unwrap_or(false)
-    } else {
-        db.chunk_texts_for_path(&entry.rel)
-            .map(|existing| {
-                !existing.is_empty()
-                    && existing.len() == parsed.chunks.len()
-                    && existing
-                        .iter()
-                        .zip(parsed.chunks.iter())
-                        .all(|((eh, ec), c)| {
-                            eh.as_deref() == c.heading.as_deref() && *ec == c.content
-                        })
-            })
-            .unwrap_or(false)
-    };
+    let chunks_unchanged = stored_chunks_match(db, &entry.rel, &parsed.chunks, context_mode);
 
     if !force && chunks_unchanged {
         let tx = db.begin_transaction()?;
