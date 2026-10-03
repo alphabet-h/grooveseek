@@ -1384,6 +1384,39 @@ mod tests {
         assert!(doc.chunks[0].content.contains("Zero styled line"));
     }
 
+    /// feature-62 (local review r2): a `<w:pStyle>` carrying the same qualified `w:val`
+    /// twice, in a document without a styles part, keeps main's spelling fallback, which
+    /// reads the attributes through `.flatten()` (plan D8). quick-xml yields the first
+    /// `w:val` and reports the second as a duplicate error that `.flatten()` drops, so the
+    /// first value alone decides: `Heading1` then `Heading2` is a level-2 `Heading1`, and
+    /// `Normal` then `Heading1` is body text.
+    #[test]
+    fn a_duplicated_pstyle_val_keeps_the_spelling_fallback_of_main() {
+        let bytes = wrap_document_xml(concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1" w:val="Heading2"/></w:pPr>"#,
+            r#"<w:r><w:t>Twice valued title</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>prose under the doubled heading</w:t></w:r></w:p>"#,
+        ));
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "doubled.docx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 1, "{:?}", doc.chunks);
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Twice valued title"));
+        assert_eq!(doc.chunks[0].level, Some(2));
+
+        let bytes = wrap_document_xml(concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Normal" w:val="Heading1"/></w:pPr>"#,
+            r#"<w:r><w:t>Plainly styled sentence</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>more ordinary text after it</w:t></w:r></w:p>"#,
+        ));
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "normalfirst.docx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 1, "{:?}", doc.chunks);
+        assert_eq!(doc.chunks[0].heading, None);
+        assert!(doc.chunks[0].content.contains("Plainly styled sentence"));
+    }
+
     use super::fixture::*;
 
     /// The (heading, level) of each chunk.

@@ -239,6 +239,16 @@ fn broken_or_oversized_styles_parts_are_named_on_stderr() {
         word.len() < CAP && doc.len() <= CAP - word.len(),
         "fixture: the styles part fits the cap with room to pad the document"
     );
+    // Well-formed up to a style whose start tag names `w:type` twice: the reader passes it,
+    // and the attribute iterator, not the reader, reports the XML error.
+    let twin = styles_xml(&format!(
+        r#"{}<w:style w:type="paragraph" w:type="paragraph" w:styleId="b"><w:name w:val="Quote"/></w:style>"#,
+        word2010_ja_styles()
+    ));
+    assert!(
+        twin.len() < CAP,
+        "fixture: the twin styles part fits the cap"
+    );
     let parts: Vec<(&str, String, String)> = vec![
         (
             "eof.docx",
@@ -273,6 +283,7 @@ fn broken_or_oversized_styles_parts_are_named_on_stderr() {
             pad_to(&doc, "</w:body>", CAP - word.len() + 1),
             word.clone(),
         ),
+        ("twin.docx", doc.clone(), twin.clone()),
     ];
     for (name, document, styles) in &parts {
         write_bytes(
@@ -312,6 +323,11 @@ fn broken_or_oversized_styles_parts_are_named_on_stderr() {
     expect_one(
         "sum.docx",
         "would take the document past [index].max_decompressed_size",
+    );
+    expect_one("twin.docx", "is not a readable styles part (XML error:");
+    assert!(
+        stderr.contains("indexed: twin.docx (1 chunks)"),
+        "an unread styles part leaves style 1 to the spelling, which is not a heading:\n{stderr}"
     );
     assert!(
         styles_lines(&stderr, "nostyles.docx").is_empty(),
