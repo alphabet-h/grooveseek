@@ -4996,6 +4996,31 @@ mod tests {
         assert!(indexed.raw_content.contains("inflated body"));
     }
 
+    /// feature-62 T17 (AC16): `get_document`'s content for a document whose headings use
+    /// numeric style IDs holds every body word and no heading word -- the read side resolves
+    /// `word/styles.xml` the way the index does, so a heading's text is the chunk's heading
+    /// and not part of the content.
+    #[test]
+    fn a_document_response_for_a_numeric_style_docx_drops_heading_text_from_content() {
+        use crate::parser::docx::fixture::{self, PStyle};
+        let registry =
+            Registry::from_enabled(&["md".to_string(), "docx".to_string()]).expect("md + docx");
+        let bytes = fixture::numeric_heading_docx(PStyle::Empty);
+        let resp = build_document_response(&registry, "quarry.docx", "docx", &bytes)
+            .expect("the document parses");
+        for body in fixture::BODIES {
+            assert!(resp.content.contains(body), "{body}: {:?}", resp.content);
+        }
+        for heading in fixture::HEADINGS {
+            assert!(
+                !resp.content.contains(heading),
+                "{heading}: {:?}",
+                resp.content
+            );
+        }
+        assert_eq!(resp.title.as_deref(), Some(fixture::TITLE));
+    }
+
     /// A registry over Markdown and PDF whose decompression cap is `decompressed`
     /// and whose raw caps are the defaults.
     fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {

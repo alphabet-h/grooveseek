@@ -1770,4 +1770,423 @@ mod tests {
             "(b) the spelling `Heading1` still is"
         );
     }
+
+    /// [`level_of`] the probe document parsed under the default budget, with `styles` as its
+    /// `word/styles.xml` when given.
+    fn level_with(styles: Option<&[u8]>, pstyle: &str) -> Option<u8> {
+        let (bytes, _) = probe_docx(styles, pstyle);
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "probe.docx", &[])
+            .expect("a probe document parses");
+        level_of(&doc)
+    }
+
+    /// [`level_with`] a styles part holding `styles`, wrapped by [`styles_xml`].
+    fn level_under(styles: &str, pstyle: &str) -> Option<u8> {
+        level_with(Some(styles_xml(styles).as_bytes()), pstyle)
+    }
+
+    /// feature-62 T3 (AC3): a style that is not named a heading takes the level of the nearest
+    /// style it is based on that is.
+    #[test]
+    fn a_style_based_on_a_heading_takes_the_nearest_heading_level() {
+        let styles = format!(
+            "{}{}{}",
+            paragraph_style("H1", Some("heading 1"), None, None),
+            paragraph_style("H2", Some("heading 2"), Some("H1"), None),
+            paragraph_style("X", Some("Callout"), Some("H2"), None),
+        );
+        assert_eq!(
+            level_under(&styles, "X"),
+            Some(3),
+            "the nearest is heading 2"
+        );
+        assert_eq!(level_under(&styles, "H2"), Some(3));
+        assert_eq!(level_under(&styles, "H1"), Some(2));
+    }
+
+    /// feature-62 T4 (AC4): of the styles between the paragraph's own and its heading
+    /// ancestor, the first that sets an outline level decides -- 9 makes body text, 0 to 8
+    /// leaves the heading at the level its name gives.
+    #[test]
+    fn a_derived_style_that_resets_the_outline_level_to_body_is_not_a_heading() {
+        let heading_1 = paragraph_style("Heading1", Some("heading 1"), None, None);
+
+        let toc = format!(
+            "{heading_1}{}",
+            paragraph_style(
+                "TOCHeading",
+                Some("TOC Heading"),
+                Some("Heading1"),
+                Some("9")
+            )
+        );
+        assert_eq!(
+            level_under(&toc, "TOCHeading"),
+            None,
+            "(a) Word's TOC Heading"
+        );
+
+        let derived = format!(
+            "{heading_1}{}",
+            paragraph_style("Derived", Some("Pull Quote"), Some("Heading1"), Some("2"))
+        );
+        assert_eq!(
+            level_under(&derived, "Derived"),
+            Some(2),
+            "(b) outline level 2 neither cancels nor sets the level; heading 1 does"
+        );
+
+        let middle = paragraph_style("M", Some("Muted"), Some("Heading1"), Some("9"));
+        let c = format!(
+            "{heading_1}{middle}{}",
+            paragraph_style("X", Some("Aside"), Some("M"), None)
+        );
+        assert_eq!(level_under(&c, "X"), None, "(c) X sets none, M sets 9");
+
+        let d = format!(
+            "{heading_1}{middle}{}",
+            paragraph_style("X", Some("Aside"), Some("M"), Some("3"))
+        );
+        assert_eq!(
+            level_under(&d, "X"),
+            Some(2),
+            "(d) X's 3 comes before M's 9"
+        );
+    }
+
+    /// feature-62 T5 (AC5): a style named `heading 2` is a heading whatever outline level it
+    /// sets itself; its own level is not in the range that can cancel it.
+    #[test]
+    fn a_heading_named_style_keeps_its_level_whatever_its_own_outline_level() {
+        let styles = paragraph_style("S2", Some("heading 2"), None, Some("9"));
+        assert_eq!(level_under(&styles, "S2"), Some(3));
+    }
+
+    /// feature-62 T6 (AC6, R1.6): an outline level never makes a heading -- not a style's when
+    /// its name is not a heading's, and not one written on the paragraph itself.
+    #[test]
+    fn outline_level_alone_does_not_make_a_heading() {
+        let styles = format!(
+            "{}{}",
+            paragraph_style("Plain", Some("Body Text"), None, Some("0")),
+            word2010_ja_styles()
+        );
+        assert_eq!(
+            level_under(&styles, "Plain"),
+            None,
+            "a style with outline level 0"
+        );
+
+        let doc = document_xml_from_body(&format!(
+            concat!(
+                r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>{probe}</w:t></w:r></w:p>"#,
+                r#"<w:p><w:r><w:t>{closing}</w:t></w:r></w:p>"#,
+            ),
+            probe = PROBE,
+            closing = CLOSING,
+        ));
+        let styles_part = styles_xml(&word2010_ja_styles());
+        let bytes = docx_with_parts(&[
+            ("word/document.xml", doc.as_bytes()),
+            ("word/styles.xml", styles_part.as_bytes()),
+        ]);
+        let parsed = DocxParser::default()
+            .parse_bytes(&bytes, "probe.docx", &[])
+            .unwrap();
+        assert_eq!(
+            level_of(&parsed),
+            None,
+            "a paragraph's own outline level is not read"
+        );
+    }
+
+    /// feature-62 T7 (AC7, R2.1 f): a character style is not in the table, so it is neither a
+    /// heading through its name nor a parent; a `w:pStyle` that names only a character style
+    /// falls back to its spelling.
+    #[test]
+    fn a_character_style_is_never_a_paragraph_heading() {
+        let styles = concat!(
+            r#"<w:style w:type="character" w:styleId="C1"><w:name w:val="heading 1"/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="P"><w:name w:val="Lead"/><w:basedOn w:val="C1"/></w:style>"#,
+            r#"<w:style w:type="character" w:styleId="Heading2"><w:name w:val="Body Char"/></w:style>"#,
+        );
+        assert_eq!(
+            level_under(styles, "C1"),
+            None,
+            "`c1` is no heading by its spelling"
+        );
+        assert_eq!(
+            level_under(styles, "P"),
+            None,
+            "a character style is not a parent"
+        );
+        assert_eq!(
+            level_under(styles, "Heading2"),
+            Some(3),
+            "an ID only a character style has is not in the table, so its spelling decides"
+        );
+    }
+
+    /// feature-62 T8 (AC8): the first definition of a style ID wins, in both orders, and
+    /// whatever the type of the first.
+    #[test]
+    fn the_first_definition_of_a_duplicated_style_id_wins() {
+        let heading_first = format!(
+            "{}{}",
+            paragraph_style("D", Some("heading 2"), None, None),
+            paragraph_style("D", Some("Normal"), None, None)
+        );
+        assert_eq!(level_under(&heading_first, "D"), Some(3));
+
+        let body_first = format!(
+            "{}{}",
+            paragraph_style("D", Some("Normal"), None, None),
+            paragraph_style("D", Some("heading 2"), None, None)
+        );
+        assert_eq!(level_under(&body_first, "D"), None);
+
+        let character_first = format!(
+            "{}{}",
+            r#"<w:style w:type="character" w:styleId="S"><w:name w:val="heading 1"/></w:style>"#,
+            paragraph_style("S", Some("heading 2"), None, None)
+        );
+        assert_eq!(
+            level_under(&character_first, "S"),
+            None,
+            "the character style came first, so `S` is not in the table and `s` is no heading"
+        );
+    }
+
+    /// A `w:basedOn` chain of `len` paragraph styles, `c1` based on `c2` and so on, whose last
+    /// is named `heading 1` and the rest are not.
+    fn chain_of(len: usize) -> String {
+        (1..=len)
+            .map(|i| {
+                let id = format!("c{i}");
+                if i == len {
+                    paragraph_style(&id, Some("heading 1"), None, None)
+                } else {
+                    let name = format!("Link {i}");
+                    let parent = format!("c{}", i + 1);
+                    paragraph_style(&id, Some(name.as_str()), Some(parent.as_str()), None)
+                }
+            })
+            .collect()
+    }
+
+    /// feature-62 T9 (AC9, J5): a `w:basedOn` cycle ends, as body text, and so does a chain
+    /// whose heading is past the bound of 16 styles, the paragraph's own counted.
+    #[test]
+    fn a_based_on_cycle_or_an_overlong_chain_ends_the_walk() {
+        let cycle = format!(
+            "{}{}",
+            paragraph_style("A", Some("Alpha"), Some("B"), None),
+            paragraph_style("B", Some("Beta"), Some("A"), None)
+        );
+        assert_eq!(level_under(&cycle, "A"), None, "a cycle ends at the bound");
+        assert_eq!(
+            level_under(&chain_of(16), "c1"),
+            Some(2),
+            "the 16th style is looked at"
+        );
+        assert_eq!(level_under(&chain_of(17), "c1"), None, "the 17th is not");
+    }
+
+    /// feature-62 T10 (AC10, J1, J4): an ID the table holds is decided by the table. A style
+    /// without a usable name lets its ID stand in for the name; a parent the table does not
+    /// hold ends the walk as body text, not as a fallback.
+    #[test]
+    fn a_style_id_the_table_resolves_is_decided_by_the_table() {
+        assert_eq!(
+            level_under(
+                &paragraph_style("Heading1", Some("Body Copy"), None, None),
+                "Heading1"
+            ),
+            None,
+            "(a) the table says body, whatever the ID spells"
+        );
+        let nameless = [
+            ("b", paragraph_style("Heading1", None, None, None)),
+            (
+                "c",
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name/></w:style>"#.to_string(),
+            ),
+            (
+                "d",
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val=""/></w:style>"#
+                    .to_string(),
+            ),
+            (
+                "e",
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="  "/></w:style>"#
+                    .to_string(),
+            ),
+        ];
+        for (case, styles) in &nameless {
+            assert_eq!(level_under(styles, "Heading1"), Some(2), "({case})");
+        }
+        assert_eq!(
+            level_under(&paragraph_style("7", None, None, None), "7"),
+            None,
+            "(f) the ID stands in, and `7` is no heading"
+        );
+        assert_eq!(
+            level_under(
+                &paragraph_style("Heading3", Some("Plain"), Some("Missing"), None),
+                "Heading3"
+            ),
+            None,
+            "(g) no fallback past a missing parent"
+        );
+    }
+
+    /// feature-62 T11 (AC11): with a usable styles part, an ID it does not define falls back to
+    /// its spelling.
+    #[test]
+    fn an_unresolved_style_id_falls_back_to_the_style_id_spelling() {
+        let styles = word2010_ja_styles();
+        assert_eq!(level_under(&styles, "Heading2"), Some(3));
+        assert_eq!(level_under(&styles, "7"), None);
+    }
+
+    /// feature-62 T12 (AC12, J6): a styles part that ends with elements still open is not used
+    /// at all -- not even the styles that closed before the end.
+    #[test]
+    fn a_styles_part_ending_with_open_elements_is_not_used() {
+        let part = format!(
+            r#"<?xml version="1.0"?><w:styles xmlns:w="{W_NS}">{}<w:style w:type="paragraph" w:styleId="2"><w:name w:val="heading 2"/>"#,
+            paragraph_style("1", Some("heading 1"), None, None)
+        );
+        assert!(
+            !quick_xml_errs(part.as_bytes()),
+            "premise: quick-xml ends this at Eof, not with an error"
+        );
+        assert_eq!(
+            level_with(Some(part.as_bytes()), "1"),
+            None,
+            "style 1 closed but is not used"
+        );
+        assert_eq!(level_with(Some(part.as_bytes()), "2"), None);
+        assert_eq!(level_with(Some(part.as_bytes()), "Heading1"), Some(2));
+    }
+
+    /// feature-62 T13 (AC13): the other ways a styles part is not used -- (a) a tag cut short,
+    /// (b) no element, (c) a root other than `w:styles` -- fall back for every paragraph, and
+    /// the parse still succeeds; (d) `<w:styles/>` is usable and holds nothing, which reads the
+    /// same (the stderr line tells them apart, `grooveseek/tests/index_docx_heading_policy.rs`).
+    #[test]
+    fn a_broken_styles_part_falls_back_for_every_paragraph() {
+        let heading_1 = paragraph_style("1", Some("heading 1"), None, None);
+        let cut = format!(r#"<w:styles xmlns:w="{W_NS}">{heading_1}<w:sty"#);
+        assert!(
+            quick_xml_errs(cut.as_bytes()),
+            "premise: (a) quick-xml errs"
+        );
+        let no_root = "not xml at all".to_string();
+        assert!(
+            !quick_xml_errs(no_root.as_bytes()),
+            "premise: (b) text, then Eof"
+        );
+        let elsewhere = format!(r#"<w:document xmlns:w="{W_NS}">{heading_1}</w:document>"#);
+        let empty = format!(r#"<w:styles xmlns:w="{W_NS}"/>"#);
+        for (case, part) in [
+            ("a", &cut),
+            ("b", &no_root),
+            ("c", &elsewhere),
+            ("d", &empty),
+        ] {
+            assert_eq!(level_with(Some(part.as_bytes()), "1"), None, "({case})");
+            assert_eq!(
+                level_with(Some(part.as_bytes()), "Heading1"),
+                Some(2),
+                "({case})"
+            );
+        }
+    }
+
+    type Section = (Option<String>, Option<u8>, String, Option<String>);
+
+    /// Each chunk as (heading, level, content, context).
+    fn sections(doc: &ParsedDocument) -> Vec<Section> {
+        doc.chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.heading.clone(),
+                    c.level,
+                    c.content.clone(),
+                    c.context.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// feature-62 T16 (AC16, R3): the read entry resolves styles the same way, and under the
+    /// default budget whatever budget the parser was built with.
+    #[test]
+    fn the_read_entry_applies_the_style_table_too() {
+        let bytes = numeric_heading_docx(PStyle::Empty);
+        let index = DocxParser::default()
+            .parse_bytes(&bytes, "quarry.docx", &[])
+            .unwrap();
+        let read = DocxParser::default()
+            .parse_bytes_for_read(&bytes, "quarry.docx", &[])
+            .unwrap();
+        assert_eq!(sections(&read), sections(&index));
+        assert_numeric_heading_sections(&read);
+
+        let styles = styles_xml(&word2010_ja_styles());
+        let (probe, doc_len) = probe_docx(Some(styles.as_bytes()), "1");
+        let tight = DocxParser::with_budget((doc_len + styles.len() - 1) as u64);
+        let indexed = tight.parse_bytes(&probe, "probe.docx", &[]).unwrap();
+        assert_eq!(
+            level_of(&indexed),
+            None,
+            "the index side skips styles.xml under its budget"
+        );
+        let read = tight
+            .parse_bytes_for_read(&probe, "probe.docx", &[])
+            .unwrap();
+        assert_eq!(
+            level_of(&read),
+            Some(2),
+            "the read side keeps the default budget"
+        );
+    }
+
+    /// feature-62 T18 (AC17): an English-Word document -- style IDs `Heading1` / `Heading2`
+    /// named `heading 1` / `heading 2`, based on `Normal` -- splits exactly as the same
+    /// paragraphs without a styles part, which the spelling rule has always split.
+    #[test]
+    fn builtin_english_heading_styles_split_exactly_as_without_styles() {
+        let paragraphs: &[(Option<&str>, &str)] = &[
+            (Some("Heading1"), "章1"),
+            (None, "本文A これは十分な長さの本文です十分な長さの本文です"),
+            (Some("Heading2"), "節1.1"),
+            (None, "本文B これは十分な長さの本文です十分な長さの本文です"),
+        ];
+        let doc = document_xml(paragraphs, PStyle::Empty);
+        let styles = styles_xml(&format!(
+            "{}{}{}",
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>"#,
+            paragraph_style("Heading1", Some("heading 1"), Some("Normal"), Some("0")),
+            paragraph_style("Heading2", Some("heading 2"), Some("Normal"), Some("1")),
+        ));
+        let parse = |bytes: &[u8]| {
+            DocxParser::default()
+                .parse_bytes(bytes, "docs/a.docx", &[])
+                .unwrap()
+        };
+        let with = parse(&docx_with_parts(&[
+            ("word/document.xml", doc.as_bytes()),
+            ("word/styles.xml", styles.as_bytes()),
+        ]));
+        let without = parse(&docx_with_parts(&[("word/document.xml", doc.as_bytes())]));
+        assert_eq!(sections(&with), sections(&without));
+        assert_eq!(
+            outline(&with),
+            vec![(Some("章1"), Some(2)), (Some("節1.1"), Some(3))]
+        );
+    }
 }
