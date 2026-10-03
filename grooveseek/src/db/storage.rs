@@ -735,4 +735,23 @@ impl Database {
             .execute("DELETE FROM documents WHERE path = ?1", params![path])?;
         Ok(())
     }
+
+    /// (feature-62) Overwrite the `content_hash` of each document in `paths` with `hash`,
+    /// leaving every other column and the chunks as they are; a path without a row is skipped.
+    /// Returns how many rows changed. A caller's transaction ([`Database::begin_transaction`])
+    /// is joined, so the overwrite commits with whatever the caller writes beside it.
+    ///
+    /// [`crate::indexer::rebuild_index`] writes a value no file hashes to over the `.docx`
+    /// rows its one-time pass could not settle, so the unchanged fast path reads those files
+    /// again on the next run.
+    pub fn overwrite_content_hash(&self, paths: &[&str], hash: &str) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE documents SET content_hash = ?1 WHERE path = ?2")?;
+        let mut changed = 0;
+        for path in paths {
+            changed += stmt.execute(params![hash, path])?;
+        }
+        Ok(changed)
+    }
 }
