@@ -1231,6 +1231,10 @@ pub fn rebuild_index(
             }
         }
     }
+    // (feature-62) The `.docx` rows this run's pass did not bring in line with the new heading
+    // rule. Marked at the end, after the sweep -- never inside the loop, so a run that stops
+    // midway leaves every hash as it was (I-4).
+    let mut unsettled_docx: HashSet<String> = HashSet::new();
 
     // 2. Process each file
     //
@@ -1293,6 +1297,23 @@ pub fn rebuild_index(
         // `settle_cross_parser_rename`'s doc for why.
         if crossed {
             settle_cross_parser_rename(db, &entry.rel, &single_result)?;
+        }
+        // (feature-62) Settled: written by this parser, re-read and found to match, or dropped
+        // by the re-read. Anything else -- a parse failure, a refusal, bytes that changed under
+        // the read, a skip on the ordinary path -- leaves a row the old rule wrote, which the end
+        // of the run marks. A row already gone (a cross-parser rename settled above) needs none.
+        if refresh_docx {
+            let settled = match &single_result {
+                SingleResult::Updated { .. } => true,
+                SingleResult::Unchanged => mode == Reindex::Reparse,
+                SingleResult::Skipped { reason, .. } => {
+                    mode == Reindex::Reparse && *reason == SKIPPED_NO_CHUNKS
+                }
+                SingleResult::MetadataRefreshed { .. } | SingleResult::Refused => false,
+            };
+            if !settled && indexed_hash_for(db, registry, &entry.rel, "docx")?.is_some() {
+                unsettled_docx.insert(entry.rel.clone());
+            }
         }
         match single_result {
             SingleResult::Updated {
@@ -1445,6 +1466,30 @@ pub fn rebuild_index(
     )?;
 
     let result = complete_index_result(db, embedder, tally, Some(embedded_since), start, false)?;
+    // (feature-62) Recorded last -- after the deletion sweep, for the reason the frontmatter
+    // key is, and after every other step of the run that can fail, so a run that returns an
+    // `Err` or stops at a check point never records it (I-4) -- together with the placeholder
+    // over every `.docx` row this run could not settle: the ones the loop marked, and the ones
+    // the scan skipped, which the loop never saw. One transaction, so the key is never there
+    // without the marks (I-1). The marks are written over whatever the rows hold now,
+    // unconditionally: a row another process wrote since the loop is marked too, and re-read
+    // once more, rather than an old-rule row being kept (ADR-0028). `--force` rewrote every
+    // row, so it marks none. The counts in `result` read rows, not hashes, so the marks do not
+    // change them.
+    if force || refresh_docx {
+        if refresh_docx {
+            for rel in &skipped_paths {
+                if indexed_hash_for(db, registry, rel, "docx")?.is_some() {
+                    unsettled_docx.insert(rel.clone());
+                }
+            }
+        }
+        let marked: Vec<&str> = unsettled_docx.iter().map(String::as_str).collect();
+        let tx = db.begin_transaction()?;
+        db.overwrite_content_hash(&marked, HASH_AWAITING_REPARSE)?;
+        db.write_docx_heading_policy(DOCX_HEADING_POLICY)?;
+        tx.commit()?;
+    }
     progress.finish();
     Ok(result)
 }
@@ -1633,8 +1678,8 @@ const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
 /// for good, and the hash is what says whether the bytes that were read this run are the ones
 /// the row was written from.
 ///
-/// (feature-62) The one-time `.docx` pass asks it with `"docx"`, for which rows it re-reads
-/// ([`rereads_unchanged_docx`]).
+/// (feature-62) The one-time `.docx` pass asks it with `"docx"`: which rows it re-reads
+/// ([`rereads_unchanged_docx`]) and, at the end of the run, which rows it could not settle.
 fn indexed_hash_for(
     db: &Database,
     registry: &Registry,
@@ -2969,8 +3014,9 @@ pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
 pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 
 /// (feature-62) Recorded in `index_meta.docx_heading_policy` once every `.docx` row of the
-/// index has been looked at by a build that reads `.docx` headings from `word/styles.xml`
-/// (ADR-0027).
+/// index has been settled under the heading rule that reads `word/styles.xml` (ADR-0027):
+/// re-read and found to split the same way, rewritten, dropped, or marked with
+/// [`HASH_AWAITING_REPARSE`] so the unchanged fast path cannot keep it.
 ///
 /// Absence means "not looked at yet": an index written before that rule holds `.docx` rows
 /// split by the style-ID spelling, with a matching content hash, and the unchanged fast path
@@ -2978,6 +3024,14 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// [`FRONTMATTER_POLICY`], and a key of its own, since the two passes cover different files and
 /// do different work (ADR-0028).
 pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
+
+/// (feature-62) The `content_hash` a `.docx` row carries when the one-time pass of
+/// [`DOCX_HEADING_POLICY`] could not settle it: skipped by the scan, failed to parse, refused
+/// by the endpoint, or changed under the read. No file hashes to it -- a SHA-256 here is 64
+/// lowercase hex digits ([`sha256_hex_bytes`]) -- so the unchanged fast path never matches it,
+/// and every later run reads the file the way it reads a changed one until it can be indexed.
+/// Nothing reads the value for anything else (ADR-0028 lists who reads `content_hash`).
+pub(crate) const HASH_AWAITING_REPARSE: &str = "awaiting-reparse";
 
 /// Where [`index_single_disk_entry`] gets the declared-field set from (feature-58; codex P2
 /// round 9 / 12 on PR #291, local Codex after round 12).
@@ -6764,5 +6818,57 @@ mod tests {
             "Re-reading 3 unchanged .docx document(s) once: headings now come from word/styles.xml; only documents whose sections change are re-embedded"
         );
         assert!(notice.is_ascii());
+    }
+
+    /// Whether `s` has the shape of [`sha256_hex_bytes`]: 64 lowercase hex digits.
+    fn is_digest_shaped(s: &str) -> bool {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// feature-62 T20 (AC34 (a)): the placeholder a row awaits a re-parse under cannot be a
+    /// digest, so no file's hash matches it.
+    #[test]
+    fn the_awaiting_reparse_hash_cannot_be_a_sha256_digest() {
+        assert!(
+            is_digest_shaped(&sha256_hex_bytes(b"any bytes")),
+            "premise: the digest's shape"
+        );
+        assert!(!HASH_AWAITING_REPARSE.is_empty());
+        assert!(
+            !is_digest_shaped(HASH_AWAITING_REPARSE),
+            "{HASH_AWAITING_REPARSE}"
+        );
+    }
+
+    /// feature-62 T21 (AC34 (b)): a row awaiting a re-parse is read on the ordinary path even
+    /// when the file is the one its chunks came from, and ends with the file's real hash.
+    /// Its chunks match, so nothing is embedded and the unreachable embedder is never called.
+    #[test]
+    fn a_row_awaiting_reparse_never_takes_the_unchanged_fast_path() {
+        use crate::parser::docx::fixture::{PStyle, numeric_heading_docx};
+        let dir = mk_tmp("f62-awaiting");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let bytes = numeric_heading_docx(PStyle::Empty);
+        let chunks = parse_docx(&registry, "quarry.docx", &bytes);
+        write_row(&db, "quarry.docx", HASH_AWAITING_REPARSE, &chunks);
+        let entry = docx_entry(&dir.0, "quarry.docx", &bytes);
+
+        let ordinary = Reindex::Incremental {
+            check_frontmatter: false,
+            refresh_fields: false,
+        };
+        assert_eq!(
+            reindex(&db, &registry, &entry, ordinary),
+            SingleResult::Updated {
+                chunks: chunks.len() as u32,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.get_document_hash("quarry.docx").unwrap(),
+            Some(entry.hash.clone())
+        );
     }
 }

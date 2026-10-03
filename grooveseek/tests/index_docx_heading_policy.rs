@@ -357,12 +357,18 @@ fn broken_or_oversized_styles_parts_are_named_on_stderr() {
 /// before the run it is about, so it holds whether or not an earlier run recorded the key.
 mod reread_pass {
     use super::*;
+    use crate::common::embed_cli::note;
     use crate::common::embed_mock::DOC_MODEL;
     use rusqlite::{Connection, OptionalExtension};
     use sha2::{Digest, Sha256};
 
     const POLICY_KEY: &str = "docx_heading_policy";
     const NOTICE: &str = "Re-reading 1 unchanged .docx document(s) once:";
+    const POLICY: &str = "styles-name-basedon";
+    /// What a row the pass could not settle carries instead of its hash.
+    const AWAITING: &str = "awaiting-reparse";
+    /// A top-level `exclude_headings` naming every heading of the AC1 document.
+    const EXCLUDE_ALL: &str = "exclude_headings = [\"Harbor\", \"Lantern\", \"Orchard\"]\n";
 
     fn db(fx: &Fixture) -> Connection {
         Connection::open(fx.layout.root().join(".groove.db")).expect("open the index")
@@ -441,6 +447,37 @@ mod reread_pass {
         format!("{:x}", Sha256::digest(bytes))
     }
 
+    fn meta(fx: &Fixture, key: &str) -> Option<String> {
+        db(fx)
+            .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .expect("read index_meta")
+    }
+
+    fn has_row(fx: &Fixture, rel: &str) -> bool {
+        content_hash(fx, rel).is_some()
+    }
+
+    /// The `path` of every hit.
+    fn hit_paths(hits: &serde_json::Value) -> Vec<String> {
+        hits.get("results")
+            .and_then(|r| r.as_array())
+            .unwrap_or_else(|| panic!("search JSON has no results array: {hits}"))
+            .iter()
+            .filter_map(|h| h.get("path").and_then(|p| p.as_str()).map(str::to_owned))
+            .collect()
+    }
+
+    /// A Markdown note beside the docx, which the pass must not touch.
+    fn write_meadow(fx: &Fixture) {
+        fx.layout.write(
+            "meadow.md",
+            &note("Meadow", "fern moss lichen growing beside the stream bank"),
+        );
+    }
+
     /// feature-62 I1s (AC23): under Static mode a changed context alone makes the re-read
     /// rewrite the document.
     #[test]
@@ -478,6 +515,7 @@ mod reread_pass {
                 .all(|r| r.model() != Some(DOC_MODEL)),
             "nothing was re-embedded"
         );
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
         assert_eq!(
             content_hash(&fx, "quarry.docx"),
             Some(sha256_hex(&bytes)),
@@ -521,6 +559,240 @@ mod reread_pass {
             headings(&fx, "quarry.docx"),
             expected_headings(),
             "the pass ran under --quiet too"
+        );
+    }
+
+    /// feature-62 I1 (AC21, I-3): the first run re-splits an unchanged docx once and leaves
+    /// Markdown alone; the run after it does not re-read again.
+    #[test]
+    fn the_first_run_after_upgrade_resplits_unchanged_docx_once() {
+        let fx = docx_kb("groove-f62-i1");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        write_meadow(&fx);
+        index_stderr(&fx);
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        set_headings(&fx, "meadow.md", "Rewritten");
+        delete_meta(&fx, POLICY_KEY);
+
+        let second = index_stderr(&fx);
+        assert!(second.contains(NOTICE), "{second}");
+        assert!(second.contains("(1 updated, "), "{second}");
+        assert_eq!(headings(&fx, "quarry.docx"), expected_headings());
+        assert_eq!(
+            headings(&fx, "meadow.md"),
+            vec![Some("Rewritten".to_string())],
+            "Markdown is not re-read"
+        );
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        let third = index_stderr(&fx);
+        assert!(!third.contains("Re-reading"), "{third}");
+        assert_eq!(
+            headings(&fx, "quarry.docx")[1].as_deref(),
+            Some("Rewritten"),
+            "the pass ran once"
+        );
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-62 I4 (AC28): `--force` records the policy without the notice.
+    #[test]
+    fn a_forced_run_records_the_docx_policy() {
+        let fx = docx_kb("groove-f62-i4");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        index_stderr(&fx);
+        delete_meta(&fx, POLICY_KEY);
+
+        let out = fx.index_force();
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        let awaiting: i64 = db(&fx)
+            .query_row(
+                "SELECT count(*) FROM documents WHERE content_hash = ?1",
+                [AWAITING],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(awaiting, 0);
+    }
+
+    /// feature-62 I5 (AC29): a knowledge base whose parsers leave docx out records the
+    /// policy on its first run.
+    #[test]
+    fn an_index_without_a_docx_parser_records_the_docx_policy() {
+        let fx = docx_kb("groove-f62-i5");
+        configure(&fx, "", r#"["md"]"#, "");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        write_meadow(&fx);
+        let stderr = index_stderr(&fx);
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        assert!(!has_row(&fx, "quarry.docx"));
+    }
+
+    /// feature-62 I8 (AC32, J7): the frontmatter pass and the docx pass are separate.
+    #[test]
+    fn the_frontmatter_pass_does_not_reopen_docx() {
+        let fx = docx_kb("groove-f62-i8");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        write_meadow(&fx);
+        index_stderr(&fx);
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        delete_meta(&fx, "frontmatter_policy");
+
+        let second = index_stderr(&fx);
+        assert!(!second.contains("Re-reading"), "{second}");
+        assert_eq!(
+            headings(&fx, "quarry.docx")[1].as_deref(),
+            Some("Rewritten")
+        );
+    }
+
+    /// feature-62 I10 (AC24, H1): a docx whose bytes changed takes the ordinary path, which
+    /// writes its new hash, and is not counted in the notice.
+    #[test]
+    fn a_changed_docx_during_the_pass_takes_the_ordinary_path() {
+        let fx = docx_kb("groove-f62-i10");
+        write_bytes(&fx, "quarry.docx", &numeric_heading_docx(TITLE, &[]));
+        index_stderr(&fx);
+        delete_meta(&fx, POLICY_KEY);
+
+        let changed =
+            numeric_heading_docx(TITLE, &[("docProps/app.xml", b"<Properties/>".as_slice())]);
+        write_bytes(&fx, "quarry.docx", &changed);
+        let second = index_stderr(&fx);
+        assert!(!second.contains("Re-reading"), "{second}");
+        assert!(second.contains("(1 updated, "), "{second}");
+        assert_eq!(content_hash(&fx, "quarry.docx"), Some(sha256_hex(&changed)));
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+    }
+
+    /// The AC1 document without its preface: every paragraph sits under a heading.
+    fn headings_only_docx() -> Vec<u8> {
+        let doc = document_xml(&[
+            (Some("1"), H_FIRST),
+            (None, B_FIRST),
+            (Some("2"), H_NESTED),
+            (None, B_NESTED),
+            (Some("1"), H_SECOND),
+            (None, B_SECOND),
+        ]);
+        let styles = styles_xml(&word2010_ja_styles());
+        let core = core_xml(TITLE);
+        docx(&[
+            ("word/document.xml", doc.as_bytes()),
+            ("word/styles.xml", styles.as_bytes()),
+            ("docProps/core.xml", core.as_bytes()),
+        ])
+    }
+
+    /// feature-62 I11 (AC25, J17, J21): a re-read that leaves nothing to index removes the
+    /// row and counts a skip, not a deletion, and the next run finds it absent too.
+    #[test]
+    fn a_docx_the_new_rule_leaves_without_chunks_is_removed() {
+        let fx = docx_kb("groove-f62-i11");
+        write_bytes(&fx, "quarry.docx", &headings_only_docx());
+        write_meadow(&fx);
+        index_stderr(&fx);
+        assert!(has_row(&fx, "quarry.docx"));
+
+        configure(&fx, EXCLUDE_ALL, MD_AND_DOCX, "");
+        delete_meta(&fx, POLICY_KEY);
+        let second = index_stderr(&fx);
+        assert!(!has_row(&fx, "quarry.docx"), "{second}");
+        assert!(
+            second.contains("(0 updated, 0 renamed, 0 deleted, 1 skipped,"),
+            "{second}"
+        );
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        let hits = fx.search_json("kettle");
+        assert!(
+            !hit_paths(&hits).iter().any(|p| p == "quarry.docx"),
+            "an excluded section's body must not stay searchable: {hits}"
+        );
+
+        let third = index_stderr(&fx);
+        assert!(!has_row(&fx, "quarry.docx"), "{third}");
+        assert!(
+            third.contains("(0 updated, 0 renamed, 0 deleted, 1 skipped,"),
+            "{third}"
+        );
+    }
+
+    /// feature-62 I11's control (AC25): with the policy recorded, the same configuration
+    /// change leaves the row on the fast path, as before.
+    #[test]
+    fn an_excluded_docx_keeps_its_row_when_no_pass_runs() {
+        let fx = docx_kb("groove-f62-i11c");
+        write_bytes(&fx, "quarry.docx", &headings_only_docx());
+        write_meadow(&fx);
+        index_stderr(&fx);
+        configure(&fx, EXCLUDE_ALL, MD_AND_DOCX, "");
+        let second = index_stderr(&fx);
+        assert!(has_row(&fx, "quarry.docx"), "{second}");
+    }
+
+    /// I3 / I3b: a `.docx` the pass cannot read under `capped` is settled with the awaiting
+    /// hash in one run (the policy is recorded), the next run under the same cap names it again
+    /// without re-running the pass, and once the cap is lifted it is read on the ordinary path
+    /// and its hash is the bytes' again.
+    fn unreadable_docx_settles_with_the_awaiting_hash(prefix: &str, capped: &str, says: &str) {
+        let fx = docx_kb(prefix);
+        let bytes = numeric_heading_docx(TITLE, &[]);
+        write_bytes(&fx, "quarry.docx", &bytes);
+        index_stderr(&fx);
+        delete_meta(&fx, POLICY_KEY);
+        let skipped = |stderr: &str| {
+            stderr
+                .lines()
+                .any(|l| l.contains("Skipping quarry.docx:") && l.contains(says))
+        };
+
+        configure(&fx, "", MD_AND_DOCX, capped);
+        let second = index_stderr(&fx);
+        assert!(skipped(&second), "{second}");
+        assert_eq!(
+            meta(&fx, POLICY_KEY).as_deref(),
+            Some(POLICY),
+            "an unreadable document does not hold the pass open:\n{second}"
+        );
+        assert_eq!(content_hash(&fx, "quarry.docx").as_deref(), Some(AWAITING));
+
+        let third = index_stderr(&fx);
+        assert!(!third.contains("Re-reading"), "{third}");
+        assert!(
+            skipped(&third),
+            "tried again, as a changed file would be:\n{third}"
+        );
+        assert_eq!(content_hash(&fx, "quarry.docx").as_deref(), Some(AWAITING));
+
+        configure(&fx, "", MD_AND_DOCX, "");
+        let fourth = index_stderr(&fx);
+        assert!(!fourth.contains("Re-reading"), "{fourth}");
+        assert!(fourth.contains("(1 updated, "), "{fourth}");
+        assert_eq!(content_hash(&fx, "quarry.docx"), Some(sha256_hex(&bytes)));
+    }
+
+    /// feature-62 I3 (AC26): a `.docx` the scan skips for its size.
+    #[test]
+    fn a_docx_the_scan_skipped_is_settled_with_a_hash_awaiting_reparse() {
+        unreadable_docx_settles_with_the_awaiting_hash(
+            "groove-f62-i3",
+            "[index]\nmax_binary_file_size = 100\n",
+            "file too large",
+        );
+    }
+
+    /// feature-62 I3b (AC27): a `.docx` that fails to parse.
+    #[test]
+    fn a_docx_that_fails_to_parse_is_settled_with_a_hash_awaiting_reparse() {
+        unreadable_docx_settles_with_the_awaiting_hash(
+            "groove-f62-i3b",
+            "[index]\nmax_decompressed_size = 100\n",
+            "parse failed",
         );
     }
 }
