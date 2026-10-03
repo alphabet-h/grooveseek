@@ -1408,4 +1408,81 @@ mod reread_pass {
         assert_eq!(content_hash(&fx, "a-bloat.docx").as_deref(), Some(AWAITING));
         assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash));
     }
+
+    /// feature-62 spec I-1 / R4.4 from the other side: an error in the write of the placeholder
+    /// itself must leave the key unwritten too. A trigger on the documents table makes the
+    /// update that stamps the placeholder fail, so [`grooveseek::indexer::rebuild_index`]
+    /// returns an error; the key is absent and every row keeps its own hash and chunks. Once
+    /// the trigger is dropped, the next run records the key and the placeholder together. A
+    /// run that committed the key before the placeholder was written would leave the key
+    /// behind and fail the first half.
+    #[test]
+    fn a_failed_mark_write_leaves_neither_the_marks_nor_the_key() {
+        if run_in_hermetic_child(
+            "reread_pass::a_failed_mark_write_leaves_neither_the_marks_nor_the_key",
+        ) {
+            return;
+        }
+        const DEC_CAP: usize = 16_384;
+        const TRIGGER: &str = "CREATE TRIGGER inject_mark_failure BEFORE UPDATE OF content_hash ON documents WHEN NEW.content_hash = 'awaiting-reparse' BEGIN SELECT RAISE(ABORT, 'injected mark failure'); END;";
+        let fx = docx_kb("groove-f62-i1mk");
+
+        // Over the second run's budget on word/document.xml alone, so that run cannot settle it.
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        // Fits the second run's budget, so that run reads it and finds its sections unchanged.
+        let tidy = numeric_heading_docx("Ledger", &[]);
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-tidy.docx", &tidy);
+
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the first run, under the default caps");
+        let (bloat_hash, tidy_hash) = (sha256_hex(&bloat), sha256_hex(&tidy));
+        assert_eq!(content_hash(&fx, "a-bloat.docx"), Some(bloat_hash.clone()));
+        assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash.clone()));
+        let (bloat_chunks, tidy_chunks) = (
+            column(&fx, "a-bloat.docx", "content"),
+            column(&fx, "b-tidy.docx", "content"),
+        );
+        assert!(!bloat_chunks.is_empty() && !tidy_chunks.is_empty());
+        delete_meta(&fx, POLICY_KEY);
+        configure(
+            &fx,
+            "",
+            MD_AND_DOCX,
+            &format!("[index]\nmax_decompressed_size = {DEC_CAP}\n"),
+        );
+
+        db(&fx).execute_batch(TRIGGER).expect("create the trigger");
+
+        let err = rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect_err("the run whose mark cannot be written fails");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("injected mark failure"), "{chain}");
+        assert_eq!(meta(&fx, POLICY_KEY), None, "the failed run records no key");
+        let after = content_hash(&fx, "a-bloat.docx");
+        assert_ne!(after.as_deref(), Some(AWAITING), "no mark was written");
+        assert_eq!(
+            after,
+            Some(bloat_hash),
+            "the unsettled row keeps its own hash"
+        );
+        assert_eq!(column(&fx, "a-bloat.docx", "content"), bloat_chunks);
+        assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash.clone()));
+        assert_eq!(column(&fx, "b-tidy.docx", "content"), tidy_chunks);
+        assert!(has_row(&fx, "a-bloat.docx") && has_row(&fx, "b-tidy.docx"));
+
+        db(&fx)
+            .execute_batch("DROP TRIGGER inject_mark_failure;")
+            .expect("drop the trigger");
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the run after the trigger is gone");
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        assert_eq!(content_hash(&fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash));
+    }
 }
