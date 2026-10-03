@@ -2224,6 +2224,59 @@ mod tests {
         assert_eq!(level_with(Some(clean.as_bytes()), "1"), Some(2));
     }
 
+    /// feature-62 (R2.3, codex review round 3): the attribute check in [`StylesWalk`] runs
+    /// before the root guard and before the guard for elements after the root, so a malformed
+    /// attribute on the root itself, or on an element written after the root closed, also
+    /// makes [`StyleTable::parse`] refuse the part. Without the duplicate each part is usable.
+    #[test]
+    fn a_malformed_attribute_on_the_root_or_after_it_is_not_used() {
+        let heading_1 = paragraph_style("1", Some("heading 1"), None, None);
+        let on_root = |second_x: &str| {
+            format!(r#"<w:styles xmlns:w="{W_NS}" w:x="1"{second_x}>{heading_1}</w:styles>"#)
+        };
+        let after_root = |second_x: &str| {
+            format!(
+                r#"<w:styles xmlns:w="{W_NS}">{heading_1}</w:styles><w:late w:x="1"{second_x}/>"#
+            )
+        };
+        let cases = [
+            ("root", on_root(r#" w:x="2""#), on_root("")),
+            ("after the root", after_root(r#" w:x="2""#), after_root("")),
+        ];
+        for (case, duplicated, clean) in &cases {
+            assert!(
+                !quick_xml_errs(duplicated.as_bytes()),
+                "premise ({case}): the reader reaches Eof; only the attributes err"
+            );
+            assert!(
+                matches!(
+                    StyleTable::parse(duplicated.as_bytes()),
+                    Err(StylesUnusable::Xml(_))
+                ),
+                "({case})"
+            );
+            assert_eq!(
+                level_with(Some(duplicated.as_bytes()), "1"),
+                None,
+                "({case})"
+            );
+            assert_eq!(
+                level_with(Some(duplicated.as_bytes()), "Heading1"),
+                Some(2),
+                "({case})"
+            );
+
+            let table = StyleTable::parse(clean.as_bytes())
+                .unwrap_or_else(|_| panic!("({case}) without the duplicate it is usable"));
+            assert_eq!(
+                verdict_for(&table, "1"),
+                StyleVerdict::Heading(2),
+                "({case})"
+            );
+            assert_eq!(level_with(Some(clean.as_bytes()), "1"), Some(2), "({case})");
+        }
+    }
+
     type Section = (Option<String>, Option<u8>, String, Option<String>);
 
     /// Each chunk as (heading, level, content, context).
