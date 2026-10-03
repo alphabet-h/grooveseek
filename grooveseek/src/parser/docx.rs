@@ -275,27 +275,46 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec
         .collect()
 }
 
-/// `<w:pStyle w:val="HeadingN">` の N から chunk level を返す (Heading1→2, ...,
-/// Heading5→6、Heading6 以上は 6 に cap)。ロケール別名 `"heading 1"` (空白入り)
-/// 等も許容 (小文字化 + prefix 除去後に trim するため)。`w:val` が見出しスタイル
-/// でなければ (`Normal`/`Title` 等) None。
+/// The number `s` spells after `heading`, read the way groove has always read a
+/// `<w:pStyle w:val>`: ASCII-lowercase it, take off a leading `heading`, trim what is left
+/// (Unicode whitespace, U+3000 included) and read it as a `u8`. `heading 0` is `Some(0)`;
+/// `heading`, `heading` with a full-width digit, `heading 1 char`, `heading 256` and
+/// ` heading 1` (a space before it) are `None`.
+///
+/// (feature-62) The one reading of `heading N` in this parser; the spelling fallback in
+/// [`heading_level_from_attr`] reads it directly, because it stops at a `heading 0` value
+/// where it reads on past any other value that is not a heading.
+fn heading_digits(s: &str) -> Option<u8> {
+    let lower = s.to_ascii_lowercase();
+    lower
+        .strip_prefix("heading")
+        .and_then(|rest| rest.trim().parse::<u8>().ok())
+}
+
+/// The chunk level of heading number `n`: one deeper than the heading, as Markdown's `#`
+/// is a document title, up to 6 for every heading from 5 down. Matched rather than computed
+/// as `n + 1`, so `heading 255` cannot overflow the `u8`.
+fn chunk_level(n: u8) -> u8 {
+    match n {
+        0..=5 => n + 1,
+        _ => 6,
+    }
+}
+
+/// The chunk level of the paragraph a `<w:pStyle>` (`e`) styles, or `None` for body text:
+/// the number its first `val` attribute that reads as `heading N` spells
+/// ([`heading_digits`]), at [`chunk_level`], or `None` when that number is 0. `Heading1` ..
+/// `Heading6` and `heading 1` with a space count; `Normal`, `Title` and `1` do not.
 fn heading_level_from_attr(e: &BytesStart) -> Option<u8> {
     for attr in e.attributes().flatten() {
         if super::ooxml_local(attr.key.as_ref()) != b"val" {
             continue;
         }
-        let val = String::from_utf8_lossy(&attr.value).to_ascii_lowercase();
-        let Some(n) = val
-            .strip_prefix("heading")
-            .and_then(|rest| rest.trim().parse::<u8>().ok())
-        else {
-            continue;
-        };
-        return match n {
-            1..=5 => Some(n + 1),
-            6.. => Some(6),
-            0 => None,
-        };
+        match heading_digits(&String::from_utf8_lossy(&attr.value)) {
+            None => continue,
+            Some(0) => return None,
+            Some(n) => return Some(chunk_level(n)),
+        }
     }
     None
 }
@@ -705,5 +724,63 @@ mod tests {
                 .is_ok(),
             "the default is the previous 50 MiB"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-62: headings from word/styles.xml
+    // -----------------------------------------------------------------------
+
+    /// feature-62 T19 (AC18): one reading of the heading digits, shared by style
+    /// names and by the style-ID spelling the fallback reads, and a chunk level
+    /// that cannot overflow however large the number.
+    #[test]
+    fn heading_digits_reads_names_the_way_the_style_id_rule_did() {
+        let headings: &[(&str, u8)] = &[
+            ("heading 1", 1),
+            ("Heading1", 1),
+            ("HEADING 3", 3),
+            ("heading 1 ", 1),
+            ("heading\u{3000}1", 1),
+            ("heading 9", 9),
+            ("heading 10", 10),
+            ("heading 255", 255),
+        ];
+        for (s, n) in headings {
+            assert_eq!(heading_digits(s), Some(*n), "{s:?}");
+        }
+        for s in [
+            "heading",
+            "heading \u{FF11}",
+            "heading 256",
+            "Heading 1 Char",
+            " heading 1",
+            "Title",
+            "1",
+        ] {
+            assert_eq!(heading_digits(s), None, "{s:?}");
+        }
+        for (n, level) in [(1, 2), (5, 6), (6, 6), (10, 6), (255, 6)] {
+            assert_eq!(chunk_level(n), level, "heading {n}");
+        }
+    }
+
+    /// feature-62 (r1 M1): the spelling fallback stops at a `heading 0` value as it always
+    /// did, rather than reading on to another `val` attribute of the same `<w:pStyle>`. Two
+    /// `val` attributes with different prefixes (`w:val`, `w14:val`) are well-formed; the
+    /// same qualified name twice is not, and quick-xml drops the second.
+    #[test]
+    fn a_heading_zero_style_id_stops_the_fallback_at_that_attribute() {
+        assert_eq!(heading_digits("heading 0"), Some(0));
+        let bytes = wrap_document_xml(concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading0" w14:val="Heading2"/></w:pPr>"#,
+            r#"<w:r><w:t>Zero styled line</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>plain body text below it</w:t></w:r></w:p>"#,
+        ));
+        let doc = DocxParser::default()
+            .parse_bytes(&bytes, "zero.docx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 1, "{:?}", doc.chunks);
+        assert_eq!(doc.chunks[0].heading, None);
+        assert!(doc.chunks[0].content.contains("Zero styled line"));
     }
 }
