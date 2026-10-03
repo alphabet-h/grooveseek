@@ -72,6 +72,7 @@ the catch-up open for every other one.
 - **The catch-up runs once.** Later runs take the fast path, except for each
   marked row, which every run reads the way it reads a changed file — its
   `Skipping ...` line repeats — until it can be indexed.
+- A marked `.docx` that parses to no chunks on a later run keeps its old chunks and is read again on every run, the way any changed file that yields no chunks does today. Only the pass's own re-read removes a row that yields no chunks; aligning the changed-file path is a behaviour change for every format and is out of scope here.
 - **A marked document that is moved** is a new file and a deletion, not a
   rename, because rename detection matches hashes.
 - **The evaluation corpus digest changes once**, on the run that writes marks,
