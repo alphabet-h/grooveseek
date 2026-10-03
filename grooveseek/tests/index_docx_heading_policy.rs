@@ -432,6 +432,16 @@ mod reread_pass {
             .expect("rewrite headings");
     }
 
+    /// Overwrite the stored content hash of `rel` with `hash`.
+    fn set_content_hash(fx: &Fixture, rel: &str, hash: &str) {
+        db(fx)
+            .execute(
+                "UPDATE documents SET content_hash = ?1 WHERE path = ?2",
+                [hash, rel],
+            )
+            .expect("rewrite content_hash");
+    }
+
     fn headings(fx: &Fixture, rel: &str) -> Vec<Option<String>> {
         column(fx, rel, "heading")
     }
@@ -1100,6 +1110,57 @@ mod reread_pass {
             headings(&fx, "quarry.docx")[1].as_deref(),
             Some("Rewritten")
         );
+    }
+
+    /// feature-62 spec R4.4 / I-2 on the daemon path: a row the pass could not settle carries
+    /// the placeholder instead of its hash, so the watcher's
+    /// [`grooveseek::indexer::reindex_single_file`] cannot take the unchanged fast path for it.
+    /// The watcher parses the file, re-embeds it and writes its real SHA-256 back, and records
+    /// no policy key. A fast path that trusted any stored hash would return unchanged here and
+    /// leave the placeholder and the rewritten headings behind.
+    #[test]
+    fn the_watcher_settles_a_docx_row_that_awaits_its_reparse() {
+        if run_in_hermetic_child(
+            "reread_pass::the_watcher_settles_a_docx_row_that_awaits_its_reparse",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f62-i9r");
+        let bytes = numeric_heading_docx(TITLE, &[]);
+        write_bytes(&fx, "quarry.docx", &bytes);
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        assert_eq!(content_hash(&fx, "quarry.docx"), Some(sha256_hex(&bytes)));
+        delete_meta(&fx, POLICY_KEY);
+
+        set_content_hash(&fx, "quarry.docx", AWAITING);
+        set_headings(&fx, "quarry.docx", "Rewritten");
+        assert_eq!(
+            content_hash(&fx, "quarry.docx"),
+            Some(AWAITING.to_string()),
+            "fixture: the row awaits its reparse"
+        );
+
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+        let kb = fx.kb().canonicalize().expect("canonical kb");
+        let (db, mut embedder) = open_in_process(&fx, &cfg);
+        let settled = reindex_single_file(&db, &mut embedder, &kb, "quarry.docx", None, &registry)
+            .expect("reindex the marked document");
+        assert_eq!(
+            settled,
+            SingleResult::Updated {
+                chunks: 4,
+                frontmatter_unparsed: false
+            },
+            "a marked row bypasses the unchanged fast path"
+        );
+        assert_eq!(
+            content_hash(&fx, "quarry.docx"),
+            Some(sha256_hex(&bytes)),
+            "the watcher writes the real hash back"
+        );
+        assert_eq!(headings(&fx, "quarry.docx"), expected_headings());
+        assert_eq!(meta(&fx, POLICY_KEY), None, "the watcher records no policy");
     }
 
     /// feature-62 spec I-1 / the single transaction of R4.4: the placeholder over the rows the
