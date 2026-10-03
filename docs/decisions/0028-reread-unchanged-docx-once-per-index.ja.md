@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-03
 - Deciders: プロジェクトオーナー
-- Applies to: v1.15.0 の次の release
+- Applies to: v1.16.0
 
 ## 背景と課題
 

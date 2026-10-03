@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-03
 - Deciders: project owner
-- Applies to: the release after v1.15.0
+- Applies to: v1.16.0
 
 ## Context and problem
 
