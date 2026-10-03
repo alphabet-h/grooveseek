@@ -34,6 +34,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `get_document`'s content for these documents, as was already the case for documents with
   `Heading1`-style IDs. See [ADR-0027](docs/decisions/0027-detect-docx-headings-from-style-names.md).
 
+- **The first `groove index` or `rebuild_index` of this version re-reads every unchanged `.docx` once.**
+  `groove index` says so on stderr unless `--quiet` is given; `rebuild_index` counts the re-split
+  documents under `updated`. Only the documents whose sections changed are re-embedded, and a document
+  the new reading leaves with nothing to index (for example when `exclude_headings` now covers every
+  section) is dropped and counted as skipped, the way an empty file is. A `.docx` that run cannot read
+  is tried again on every later run until it can be, the way a changed file that fails to parse already
+  is, so its `Skipping ...` line repeats. Every other document takes the fast path again. **If you run
+  `groove serve`, restart it on this version first, then call the `rebuild_index` tool or run
+  `groove index` once:** the file watcher re-reads only files that change, and a daemon still running
+  the previous version would write edited `.docx` files the old way after the re-read, which only
+  `--force` undoes. See [ADR-0028](docs/decisions/0028-reread-unchanged-docx-once-per-index.md).
+
 ## [1.15.0] - 2026-10-02
 
 ### Added

@@ -8215,4 +8215,88 @@ mod tests {
             "the directory is untouched"
         );
     }
+
+    /// feature-62: the docx heading generation is a key of its own beside the frontmatter
+    /// one (J7), and writing one leaves the other alone.
+    #[test]
+    fn docx_heading_policy_round_trips_beside_the_frontmatter_policy() {
+        let db = db_with_384();
+        assert_eq!(db.read_docx_heading_policy().unwrap(), None);
+        db.write_frontmatter_policy("tag-unparsed").unwrap();
+        db.write_docx_heading_policy("styles-name-basedon").unwrap();
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some("styles-name-basedon")
+        );
+        assert_eq!(
+            db.read_frontmatter_policy().unwrap().as_deref(),
+            Some("tag-unparsed")
+        );
+        db.write_docx_heading_policy("next").unwrap();
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some("next")
+        );
+    }
+
+    /// feature-62: overwriting the content hash touches the named rows' hash and nothing
+    /// else -- not the chunks, not another row -- and a path without a row is skipped.
+    #[test]
+    fn overwrite_content_hash_touches_only_the_named_rows_and_their_hash() {
+        let db = db_with_384();
+        let a = db
+            .upsert_document(
+                "a.docx",
+                Some("A"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "hash-a",
+                10,
+            )
+            .unwrap();
+        db.insert_chunk(
+            a,
+            0,
+            Some("H"),
+            Some(2),
+            "alpha body",
+            None,
+            &[0.1_f32; 384],
+            1.0,
+        )
+        .unwrap();
+        db.upsert_document(
+            "b.docx",
+            Some("B"),
+            None,
+            None,
+            None,
+            &[],
+            None,
+            "hash-b",
+            20,
+        )
+        .unwrap();
+
+        let changed = db
+            .overwrite_content_hash(&["a.docx", "missing.docx"], "marker")
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(
+            db.get_document_hash("a.docx").unwrap().as_deref(),
+            Some("marker")
+        );
+        assert_eq!(
+            db.get_document_hash("b.docx").unwrap().as_deref(),
+            Some("hash-b")
+        );
+        assert_eq!(
+            db.chunk_texts_for_path("a.docx").unwrap(),
+            vec![(Some("H".to_string()), "alpha body".to_string())]
+        );
+        assert_eq!(db.overwrite_content_hash(&[], "marker").unwrap(), 0);
+    }
 }

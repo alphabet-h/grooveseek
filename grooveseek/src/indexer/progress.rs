@@ -582,6 +582,21 @@ impl ProgressReporter {
         }
     }
 
+    /// (feature-62) One line saying what the run is about to do, written the way this reporter
+    /// writes its progress: through the bar under Tty, so the bar is not torn; to stderr under
+    /// Verbose and the non-TTY modes; not at all under Quiet, whose `report_*` are no-ops and
+    /// whose `--quiet` promises the start, `Found` and `Done in` lines only, nor under Callback,
+    /// which turns output into [`ProgressEvent`]s and gains no event for this.
+    pub(crate) fn announce(&self, line: &str) {
+        match &self.inner {
+            ProgressInner::Verbose | ProgressInner::AutoPending | ProgressInner::NonTty { .. } => {
+                eprintln!("{line}");
+            }
+            ProgressInner::Tty(bar) => bar.println(line),
+            ProgressInner::Quiet | ProgressInner::Callback { .. } => {}
+        }
+    }
+
     /// (v1.14.0+) Let `token` stop the run this reporter is handed to. Works
     /// on a reporter of any mode, whether built by [`ProgressReporter::new`],
     /// [`ProgressReporter::from_cli_flags`] or
@@ -1311,5 +1326,19 @@ mod tests {
             "the message is cleared once the scan reaches total, so an unchanged-only run does not keep it"
         );
         assert_eq!(bar.position(), 0, "the bar still belongs to the documents");
+    }
+
+    /// feature-62 (J25): the one-time notice is not an event, so a callback reporter hears
+    /// nothing of it, and a quiet one writes nothing (its output is the subprocess tests').
+    #[test]
+    fn announce_hands_a_callback_reporter_nothing() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&calls);
+        let r = ProgressReporter::with_callback(Box::new(move |_| {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+        r.announce("Re-reading 1 unchanged .docx document(s) once");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        ProgressReporter::new(ProgressMode::Quiet).announce("quiet");
     }
 }
