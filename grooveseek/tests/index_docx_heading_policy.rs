@@ -1026,6 +1026,160 @@ mod reread_pass {
         );
     }
 
+    /// feature-62 I6 at C1 (spec I-4, AC30): a run stopped by a token set from the first scan
+    /// report returns through the early branch after the scan, before the list of unsettled
+    /// documents is built or the final transaction runs, and so records neither the policy
+    /// nor a placeholder. A run that wrote either ahead of that branch would fail here.
+    #[test]
+    fn a_run_cancelled_during_the_scan_records_no_docx_settlement() {
+        if run_in_hermetic_child(
+            "reread_pass::a_run_cancelled_during_the_scan_records_no_docx_settlement",
+        ) {
+            return;
+        }
+        a_run_cancelled_at_the_scan_records_nothing("groove-f62-c1", false);
+    }
+
+    /// feature-62 I6 at C2 (spec I-4, AC30): a run stopped by a token set from the last scan
+    /// report, after every file was scanned and before the first document. From a callback
+    /// this reaches the C2 check through the observer's stop at the last file -- the same early
+    /// branch C2 returns through, as the cancellation tests of feature-60 note -- so the whole
+    /// scan, the skipped file included, is behind it. A run that settled the docx rows between
+    /// the scan and the first document would fail here.
+    #[test]
+    fn a_run_cancelled_after_the_scan_records_no_docx_settlement() {
+        if run_in_hermetic_child(
+            "reread_pass::a_run_cancelled_after_the_scan_records_no_docx_settlement",
+        ) {
+            return;
+        }
+        a_run_cancelled_at_the_scan_records_nothing("groove-f62-c2", true);
+    }
+
+    /// The knowledge base of the C3 test (one docx that fails to parse under the run's
+    /// budget, one the scan skips under the run's file cap, two readable ones), first indexed
+    /// under the default caps, the policy then removed; then a run under the lower caps whose
+    /// callback sets the cancel token from a scan report -- the last one when at_last_file is
+    /// set, the first otherwise; then an ordinary run, which shows the stopped run had rows
+    /// to mark.
+    fn a_run_cancelled_at_the_scan_records_nothing(prefix: &str, at_last_file: bool) {
+        const BIN_CAP: usize = 65_536;
+        const DEC_CAP: usize = 16_384;
+        const DOCS: [&str; 4] = ["a-bloat.docx", "b-one.docx", "c-two.docx", "z-huge.docx"];
+        let fx = docx_kb(prefix);
+
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        let one = numeric_heading_docx("Ledger", &[]);
+        let two = numeric_heading_docx("Vellum", &[]);
+        let picture = incompressible(BIN_CAP + 1);
+        let huge = numeric_heading_docx("Quarto", &[("word/media/image1.bin", picture.as_slice())]);
+        assert!(
+            bloat.len() < BIN_CAP && huge.len() > BIN_CAP,
+            "fixture: one docx under the file cap, one over it"
+        );
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-one.docx", &one);
+        write_bytes(&fx, "c-two.docx", &two);
+        write_bytes(&fx, "z-huge.docx", &huge);
+
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the first run, under the default caps");
+        let before: Vec<Option<String>> = DOCS.iter().map(|rel| content_hash(&fx, rel)).collect();
+        assert_eq!(before[0], Some(sha256_hex(&bloat)));
+        assert_eq!(before[3], Some(sha256_hex(&huge)));
+        for (rel, hash) in DOCS.iter().zip(&before) {
+            assert!(
+                hash.is_some() && hash.as_deref() != Some(AWAITING),
+                "fixture: {rel} holds its sha256 before the stopped run: {hash:?}"
+            );
+        }
+
+        delete_meta(&fx, POLICY_KEY);
+        let caps = format!(
+            "[index]\nmax_binary_file_size = {BIN_CAP}\nmax_decompressed_size = {DEC_CAP}\n"
+        );
+        configure(&fx, "", MD_AND_DOCX, &caps);
+
+        let token = CancelToken::new();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let scan_total = Arc::new(AtomicUsize::new(0));
+        let documents = Arc::new(AtomicUsize::new(0));
+        let stop = token.clone();
+        let (seen_scans, seen_total, seen_documents) = (
+            Arc::clone(&scans),
+            Arc::clone(&scan_total),
+            Arc::clone(&documents),
+        );
+        let reporter = ProgressReporter::with_callback(Box::new(move |ev| match ev {
+            ProgressEvent::Scanning { done, total } => {
+                seen_scans.fetch_add(1, Ordering::SeqCst);
+                seen_total.store(total, Ordering::SeqCst);
+                let last = done == total;
+                if (at_last_file && last) || (!at_last_file && done == 1) {
+                    stop.cancel();
+                }
+            }
+            ProgressEvent::Indexed { .. } | ProgressEvent::Unchanged { .. } => {
+                seen_documents.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }))
+        .with_cancel(token);
+        let result = rebuild_in_process(&fx, reporter).expect("a cancelled run returns Ok");
+        assert!(result.cancelled, "{result:?}");
+
+        let (scanned, total) = (
+            scans.load(Ordering::SeqCst),
+            scan_total.load(Ordering::SeqCst),
+        );
+        assert!(total >= DOCS.len(), "the scan reports every docx: {total}");
+        if at_last_file {
+            assert_eq!(
+                scanned, total,
+                "the token is set after the last scan report"
+            );
+        } else {
+            assert_eq!(scanned, 1, "the scan stops at the first file");
+        }
+        assert_eq!(
+            documents.load(Ordering::SeqCst),
+            0,
+            "the run stops before its first document"
+        );
+        assert_eq!(
+            meta(&fx, POLICY_KEY),
+            None,
+            "a run stopped at the scan records no policy"
+        );
+        for (rel, hash) in DOCS.iter().zip(&before) {
+            assert_eq!(
+                &content_hash(&fx, rel),
+                hash,
+                "a run stopped at the scan leaves {rel}'s hash as it was"
+            );
+        }
+        let awaiting: i64 = db(&fx)
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE content_hash = ?1",
+                [AWAITING],
+                |r| r.get(0),
+            )
+            .expect("count placeholder rows");
+        assert_eq!(awaiting, 0, "no row carries the placeholder");
+
+        let result = rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet))
+            .expect("the next run");
+        assert!(!result.cancelled, "{result:?}");
+        assert_eq!(meta(&fx, POLICY_KEY).as_deref(), Some(POLICY));
+        assert_eq!(content_hash(&fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(content_hash(&fx, "z-huge.docx").as_deref(), Some(AWAITING));
+    }
+
     /// feature-62 I7 (AC31): the shape desktop sees -- a callback reporter, `force=false` --
     /// hears `Indexed` for a re-split document and `Unchanged` for one that matched.
     #[test]
