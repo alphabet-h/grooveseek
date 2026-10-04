@@ -14,6 +14,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **MCP tool descriptions no longer name a `knowledge-base/` directory.** `get_document`, its `path`
+  argument, `get_connection_graph`'s `start` argument and the "File not found" error now say a path
+  is relative to the knowledge base root, which is whatever `kb_path` names. `get_connection_graph`
+  says when to reach for it after `search`, `list_topics` says it is where the `category` / `topic`
+  filter values come from, and `search`'s `category` / `topic` arguments no longer give example
+  values taken from one particular knowledge base. Argument descriptions also drop their
+  `(v0.7.0+)` / `(v1.9.0+)` markers; the docs keep them.
+
 ## [1.16.0] - 2026-10-03
 
 ### Changed
