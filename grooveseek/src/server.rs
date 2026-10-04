@@ -178,11 +178,11 @@ struct SearchParams {
     query: String,
     /// Maximum number of results to return (default: 5)
     limit: Option<u32>,
-    /// Filter by category (legacy, single value), spelled as the list_topics
+    /// Filter by category (legacy, single value), spelled as the topic-listing
     /// tool reports it. Prefer `path_globs` / `tags_any` / `tags_all` for new
     /// clients.
     category: Option<String>,
-    /// Filter by topic (legacy, single value), spelled as the list_topics
+    /// Filter by topic (legacy, single value), spelled as the topic-listing
     /// tool reports it. Prefer `path_globs` / `tags_any` / `tags_all` for new
     /// clients.
     topic: Option<String>,
