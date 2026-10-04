@@ -53,7 +53,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    Phase 1 の報告に「kuriya 未接続、突き合わせ未実施」と 1 行書いて handoff だけで続ける
 6. **repo 状態を見る** — root は `git -C <repo root の絶対パス> status --short --branch`、続けて nested repo の
    `git -C <repo root の絶対パス>/.dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
-   commit し忘れていればここでしか分からない)。**root にも `-C` を付ける** — `-C` 無しの git は hook R5 が deny する
+   commit し忘れていればここでしか分からない)。**root にも `-C` を付ける** — project root での素の `git` は hook が `-C` を足して通すが、それ以外の cwd では deny する
    (cwd は呼び出しを跨いで残り、`.dev` が nested repo なので、cwd 依存の git は黙って別 repo の答えを返す)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
    step 4 で読んだ handoff (遡った分も含む)、または FOCUS 行の `repo=<絶対パス>` が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
@@ -88,11 +88,19 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 それ以外は subagent に渡す。subagent は Agent tool で起動し、**`model` を毎回明示する** —
 省くと agent 定義の `model:` → 環境変数 `CLAUDE_CODE_SUBAGENT_MODEL` → session のモデルの順で決まる:
 
-| model | 渡すもの |
-|---|---|
-| `opus` | 実装、spec / plan 執筆、レビュー (spec 準拠 / 品質)、原因調査、brief の行番号検証 (Explore)、スクリーンショット・図・グラフの読み取り |
-| `sonnet` | 完成形を渡せる定型: docs 同期、rename、固定 diff の適用、テスト実行と報告、CHANGELOG 文言 |
-| `haiku` | 読み取りだけ: grep / ファイル一覧 / 状態確認 / リンク切れ確認 |
+| model | `subagent_type` | 渡すもの |
+|---|---|---|
+| `opus` | `implementer` | 実装、spec / plan 執筆、原因調査、スクリーンショット・図・グラフの読み取り |
+| `opus` | `reviewer` | レビュー (spec 準拠 / 品質)。指摘は `file:line` つきで返し、修正はしない |
+| `opus` | `Explore` | brief の行番号検証 |
+| `sonnet` | `doc-writer` | 完成形を渡せる定型: docs 同期、rename、固定 diff の適用、CHANGELOG 文言 (cargo は打たない) |
+| `sonnet` | `general-purpose` | テスト実行と報告 (cargo を打つので下の定型を読ませる) |
+| `haiku` | `reader` | 読み取りだけ: grep / ファイル一覧 / 状態確認 / リンク切れ確認 |
+
+`implementer` / `reviewer` / `doc-writer` / `reader` は `.claude/agents/*.md` の project subagent で、下の定型 5 項を
+skill として preload する。**`model` は agent 定義の `model:` と同じ値を明示する** (明示した `model` は agent 定義に勝つ。値を揃えておけば
+どちらが効いても同じ)。**fallback**: `subagent_type` が解決しない時 (anthropics/claude-code#59881 / #88023 — project agent が
+見つからない / `/compact` 後に消える) は `general-purpose` + `model` 明示 + 下の定型を読ませる指示を prompt に書く。
 
 **迷ったら 1 段上**。sonnet / haiku に振った task が 2 round で収束しなければ opus に上げる。
 **段の上端は `opus`** — 能力のために `fable` へは上げない (Claude Code 2.1.280 以降の `opus` が解決する
@@ -104,13 +112,9 @@ subagent の effort は Agent tool では指定できない (docs では、agent
 **session と subagent のモデルが違う時** (Fable の controller から `opus` を起こす等) に、session の値と subagent の
 モデルの `modelSettings` のどちらが効くかは未確認 — controller の effort を変えれば subagent の effort も変わる、とは決めてかからない。
 
-subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む):
-
-- `.dev/` は untracked なので `git add .dev/...` は silently スキップされる。`.dev/` の更新は commit に乗らない
-- git は `git -C <絶対パス> …` をそのまま貼る (`cd` は hook R6 で止まる)
-- cargo 以外で `run_in_background` を使ったら、その後は foreground で待つ (kuriya trap #219)。**cargo には `run_in_background` を使わない** (次の項)
-- 結果は status ファイルの最終行に書く
-- cargo を打たせるなら 4 点 (`windows-quirks` skill の罠 16 と同じ並び): `cargo test` は `-j 2` / 重い cargo を 2 本同時に走らせない / `run_in_background` を使わず foreground + timeout / status ファイルは手順ごとに追記させる
+subagent が**毎回守る定型** (抜けた分だけ subagent が踏む): 定型 5 項の家は `.claude/skills/house-rules/SKILL.md`。
+project agent (`implementer` / `reviewer` / `doc-writer` / `reader`) は `skills:` で preload する。fallback の
+`general-purpose` には prompt の最初に『Skill tool で `house-rules` を読んでから始める』と書く。
 
 prompt に**書かないもの**: system prompt の引用や、内部の思考過程をそのまま書き出させる指示。Opus 5.5 の
 `reasoning_extraction` 分類器がその turn を止めることがある (anthropics/claude-code#96139)。根拠として

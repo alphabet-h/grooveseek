@@ -685,7 +685,7 @@ fn a_heredoc_that_never_terminates_is_reported_rather_than_swallowed() {
 #[test]
 fn a_case_arm_is_read_as_the_instruction_it_runs() {
     use common::docs::{LineRead, heads_of, read_block};
-    // `.claude/commands/feature-flow.md` commits `.dev` inside a `case` on the
+    // `.claude/skills/close-session/SKILL.md` commits `.dev` inside a `case` on the
     // repository root. The pattern is a branch condition, not an instruction,
     // and `;;` is grammar; what stands between them is what the reader runs,
     // and it was invisible to every guard.
@@ -954,7 +954,7 @@ fn no_line_in_a_shell_block_in_the_corpus_is_left_unread() {
         ("comment", "docs/usage.md"),
         ("blank", "docs/usage.md"),
         // `esac`, and the arms of the one `case` in the tree.
-        ("syntax", ".claude/commands/feature-flow.md"),
+        ("syntax", ".claude/skills/close-session/SKILL.md"),
     ] {
         assert!(
             seen.get(class).is_some_and(|pages| pages.contains(page)),
