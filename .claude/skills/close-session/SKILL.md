@@ -8,7 +8,7 @@ argument-hint: <topic>
 
 session を閉じる手順の唯一の家。`/feature-flow` の「handoff と session の区切り」節と `CLAUDE.local.md` の「PR が merge されたら」は、ここを指すだけで手順を持たない。
 
-**owner 用 command で、`.dev/` が private repository として無い checkout (公開 repo を clone しただけ) では動かない** (`/next-work` の `## 前提` 節と同じ)。その checkout では下の「状態」が `state: skipped (no .dev checkout — /close-session is an owner-only command)` と印字する。その時は手順に進まず、owner 用 command で、この checkout では動かないと 1 行で報告して止まる。
+**owner 用 command で、`.dev/` が private repository として無い checkout (公開 repo を clone しただけ) では動かない** (`/next-work` の `## 前提` 節と同じ)。その checkout では step 0 の最初の command (状態 helper) が `state: skipped (no .dev checkout — /close-session is an owner-only command)` と印字する。その時は手順に進まず、owner 用 command で、この checkout では動かないと 1 行で報告して止まる。
 
 **controller が起動してよい** (`disable-model-invocation` は付けていない)。merge 後に無人で進む session も handoff を書けるようにするため。`/clear` だけは user が打つ (controller は打てない。step 6 の通知で促す)。
 
@@ -18,24 +18,29 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
 
 step 1-6 と末尾の 2 段落は `/feature-flow` から逐語で移した。本文の「前提の節」は `.claude/commands/feature-flow.md` の `## 前提` 節、「Phase 7 step 7」は同じ file の Phase 7 を指す。
 
-## 状態 (この command の本文より先に展開される)
-
-!`python .claude/skills/close-session/scripts/close_session_state.py`
-
-各項目の `exit:` 行が 0 以外なら、その項目は読めていない (script 自体は常に exit 0 で終わる)。`session id:` 行の `source:` が `env` 以外なら取得元を疑う — `guess` は最も新しい scratchpad で、別 session を数えていることがある (kuriya trap #295)。
-
 ## しないこと
 
 - `/clear` を自分で打つ
 - `--no-verify` で push する、`disk-sweep.ps1` に `-Apply` を付ける
 - push が通る前に kuriya の goal を update する
 
-止まる条件は各 step にある: 鎖の末端 script が exit 0 以外 (step 1 / 2)、push が拒否された (pre-push hook を含む。step 3)、commit / push がそれ以外の理由で失敗した (step 3 / 6)。kuriya に繋がらないことでは止まらない (step 4 の文言を handoff 冒頭に書いて続ける)。上の「状態」に injection の展開が出なければ session shell の cwd が root でない — root で打ち直す。または `.dev` の無い checkout (public clone) — その時は wrapper が `state: skipped …` を印字する。
+止まる条件は各 step にある: 鎖の末端 script が exit 0 以外 (step 1 / 2)、push が拒否された (pre-push hook を含む。step 3)、commit / push がそれ以外の理由で失敗した (step 3 / 6)。kuriya に繋がらないことでは止まらない (step 4 の文言を handoff 冒頭に書いて続ける)。step 0 の状態 helper が `state: skipped …` を印字した時 (`.dev` の無い checkout、public clone) もここで止まる。
 
 ## 手順
 
-0. **数える** — 先に background task の leak を見る (`run_in_background` の polling が残っていないか。あれば `TaskStop`)。
-   次に上の「状態」の `guard_deny_by_rule.py --list` の行から controller 分の deny を選び、step 1 で書く handoff の guard 節に
+0. **状態を読んで、数える**
+   - **最初に状態 helper を打つ** — controller が Bash tool で、**絶対 path** のまま実行する (script は cwd に依存しない):
+     ```bash
+     python "<repo root の絶対パス>/.claude/skills/close-session/scripts/close_session_state.py"
+     ```
+     `<repo root の絶対パス>` は `/next-work` の git command と同じ置き方 (`.claude/commands/next-work.md` の Phase 0) で、
+     この checkout の root の絶対 path を書く。出力の「状態」block (鎖の末端、`session id:` と `source:`、3 つの git status、
+     deny / rewrite の集計) を**読んでから**先へ進む。
+     - command 自体が error になった (`python` が無い、path が違う) なら通常の tool error — path か interpreter を直して打ち直す
+     - `state: skipped (no .dev checkout — …)` が出たら、この checkout では手順を回せない (owner 用)。user に 1 行で伝えて止まる (`/next-work` と同じ)
+     - 各項目の `exit:` 行が 0 以外なら、その項目は読めていない (script 自体は常に exit 0 で終わる)。`session id:` 行の `source:` が `env` 以外なら取得元を疑う — `guess` は最も新しい scratchpad で、別 session を数えていることがある (kuriya trap #295)
+   - 次に background task の leak を見る (`run_in_background` の polling が残っていないか。あれば `TaskStop`)
+   - 次に上で読んだ「状態」の `guard_deny_by_rule.py --list` の行から controller 分の deny を選び、step 1 で書く handoff の guard 節に
    1 件ずつ `- [Rn] <target の先頭> — 判断: なし (反射) | あり (<理由>) | 不明` と書く。subagent 分は deny の場の記録が無いので
    `判断: 不明` とまとめて 1 行で書き、後から埋めない (台帳 `.dev/knowledge/repeat-offences-ledger.md` の `判断` 列と同じ規律)。
    `rewrite by rule:` 行の件数 (hook が R5 / R6 を書き換えて通した数) も同じ節に書く
