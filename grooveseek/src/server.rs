@@ -178,12 +178,13 @@ struct SearchParams {
     query: String,
     /// Maximum number of results to return (default: 5)
     limit: Option<u32>,
-    /// Filter by category (legacy, single value; e.g. "deep-dive",
-    /// "ai-news", "tech-watch"). Prefer `path_globs` / `tags_any` /
-    /// `tags_all` for new clients.
+    /// Filter by category (legacy, single value), spelled as the topic-listing
+    /// tool reports it. Prefer `path_globs` / `tags_any` / `tags_all` for new
+    /// clients.
     category: Option<String>,
-    /// Filter by topic (legacy, single value; e.g. "mcp", "chromadb").
-    /// Prefer `path_globs` / `tags_any` / `tags_all` for new clients.
+    /// Filter by topic (legacy, single value), spelled as the topic-listing
+    /// tool reports it. Prefer `path_globs` / `tags_any` / `tags_all` for new
+    /// clients.
     topic: Option<String>,
     /// Override the server default for reranking. Requires the server to have
     /// been started with `--reranker <model>` (otherwise ignored).
@@ -209,7 +210,7 @@ struct SearchParams {
     date_from: Option<String>,
     /// Inclusive upper bound on `frontmatter.date` (lexicographic, ISO-8601 friendly).
     date_to: Option<String>,
-    /// (v1.9.0+) Keep only documents whose frontmatter holds one of the given
+    /// Keep only documents whose frontmatter holds one of the given
     /// values for each key: `{"status": ["active"], "environment": ["dev", "prod"]}`
     /// means status is active AND environment is dev or prod. Exact string
     /// comparison. Only keys `groove-schema.toml` declared when the index was
@@ -217,7 +218,7 @@ struct SearchParams {
     /// A document without the key does not match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fields: Option<std::collections::BTreeMap<String, Vec<String>>>,
-    /// (v1.9.0+) Drop documents whose frontmatter holds one of the given
+    /// Drop documents whose frontmatter holds one of the given
     /// values for any key: `{"status": ["deprecated"]}`. A document without
     /// the key is kept. Same shape and rules as `fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,27 +231,27 @@ struct SearchParams {
     min_confidence_ratio: Option<f32>,
 
     // ----- MMR / Parent retriever (per-call overrides) -----
-    /// (v0.7.0+) Enable MMR diversity re-rank. When `null`, falls back to
+    /// Enable MMR diversity re-rank. When `null`, falls back to
     /// `[search.mmr].enabled` from groove.toml. Setting `true` / `false`
     /// per call overrides the toml default for that call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mmr: Option<bool>,
 
-    /// (v0.7.0+) MMR lambda (relevance vs. diversity tradeoff). Must be in
+    /// MMR lambda (relevance vs. diversity tradeoff). Must be in
     /// `[0.0, 1.0]`; values outside that range are rejected. `1.0` is
     /// equivalent to MMR off; lower values lean toward exploration. When
     /// `null`, falls back to `[search.mmr].lambda` from groove.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mmr_lambda: Option<f32>,
 
-    /// (v0.7.0+) Extra cost when an already-selected chunk lives in the
+    /// Extra cost when an already-selected chunk lives in the
     /// same document. Must be in `[0.0, 1.0]`. `0.0` is pure MMR; raise to
     /// actively deduplicate same-document chunks. When `null`, falls back
     /// to `[search.mmr].same_doc_penalty`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mmr_same_doc_penalty: Option<f32>,
 
-    /// (v0.7.0+) Enable parent retriever content expansion. When `true`,
+    /// Enable parent retriever content expansion. When `true`,
     /// short hit chunks are expanded to adjacent siblings or the whole
     /// document. The `score`, rank and `path` of the hit are preserved;
     /// `content`, `expanded_from`, `match_spans` and the line metadata
@@ -278,7 +279,7 @@ impl From<&SearchParams> for crate::config::SearchOverrides {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetDocumentParams {
-    /// Relative path to the document within knowledge-base/ (e.g. "deep-dive/mcp/overview.md").
+    /// Path to the document relative to the knowledge base root (e.g. "deep-dive/mcp/overview.md").
     /// Pass it exactly as the search tool returned it: `/`-separated, no leading `./`, same case.
     /// Any other spelling of the same file is answered "not found".
     path: String,
@@ -303,7 +304,7 @@ struct RebuildIndexParams {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetConnectionGraphParams {
-    /// Relative path of the starting document within knowledge-base/
+    /// Path of the starting document relative to the knowledge base root
     /// (e.g. "deep-dive/mcp/overview.md"). Must be already indexed.
     /// Named `start` rather than `path` because it is the seed of a walk, not
     /// the document being fetched — `groove graph --start` calls it the same
@@ -844,7 +845,7 @@ impl KbServer {
 
     #[tool(
         name = "list_topics",
-        description = "List all indexed topics and categories with document counts. Each entry also carries children: the directory tree beneath that category/topic, one node per path segment with segment, file_count (documents under that prefix) and nested children; a flat group returns an empty array."
+        description = "List all indexed topics and categories with document counts. Each entry also carries children: the directory tree beneath that category/topic, one node per path segment with segment, file_count (documents under that prefix) and nested children; a flat group returns an empty array. Call it to learn which `category` and `topic` values the `search` filters accept."
     )]
     async fn list_topics(&self) -> String {
         let core = Arc::clone(&self.core);
@@ -853,7 +854,7 @@ impl KbServer {
 
     #[tool(
         name = "get_document",
-        description = "Get the full content and metadata of a document by its relative path within knowledge-base/. The path must be spelled exactly as `search` returned it; any other spelling of the same file is answered \"not found\"."
+        description = "Get the full content and metadata of a document by its path relative to the knowledge base root. The path must be spelled exactly as `search` returned it; any other spelling of the same file is answered \"not found\"."
     )]
     async fn get_document(&self, Parameters(params): Parameters<GetDocumentParams>) -> String {
         let core = Arc::clone(&self.core);
@@ -908,10 +909,14 @@ impl KbServer {
     #[tool(
         name = "get_connection_graph",
         description = "BFS-expand semantically related chunks starting from a \
-                       document path. Returns a flat list of nodes with \
-                       parent_id / depth / score / snippet, useful for chained \
-                       context discovery by an LLM agent, plus truncated and \
-                       truncation[] when a bound cut the walk short."
+                       document path. Use it after `search` when the answer \
+                       may sit in documents the query's wording did not \
+                       reach: the walk follows embedding similarity from the \
+                       start document, not the query. Returns a flat list of \
+                       nodes with parent_id / depth / score / snippet, plus \
+                       truncated and truncation[] when a bound cut the walk \
+                       short. A snippet is an excerpt; call `get_document` \
+                       for a node's full text."
     )]
     async fn get_connection_graph(
         &self,

@@ -473,7 +473,7 @@ pub(crate) fn validate_get_document_path(
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!(
-                    "File not found: {rel_path}. Path should be relative to knowledge-base/ (e.g. \"deep-dive/mcp/overview.md\")."
+                    "File not found: {rel_path}. Path should be relative to the knowledge base root (e.g. \"deep-dive/mcp/overview.md\")."
                 ),
             });
         }
@@ -493,7 +493,7 @@ pub(crate) fn validate_get_document_path(
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!(
-                    "File not found: {rel_path}. Path should be relative to knowledge-base/ (e.g. \"deep-dive/mcp/overview.md\")."
+                    "File not found: {rel_path}. Path should be relative to the knowledge base root (e.g. \"deep-dive/mcp/overview.md\")."
                 ),
             });
         }

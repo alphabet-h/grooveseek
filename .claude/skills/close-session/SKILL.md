@@ -16,7 +16,7 @@ TOPIC: $ARGUMENTS
 
 handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`。TOPIC が空なら、この session の主題を短い kebab-case で controller が決め、step 6 の通知に書く。
 
-step 1-6 と末尾の 2 段落は `/feature-flow` から逐語で移した。本文の「前提の節」は `.claude/commands/feature-flow.md` の `## 前提` 節、「Phase 7 step 7」は同じ file の Phase 7 を指す。
+本文の「前提の節」は `.claude/commands/feature-flow.md` の `## 前提` 節、「Phase 7 step 7」は同じ file の Phase 7 を指す。
 
 ## しないこと
 
@@ -105,6 +105,5 @@ step 1-6 と末尾の 2 段落は `/feature-flow` から逐語で移した。本
 
 context が切り替わったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
-handoff doc の型は**固定の 1 本ではなく、鎖の末端 (= 直前の handoff)**。型の file 名をここに書かない — 規約が変わっても
-古い型を指し続けるからで、2026-10-02 まで名指ししていた 2026-08-22 の handoff は `前の handoff:` の規約
-(2026-08-25〜、`.dev/README.md`) より古く、それだけをなぞった handoff が鎖を切った。
+handoff doc の型は**固定の 1 本ではなく、鎖の末端 (= 直前の handoff)**。型の file 名をここに書かない — 規約
+(`前の handoff:` の書き方は `.dev/README.md`) が変わっても古い型を指し続け、それをなぞった handoff が鎖を切る。
