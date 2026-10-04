@@ -156,7 +156,7 @@ phase が **release を構成する最終 PR** だった場合のみ:
 cycle 完了時に必ず:
 
 - `.dev/knowledge/<feature-NN>-summary.md` 作成 (結果サマリ / 設計判断 / ハマりどころ / 工程まとめ / 後続候補)
-  subagent に書かせて、最終 message が「rename が要る」か「書けなかった」を返したら、controller が rename するか自分で書く (`.claude/agents/implementer.md` の書き方の節)
+  subagent に書かせたら、戻った後の確かめ方は `.claude/commands/next-work.md` Phase 2 の「名前を指定して file を書かせた時」
 - `.dev/feature-ideas.md` の対応 ID を `done` マーク + done line に PR 番号と merge 日付を追記
 - `/full-audit` を回した場合は `.dev/archive/<date>-cycle/audit-todos.md` に deferred items を整理
 
