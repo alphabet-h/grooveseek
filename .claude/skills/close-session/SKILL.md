@@ -1,4 +1,5 @@
 ---
+name: close-session
 description: PR merge 後 / 日の終わり / context が逼迫した時に controller が起動する。handoff を書いて .dev を push し、kuriya goal を向け直し、/next-work の入口が通ることを確かめる。/clear は user
 argument-hint: <topic>
 ---
@@ -6,6 +7,8 @@ argument-hint: <topic>
 # /close-session
 
 session を閉じる手順の唯一の家。`/feature-flow` の「handoff と session の区切り」節と `CLAUDE.local.md` の「PR が merge されたら」は、ここを指すだけで手順を持たない。
+
+**owner 用 command で、`.dev/` が private repository として無い checkout (公開 repo を clone しただけ) では動かない** (`/next-work` の `## 前提` 節と同じ)。その checkout では下の「状態」が `state: skipped (no .dev checkout — /close-session is an owner-only command)` と印字する。その時は手順に進まず、owner 用 command で、この checkout では動かないと 1 行で報告して止まる。
 
 **controller が起動してよい** (`disable-model-invocation` は付けていない)。merge 後に無人で進む session も handoff を書けるようにするため。`/clear` だけは user が打つ (controller は打てない。step 6 の通知で促す)。
 
@@ -17,7 +20,7 @@ step 1-6 と末尾の 2 段落は `/feature-flow` から逐語で移した。本
 
 ## 状態 (この command の本文より先に展開される)
 
-!`python .dev/tools/close_session_state.py`
+!`python .claude/skills/close-session/scripts/close_session_state.py`
 
 各項目の `exit:` 行が 0 以外なら、その項目は読めていない (script 自体は常に exit 0 で終わる)。`session id:` 行の `source:` が `env` 以外なら取得元を疑う — `guess` は最も新しい scratchpad で、別 session を数えていることがある (kuriya trap #295)。
 
@@ -27,7 +30,7 @@ step 1-6 と末尾の 2 段落は `/feature-flow` から逐語で移した。本
 - `--no-verify` で push する、`disk-sweep.ps1` に `-Apply` を付ける
 - push が通る前に kuriya の goal を update する
 
-止まる条件は各 step にある: 鎖の末端 script が exit 0 以外 (step 1 / 2)、push が拒否された (pre-push hook を含む。step 3)、commit / push がそれ以外の理由で失敗した (step 3 / 6)。kuriya に繋がらないことでは止まらない (step 4 の文言を handoff 冒頭に書いて続ける)。上の「状態」に injection の展開が出なければ session shell の cwd が root でない — root で打ち直す。
+止まる条件は各 step にある: 鎖の末端 script が exit 0 以外 (step 1 / 2)、push が拒否された (pre-push hook を含む。step 3)、commit / push がそれ以外の理由で失敗した (step 3 / 6)。kuriya に繋がらないことでは止まらない (step 4 の文言を handoff 冒頭に書いて続ける)。上の「状態」に injection の展開が出なければ session shell の cwd が root でない — root で打ち直す。または `.dev` の無い checkout (public clone) — その時は wrapper が `state: skipped …` を印字する。
 
 ## 手順
 

@@ -59,7 +59,7 @@ powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Apply
      `.dev` にも。`.dev` は tracked な private repo で、ここでノートに追記して止めると未 commit の変更が残り、次の
      `/next-work` がそれを想定外の git state として止まる (掃除が session の入口を塞ぐ)。かといってここで commit / push まで
      持つと、既にあった未 commit の編集を巻き込む、push が失敗する、といった分岐をこの page が抱えることになる。
-     記録は session を閉じる時の handoff が持つ (`.claude/commands/close-session.md` の step 1 が
+     記録は session を閉じる時の handoff が持つ (`.claude/skills/close-session/SKILL.md` の step 1 が
      disk の数字を書かせ、`.dev` の commit / push も同じ command の step 3 にある)。履歴のノート `.dev/knowledge/target-dir-disk-hygiene.md` に
      その行を足すかどうかは、その時に user が決める
    - `1` で末尾が `PRECHECK-REFUSED` — 事前確認が拒否した。**何も消えていない**。理由 (走っている cargo / rustc / link、
@@ -92,4 +92,4 @@ flag を足した引数は報告のみになる (上の節)。組み合わせご
 - `.dev/knowledge/target-dir-disk-hygiene.md` (= なぜその判定なのか、と回ごとの実測)
 - `.dev/tools/session-hooks/session-start.sh` (= `disk` 行と `LOW` の閾値 `GROOVE_DISK_WARN_GB`)
 - `.claude/commands/feature-flow.md` (= Phase 7 からここへ来る)
-- `.claude/commands/close-session.md` (= step 1 の disk の数字からここへ来る)
+- `.claude/skills/close-session/SKILL.md` (= step 1 の disk の数字からここへ来る)

@@ -174,7 +174,7 @@ cycle 完了時に必ず:
 226 MB / 1 MB / 3 MB)。立ち上げ直す価値があるのは **`settings.json` / hook を触った直後だけ**
 (skill は同 session 内で反映される)。`/clear` は background task を止めないので、下の leak 確認が効く:
 
-**閉じる手順は `/close-session <topic>` (`.claude/commands/close-session.md`) にだけ書く** — leak の確認 (同 command の step 0)、鎖の末端 (`handoff_tail.ps1`) を型にした handoff、push の前の鎖の確認、`.dev` の push、push が通ってからの kuriya goal の向け直しと読み戻し、`/next-work` Phase 0 の自己確認、user への通知とその gate、止まる条件まで。controller が起動してよく (`disable-model-invocation` は付けていない)、`/clear` だけは user が打つ。手順をここへ写し戻さない — 写しは食い違う。
+**閉じる手順は `/close-session <topic>` (`.claude/skills/close-session/SKILL.md`) にだけ書く** — leak の確認 (同 skill の step 0)、鎖の末端 (`handoff_tail.ps1`) を型にした handoff、push の前の鎖の確認、`.dev` の push、push が通ってからの kuriya goal の向け直しと読み戻し、`/next-work` Phase 0 の自己確認、user への通知とその gate、止まる条件まで。controller が起動してよく (`disable-model-invocation` は付けていない)、`/clear` だけは user が打つ。手順をここへ写し戻さない — 写しは食い違う。
 
 ## 介入ポイント以外でユーザを巻き込まない原則
 
