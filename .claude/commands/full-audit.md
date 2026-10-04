@@ -19,7 +19,8 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 - `.dev/knowledge/` の運用ルールと、「audit / 大改修サイクルは Markdown ベース (`audit-todos.md` 等) を
   `.dev/archive/<date>-cycle/` 配下に作る」方針 (`CLAUDE.local.md`) が有効
-- subagent type: `feature-dev:code-reviewer` (plugin `feature-dev` の agent で、`.claude/agents/` には無い) と `general-purpose` が available。4 軸とも `model: opus` を明示して起動する (`/next-work` Phase 2 の表: レビューは opus)。
+- subagent type: `feature-dev:code-reviewer` (plugin `feature-dev` の agent で、`.claude/agents/` には無い) と `general-purpose` が available。4 軸とも `model: opus` を明示して起動する。`/next-work` Phase 2 の表は**作業の種類で行を引く** — 4 軸はどれもレビューなので `opus` の行で、
+  `general-purpose` で起動する軸も `opus` (表の `sonnet` / `general-purpose` はテスト実行の行。fallback は「`general-purpose` + 元の行の `model` を明示」)。
   **project agent の `reviewer` はここでは使わない** — `maxTurns: 40` (`.claude/agents/reviewer.md:6`) は diff のレビューに合わせた上限で、tree 全体の監査では尽きる恐れがある。
   `feature-dev:code-reviewer` が解決しない時は `/next-work` Phase 2 の fallback と同じく `general-purpose` で起動する
 - 過去 audit の実例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md`
@@ -44,8 +45,10 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 **重要**: 1 回の message で 4 つの Agent tool 呼び出しを並列発行する。順次にすると 4 倍時間がかかる。
 
 各 subagent の prompt は以下のテンプレを使う。**`{{REPO_PATH}}` は CWD 絶対パスに、`{{VERSION}}` は `Cargo.toml` の version、`{{LATEST_COMMIT}}` は `git rev-parse HEAD` に置換**。
-`general-purpose` で起動する軸 (軸 2〜4 と、fallback した軸 1) は、prompt の先頭に『Skill tool で `house-rules` を読んでから始める』を足す
-(`/next-work` Phase 2 と同じ。project agent は `skills:` で preload するが、`general-purpose` にはその仕組みが無い)。
+`general-purpose` で起動する軸 (軸 2〜4 と、fallback した軸 1) は、prompt の先頭に次の 2 文を足す。
+『Skill tool で `house-rules` を読んでから始める』(`/next-work` Phase 2 と同じ。project agent は `skills:` で preload するが、`general-purpose` にはその仕組みが無い) と、
+『読み取り専用で動く: file を編集しない、tree や git の状態を変えるコマンドを打たない、指摘を message で返すだけ』
+(`general-purpose` は Write / Edit も shell も持ち、読み取り専用の契約も持たない。plugin の `feature-dev:code-reviewer` は書き込みの tool を持たない)。
 
 #### 軸 1: Rust コード品質
 
