@@ -16,7 +16,7 @@ skills:
 
 ## 書き方
 
-- 作る file の名前に `report` / `summary` / `findings` / `analysis` を使わない (subagent の Write がその名前で拒否されることがある。anthropics/claude-code#44657)
+- 作る file の名前を自分で決める時は `report` / `summary` / `findings` / `analysis` を使わない (subagent の Write がその名前で拒否されることがある。anthropics/claude-code#44657)。prompt が名前を指定した時 (`feature-NN-summary.md` など) はその名前で書き、Write が拒否されたら、拒否されたことと本文を最終 message に返す (長文は切れるので、続きは controller が SendMessage で求める。kuriya trap #313)
 - 結果は最終 message に書き、prompt が status file を指定していれば、その最終行にも同じ結論を 1 行で書く
 - `.dev/` 配下を変えたら、それが root repo の commit に乗らないことを最終 message に書く
 - 数を書く時は、それを出したコマンドか `file:line` を隣に置く (hook `claim_guard` が止める)。測っていない数は「推定」と書く
