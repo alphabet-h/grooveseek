@@ -5,8 +5,9 @@
 //! this server in `.mcp.json` rather than anything chosen here — so each one
 //! exists to answer a question the tools can already answer but that a caller
 //! has to know how to assemble.
-//! `search` alone does not tell anyone to follow it with `get_connection_graph`,
-//! or that a `low_confidence` flag means the answer should say so.
+//! The graph tool's description says it can follow a search, but no tool says
+//! how far to expand, when to search again with the vocabulary that turns up,
+//! or that a low-confidence flag means the answer should say so.
 //!
 //! # Why these are in the binary and not in `groove.toml`
 //!

@@ -17,7 +17,7 @@ GrooveSeek が接続クライアントに公開する MCP の面。
 
 ## MCP プロンプト
 
-(v0.22.0+) 4 つの prompt を同梱している。クライアントはこれを**ユーザが選ぶコマンド**として出す (Claude Code では `/mcp__<server>__<name>`。`<server>` は `.mcp.json` でこのサーバに付けた鍵であって、GrooveSeek が決める名前ではない)。存在理由は「ツールだけでは組み合わせ方が分からない」こと — `search` は「次に `get_connection_graph` を呼べ」とも「`low_confidence` が立ったらそう言え」とも言わない。
+(v0.22.0+) 4 つの prompt を同梱している。クライアントはこれを**ユーザが選ぶコマンド**として出す (Claude Code では `/mcp__<server>__<name>`。`<server>` は `.mcp.json` でこのサーバに付けた鍵であって、GrooveSeek が決める名前ではない)。存在理由は「ツールだけでは組み合わせ方が分からない」こと — `get_connection_graph` は `search` の後に使えるとは言うが、どこまで広げるか、出てきた語彙で検索し直すか、`low_confidence` が立ったらそう言うべきかは、どのツールも言わない。
 
 | Prompt | 引数 | 何を指示するか |
 |---|---|---|
