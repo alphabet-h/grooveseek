@@ -120,9 +120,9 @@ prompt に**書かないもの**: system prompt の引用や、内部の思考�
 `reasoning_extraction` 分類器がその turn を止めることがある (anthropics/claude-code#96139)。根拠として
 `file:line` やコマンド出力を求めるのは構わない。
 
-**名前を指定して file を書かせた時**: subagent が戻ったら、その path があるかを controller が確かめる。無ければ最終 message の
-`RENAME: <書いた path> -> <指定された path>` に従って rename し、`NOT WRITTEN: <path>` なら controller が書くか出し直す。
-どちらの行も無いまま path が無ければ、先へ進まずに原因を確かめる (agent 側の決まりは `.claude/agents/implementer.md` の「書き方」)。
+**名前を指定して file を書かせた時**: subagent が戻ったら、最終 message の行を先に見る。`RENAME: <書いた path> -> <指定された path>`
+があれば、指定 path に前の file が残っていても置き換えて rename する。`NOT WRITTEN: <path>` なら controller が書くか出し直す。
+どちらの行も無ければ、指定 path が今回書かれたこと (更新時刻か中身) を確かめ、確かめられなければ先へ進まずに原因を確かめる (agent 側の決まりは `.claude/agents/implementer.md` の「書き方」)。
 
 **着手**: 着手先は Phase 1 の focus 判定に従う (focus 無し / 含まれる → 「★ 次にやること」の先頭、
 別件 → focus)。着手先が skill の起動 (`superpowers:writing-plans` など) を指しているなら、
