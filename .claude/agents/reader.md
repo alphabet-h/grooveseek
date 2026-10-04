@@ -14,9 +14,9 @@ tool は frontmatter の `tools:` に並べた allowlist だけを持つ。MCP �
 
 ## 毎回守る定型
 
-定型 5 項は skill `house-rules` が preload される。preload されていなければ最初に Skill tool で `house-rules` を読む (anthropics/claude-code#67251)。
+定型 5 項は frontmatter の `skills:` により skill `house-rules` が preload されて届く。
 
 ## 書き方
 
 - 結果は最終 message に書く。reader は status file を書けない — prompt が指定していれば、その旨を最終 message の最終行に書く
-- Windows 固有の症状 (文字化け / CRLF) の説明が要る時は、Skill tool で `windows-quirks` を読む
+- Windows 固有の症状 (文字化け / CRLF) に当たって `windows-quirks` の知識が要る時は、要ると最終 message に書いて controller に返す (reader は Skill tool を持たない)
