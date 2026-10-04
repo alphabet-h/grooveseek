@@ -45,10 +45,11 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 **重要**: 1 回の message で 4 つの Agent tool 呼び出しを並列発行する。順次にすると 4 倍時間がかかる。
 
 各 subagent の prompt は以下のテンプレを使う。**`{{REPO_PATH}}` は CWD 絶対パスに、`{{VERSION}}` は `Cargo.toml` の version、`{{LATEST_COMMIT}}` は `git rev-parse HEAD` に置換**。
-`general-purpose` で起動する軸 (軸 2〜4 と、fallback した軸 1) は、prompt の先頭に次の 2 文を足す。
-『Skill tool で `house-rules` を読んでから始める』(`/next-work` Phase 2 と同じ。project agent は `skills:` で preload するが、`general-purpose` にはその仕組みが無い) と、
-『読み取り専用で動く: file を編集しない、tree や git の状態を変えるコマンドを打たない、指摘を message で返すだけ』
-(`general-purpose` は Write / Edit も shell も持ち、読み取り専用の契約も持たない。plugin の `feature-dev:code-reviewer` は書き込みの tool を持たない)。
+4 軸とも、prompt の先頭に『読み取り専用で動く: file を編集しない、tracked file や git の状態を変えるコマンドを打たない
+(`target/` への build と test 実行は可)、指摘を message で返すだけ』を足す (ここで使う subagent type はどちらも tool の allowlist
+だけでは読み取り専用にならない — `general-purpose` は Write / Edit と shell を持ち、plugin の `feature-dev:code-reviewer` も `TodoWrite` を持つ)。
+`general-purpose` で起動する軸 (軸 2〜4 と、fallback した軸 1) は、さらに『Skill tool で `house-rules` を読んでから始める』を足す
+(`/next-work` Phase 2 と同じ。project agent は `skills:` で preload するが、`general-purpose` にはその仕組みが無い)。
 
 #### 軸 1: Rust コード品質
 
