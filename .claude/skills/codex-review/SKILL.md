@@ -320,6 +320,7 @@ reset からも呼ばれる形がある。1 行に畳むと、その行に `n/a`
 
 **subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
 行が落ちる。**返させるのは表そのものではなく、その file の path** — inline text は truncate される。
+最終 message が `NOT WRITTEN: <path>` なら表は書かれていない — `.claude/commands/next-work.md` Phase 2 の「名前を指定して file を書かせた時」に従う。
 
 **step 3 — 表で `no` になった経路は、指摘された行とまとめて同じ fix wave に入れる。**
 fix の brief は**表をそのまま貼って始める**。指摘された行だけ直して push すると、

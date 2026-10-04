@@ -20,5 +20,5 @@ fallback の `general-purpose` は prompt の指示で最初に Skill tool か�
 
 上の 5 項とは別の決まり。名前を自分で決める時は `report` / `summary` / `findings` / `analysis` を使わない (subagent の Write がその名前で拒否されることがある。anthropics/claude-code#44657)。
 
-prompt が名前を指定した時 (`feature-NN-summary.md` など) はその名前で書く。その Write が拒否されたら、4 語を含まない名前 (`summary` を `notes` に替えるなど) で同じ場所に書き直し、最終 message に `RENAME: <書いた path> -> <指定された path>` の 1 行を書く。書き直しも拒否されたら本文は返さず (長文は返答の途中で切れる。kuriya trap #313)、最終 message に `NOT WRITTEN: <指定された path>` の 1 行を書いて止まる。
+prompt が名前を指定した時 (`feature-NN-summary.md` など) はその名前で書き、別の名前に逃がさない (既存 file の編集も同じ)。その Write が拒否されたら本文は返さず (長文は返答の途中で切れる。kuriya trap #313)、最終 message に `NOT WRITTEN: <指定された path>` の 1 行を書いて止まる。
 controller 側の扱いは `.claude/commands/next-work.md` Phase 2 の「名前を指定して file を書かせた時」。

@@ -105,6 +105,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 - task ごとに implementer subagent + spec compliance reviewer + code quality reviewer の 3 段
 - review round の中間 fix もユーザ非介在。**reviewer の指摘が `.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形なら、その節どおり表にしてから fix に写す** (codex round を待たず、ここで兄弟の書き込み点を拾う)
+- implementer が `NOT WRITTEN: <path>` を返したら、その task は終わっていない。扱いは `.claude/commands/next-work.md` Phase 2 の「名前を指定して file を書かせた時」
 - task 単位で `feat(<scope>): ...` 形式のコミット 1 個
 - PR は phase 区切り (PR-1 / PR-2 / ...) で作成
 
