@@ -19,7 +19,7 @@ Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっ
 
 - リポジトリは git clean (uncommitted changes なし)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` skill が利用可能
-- subagent type: `feature-dev:code-reviewer` / `feature-dev:code-architect` / `general-purpose` / `superpowers:code-reviewer` が available
+- subagent type: project agent `reviewer` (`.claude/agents/reviewer.md`) と `general-purpose` が available。起動時の `model` は `/next-work` Phase 2 の表に従う
 - GitHub CLI (`gh`) が認証済 (`gh auth status` で確認可)
 - `@codex review` 経由で chatgpt-codex-connector が動く (PR repo 側で設定済)
 - plugin `codex@openai-codex` が install 済で、Codex CLI が 0.153.4 以上、`codex login` 済 (`/codex:setup` が
@@ -31,7 +31,7 @@ Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっ
   `.dev/knowledge/*.md` も、書き出す `.dev/specs/` `.dev/plans/` `.dev/knowledge/` も、すべてこの
   private repo 側にある。**公開 repo を clone しただけの checkout には無い**ので、本 command は
   そのままでは動かない (= owner 用の workflow で、手順を公開側へ写して二重化することはしない)
-- `CLAUDE.local.md` の「開発フロー」節 (本 command の常時 guardrail) を遵守する
+- `CLAUDE.local.md` の「feature-flow の常時 guardrail」節 (本 command の常時 guardrail) を遵守する
 
 ## ユーザ介入ポイントの最小化方針
 
@@ -71,7 +71,7 @@ spec を `.dev/specs/<feature-NN-name>.md` に起草する (groove の `CLAUDE.l
 
 その後 **subagent review loop** を回す:
 
-1. **dispatch**: `superpowers:code-reviewer` (or `feature-dev:code-reviewer`) に spec を渡し、低/中/高/重大の 4 段階で指摘を返させる
+1. **dispatch**: `reviewer` (`model: opus`、`/next-work` Phase 2 の表) に spec を渡し、低/中/高/重大の 4 段階で指摘を返させる
 2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。**読んでから書くまでに何かが挟まり得る形の指摘なら、不変条件を 1 行で spec に書く** (書き込み点がまだ無いので表は作らない — 表は実装後、`.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
 3. **re-dispatch**: 同じ subagent に「low-only に到達したか」を再評価させる
 4. **convergence**: low-only or "no major issues" が 2 round 連続で得られたら脱出。最大 5 round。5 round で収束しないなら spec 起草の前提が崩れている = ユーザに再相談
@@ -212,21 +212,14 @@ cycle 完了時に必ず:
 ## 関連
 
 - `.dev/release-checklist.md` (= Phase 7 step 1 / step 3 の元。`CLAUDE.local.md` の「リリース運用」から辿れる)
-- `CLAUDE.local.md` の「開発フロー」節 (= 本 command の常時 guardrail)
+- `CLAUDE.local.md` の「feature-flow の常時 guardrail」節 (= 本 command の常時 guardrail)
 - `.claude/commands/full-audit.md` (Phase 7 で起動判断)
 - `.claude/skills/codex-review/SKILL.md` + `.claude/skills/codex-review/scripts/codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke。push 前の sweep とローカル Codex 前掃除の節も同じ SKILL.md)
 - `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference。罠の番号はここに写さない — 引き方は Phase 6 の参照行)
 - `.dev/knowledge/index-progress-buffering-pitfall.md` (background bash の罠 reference)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` (orchestrate される 3 skill)
 
-## 過去 cycle の参照
-
-直近の完走例 (本 command 化の元になった手動フロー):
-- feature-28 (MMR + Parent retriever): 4 PR の brainstorming → spec → plan → 実装 → codex 5 round → merge → v0.7.0 tag を 2 セッションで完走
-  - spec: `.dev/specs/feature-28-mmr-parent.md`
-  - plan: `.dev/plans/feature-28-mmr-parent.md`
-  - 統合 summary: `.dev/knowledge/feature-28-summary.md`
-  - PR: #35 / #36 / #37 / #38
+## 成立したかの判定
 
 このコマンドが対象とする「介入ポイントの 3 点絞り込み」が成立したかは、過去 cycle で「controller が即決した数 / ユーザに飛んだ判断の数」で判定する。session の数は
 PR の数で決まる (Phase 6 step 6) ので、session を跨いだこと自体は失敗ではない。

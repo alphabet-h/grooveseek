@@ -64,10 +64,10 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 ## 運用の細則
 
-- **`Cargo.lock` はコミットする** (binary crate)
+- **`Cargo.lock` はコミットする** (binary を配布する workspace)
 - **`.groove.db` はクライアントプロジェクト側の責務**。本リポジトリでは生成しない
 - **テストは 2 層構造**: 通常 `cargo test` では `#[ignore]` の embedding 実行テストはスキップされる。CI 等で検証したければ `-- --ignored` を付ける
-- **staging 禁止ファイル**: `.mcp.json` (ローカルパス)、`groove.toml` (ユーザ設定) は `.gitignore` 済み。テンプレートは `.mcp.json.example` / `groove.toml.example`
+- **staging 禁止ファイル**: `.mcp.json` (ローカルパス)、`groove.toml` (ユーザ設定) は `.gitignore` 済み。テンプレートは `.mcp.json.example` / `grooveseek/groove.toml.example`
 - **設計判断は ADR に残す**: ① 実際に選択肢を比較した ② 覆すのが高くつく ③ structure / 依存 / interface / 非機能特性に影響する — **3 つすべて**を満たす時だけ `docs/decisions/` に英日ペアで追加する。満たさないなら `CHANGELOG` で足りる。ADR を足したら、同じ理由を言い直している `CHANGELOG` / `README` / ソースコメントを要約 + リンクに削る。決定を覆す時は**編集せず**新 ADR を追加し、旧 ADR の status を `superseded by ADR-NNNN` にする。詳細は [ADR-0000](./docs/decisions/0000-record-decisions-as-adrs.ja.md)
 
 ## Embedding モデルのキャッシュ

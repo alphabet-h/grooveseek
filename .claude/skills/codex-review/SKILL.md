@@ -43,10 +43,9 @@ python .dev/tools/doc_link_sweep.py
 tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
 bucket に振り分ける。exit 1 なら直してから push。**exit 0 は sweep の終わりではない** —
 下の表の advisory bucket (`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME`) を
-全部読んで初めて終わる。手順として grep を打っていた時代 (PR #238〜2026-09-10) に、範囲を
-`git diff -- '*.rs'` に縮めた (台帳 #39) / private だからと外した (#43) / 形で skip した (#52) の
-3 つは、どれも人が決めていた。script が消すのはその 3 つ = **diff の範囲、tree にあるかどうか、
-複合項の中の名前の列挙**。何を link にするかの判断は残る (だから bucket ごとに直し方が書いてある)。
+全部読んで初めて終わる。script が決めるのは **diff の範囲、tree にあるかどうか、複合項の中の名前の列挙**
+の 3 つ (人が決めると、範囲を縮める / private だからと外す / 形で skip する — 台帳 #39 / #43 / #52)。
+何を link にするかの判断は残る (だから bucket ごとに直し方が書いてある)。
 `.dev/` が無い環境では旧形を打つ:
 `` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
 (pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
@@ -151,8 +150,8 @@ login 状態は自分で `/codex:setup` を打って確かめ、無ければ `co
 下の `codex_review_round.sh` と同じ受け方 — controller (= main agent) が `run_in_background` で打ち、
 stdout / stderr を scratchpad の file に分ける。**subagent `codex:codex-rescue` に打たせない**:
 plugin の agent 定義は `task` だけを forward し、`adversarial-review` は呼ばないと決めている
-(plugin の `agents/codex-rescue.md`「Forwarding rules」)。2026-09-09 はそれに反する prompt で動いて
-いたが、plugin の更新で壊れる形なので採らない:
+(plugin の `agents/codex-rescue.md`「Forwarding rules」)。契約に反する prompt でたまたま動いても、
+plugin の更新で壊れる:
 
 ```bash
 S=<scratchpad>

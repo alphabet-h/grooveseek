@@ -19,7 +19,7 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 - `.dev/knowledge/` の運用ルールと、「audit / 大改修サイクルは Markdown ベース (`audit-todos.md` 等) を
   `.dev/archive/<date>-cycle/` 配下に作る」方針 (`CLAUDE.local.md`) が有効
-- subagent type: `feature-dev:code-reviewer`, `general-purpose` が available
+- subagent type: `feature-dev:code-reviewer`, `general-purpose` が available。4 軸とも `model: opus` を明示して起動する (`/next-work` Phase 2 の表: レビューは opus)
 - 過去 audit の実例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md`
 - `.dev/` は `.git/info/exclude` で公開 repo の追跡外にある owner 側の private repo。本 command が
   参照する `.dev/release-checklist.md` も書き出す `.dev/knowledge/` もそちらにあり、**公開 repo を
@@ -47,6 +47,7 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 ```
 subagent_type: feature-dev:code-reviewer
+model: opus
 description: Rust コード品質レビュー
 prompt:
 
@@ -56,7 +57,7 @@ prompt:
 - リポジトリパス: {{REPO_PATH}}
 - 現バージョン: {{VERSION}}、commit {{LATEST_COMMIT}}
 - アーキ詳細: docs/ARCHITECTURE.md / docs/ARCHITECTURE.ja.md
-- 主要モジュール: src/main.rs (CLI / clap)、src/db.rs (SQLite + sqlite-vec + FTS5)、src/embedder.rs、src/indexer.rs、src/config.rs、src/eval.rs、src/server.rs (rmcp)、src/parser/、src/schema.rs
+- 主要モジュール (`grooveseek/src/` 配下): main.rs (CLI / clap)、db.rs + db/ (SQLite + sqlite-vec + FTS5)、embedder.rs、indexer.rs、config.rs、eval.rs、server.rs (rmcp)、parser/、schema.rs
 - 開発記憶: CLAUDE.md / CLAUDE.local.md / .dev/knowledge/*.md を **先に読む** こと
 
 # レビューしてほしい観点 (すべて)
@@ -74,7 +75,7 @@ prompt:
 - 高信頼度のみ (推測ベース除外)
 - 形式: Markdown で Critical / High / Medium / Low 4 段階。各 issue に file:line + 1 行サマリ + 詳細 + 修正案
 - 既知 trade-off (CLAUDE.local.md / .dev/knowledge/ にあるもの) は除外
-- 1500-2500 words 程度
+- 長さは指摘の数で決まる。controller が 4 本を統合するので、Critical / High は根拠つきで漏れなく、Low は 1 件 1 行で
 
 レポートを直接 message で返してください。
 ```
@@ -83,6 +84,7 @@ prompt:
 
 ```
 subagent_type: general-purpose
+model: opus
 description: セキュリティ・入力検証レビュー
 prompt:
 
@@ -93,11 +95,11 @@ prompt:
 - 現バージョン: {{VERSION}}、commit {{LATEST_COMMIT}}
 - stdio + Streamable HTTP の 2 transport
 - HTTP transport は intranet 想定 (認証なし、loopback or 信頼内 LAN 想定)
-- 既知の制約 (除外して OK): HTTP に認証 layer なし — CLAUDE.local.md「既知の残り課題」を先に読むこと
+- 既知の制約 (除外して OK): HTTP に認証 layer なし — 残課題の一覧 `.dev/known-issues.md` を先に読むこと
 
 # レビューしてほしい観点 (すべて)
 1. 入力検証 (MCP tool 引数、frontmatter YAML、groove.toml、golden YAML の信頼境界)
-2. SQL injection (src/db.rs の query 組み立て、? placeholder、動的 SQL)
+2. SQL injection (grooveseek/src/db.rs と db/ の query 組み立て、? placeholder、動的 SQL)
 3. パストラバーサル (kb_path 配下の `..` 抜け、symlink、exclude_dirs bypass、Win/POSIX 差)
 4. ファイルシステム (任意 read 境界、--config の任意ファイル、watcher の対象外監視)
 5. HTTP transport (Host header、DNS rebinding、CORS、/healthz 漏洩、bind デフォルト)
@@ -114,7 +116,7 @@ prompt:
 - 各 issue に file:line / 攻撃シナリオ / 詳細 / 緩和策
 - 既知制約は重複指摘せず残存リスクを拾う
 - 効いている既存防御策は明記
-- 1000-2000 words 程度
+- 長さは指摘の数で決まる。controller が 4 本を統合するので、Critical / High は根拠つきで漏れなく、Low / Info は 1 件 1 行で
 
 レポートを直接 message で返してください。
 ```
@@ -123,6 +125,7 @@ prompt:
 
 ```
 subagent_type: general-purpose
+model: opus
 description: テスト品質・カバレッジレビュー
 prompt:
 
@@ -131,12 +134,12 @@ prompt:
 # プロジェクト背景
 - リポジトリパス: {{REPO_PATH}}
 - 現バージョン: {{VERSION}}
-- Rust binary crate、test は src/*.rs 内 #[cfg(test)] と tests/*.rs に分散
+- Cargo workspace (本体 grooveseek/ は lib + bin `groove`)、test は grooveseek/src/ 内 #[cfg(test)] と grooveseek/tests/*.rs に分散
 - 重要なローカル制約 (CLAUDE.local.md より):
   - テストの削除・編集は禁止
   - cargo test (default) は embedding 実モデル DL 不要なものだけ。-- --ignored で実モデル
-  - tempfile / tempdir crate は使わず std::env::temp_dir() + PID + nanos + Drop guard で自作
-  - binary crate なので cargo test --lib は空振り、cargo test --bin groove <name> で叩く
+  - tempfile / tempdir crate は使わず std::env::temp_dir() + PID + nanos + アトミックカウンタ + Drop guard (共有ヘルパは grooveseek/src/test_support.rs)
+  - lib + bin の二重 target で test 本体は lib にあるので、cargo test --bin groove は空振りし得る。cargo test --lib <name> で叩く
   - subprocess test で stderr 文字列 assert する時は ANSI 色を strip
 
 # レビューしてほしい観点 (すべて)
@@ -154,7 +157,7 @@ prompt:
 - 既存テスト数の カウントを簡潔に
 - 形式: 欠落 test ケースを Critical / High / Medium / Low、各項目に「想定シナリオ」「テスト名候補」「対象 file:line」
 - 「テスト削除・編集禁止」を尊重し追加提案のみ
-- 1500-2500 words 程度
+- 長さは指摘の数で決まる。controller が 4 本を統合するので、Critical / High は根拠つきで漏れなく、Low は 1 件 1 行で
 
 レポートを直接 message で返してください。
 ```
@@ -163,6 +166,7 @@ prompt:
 
 ```
 subagent_type: general-purpose
+model: opus
 description: ドキュメント整合性レビュー
 prompt:
 
@@ -172,7 +176,7 @@ prompt:
 - リポジトリパス: {{REPO_PATH}}
 - 現バージョン: {{VERSION}}
 - 英語プライマリの日英バイリンガル運用
-- ドキュメント: README.md / README.ja.md、docs/{configuration,usage,clients,mcp-tools,behavior}.{md,ja.md}、docs/ARCHITECTURE.{md,ja.md}、docs/{eval,citations,filters,retrieval-pipeline,stability}.{md,ja.md}、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、groove.toml.example
+- ドキュメント: README.md / README.ja.md、docs/{configuration,usage,clients,mcp-tools,behavior}.{md,ja.md}、docs/ARCHITECTURE.{md,ja.md}、docs/{eval,citations,filters,retrieval-pipeline,stability}.{md,ja.md}、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、grooveseek/examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、grooveseek/groove.toml.example
 - リリース履歴: git tag --list で確認
 - `.dev/release-checklist.md` に「ドキュメント同期」節あり (要参照)
 
@@ -182,10 +186,10 @@ prompt:
 3. CHANGELOG vs git tag 整合 (compare link、日付)
 4. README → 各 docs / examples へのリンク (dead link、相対パス、anchor)
 5. サブコマンドの doc (README 記述と --help 出力の整合)
-6. groove.toml.example と src/config.rs の対応
-7. examples/deployments/ の現実装挙動と一致
+6. grooveseek/groove.toml.example と grooveseek/src/config.rs の対応
+7. grooveseek/examples/deployments/ の現実装挙動と一致
 8. CONTRIBUTING.md の手順が実環境で動くか
-9. docs/ARCHITECTURE.md の source layout 表が src/*.rs の現状と合っているか
+9. docs/ARCHITECTURE.md の source layout 表が grooveseek/src/ と crates/ の現状と合っているか
 10. MCP tool 一覧と docstring の整合
 
 # 要件
@@ -193,7 +197,7 @@ prompt:
 - 形式: Markdown で Critical / High / Medium / Low 4 段階
 - 各 issue に該当 file:line + 修正前/修正後 スニペット
 - 英日両方を見て片側にしかない情報があれば必ず指摘
-- 1500-2500 words 程度
+- 長さは指摘の数で決まる。controller が 4 本を統合するので、Critical / High は根拠つきで漏れなく、Low は 1 件 1 行で
 
 レポートを直接 message で返してください。
 ```
@@ -257,7 +261,7 @@ subagent の指摘のうち、過去に **同じ内容を 2 回以上「欠け�
 
 | ID | 重大度 | status | 対象 | 内容 / 修正方針 | 検証 |
 |---|---|---|---|---|---|
-| `AU-01` | **Critical** | todo | `src/db.rs:1618` | 何が / なぜ壊れるか / どう直すか | 実装後に何を見れば直ったと言えるか |
+| `AU-01` | **Critical** | todo | `grooveseek/src/db.rs:1618` | 何が / なぜ壊れるか / どう直すか | 実装後に何を見れば直ったと言えるか |
 
 台帳はサイクルが終わるまで生きているので、**Phase 4 でその場で着手すると決めた分は `status` を
 同期させる**。タグ前に fix しきった分を載せるかはサイクル次第 — 載せずに review ノート側の
