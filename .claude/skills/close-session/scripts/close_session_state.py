@@ -2,10 +2,16 @@
 
 The skill runs this script as its step 0. The real collector lives in the
 private nested repo at `.dev/tools/close_session_state.py`; a public clone
-has no `.dev`, so this wrapper prints a skip line and exits 0 there.
+has no `.dev` directory, so this wrapper prints a skip line and exits 0 there.
+A `.dev` that exists without the delegate is a broken owner setup (for
+example an older `.dev` revision), not a public clone: that is an error.
 
 Exit codes:
-  0   no `.dev` (skip line printed), or the delegate ran and exited 0.
+  0   no `.dev` directory (skip line printed), or the delegate ran and
+      exited 0.
+  2   `.dev` exists but `.dev/tools/close_session_state.py` does not: the
+      last line is `wrapper: error delegate missing: <path> (update the
+      .dev checkout)`. The caller must stop.
   n   the delegate exited n != 0 (crash, interpreter error, killed): the
       last line is `wrapper: delegate exit n` and this wrapper exits n
       (1 if n is outside 0-255). State is incomplete; the caller must stop.
@@ -36,10 +42,14 @@ def main():
     # .claude/skills/close-session/scripts/ -> repo root is four levels up.
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-    delegate = os.path.join(root, ".dev", "tools", "close_session_state.py")
-    if not os.path.isfile(delegate):
+    dev = os.path.join(root, ".dev")
+    delegate = os.path.join(dev, "tools", "close_session_state.py")
+    if not os.path.isdir(dev):
         _out(SKIP_LINE + "\n")
         return 0
+    if not os.path.isfile(delegate):
+        _out("wrapper: error delegate missing: %s (update the .dev checkout)\n" % delegate)
+        return 2
     sys.stdout.flush()
     rc = subprocess.call([sys.executable, delegate] + sys.argv[1:], cwd=root)
     if rc != 0:
