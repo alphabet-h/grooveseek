@@ -12,6 +12,11 @@ Exit codes:
   2   `.dev` exists but `.dev/tools/close_session_state.py` does not: the
       last line is `wrapper: error delegate missing: <path> (update the
       .dev checkout)`. The caller must stop.
+  2   `.dev` and the delegate exist but `.dev` is not its own git repository
+      (`git -C .dev rev-parse --show-toplevel` fails or does not end in
+      `/.dev`, the same check /next-work makes): the last line is `wrapper:
+      error .dev is not a nested git repository: <toplevel or git error>`.
+      The delegate is not run. The caller must stop.
   n   the delegate exited n != 0 (crash, interpreter error, killed): the
       last line is `wrapper: delegate exit n` and this wrapper exits n
       (1 if n is outside 0-255). State is incomplete; the caller must stop.
@@ -38,6 +43,42 @@ def _out(text):
     sys.stdout.flush()
 
 
+def _decode(data):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp932", errors="replace")
+
+
+def _one_line(text):
+    return " ".join(text.split()) or "(no output)"
+
+
+def _nested_repo_problem(dev):
+    """None when `dev` is its own git repo (toplevel ends in /.dev), else a one-line reason.
+
+    Same predicate as /next-work's precondition: `rev-parse --show-toplevel`
+    must end in `/.dev`. A `.dev` copied without its `.git` resolves to the
+    outer repo and fails here.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", dev, "rev-parse", "--show-toplevel"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "git failed: %s" % _one_line(str(exc))
+    if proc.returncode != 0:
+        return "git failed: %s" % _one_line(_decode(proc.stderr))
+    top = _decode(proc.stdout).strip().replace("\\", "/")
+    if not top.lower().endswith("/.dev"):
+        return _one_line(top)
+    return None
+
+
 def main():
     # .claude/skills/close-session/scripts/ -> repo root is four levels up.
     here = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +90,10 @@ def main():
         return 0
     if not os.path.isfile(delegate):
         _out("wrapper: error delegate missing: %s (update the .dev checkout)\n" % delegate)
+        return 2
+    problem = _nested_repo_problem(dev)
+    if problem is not None:
+        _out("wrapper: error .dev is not a nested git repository: %s\n" % problem)
         return 2
     sys.stdout.flush()
     rc = subprocess.call([sys.executable, delegate] + sys.argv[1:], cwd=root)
