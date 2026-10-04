@@ -36,9 +36,9 @@ step 1-6 と末尾の 2 段落は `/feature-flow` から逐語で移した。本
      `<repo root の絶対パス>` は `/next-work` の git command と同じ置き方 (`.claude/commands/next-work.md` の Phase 0) で、
      この checkout の root の絶対 path を書く。出力の「状態」block (鎖の末端、`session id:` と `source:`、3 つの git status、
      deny / rewrite の集計) を**読んでから**先へ進む。
-     - command 自体が error になった (`python` が無い、path が違う) なら通常の tool error — path か interpreter を直して打ち直す
+     - この command が 0 以外で終わった (`wrapper: delegate exit N` / `wrapper: error …` / tool error。`python` が無い、path が違う、collector が落ちた) なら、state は不完全。**止めて原因を直し、打ち直す**。0 以外のまま step 1 以降へ進まない
      - `state: skipped (no .dev checkout — …)` が出たら、この checkout では手順を回せない (owner 用)。user に 1 行で伝えて止まる (`/next-work` と同じ)
-     - 各項目の `exit:` 行が 0 以外なら、その項目は読めていない (script 自体は常に exit 0 で終わる)。`session id:` 行の `source:` が `env` 以外なら取得元を疑う — `guess` は最も新しい scratchpad で、別 session を数えていることがある (kuriya trap #295)
+     - exit 0 で終わった run の中の各項目の `exit:` 行が 0 以外なら、その項目は読めていない (collector 自体は常に exit 0 で終わる)。鎖の末端の項目の `exit:` が 0 以外なら step 1 の「鎖が切れている」停止条件。`session id:` 行の `source:` が `env` 以外なら取得元を疑う — `guess` は最も新しい scratchpad で、別 session を数えていることがある (kuriya trap #295)
    - 次に background task の leak を見る (`run_in_background` の polling が残っていないか。あれば `TaskStop`)
    - 次に上で読んだ「状態」の `guard_deny_by_rule.py --list` の行から controller 分の deny を選び、step 1 で書く handoff の guard 節に
    1 件ずつ `- [Rn] <target の先頭> — 判断: なし (反射) | あり (<理由>) | 不明` と書く。subagent 分は deny の場の記録が無いので

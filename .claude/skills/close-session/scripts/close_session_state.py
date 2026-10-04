@@ -1,10 +1,19 @@
 """State block for /close-session, safe on any checkout.
 
-The skill injects this script's output before its body. The real collector
-lives in the private nested repo at `.dev/tools/close_session_state.py`; a
-public clone has no `.dev`, so this wrapper prints a skip line instead of
-failing (a nonzero exit would abort the skill before its text is shown).
-It always exits 0.
+The skill runs this script as its step 0. The real collector lives in the
+private nested repo at `.dev/tools/close_session_state.py`; a public clone
+has no `.dev`, so this wrapper prints a skip line and exits 0 there.
+
+Exit codes:
+  0   no `.dev` (skip line printed), or the delegate ran and exited 0.
+  n   the delegate exited n != 0 (crash, interpreter error, killed): the
+      last line is `wrapper: delegate exit n` and this wrapper exits n
+      (1 if n is outside 0-255). State is incomplete; the caller must stop.
+  2   unexpected wrapper error: `wrapper: error <ExcType>: <message>`.
+
+The delegate itself exits 0 by its own contract and reports per-item
+failures as `exit:` lines, so a non-zero exit here means it could not even
+run to completion.
 """
 
 import os
@@ -30,19 +39,25 @@ def main():
     delegate = os.path.join(root, ".dev", "tools", "close_session_state.py")
     if not os.path.isfile(delegate):
         _out(SKIP_LINE + "\n")
-        return
+        return 0
     sys.stdout.flush()
     rc = subprocess.call([sys.executable, delegate] + sys.argv[1:], cwd=root)
     if rc != 0:
         _out("wrapper: delegate exit %d\n" % rc)
+        return rc if 0 < rc <= 255 else 1
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except BaseException as exc:  # noqa: BLE001 - the skill must never abort
+        code = main()
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - report, then fail loudly
         try:
-            _out("wrapper: error %s\n" % type(exc).__name__)
+            msg = str(exc).encode("ascii", errors="backslashreplace").decode("ascii")
+            _out("wrapper: error %s: %s\n" % (type(exc).__name__, msg))
         except BaseException:
             pass
-    sys.exit(0)
+        code = 2
+    sys.exit(code)
