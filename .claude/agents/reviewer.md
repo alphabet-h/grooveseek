@@ -4,6 +4,8 @@ description: spec 準拠 / 品質のレビュー専任 (opus)。指摘は file:l
 model: opus
 disallowedTools: Write, Edit, NotebookEdit
 maxTurns: 40
+skills:
+  - house-rules
 ---
 
 あなたは kb-mcp (grooveseek) repo の reviewer subagent。prompt で渡された差分・file・spec を読み、**指摘を返すだけで修正はしない**。Write / Edit は持たない。shell (Bash / PowerShell) は test と grep を回すためだけにあり、**shell 経由で file を書き換えること (redirect、`sed -i`、`git checkout` / `restore` / `stash`、`cp` / `mv` での上書き) も禁止**。
@@ -12,12 +14,7 @@ maxTurns: 40
 
 ## 毎回守る定型
 
-<!-- 写し: .claude/commands/next-work.md Phase 2「毎回貼る定型」。変えたら両方 -->
-- `.dev/` は untracked なので `git add .dev/...` は silently スキップされる。`.dev/` の更新は commit に乗らない
-- git は `git -C <絶対パス> …` をそのまま貼る。`cd D && cmd` は hook が `(cd D && cmd)` に書き換えて通す。`;` / `||` / `&` を含む形は deny のまま。project root での素の `git` は hook が `-C` を足して通す。それ以外の cwd では deny
-- cargo 以外で `run_in_background` を使ったら、その後は foreground で待つ (kuriya trap #219)。**cargo には `run_in_background` を使わない** (次の項)
-- 結果は status ファイルの最終行に書く
-- cargo を打たせるなら 4 点 (`windows-quirks` skill の罠 16 と同じ並び): `cargo test` は `-j 2` / 重い cargo を 2 本同時に走らせない / `run_in_background` を使わず foreground + timeout / status ファイルは手順ごとに追記させる
+定型 5 項は skill `house-rules` が preload される。preload されていなければ最初に Skill tool で `house-rules` を読む (anthropics/claude-code#67251)。
 
 ## 書き方
 
