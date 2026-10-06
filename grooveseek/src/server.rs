@@ -5026,6 +5026,40 @@ mod tests {
         assert_eq!(resp.title.as_deref(), Some(fixture::TITLE));
     }
 
+    /// feature-63 T7s (AC10): `get_document`'s content for a document with an empty chapter
+    /// carries the chapter's title where it stood, without the blank lines an empty section
+    /// left, and still not the sections' own headings.
+    #[test]
+    fn a_document_response_puts_a_folded_chapter_where_it_stood() {
+        use crate::parser::docx::fixture;
+        let registry =
+            Registry::from_enabled(&["md".to_string(), "docx".to_string()]).expect("md + docx");
+        let resp = build_document_response(
+            &registry,
+            "quarry.docx",
+            "docx",
+            &fixture::folded_chapter_docx(),
+        )
+        .expect("the document parses");
+        assert_eq!(
+            resp.content,
+            format!(
+                "{}\n\n{}\n{}\n\n{}",
+                fixture::FOLD_PREFACE,
+                fixture::FOLD_CHAPTER,
+                fixture::FOLD_FIRST_BODY,
+                fixture::FOLD_SECOND_BODY
+            )
+        );
+        for heading in [fixture::FOLD_FIRST, fixture::FOLD_SECOND] {
+            assert!(
+                !resp.content.contains(heading),
+                "{heading}: {:?}",
+                resp.content
+            );
+        }
+    }
+
     /// A registry over Markdown and PDF whose decompression cap is `decompressed`
     /// and whose raw caps are the defaults.
     fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
