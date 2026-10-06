@@ -980,8 +980,12 @@ pub fn rebuild_index(
     // (feature-62) The same kind of generation for `.docx`: an index whose `.docx` rows were
     // split before headings were read from `word/styles.xml` re-reads each unchanged one once
     // ([`DOCX_HEADING_POLICY`], ADR-0028). `--force` re-parses everything anyway.
-    let refresh_docx =
-        !force && db.read_docx_heading_policy()?.as_deref() != Some(DOCX_HEADING_POLICY);
+    // (feature-63) So does one whose rows were cut before a heading with no body text was
+    // folded into the next section ([`DOCX_SECTION_POLICY`]). Read here, once, before the
+    // loop; the run does not read either key again.
+    let refresh_docx = !force
+        && (db.read_docx_heading_policy()?.as_deref() != Some(DOCX_HEADING_POLICY)
+            || db.read_docx_section_policy()?.as_deref() != Some(DOCX_SECTION_POLICY));
 
     // (feature-58) The keys the schema declares are what `document_fields` holds.
     // `schema` was already loaded above, before the destructive reset, from the
@@ -1488,6 +1492,9 @@ pub fn rebuild_index(
         let tx = db.begin_transaction()?;
         db.overwrite_content_hash(&marked, HASH_AWAITING_REPARSE)?;
         db.write_docx_heading_policy(DOCX_HEADING_POLICY)?;
+        // (feature-63) After the heading key, in the same transaction: a run that fails on
+        // either write records neither.
+        db.write_docx_section_policy(DOCX_SECTION_POLICY)?;
         tx.commit()?;
     }
     progress.finish();
@@ -3027,7 +3034,19 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// in [`rebuild_index`] would never read them again. A generation, like
 /// [`FRONTMATTER_POLICY`], and a key of its own, since the two passes cover different files and
 /// do different work (ADR-0028).
+///
+/// (feature-63) The pass also runs while [`DOCX_SECTION_POLICY`] is not recorded.
 pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
+
+/// (feature-63) Recorded in `index_meta.docx_section_policy` beside [`DOCX_HEADING_POLICY`],
+/// in the same transaction, once every `.docx` row of the index has been settled under the
+/// rule that folds a heading with no body text into the next section that has one (instead of
+/// a chunk with an empty body). Absence or another value opens the same one-time pass the
+/// heading key does (ADR-0028): [`rebuild_index`] runs it when either key is not at its value.
+///
+/// A key of its own rather than a new value of [`DOCX_HEADING_POLICY`], which stays what
+/// v1.16.0 recorded; the two answer different questions about the same rows.
+pub(crate) const DOCX_SECTION_POLICY: &str = "fold-empty-headings";
 
 /// (feature-62) The `content_hash` a `.docx` row carries when the one-time pass of
 /// [`DOCX_HEADING_POLICY`] could not settle it: skipped by the scan, failed to parse, refused

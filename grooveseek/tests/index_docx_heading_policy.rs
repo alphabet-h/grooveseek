@@ -1486,3 +1486,235 @@ mod reread_pass {
         assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash));
     }
 }
+
+/// feature-63: a `.docx` heading with no body text folds into the next section, and an index
+/// written before that re-reads its unchanged `.docx` once more under a second generation key,
+/// `docx_section_policy`, beside the unchanged `docx_heading_policy`. Appended to this file
+/// rather than given one of its own so it uses the docx builders above instead of a copy;
+/// the DB helpers of [`reread_pass`] are private to it, so the few this module needs are
+/// repeated here rather than opened up, which would edit that module.
+mod fold_pass {
+    use super::*;
+    use rusqlite::{Connection, OptionalExtension};
+    use sha2::{Digest, Sha256};
+
+    const HEADING_KEY: &str = "docx_heading_policy";
+    const SECTION_KEY: &str = "docx_section_policy";
+    /// The value of `docx_heading_policy`, which this feature leaves as it was.
+    const HEADING_POLICY: &str = "styles-name-basedon";
+    const SECTION_POLICY: &str = "fold-empty-headings";
+    const AWAITING: &str = "awaiting-reparse";
+
+    fn db(fx: &Fixture) -> Connection {
+        Connection::open(fx.layout.root().join(".groove.db")).expect("open the index")
+    }
+
+    fn meta(fx: &Fixture, key: &str) -> Option<String> {
+        db(fx)
+            .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .expect("read index_meta")
+    }
+
+    fn delete_meta(fx: &Fixture, key: &str) {
+        db(fx)
+            .execute("DELETE FROM index_meta WHERE key = ?1", [key])
+            .expect("delete an index_meta key");
+    }
+
+    fn content_hash(fx: &Fixture, rel: &str) -> Option<String> {
+        db(fx)
+            .query_row(
+                "SELECT content_hash FROM documents WHERE path = ?1",
+                [rel],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("read content_hash")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// The AC1 document of the parser tests ([`numeric_heading_docx`]): no empty section, so
+    /// folding changes nothing in it.
+    fn clean_docx() -> Vec<u8> {
+        numeric_heading_docx(TITLE, &[])
+    }
+
+    /// feature-63 I2a (AC13): a new index records both generations, the heading one at the
+    /// value it always had, and announces nothing (there is nothing to re-read).
+    #[test]
+    fn a_new_index_records_both_docx_generations() {
+        let fx = docx_kb("groove-f63-i2a");
+        write_bytes(&fx, "b-clean.docx", &clean_docx());
+        let stderr = index_stderr(&fx);
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-63 I2b (AC18): either key away from its value opens the one-time pass, which
+    /// records both again. A clean document matches, so nothing is updated.
+    #[test]
+    fn either_stale_docx_generation_opens_the_reread_pass() {
+        for (case, stale) in [("section", SECTION_KEY), ("heading", HEADING_KEY)] {
+            let fx = docx_kb(&format!("groove-f63-i2b-{case}"));
+            write_bytes(&fx, "b-clean.docx", &clean_docx());
+            index_stderr(&fx);
+            delete_meta(&fx, stale);
+
+            let second = index_stderr(&fx);
+            assert!(
+                second.contains("Re-reading 1 unchanged .docx document(s) once:"),
+                "({case}) {second}"
+            );
+            assert!(second.contains("(0 updated, "), "({case}) {second}");
+            assert_eq!(
+                meta(&fx, HEADING_KEY).as_deref(),
+                Some(HEADING_POLICY),
+                "({case})"
+            );
+            assert_eq!(
+                meta(&fx, SECTION_KEY).as_deref(),
+                Some(SECTION_POLICY),
+                "({case})"
+            );
+
+            let third = index_stderr(&fx);
+            assert!(!third.contains("Re-reading"), "({case}) {third}");
+            assert_dir_empty(&fx.cache);
+        }
+    }
+
+    /// feature-63 I2c (AC19): `--force` records both generations without the notice.
+    #[test]
+    fn a_forced_run_records_both_docx_generations() {
+        let fx = docx_kb("groove-f63-i2c");
+        write_bytes(&fx, "b-clean.docx", &clean_docx());
+        index_stderr(&fx);
+        delete_meta(&fx, HEADING_KEY);
+        delete_meta(&fx, SECTION_KEY);
+
+        let out = fx.index_force();
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+    }
+
+    /// The decompression budget of the failing runs: a document over it fails to parse.
+    const DEC_CAP: usize = 16_384;
+
+    /// A knowledge base the failing runs share: `a-bloat.docx`, whose `word/document.xml`
+    /// alone is over [`DEC_CAP`], and `b-tidy.docx`, a clean document within it; indexed once
+    /// under the default caps, then left with the heading key at its value and no section key,
+    /// under [`DEC_CAP`].
+    fn failing_run_kb(prefix: &str) -> (Fixture, String) {
+        let fx = docx_kb(prefix);
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-tidy.docx", &numeric_heading_docx("Ledger", &[]));
+        index_stderr(&fx);
+        delete_meta(&fx, SECTION_KEY);
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        configure(
+            &fx,
+            "",
+            MD_AND_DOCX,
+            &format!("[index]\nmax_decompressed_size = {DEC_CAP}\n"),
+        );
+        (fx, sha256_hex(&bloat))
+    }
+
+    /// After a run that returned an error: no section key, the heading key as it was, no row
+    /// marked, `a-bloat.docx` still holding its own hash. Then, the trigger gone, the next run
+    /// announces the pass, marks the row it cannot read and records both keys.
+    fn assert_nothing_recorded_then_recorded(fx: &Fixture, bloat_hash: &str, trigger: &str) {
+        assert_eq!(
+            meta(fx, SECTION_KEY),
+            None,
+            "the failed run records no section key"
+        );
+        assert_eq!(meta(fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        let marked: i64 = db(fx)
+            .query_row(
+                "SELECT count(*) FROM documents WHERE content_hash = ?1",
+                [AWAITING],
+                |r| r.get(0),
+            )
+            .expect("count marks");
+        assert_eq!(marked, 0, "the failed run marks nothing");
+        assert_eq!(
+            content_hash(fx, "a-bloat.docx").as_deref(),
+            Some(bloat_hash)
+        );
+
+        db(fx)
+            .execute_batch(&format!("DROP TRIGGER {trigger};"))
+            .expect("drop the trigger");
+        let next = index_stderr(fx);
+        assert!(
+            next.contains("Re-reading 2 unchanged .docx document(s) once:"),
+            "{next}"
+        );
+        assert_eq!(content_hash(fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(meta(fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+    }
+
+    /// feature-63 I6a (AC20 (a)): the update that marks the unreadable row fails, so the run
+    /// returns an error before either key is written.
+    #[test]
+    fn a_run_whose_marks_fail_records_no_section_generation() {
+        let (fx, bloat_hash) = failing_run_kb("groove-f63-i6a");
+        db(&fx)
+            .execute_batch("CREATE TRIGGER inject_mark_failure BEFORE UPDATE OF content_hash ON documents WHEN NEW.content_hash = 'awaiting-reparse' BEGIN SELECT RAISE(ABORT, 'injected mark failure'); END;")
+            .expect("create the trigger");
+
+        let out = fx.run_index();
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("injected mark failure"), "{stderr}");
+        assert_nothing_recorded_then_recorded(&fx, &bloat_hash, "inject_mark_failure");
+    }
+
+    /// feature-63 I6b (AC20 (b)): the write of the heading key fails; the section key, written
+    /// after it in the same transaction, is not there either.
+    #[test]
+    fn a_run_whose_heading_key_fails_records_no_section_generation() {
+        let (fx, bloat_hash) = failing_run_kb("groove-f63-i6b");
+        {
+            let conn = db(&fx);
+            conn.execute_batch("CREATE TRIGGER inject_policy_failure BEFORE INSERT ON index_meta WHEN NEW.key = 'docx_heading_policy' BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END;")
+                .expect("create the trigger");
+            let probe = conn
+                .execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_heading_policy', 'probe')",
+                    [],
+                )
+                .expect_err("premise: the trigger stops INSERT OR REPLACE over an existing key");
+            assert!(
+                probe.to_string().contains("injected policy failure"),
+                "{probe}"
+            );
+        }
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+
+        let out = fx.run_index();
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("injected policy failure"), "{stderr}");
+        assert_nothing_recorded_then_recorded(&fx, &bloat_hash, "inject_policy_failure");
+    }
+}

@@ -316,6 +316,31 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.docx_section_policy` (feature-63): how the `.docx` sections of this index
+    /// were assembled, recorded beside `docx_heading_policy` by
+    /// [`crate::indexer::rebuild_index`]. `None` = never recorded, which is every index written
+    /// before a `.docx` heading with no body text was folded into the next section.
+    pub fn read_docx_section_policy(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'docx_section_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `index_meta.docx_section_policy` を記録する (INSERT OR REPLACE、feature-63)。
+    pub fn write_docx_section_policy(&self, policy: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_section_policy', ?1)",
+            params![policy],
+        )?;
+        Ok(())
+    }
+
     /// `index_meta.declared_fields` (feature-58): the sorted JSON array of key
     /// names `groove-schema.toml` declared when the index was last completed.
     /// `None` = never recorded, which is every index written before 1.9.0.
