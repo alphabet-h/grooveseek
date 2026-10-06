@@ -1895,7 +1895,7 @@ mod fold_pass {
     const HERMETIC_CHILD: &str = "GROOVE_F63_HERMETIC_CHILD";
 
     /// Run the test `name` (with its module path) again in a child of this test binary under
-    /// the environment [`crate::common::embed_mock::hermetic`] pins; the copy `reread_pass`
+    /// the environment [`crate::common::embed_mock::hermetic`] pins; the copy [`super::reread_pass`]
     /// holds is private to it. `true` in the parent, after the child passed exactly one test;
     /// `false` in the child.
     fn run_in_hermetic_child(name: &str) -> bool {
@@ -1934,7 +1934,8 @@ mod fold_pass {
     }
 
     /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
-    /// `groove index` wires it, reporting to `progress`.
+    /// `groove index` wires it, reporting to the
+    /// [`grooveseek::indexer::progress::ProgressReporter`] it is given.
     fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
         let kb = fx.kb();
         let cfg = Config::load_from(&fx.config).expect("load groove.toml");

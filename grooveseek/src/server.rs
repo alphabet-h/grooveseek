@@ -5026,7 +5026,7 @@ mod tests {
         assert_eq!(resp.title.as_deref(), Some(fixture::TITLE));
     }
 
-    /// feature-63 T7s (AC10): `get_document`'s content for a document with an empty chapter
+    /// feature-63 T7s (AC10): [`get_document`](KbServer::get_document)'s content for a document with an empty chapter
     /// carries the chapter's title where it stood, without the blank lines an empty section
     /// left, and still not the sections' own headings.
     #[test]
