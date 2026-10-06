@@ -1486,3 +1486,724 @@ mod reread_pass {
         assert_eq!(content_hash(&fx, "b-tidy.docx"), Some(tidy_hash));
     }
 }
+
+/// feature-63: a `.docx` heading with no body text folds into the next section, and an index
+/// written before that re-reads its unchanged `.docx` once more under a second generation key,
+/// `docx_section_policy`, beside the unchanged `docx_heading_policy`. Appended to this file
+/// rather than given one of its own so it uses the docx builders above instead of a copy;
+/// the DB helpers of [`reread_pass`] are private to it, so the few this module needs are
+/// repeated here rather than opened up, which would edit that module.
+mod fold_pass {
+    use super::*;
+    use crate::common::embed_mock::{DOC_MODEL, hermetic};
+    use crate::common::temp::TempRoot;
+    use grooveseek::config::Config;
+    use grooveseek::db::{ContextMode, Database};
+    use grooveseek::embedder::Embedder;
+    use grooveseek::indexer::progress::{ProgressEvent, ProgressMode, ProgressReporter};
+    use grooveseek::indexer::{
+        IndexResult, RenameOutcome, SingleResult, load_declared_schema, rebuild_index,
+        reindex_single_file, rename_single_file,
+    };
+    use rusqlite::{Connection, OptionalExtension};
+    use sha2::{Digest, Sha256};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    const HEADING_KEY: &str = "docx_heading_policy";
+    const SECTION_KEY: &str = "docx_section_policy";
+    /// The value of `docx_heading_policy`, which this feature leaves as it was.
+    const HEADING_POLICY: &str = "styles-name-basedon";
+    const SECTION_POLICY: &str = "fold-empty-headings";
+    const AWAITING: &str = "awaiting-reparse";
+
+    fn db(fx: &Fixture) -> Connection {
+        Connection::open(fx.layout.root().join(".groove.db")).expect("open the index")
+    }
+
+    fn meta(fx: &Fixture, key: &str) -> Option<String> {
+        db(fx)
+            .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .expect("read index_meta")
+    }
+
+    fn delete_meta(fx: &Fixture, key: &str) {
+        db(fx)
+            .execute("DELETE FROM index_meta WHERE key = ?1", [key])
+            .expect("delete an index_meta key");
+    }
+
+    fn content_hash(fx: &Fixture, rel: &str) -> Option<String> {
+        db(fx)
+            .query_row(
+                "SELECT content_hash FROM documents WHERE path = ?1",
+                [rel],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("read content_hash")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// The AC1 document of the parser tests ([`numeric_heading_docx`]): no empty section, so
+    /// folding changes nothing in it.
+    fn clean_docx() -> Vec<u8> {
+        numeric_heading_docx(TITLE, &[])
+    }
+
+    /// feature-63 I2a (AC13): a new index records both generations, the heading one at the
+    /// value it always had, and announces nothing (there is nothing to re-read).
+    #[test]
+    fn a_new_index_records_both_docx_generations() {
+        let fx = docx_kb("groove-f63-i2a");
+        write_bytes(&fx, "b-clean.docx", &clean_docx());
+        let stderr = index_stderr(&fx);
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-63 I2b (AC18): either key away from its value opens the one-time pass, which
+    /// records both again. A clean document matches, so nothing is updated.
+    #[test]
+    fn either_stale_docx_generation_opens_the_reread_pass() {
+        for (case, stale) in [("section", SECTION_KEY), ("heading", HEADING_KEY)] {
+            let fx = docx_kb(&format!("groove-f63-i2b-{case}"));
+            write_bytes(&fx, "b-clean.docx", &clean_docx());
+            index_stderr(&fx);
+            delete_meta(&fx, stale);
+
+            let second = index_stderr(&fx);
+            assert!(
+                second.contains("Re-reading 1 unchanged .docx document(s) once:"),
+                "({case}) {second}"
+            );
+            assert!(second.contains("(0 updated, "), "({case}) {second}");
+            assert_eq!(
+                meta(&fx, HEADING_KEY).as_deref(),
+                Some(HEADING_POLICY),
+                "({case})"
+            );
+            assert_eq!(
+                meta(&fx, SECTION_KEY).as_deref(),
+                Some(SECTION_POLICY),
+                "({case})"
+            );
+
+            let third = index_stderr(&fx);
+            assert!(!third.contains("Re-reading"), "({case}) {third}");
+            assert_dir_empty(&fx.cache);
+        }
+    }
+
+    /// feature-63 I2c (AC19): `--force` records both generations without the notice.
+    #[test]
+    fn a_forced_run_records_both_docx_generations() {
+        let fx = docx_kb("groove-f63-i2c");
+        write_bytes(&fx, "b-clean.docx", &clean_docx());
+        index_stderr(&fx);
+        delete_meta(&fx, HEADING_KEY);
+        delete_meta(&fx, SECTION_KEY);
+
+        let out = fx.index_force();
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+    }
+
+    /// The decompression budget of the failing runs: a document over it fails to parse.
+    const DEC_CAP: usize = 16_384;
+
+    /// A knowledge base the failing runs share: `a-bloat.docx`, whose `word/document.xml`
+    /// alone is over [`DEC_CAP`], and `b-tidy.docx`, a clean document within it; indexed once
+    /// under the default caps, then left with the heading key at its value and no section key,
+    /// under [`DEC_CAP`].
+    fn failing_run_kb(prefix: &str) -> (Fixture, String) {
+        let fx = docx_kb(prefix);
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-tidy.docx", &numeric_heading_docx("Ledger", &[]));
+        index_stderr(&fx);
+        delete_meta(&fx, SECTION_KEY);
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        configure(
+            &fx,
+            "",
+            MD_AND_DOCX,
+            &format!("[index]\nmax_decompressed_size = {DEC_CAP}\n"),
+        );
+        (fx, sha256_hex(&bloat))
+    }
+
+    /// After a run that returned an error: no section key, the heading key as it was, no row
+    /// marked, `a-bloat.docx` still holding its own hash. Then, the trigger gone, the next run
+    /// announces the pass, marks the row it cannot read and records both keys.
+    fn assert_nothing_recorded_then_recorded(fx: &Fixture, bloat_hash: &str, trigger: &str) {
+        assert_eq!(
+            meta(fx, SECTION_KEY),
+            None,
+            "the failed run records no section key"
+        );
+        assert_eq!(meta(fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        let marked: i64 = db(fx)
+            .query_row(
+                "SELECT count(*) FROM documents WHERE content_hash = ?1",
+                [AWAITING],
+                |r| r.get(0),
+            )
+            .expect("count marks");
+        assert_eq!(marked, 0, "the failed run marks nothing");
+        assert_eq!(
+            content_hash(fx, "a-bloat.docx").as_deref(),
+            Some(bloat_hash)
+        );
+
+        db(fx)
+            .execute_batch(&format!("DROP TRIGGER {trigger};"))
+            .expect("drop the trigger");
+        let next = index_stderr(fx);
+        assert!(
+            next.contains("Re-reading 2 unchanged .docx document(s) once:"),
+            "{next}"
+        );
+        assert_eq!(content_hash(fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(meta(fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+    }
+
+    /// feature-63 I6a (AC20 (a)): the update that marks the unreadable row fails, so the run
+    /// returns an error before either key is written.
+    #[test]
+    fn a_run_whose_marks_fail_records_no_section_generation() {
+        let (fx, bloat_hash) = failing_run_kb("groove-f63-i6a");
+        db(&fx)
+            .execute_batch("CREATE TRIGGER inject_mark_failure BEFORE UPDATE OF content_hash ON documents WHEN NEW.content_hash = 'awaiting-reparse' BEGIN SELECT RAISE(ABORT, 'injected mark failure'); END;")
+            .expect("create the trigger");
+
+        let out = fx.run_index();
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("injected mark failure"), "{stderr}");
+        assert_nothing_recorded_then_recorded(&fx, &bloat_hash, "inject_mark_failure");
+    }
+
+    /// feature-63 I6b (AC20 (b)): the write of the heading key fails; the section key, written
+    /// after it in the same transaction, is not there either.
+    #[test]
+    fn a_run_whose_heading_key_fails_records_no_section_generation() {
+        let (fx, bloat_hash) = failing_run_kb("groove-f63-i6b");
+        {
+            let conn = db(&fx);
+            conn.execute_batch("CREATE TRIGGER inject_policy_failure BEFORE INSERT ON index_meta WHEN NEW.key = 'docx_heading_policy' BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END;")
+                .expect("create the trigger");
+            let probe = conn
+                .execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_heading_policy', 'probe')",
+                    [],
+                )
+                .expect_err("premise: the trigger stops INSERT OR REPLACE over an existing key");
+            assert!(
+                probe.to_string().contains("injected policy failure"),
+                "{probe}"
+            );
+        }
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+
+        let out = fx.run_index();
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("injected policy failure"), "{stderr}");
+        assert_nothing_recorded_then_recorded(&fx, &bloat_hash, "inject_policy_failure");
+    }
+
+    /// One text column of `rel`'s chunks, in chunk order.
+    fn column(fx: &Fixture, rel: &str, name: &str) -> Vec<Option<String>> {
+        let conn = db(fx);
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT c.{name} FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = ?1 ORDER BY c.chunk_index"
+            ))
+            .expect("prepare");
+        stmt.query_map([rel], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    }
+
+    /// How many of `rel`'s chunks have an empty body.
+    fn empty_chunks(fx: &Fixture, rel: &str) -> i64 {
+        db(fx)
+            .query_row(
+                "SELECT count(*) FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = ?1 AND trim(c.content, ' ' || char(9) || char(10) || char(13)) = ''",
+                [rel],
+                |r| r.get(0),
+            )
+            .expect("count empty chunks")
+    }
+
+    /// The headings of the chunks whose `content` column -- not the heading, not the context --
+    /// matches `phrase` in the full-text index.
+    fn content_matches(fx: &Fixture, phrase: &str) -> Vec<Option<String>> {
+        let conn = db(fx);
+        let mut stmt = conn
+            .prepare("SELECT c.heading FROM fts_chunks JOIN chunks c ON c.id = fts_chunks.rowid WHERE fts_chunks MATCH ?1 ORDER BY c.id")
+            .expect("prepare");
+        stmt.query_map([format!("content : \"{phrase}\"")], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    }
+
+    // The work-rules document of the parser's `rules_docx`, copied: an integration test cannot
+    // reach the crate's `cfg(test)` fixture. Same words, so the two stay one document.
+    const RULES_TITLE: &str = "Statute";
+    const RULES_PREFACE: &str = "lantana preamble stating the purpose of these rules";
+    const RULES_CHAPTERS: [&str; 3] = ["Chapter Granite", "Chapter Basalt", "Chapter Marble"];
+    const RULES_ARTICLES: [[&str; 2]; 3] = [
+        ["Article Plover", "Article Heron"],
+        ["Article Egret", "Article Crane"],
+        ["Article Stork", "Article Ibis"],
+    ];
+    const RULES_BODIES: [[&str; 2]; 3] = [
+        [
+            "first duty about punctual arrival each morning",
+            "second duty about tidy desks at closing",
+        ],
+        [
+            "third duty about leave requests in writing",
+            "fourth duty about overtime approval beforehand",
+        ],
+        [
+            "fifth duty about returning borrowed laptops",
+            "sixth duty about reporting lost badges promptly",
+        ],
+    ];
+
+    /// The work rules, titled `title`: [`RULES_PREFACE`], then three chapters with no body of
+    /// their own, each followed directly by two articles over their bodies.
+    fn rules_docx(title: &str) -> Vec<u8> {
+        rules_docx_with(title, RULES_PREFACE)
+    }
+
+    /// A preamble the renamed copy of the work rules opens with instead of [`RULES_PREFACE`],
+    /// so the rename changes a chunk's content, not just the title.
+    const AMENDED_PREFACE: &str = "amended preamble replacing the earlier purpose statement";
+
+    /// [`rules_docx`] titled `title` and opening with `preface`.
+    fn rules_docx_with(title: &str, preface: &str) -> Vec<u8> {
+        let mut paragraphs: Vec<(Option<&str>, &str)> = vec![(None, preface)];
+        for ((chapter, articles), bodies) in RULES_CHAPTERS
+            .iter()
+            .zip(&RULES_ARTICLES)
+            .zip(&RULES_BODIES)
+        {
+            paragraphs.push((Some("1"), *chapter));
+            for (article, body) in articles.iter().zip(bodies) {
+                paragraphs.push((Some("2"), *article));
+                paragraphs.push((None, *body));
+            }
+        }
+        let doc = document_xml(&paragraphs);
+        let styles = styles_xml(&word2010_ja_styles());
+        let core = core_xml(title);
+        docx(&[
+            ("word/document.xml", doc.as_bytes()),
+            ("word/styles.xml", styles.as_bytes()),
+            ("docProps/core.xml", core.as_bytes()),
+        ])
+    }
+
+    /// The chunks v1.16.0 wrote for [`rules_docx`]: each chapter a chunk of its own with an
+    /// empty body, its articles after it.
+    fn v116_rules_chunks() -> Vec<(Option<&'static str>, Option<u8>, &'static str)> {
+        let mut chunks = vec![(None, None, RULES_PREFACE)];
+        for ((chapter, articles), bodies) in RULES_CHAPTERS
+            .iter()
+            .zip(&RULES_ARTICLES)
+            .zip(&RULES_BODIES)
+        {
+            chunks.push((Some(*chapter), Some(2), ""));
+            for (article, body) in articles.iter().zip(bodies) {
+                chunks.push((Some(*article), Some(3), *body));
+            }
+        }
+        chunks
+    }
+
+    /// Replace `rel`'s rows with the ones v1.16.0 wrote for `bytes` (a [`rules_docx`]), under
+    /// the hash of `bytes`, through the public write API, so the unchanged fast path keeps them.
+    fn write_v116_rules_rows(fx: &Fixture, rel: &str, bytes: &[u8]) {
+        let path = fx.layout.root().join(".groove.db");
+        let db = Database::open(&path.to_string_lossy()).expect("open the index");
+        db.delete_document(rel)
+            .expect("drop the rows this version wrote");
+        let id = db
+            .upsert_document(
+                rel,
+                Some(RULES_TITLE),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                &sha256_hex(bytes),
+                bytes.len() as u64,
+            )
+            .expect("a v1.16.0 row");
+        for (i, (heading, level, content)) in v116_rules_chunks().iter().enumerate() {
+            db.insert_chunk(
+                id,
+                i as i32,
+                *heading,
+                *level,
+                content,
+                None,
+                &[0.125_f32; DIM],
+                1.0,
+            )
+            .expect("a v1.16.0 chunk");
+        }
+    }
+
+    /// Headings alone, with no body text: a document R2 keeps a chunk per heading for.
+    fn headings_alone_docx() -> Vec<u8> {
+        let doc = document_xml(&[(Some("1"), "Summit"), (Some("3"), "Ridge")]);
+        let styles = styles_xml(&word2010_ja_styles());
+        let core = core_xml("Outline");
+        docx(&[
+            ("word/document.xml", doc.as_bytes()),
+            ("word/styles.xml", styles.as_bytes()),
+            ("docProps/core.xml", core.as_bytes()),
+        ])
+    }
+
+    /// Set on the child [`run_in_hermetic_child`] starts, so the child runs the test body.
+    const HERMETIC_CHILD: &str = "GROOVE_F63_HERMETIC_CHILD";
+
+    /// Run the test `name` (with its module path) again in a child of this test binary under
+    /// the environment [`crate::common::embed_mock::hermetic`] pins; the copy [`super::reread_pass`]
+    /// holds is private to it. `true` in the parent, after the child passed exactly one test;
+    /// `false` in the child.
+    fn run_in_hermetic_child(name: &str) -> bool {
+        if std::env::var_os(HERMETIC_CHILD).is_some() {
+            return false;
+        }
+        let cache = TempRoot::new("groove-f63-fastembed");
+        let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+        cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(HERMETIC_CHILD, "1");
+        hermetic(&mut cmd, cache.path());
+        let out = cmd.output().expect("run the test in a child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} failed in the child:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child ran no test named {name}:\n{stdout}\n{stderr}"
+        );
+        assert_dir_empty(cache.path());
+        true
+    }
+
+    /// The index and the embedder under `cfg`, opened the way `groove index` opens them.
+    fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
+        let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
+        let db_path = grooveseek::resolve_db_path(fx.kb());
+        let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
+        db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
+            .expect("embedding meta");
+        let embedder = Embedder::with_settings(embedding).expect("build the embedder");
+        (db, embedder)
+    }
+
+    /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
+    /// `groove index` wires it, reporting to the
+    /// [`grooveseek::indexer::progress::ProgressReporter`] it is given.
+    fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
+        let kb = fx.kb();
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(kb).expect("parser registry");
+        let schema = load_declared_schema(kb).expect("groove-schema.toml");
+        let (db, mut embedder) = open_in_process(fx, &cfg);
+        rebuild_index(
+            &db,
+            &mut embedder,
+            kb,
+            schema,
+            false,
+            cfg.exclude_headings.as_deref(),
+            &cfg.resolve_exclude_dirs(),
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+    }
+
+    /// feature-63 I1 (AC12): through the binary, the work rules index without an empty chunk,
+    /// and each chapter title is found in the `content` column of its first article -- in the
+    /// default context mode, which stores no context.
+    #[test]
+    fn a_rules_docx_is_indexed_without_empty_chunks_and_with_its_chapters_in_content() {
+        let fx = docx_kb("groove-f63-i1");
+        write_bytes(&fx, "rulebook.docx", &rules_docx(RULES_TITLE));
+        let stderr = index_stderr(&fx);
+        assert!(
+            stderr.contains("indexed: rulebook.docx (7 chunks)"),
+            "{stderr}"
+        );
+        assert_eq!(empty_chunks(&fx, "rulebook.docx"), 0);
+        for (chapter, articles) in RULES_CHAPTERS.iter().zip(&RULES_ARTICLES) {
+            assert_eq!(
+                content_matches(&fx, chapter),
+                vec![Some(articles[0].to_string())],
+                "{chapter}"
+            );
+        }
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-63 I3 (AC14-AC17): an index holding the rows v1.16.0 wrote keeps them while
+    /// both keys are at their value; with no section key the next run re-reads the three
+    /// unchanged `.docx` once, rewrites and re-embeds only the one with empty chapters, keeps
+    /// the clean one and the one of headings alone as they were, and records both keys; the run
+    /// after it re-reads nothing.
+    #[test]
+    fn a_v116_index_folds_its_empty_chapters_once() {
+        let fx = docx_kb("groove-f63-i3");
+        let rules = rules_docx(RULES_TITLE);
+        let clean = clean_docx();
+        let outline = headings_alone_docx();
+        write_bytes(&fx, "a-rules.docx", &rules);
+        write_bytes(&fx, "b-clean.docx", &clean);
+        write_bytes(&fx, "c-outline.docx", &outline);
+        index_stderr(&fx);
+        write_v116_rules_rows(&fx, "a-rules.docx", &rules);
+        assert_eq!(
+            empty_chunks(&fx, "a-rules.docx"),
+            3,
+            "fixture: the v1.16.0 rows hold the three empty chapters"
+        );
+
+        let control = index_stderr(&fx);
+        assert!(!control.contains("Re-reading"), "{control}");
+        assert!(control.contains("(0 updated, "), "{control}");
+        assert_eq!(
+            empty_chunks(&fx, "a-rules.docx"),
+            3,
+            "with both keys at their value the old rows stay on the fast path"
+        );
+
+        delete_meta(&fx, SECTION_KEY);
+        let before = fx.mock.requests().len();
+        let second = index_stderr(&fx);
+        assert!(
+            second.contains("Re-reading 3 unchanged .docx document(s) once:"),
+            "{second}"
+        );
+        assert!(second.contains("(1 updated, "), "{second}");
+        assert_eq!(empty_chunks(&fx, "a-rules.docx"), 0);
+        let rules_contents = column(&fx, "a-rules.docx", "content");
+        for chapter in RULES_CHAPTERS {
+            assert!(
+                rules_contents
+                    .iter()
+                    .flatten()
+                    .any(|c| c.starts_with(&format!("{chapter}\n"))),
+                "{chapter}: {rules_contents:?}"
+            );
+        }
+        let embedded: Vec<String> = fx
+            .requests_since(before)
+            .iter()
+            .filter(|r| r.model() == Some(DOC_MODEL))
+            .flat_map(|r| r.inputs())
+            .collect();
+        assert!(
+            embedded.iter().any(|t| t.contains(RULES_BODIES[0][0])),
+            "the folded document was re-embedded: {embedded:?}"
+        );
+        assert!(
+            embedded
+                .iter()
+                .all(|t| !t.contains(B_FIRST) && !t.contains(B_SECOND)),
+            "the clean document was not: {embedded:?}"
+        );
+        assert_eq!(content_hash(&fx, "b-clean.docx"), Some(sha256_hex(&clean)));
+        assert_eq!(
+            content_hash(&fx, "c-outline.docx"),
+            Some(sha256_hex(&outline))
+        );
+        assert_eq!(
+            column(&fx, "c-outline.docx", "content"),
+            vec![Some(String::new()), Some(String::new())],
+            "headings alone keep a chunk per heading"
+        );
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+
+        let before = fx.mock.requests().len();
+        let third = index_stderr(&fx);
+        assert!(!third.contains("Re-reading"), "{third}");
+        assert!(third.contains("(0 updated, "), "{third}");
+        assert!(
+            fx.requests_since(before)
+                .iter()
+                .all(|r| r.model() != Some(DOC_MODEL)),
+            "nothing is embedded once the pass is recorded"
+        );
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-63 I4 (AC15): the shape desktop sees -- a callback reporter, `force=false` --
+    /// hears `Indexed` for the document whose empty chapters fold and `Unchanged` for the clean
+    /// one.
+    #[test]
+    fn a_folded_docx_reports_indexed_and_a_clean_one_unchanged() {
+        if run_in_hermetic_child(
+            "fold_pass::a_folded_docx_reports_indexed_and_a_clean_one_unchanged",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f63-i4");
+        let rules = rules_docx(RULES_TITLE);
+        write_bytes(&fx, "a-rules.docx", &rules);
+        write_bytes(&fx, "b-clean.docx", &clean_docx());
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        write_v116_rules_rows(&fx, "a-rules.docx", &rules);
+        delete_meta(&fx, SECTION_KEY);
+
+        let log: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let reporter = ProgressReporter::with_callback(Box::new(move |ev| {
+            let seen = match ev {
+                ProgressEvent::Indexed { rel, .. } => Some((rel.to_string(), "indexed")),
+                ProgressEvent::Unchanged { rel, .. } => Some((rel.to_string(), "unchanged")),
+                _ => None,
+            };
+            if let Some(seen) = seen {
+                sink.lock().expect("log").push(seen);
+            }
+        }));
+        rebuild_in_process(&fx, reporter).expect("second run");
+        assert_eq!(
+            *log.lock().expect("log"),
+            vec![
+                ("a-rules.docx".to_string(), "indexed"),
+                ("b-clean.docx".to_string(), "unchanged"),
+            ]
+        );
+        assert_eq!(empty_chunks(&fx, "a-rules.docx"), 0);
+    }
+
+    /// feature-63 I5 (AC21): the watcher records neither key. It leaves an unchanged
+    /// document's old rows alone, and cuts a changed one by the folding rule -- including one
+    /// renamed with its content changed whose rows are the ones v1.16.0 wrote, so the rename
+    /// path itself is what folds them.
+    #[test]
+    fn the_watcher_folds_changed_and_renamed_docx_and_records_no_generation() {
+        if run_in_hermetic_child(
+            "fold_pass::the_watcher_folds_changed_and_renamed_docx_and_records_no_generation",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f63-i5");
+        let rules = rules_docx(RULES_TITLE);
+        let ledger = rules_docx("Ledger");
+        write_bytes(&fx, "kept.docx", &rules);
+        write_bytes(&fx, "old.docx", &ledger);
+        let draft = document_xml(&[(None, PREFACE)]);
+        write_bytes(
+            &fx,
+            "draft.docx",
+            &docx(&[("word/document.xml", draft.as_bytes())]),
+        );
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        write_v116_rules_rows(&fx, "kept.docx", &rules);
+        write_v116_rules_rows(&fx, "old.docx", &ledger);
+        delete_meta(&fx, SECTION_KEY);
+
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+        let kb = fx.kb().canonicalize().expect("canonical kb");
+        let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+        let unchanged = reindex_single_file(&db, &mut embedder, &kb, "kept.docx", None, &registry)
+            .expect("reindex the unchanged document");
+        assert_eq!(unchanged, SingleResult::Unchanged);
+        assert_eq!(
+            empty_chunks(&fx, "kept.docx"),
+            3,
+            "the watcher runs no pass"
+        );
+
+        write_bytes(&fx, "draft.docx", &rules_docx("Draft"));
+        let changed = reindex_single_file(&db, &mut embedder, &kb, "draft.docx", None, &registry)
+            .expect("reindex the changed document");
+        assert_eq!(
+            changed,
+            SingleResult::Updated {
+                chunks: 7,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(empty_chunks(&fx, "draft.docx"), 0);
+
+        assert_eq!(
+            empty_chunks(&fx, "old.docx"),
+            3,
+            "fixture: the rename source holds the v1.16.0 rows"
+        );
+        std::fs::remove_file(fx.kb().join("old.docx")).expect("move the old document away");
+        write_bytes(
+            &fx,
+            "moved.docx",
+            &rules_docx_with("Ledger", AMENDED_PREFACE),
+        );
+        let renamed = rename_single_file(
+            &db,
+            &mut embedder,
+            &kb,
+            "old.docx",
+            "moved.docx",
+            None,
+            &registry,
+        )
+        .expect("rename with changed content");
+        assert_eq!(renamed, RenameOutcome::RenamedAndReindexed { chunks: 7 });
+        assert_eq!(empty_chunks(&fx, "moved.docx"), 0);
+        assert_eq!(
+            column(&fx, "moved.docx", "content")[0].as_deref(),
+            Some(AMENDED_PREFACE),
+            "the renamed document was parsed again, not carried over"
+        );
+        assert_eq!(
+            content_hash(&fx, "old.docx"),
+            None,
+            "the old path has no row left"
+        );
+
+        assert_eq!(
+            meta(&fx, SECTION_KEY),
+            None,
+            "the watcher records no generation"
+        );
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+    }
+}

@@ -523,6 +523,57 @@ fn push_intra_paragraph_separator(local_name: &[u8], para_text: &mut String) {
     }
 }
 
+/// One stretch of a document between headings, as [`parse_document_xml`] gathers it before it
+/// becomes a [`Chunk`]: the heading that opens it (`None` for the text before the first
+/// heading), that heading's chunk level, the headings above it when it was read, and its
+/// body paragraphs, each trimmed, joined by `\n`.
+struct DocxSection {
+    heading: Option<String>,
+    level: Option<u8>,
+    ancestry: Vec<String>,
+    body: String,
+}
+
+/// (feature-63) The sections of a document that become its chunks, in order.
+///
+/// A section whose body is empty once trimmed is not a chunk of its own. Its heading's text
+/// is held and opens the body of the next section that has a body, one line per heading, in
+/// document order, whatever the levels -- so the words of a chapter heading followed directly
+/// by a section heading stay in the indexed content in every context mode, and the joined
+/// bodies read them where they stood. A heading with no text adds no line. Headings still
+/// held at the end, with no body after them, are dropped. The section that receives them
+/// keeps its own heading, level and ancestry.
+///
+/// A document none of whose sections has a body is cut as before: a chunk per heading, each
+/// with an empty body, so a document of headings alone stays in the index.
+fn fold_empty_heading_sections(sections: Vec<DocxSection>) -> Vec<DocxSection> {
+    if sections.iter().all(|s| s.body.trim().is_empty()) {
+        return sections
+            .into_iter()
+            .filter(|s| s.heading.is_some())
+            .collect();
+    }
+    let mut held: Vec<String> = Vec::new();
+    let mut kept: Vec<DocxSection> = Vec::new();
+    for mut section in sections {
+        if section.body.trim().is_empty() {
+            if let Some(heading) = section.heading
+                && !heading.trim().is_empty()
+            {
+                held.push(heading);
+            }
+            continue;
+        }
+        if !held.is_empty() {
+            held.push(std::mem::take(&mut section.body));
+            section.body = held.join("\n");
+            held.clear();
+        }
+        kept.push(section);
+    }
+    kept
+}
+
 /// `word/document.xml` を段落 (`<w:p>`) 単位で読み、見出し段落を見出し境界として Markdown 同様の
 /// 階層チャンクに変換する。段落が見出しかどうかは、その `<w:pStyle>` を
 /// [`heading_level_from_attr`] が `styles` (`word/styles.xml` の style 表、使えなければ `None`)
@@ -531,6 +582,9 @@ fn push_intra_paragraph_separator(local_name: &[u8], para_text: &mut String) {
 /// 表 (`w:tbl`) 内のテキストも専用ハンドリングはしない: OOXML 上は
 /// `w:tbl > w:tr > w:tc > w:p > w:r > w:t` と入れ子になっているだけなので、
 /// 通常の `<w:p>` 境界処理だけで現在のセクション本文に自然に取り込まれる。
+///
+/// (feature-63) Which sections become chunks, and where a heading with no body text goes, is
+/// [`fold_empty_heading_sections`]'s.
 fn parse_document_xml(
     xml: &[u8],
     excludes: &[&str],
@@ -543,13 +597,7 @@ fn parse_document_xml(
 
     // (heading, level, 祖先見出しスナップショット, body) の raw セクション列を組む。
     // 見出し前本文は先頭の heading=None セクションに溜まる。
-    struct Section {
-        heading: Option<String>,
-        level: Option<u8>,
-        ancestry: Vec<String>,
-        body: String,
-    }
-    let mut sections: Vec<Section> = vec![Section {
+    let mut sections: Vec<DocxSection> = vec![DocxSection {
         heading: None,
         level: None,
         ancestry: Vec::new(),
@@ -630,7 +678,7 @@ fn parse_document_xml(
                             excluded = true;
                         } else {
                             excluded = false;
-                            sections.push(Section {
+                            sections.push(DocxSection {
                                 heading: Some(text),
                                 level: Some(level),
                                 ancestry,
@@ -655,9 +703,8 @@ fn parse_document_xml(
         buf.clear();
     }
 
-    sections
+    fold_empty_heading_sections(sections)
         .into_iter()
-        .filter(|s| s.heading.is_some() || !s.body.trim().is_empty())
         .enumerate()
         .map(|(i, s)| {
             // context parts: [title, ...ancestry, heading]
@@ -916,6 +963,128 @@ pub(crate) mod fixture {
             ("word/styles.xml", styles.as_bytes()),
             ("docProps/core.xml", core.as_bytes()),
         ])
+    }
+
+    /// How the heading paragraphs of [`folded_chapter_docx_as`] and [`rules_docx_as`] name
+    /// their style.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum HeadingIds {
+        /// `1` .. `3`, under [`word2010_ja_styles`], the form Word 2010 with a Japanese UI
+        /// writes.
+        Numbered,
+        /// `Heading1` .. `Heading3`, with no styles part, which the spelling rule reads.
+        Spelled,
+    }
+
+    /// A document of `paragraphs`, whose heading styles are numbered `1` .. `3`, written with
+    /// its headings named as `ids` says and titled `title`.
+    fn headed_docx(paragraphs: &[(Option<&str>, &str)], ids: HeadingIds, title: &str) -> Vec<u8> {
+        let renamed: Vec<(Option<String>, &str)> = paragraphs
+            .iter()
+            .map(|(id, text)| {
+                let id = id.map(|n| match ids {
+                    HeadingIds::Numbered => n.to_string(),
+                    HeadingIds::Spelled => format!("Heading{n}"),
+                });
+                (id, *text)
+            })
+            .collect();
+        let refs: Vec<(Option<&str>, &str)> = renamed
+            .iter()
+            .map(|(id, text)| (id.as_deref(), *text))
+            .collect();
+        let doc = document_xml(&refs, PStyle::Empty);
+        let styles = styles_xml(&word2010_ja_styles());
+        let core = core_xml(title);
+        let mut parts: Vec<(&str, &[u8])> = vec![("word/document.xml", doc.as_bytes())];
+        if let HeadingIds::Numbered = ids {
+            parts.push(("word/styles.xml", styles.as_bytes()));
+        }
+        parts.push(("docProps/core.xml", core.as_bytes()));
+        docx_with_parts(&parts)
+    }
+
+    /// The words of [`folded_chapter_docx`] (feature-63, AC1 / AC10), sharing none with each
+    /// other or with the file names the tests give it.
+    pub(crate) const FOLD_TITLE: &str = "Gazette";
+    pub(crate) const FOLD_PREFACE: &str = "opening remarks about the harbour district";
+    pub(crate) const FOLD_CHAPTER: &str = "Granite";
+    pub(crate) const FOLD_FIRST: &str = "Plover";
+    pub(crate) const FOLD_FIRST_BODY: &str = "kettle passage under the first section";
+    pub(crate) const FOLD_SECOND: &str = "Heron";
+    pub(crate) const FOLD_SECOND_BODY: &str = "violin passage under the second section";
+
+    /// A preface, then the chapter [`FOLD_CHAPTER`] (style `1`) with no body of its own,
+    /// followed by the sections [`FOLD_FIRST`] and [`FOLD_SECOND`] (style `2`), each over its
+    /// body, styled by [`word2010_ja_styles`] and titled [`FOLD_TITLE`].
+    pub(crate) fn folded_chapter_docx() -> Vec<u8> {
+        folded_chapter_docx_as(HeadingIds::Numbered)
+    }
+
+    /// [`folded_chapter_docx`] with its headings named as `ids` says.
+    pub(crate) fn folded_chapter_docx_as(ids: HeadingIds) -> Vec<u8> {
+        headed_docx(
+            &[
+                (None, FOLD_PREFACE),
+                (Some("1"), FOLD_CHAPTER),
+                (Some("2"), FOLD_FIRST),
+                (None, FOLD_FIRST_BODY),
+                (Some("2"), FOLD_SECOND),
+                (None, FOLD_SECOND_BODY),
+            ],
+            ids,
+            FOLD_TITLE,
+        )
+    }
+
+    /// The words of [`rules_docx`] (feature-63, AC12): a set of work rules, chapter then
+    /// article, the shape kuriya #323 reported.
+    pub(crate) const RULES_TITLE: &str = "Statute";
+    pub(crate) const RULES_PREFACE: &str = "lantana preamble stating the purpose of these rules";
+    pub(crate) const RULES_CHAPTERS: [&str; 3] =
+        ["Chapter Granite", "Chapter Basalt", "Chapter Marble"];
+    pub(crate) const RULES_ARTICLES: [[&str; 2]; 3] = [
+        ["Article Plover", "Article Heron"],
+        ["Article Egret", "Article Crane"],
+        ["Article Stork", "Article Ibis"],
+    ];
+    pub(crate) const RULES_BODIES: [[&str; 2]; 3] = [
+        [
+            "first duty about punctual arrival each morning",
+            "second duty about tidy desks at closing",
+        ],
+        [
+            "third duty about leave requests in writing",
+            "fourth duty about overtime approval beforehand",
+        ],
+        [
+            "fifth duty about returning borrowed laptops",
+            "sixth duty about reporting lost badges promptly",
+        ],
+    ];
+
+    /// [`RULES_PREFACE`], then each of [`RULES_CHAPTERS`] (style `1`) with no body of its own,
+    /// followed directly by its two [`RULES_ARTICLES`] (style `2`), each over its
+    /// [`RULES_BODIES`] entry; styled by [`word2010_ja_styles`] and titled [`RULES_TITLE`].
+    pub(crate) fn rules_docx() -> Vec<u8> {
+        rules_docx_as(HeadingIds::Numbered)
+    }
+
+    /// [`rules_docx`] with its headings named as `ids` says.
+    pub(crate) fn rules_docx_as(ids: HeadingIds) -> Vec<u8> {
+        let mut paragraphs: Vec<(Option<&str>, &str)> = vec![(None, RULES_PREFACE)];
+        for ((chapter, articles), bodies) in RULES_CHAPTERS
+            .iter()
+            .zip(&RULES_ARTICLES)
+            .zip(&RULES_BODIES)
+        {
+            paragraphs.push((Some("1"), *chapter));
+            for (article, body) in articles.iter().zip(bodies) {
+                paragraphs.push((Some("2"), *article));
+                paragraphs.push((None, *body));
+            }
+        }
+        headed_docx(&paragraphs, ids, RULES_TITLE)
     }
 }
 
@@ -2359,6 +2528,494 @@ mod tests {
         assert_eq!(
             outline(&with),
             vec![(Some("章1"), Some(2)), (Some("節1.1"), Some(3))]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-63: a heading with no body text folds into the next section
+    // -----------------------------------------------------------------------
+
+    /// `paragraphs` as their `w:pStyle` IDs: a heading level `n` (1 to 3) spelled `HeadingN`,
+    /// or numbered `N` for [`word2010_ja_styles`]; `None` is a body paragraph.
+    fn styled(
+        paragraphs: &[(Option<u8>, &'static str)],
+        numbered: bool,
+    ) -> Vec<(Option<String>, &'static str)> {
+        paragraphs
+            .iter()
+            .map(|(level, text)| {
+                let id = level.map(|n| {
+                    if numbered {
+                        n.to_string()
+                    } else {
+                        format!("Heading{n}")
+                    }
+                });
+                (id, *text)
+            })
+            .collect()
+    }
+
+    /// Parse `paragraphs` twice -- spelled `HeadingN` without a styles part, and numbered `N`
+    /// under [`word2010_ja_styles`] -- under `excludes`, as `docs/ledger.docx` (title `ledger`,
+    /// no core.xml). Both must split identically, whichever way the headings were found; the
+    /// first is returned.
+    fn parse_both(paragraphs: &[(Option<u8>, &'static str)], excludes: &[&str]) -> ParsedDocument {
+        let styles = styles_xml(&word2010_ja_styles());
+        let build = |numbered: bool| {
+            let owned = styled(paragraphs, numbered);
+            let refs: Vec<(Option<&str>, &str)> = owned
+                .iter()
+                .map(|(id, text)| (id.as_deref(), *text))
+                .collect();
+            let doc = document_xml(&refs, PStyle::Empty);
+            let mut parts: Vec<(&str, &[u8])> = vec![("word/document.xml", doc.as_bytes())];
+            if numbered {
+                parts.push(("word/styles.xml", styles.as_bytes()));
+            }
+            let bytes = docx_with_parts(&parts);
+            DocxParser::default()
+                .parse_bytes(&bytes, "docs/ledger.docx", excludes)
+                .expect("a generated document parses")
+        };
+        let spelled = build(false);
+        let numbered = build(true);
+        assert_eq!(
+            sections(&spelled),
+            sections(&numbered),
+            "both heading paths split alike"
+        );
+        assert_eq!(spelled.raw_content, numbered.raw_content);
+        spelled
+    }
+
+    /// [`parse_both`] for a `<w:body>` written out by hand: `body` names its heading styles
+    /// `Heading1` / `Heading2` and is parsed as written, without a styles part, and again with
+    /// them numbered `1` / `2` under [`word2010_ja_styles`]. Both must split identically; the
+    /// first is returned.
+    fn parse_raw_both(body: &str) -> ParsedDocument {
+        let spelled = DocxParser::default()
+            .parse_bytes(&wrap_document_xml(body), "docs/ledger.docx", &[])
+            .expect("a generated document parses");
+        let numbered_body = body
+            .replace(r#"w:val="Heading1""#, r#"w:val="1""#)
+            .replace(r#"w:val="Heading2""#, r#"w:val="2""#);
+        assert_ne!(numbered_body, body, "the body names its heading styles");
+        let doc = document_xml_from_body(&numbered_body);
+        let styles = styles_xml(&word2010_ja_styles());
+        let numbered = DocxParser::default()
+            .parse_bytes(
+                &docx_with_parts(&[
+                    ("word/document.xml", doc.as_bytes()),
+                    ("word/styles.xml", styles.as_bytes()),
+                ]),
+                "docs/ledger.docx",
+                &[],
+            )
+            .expect("a generated document parses");
+        assert_eq!(
+            sections(&spelled),
+            sections(&numbered),
+            "both heading paths split alike"
+        );
+        assert_eq!(spelled.raw_content, numbered.raw_content);
+        spelled
+    }
+
+    /// The content of each chunk, in order.
+    fn contents(doc: &ParsedDocument) -> Vec<&str> {
+        doc.chunks.iter().map(|c| c.content.as_str()).collect()
+    }
+
+    /// feature-63 T1 (AC1): an empty chapter is no chunk of its own; its title opens the body
+    /// of the section after it, and the sections keep their own heading, level and context.
+    #[test]
+    fn an_empty_chapter_folds_into_the_section_after_it() {
+        let doc = parse_both(
+            &[
+                (None, "opening remarks about the harbour district"),
+                (Some(1), "Granite"),
+                (Some(2), "Plover"),
+                (None, "kettle passage under the first section"),
+                (Some(2), "Heron"),
+                (None, "violin passage under the second section"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            outline(&doc),
+            vec![
+                (None, None),
+                (Some("Plover"), Some(3)),
+                (Some("Heron"), Some(3))
+            ]
+        );
+        assert_eq!(
+            doc.chunks.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            contents(&doc),
+            vec![
+                "opening remarks about the harbour district",
+                "Granite\nkettle passage under the first section",
+                "violin passage under the second section",
+            ]
+        );
+        assert_eq!(
+            doc.chunks[1].context.as_deref(),
+            Some("ledger > Granite > Plover")
+        );
+        assert_eq!(
+            doc.chunks[2].context.as_deref(),
+            Some("ledger > Granite > Heron")
+        );
+        assert_eq!(
+            doc.raw_content,
+            "opening remarks about the harbour district\n\nGranite\nkettle passage under the first section\n\nviolin passage under the second section"
+        );
+    }
+
+    /// feature-63 T2 (AC2): consecutive empty headings fold in document order, one line each;
+    /// a heading paragraph with no text adds no line.
+    #[test]
+    fn consecutive_empty_headings_fold_one_line_each() {
+        let doc = parse_both(
+            &[
+                (Some(1), "Granite"),
+                (Some(2), "Basalt"),
+                (Some(3), "Plover"),
+                (None, "kettle passage under the deepest section"),
+            ],
+            &[],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(4))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nBasalt\nkettle passage under the deepest section"]
+        );
+        assert_eq!(
+            doc.chunks[0].context.as_deref(),
+            Some("ledger > Granite > Basalt > Plover")
+        );
+
+        let doc = parse_both(
+            &[
+                (Some(1), "Granite"),
+                (Some(2), ""),
+                (Some(3), "Plover"),
+                (None, "kettle passage under the deepest section"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nkettle passage under the deepest section"]
+        );
+    }
+
+    /// feature-63 T3 (AC3, AC4): an empty heading with nothing after it is dropped, and one
+    /// followed by a sibling or a shallower heading folds into it all the same.
+    #[test]
+    fn a_trailing_empty_heading_drops_and_a_sibling_one_folds_forward() {
+        let doc = parse_both(
+            &[
+                (Some(1), "Granite"),
+                (None, "kettle passage under the only chapter"),
+                (Some(1), "Marble"),
+            ],
+            &[],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Granite"), Some(2))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["kettle passage under the only chapter"]
+        );
+        assert!(!doc.raw_content.contains("Marble"), "{:?}", doc.raw_content);
+
+        let doc = parse_both(
+            &[
+                (Some(2), "Basalt"),
+                (Some(2), "Plover"),
+                (None, "violin passage under the sibling"),
+            ],
+            &[],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(3))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Basalt\nviolin passage under the sibling"]
+        );
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("ledger > Plover"));
+
+        let doc = parse_both(
+            &[
+                (Some(3), "Basalt"),
+                (Some(1), "Plover"),
+                (None, "violin passage under the shallower heading"),
+            ],
+            &[],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(2))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Basalt\nviolin passage under the shallower heading"]
+        );
+    }
+
+    /// feature-63 T4 (AC5, AC6, AC7): a document of headings alone keeps a chunk per heading;
+    /// one whose only body is the preface keeps the preface and drops the headings; an empty
+    /// body has no chunk.
+    #[test]
+    fn headings_alone_keep_their_chunks_and_a_preface_alone_drops_them() {
+        let doc = parse_both(&[(Some(1), "Granite"), (Some(3), "Plover")], &[]);
+        assert_eq!(
+            outline(&doc),
+            vec![(Some("Granite"), Some(2)), (Some("Plover"), Some(4))]
+        );
+        assert_eq!(contents(&doc), vec!["", ""]);
+
+        let doc = parse_both(
+            &[
+                (None, "opening remarks about the harbour district"),
+                (Some(1), "Granite"),
+                (Some(2), "Plover"),
+            ],
+            &[],
+        );
+        assert_eq!(outline(&doc), vec![(None, None)]);
+        assert_eq!(
+            doc.raw_content,
+            "opening remarks about the harbour district"
+        );
+
+        let doc = parse_both(&[], &[]);
+        assert!(doc.chunks.is_empty(), "{:?}", doc.chunks);
+    }
+
+    /// feature-63 T5 (AC8): a body of whitespace, ideographic spaces or empty table cells is no
+    /// body, so the heading over it folds forward.
+    #[test]
+    fn whitespace_and_empty_cells_are_no_body() {
+        let body = concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Granite</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">   </w:t></w:r></w:p>"#,
+            "<w:p><w:r><w:t>\u{3000}\u{3000}</w:t></w:r></w:p>",
+            r#"<w:tbl><w:tr><w:tc><w:p></w:p></w:tc><w:tc><w:p><w:r><w:t> </w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Plover</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>kettle passage under the section</w:t></w:r></w:p>"#,
+        );
+        let doc = parse_raw_both(body);
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(3))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nkettle passage under the section"]
+        );
+    }
+
+    /// feature-63 T6 (AC9): an excluded heading is never folded nor folded into; an empty
+    /// heading before it folds past it into the next section that has a body; with no such
+    /// section the document falls back to a chunk per heading, and the excluded body is
+    /// nowhere.
+    #[test]
+    fn excluded_headings_neither_fold_nor_receive() {
+        let doc = parse_both(
+            &[
+                (Some(1), "Secret"),
+                (None, "confidential clause kept out of the index"),
+                (Some(1), "Granite"),
+                (Some(2), "Plover"),
+                (None, "kettle passage under the public section"),
+            ],
+            &["Secret"],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(3))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nkettle passage under the public section"]
+        );
+
+        let doc = parse_both(
+            &[
+                (Some(1), "Granite"),
+                (Some(2), "Secret"),
+                (None, "confidential clause kept out of the index"),
+                (Some(1), "Plover"),
+                (None, "kettle passage under the public chapter"),
+            ],
+            &["Secret"],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(2))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nkettle passage under the public chapter"]
+        );
+        assert!(!doc.raw_content.contains("Secret"), "{:?}", doc.raw_content);
+        assert!(
+            !doc.raw_content.contains("confidential"),
+            "{:?}",
+            doc.raw_content
+        );
+
+        let doc = parse_both(
+            &[
+                (Some(1), "Granite"),
+                (Some(2), "Secret"),
+                (None, "confidential clause kept out of the index"),
+            ],
+            &["Secret"],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Granite"), Some(2))]);
+        assert_eq!(contents(&doc), vec![""]);
+        assert!(
+            !doc.raw_content.contains("confidential"),
+            "{:?}",
+            doc.raw_content
+        );
+    }
+
+    /// feature-63 T7 (AC10, parser side): the read entry folds the same way the index does,
+    /// whether the headings are numbered under a styles part or spelled `HeadingN`.
+    #[test]
+    fn the_read_entry_folds_empty_headings_the_same_way() {
+        let mut split = Vec::new();
+        for (ids, bytes) in [
+            (HeadingIds::Numbered, folded_chapter_docx()),
+            (
+                HeadingIds::Spelled,
+                folded_chapter_docx_as(HeadingIds::Spelled),
+            ),
+        ] {
+            let index = DocxParser::default()
+                .parse_bytes(&bytes, "quarry.docx", &[])
+                .unwrap();
+            let read = DocxParser::default()
+                .parse_bytes_for_read(&bytes, "quarry.docx", &[])
+                .unwrap();
+            assert_eq!(sections(&read), sections(&index), "{ids:?}");
+            assert_eq!(read.raw_content, index.raw_content, "{ids:?}");
+            assert_eq!(
+                index.chunks[1].content,
+                format!("{FOLD_CHAPTER}\n{FOLD_FIRST_BODY}"),
+                "{ids:?}"
+            );
+            split.push(sections(&index));
+        }
+        assert_eq!(split[0], split[1], "both heading paths split alike");
+    }
+
+    /// feature-63 T8 (AC12): the work-rules shape kuriya #323 met has no empty chunk, and each
+    /// chapter title is the first line of its first article and of no other chunk -- whether
+    /// the headings are numbered under a styles part or spelled `HeadingN`.
+    #[test]
+    fn a_rules_document_has_no_empty_chunk_and_each_chapter_opens_its_first_article() {
+        let mut split = Vec::new();
+        for (ids, bytes) in [
+            (HeadingIds::Numbered, rules_docx()),
+            (HeadingIds::Spelled, rules_docx_as(HeadingIds::Spelled)),
+        ] {
+            let doc = DocxParser::default()
+                .parse_bytes(&bytes, "rulebook.docx", &[])
+                .unwrap();
+            assert_eq!(doc.chunks.len(), 7, "{ids:?}: {:?}", outline(&doc));
+            assert!(
+                doc.chunks.iter().all(|c| !c.content.trim().is_empty()),
+                "{ids:?}: {:?}",
+                contents(&doc)
+            );
+            for (c, (chapter, articles)) in RULES_CHAPTERS.iter().zip(&RULES_ARTICLES).enumerate() {
+                let first = 1 + 2 * c;
+                let holders: Vec<usize> = doc
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, chunk)| chunk.content.contains(chapter))
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(holders, vec![first], "{ids:?}: {chapter}");
+                assert_eq!(
+                    doc.chunks[first].content.lines().next(),
+                    Some(*chapter),
+                    "{ids:?}"
+                );
+                assert_eq!(
+                    doc.chunks[first].heading.as_deref(),
+                    Some(articles[0]),
+                    "{ids:?}"
+                );
+            }
+            split.push(sections(&doc));
+        }
+        assert_eq!(split[0], split[1], "both heading paths split alike");
+    }
+
+    /// feature-63 Review Focus 2: a document that opens with an empty chapter and no preface
+    /// starts its content with the chapter's title, not with a blank line.
+    #[test]
+    fn a_document_opening_with_an_empty_chapter_starts_with_its_title() {
+        let doc = parse_both(
+            &[
+                (Some(1), "Granite"),
+                (Some(2), "Plover"),
+                (None, "kettle passage under the first section"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            doc.raw_content,
+            "Granite\nkettle passage under the first section"
+        );
+    }
+
+    /// feature-63 Review Focus 3: a heading broken over two lines by `<w:br/>` folds with both
+    /// lines.
+    #[test]
+    fn a_folded_heading_with_a_line_break_keeps_both_lines() {
+        let body = concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Granite</w:t><w:br/><w:t>Quarry</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Plover</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>kettle passage under the section</w:t></w:r></w:p>"#,
+        );
+        let doc = parse_raw_both(body);
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nQuarry\nkettle passage under the section"]
+        );
+    }
+
+    /// feature-63 Review Focus 4: a section whose only body is a table is a section with a
+    /// body, and an empty chapter before it folds into it.
+    #[test]
+    fn an_empty_chapter_folds_into_a_table_only_section() {
+        let body = concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Granite</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Plover</w:t></w:r></w:p>"#,
+            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>kettle cell inside the table</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        );
+        let doc = parse_raw_both(body);
+        assert_eq!(outline(&doc), vec![(Some("Plover"), Some(3))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Granite\nkettle cell inside the table"]
+        );
+    }
+
+    /// feature-63 Review Focus 5: an empty heading whose text is its child's still folds; the
+    /// context drops the repeat, the content keeps it.
+    #[test]
+    fn an_empty_heading_with_the_same_text_as_its_child_still_folds() {
+        let doc = parse_both(
+            &[
+                (Some(1), "Overview"),
+                (Some(2), "Overview"),
+                (None, "kettle passage under the repeated heading"),
+            ],
+            &[],
+        );
+        assert_eq!(outline(&doc), vec![(Some("Overview"), Some(3))]);
+        assert_eq!(
+            contents(&doc),
+            vec!["Overview\nkettle passage under the repeated heading"]
         );
     }
 }

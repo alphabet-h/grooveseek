@@ -8239,6 +8239,33 @@ mod tests {
         );
     }
 
+    /// feature-63: the docx section generation is a key of its own beside the heading one,
+    /// and writing either leaves the other alone.
+    #[test]
+    fn docx_section_policy_round_trips_beside_the_heading_policy() {
+        let db = db_with_384();
+        assert_eq!(db.read_docx_section_policy().unwrap(), None);
+        db.write_docx_heading_policy("styles-name-basedon").unwrap();
+        db.write_docx_section_policy("fold-empty-headings").unwrap();
+        assert_eq!(
+            db.read_docx_section_policy().unwrap().as_deref(),
+            Some("fold-empty-headings")
+        );
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some("styles-name-basedon")
+        );
+        db.write_docx_section_policy("next").unwrap();
+        assert_eq!(
+            db.read_docx_section_policy().unwrap().as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some("styles-name-basedon")
+        );
+    }
+
     /// feature-62: overwriting the content hash touches the named rows' hash and nothing
     /// else -- not the chunks, not another row -- and a path without a row is skipped.
     #[test]
