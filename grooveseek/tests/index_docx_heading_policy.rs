@@ -1748,7 +1748,7 @@ mod fold_pass {
     fn empty_chunks(fx: &Fixture, rel: &str) -> i64 {
         db(fx)
             .query_row(
-                "SELECT count(*) FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = ?1 AND trim(c.content) = ''",
+                "SELECT count(*) FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = ?1 AND trim(c.content, ' ' || char(9) || char(10) || char(13)) = ''",
                 [rel],
                 |r| r.get(0),
             )

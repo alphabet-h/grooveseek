@@ -3035,7 +3035,8 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// [`FRONTMATTER_POLICY`], and a key of its own, since the two passes cover different files and
 /// do different work (ADR-0028).
 ///
-/// (feature-63) The pass also runs while [`DOCX_SECTION_POLICY`] is not recorded.
+/// (feature-63) The pass also runs while [`DOCX_SECTION_POLICY`] is not recorded at its
+/// value (absent or another value).
 pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
 
 /// (feature-63) Recorded in `index_meta.docx_section_policy` beside [`DOCX_HEADING_POLICY`],
