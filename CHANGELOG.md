@@ -24,6 +24,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   values taken from one particular knowledge base. Argument descriptions also drop their
   `(v0.7.0+)` / `(v1.9.0+)` markers; the docs keep them.
 
+- **A `.docx` heading with no body text of its own is no longer a chunk of its own; its text moves
+  to the start of the next section's body.** A chapter heading followed directly by a section
+  heading (the usual shape of Japanese rules and policies: chapter, then article) used to become a
+  chunk with an empty body, which was embedded as an empty string, passed the quality filter, and
+  could rank among the top results for unrelated queries. The heading's text now opens the body of
+  the next section that has one, one line per heading, so full-text search still finds it in every
+  context mode, and `get_document` shows it where it stood in the document. A heading with no body
+  after it at the end of a document is left out. A document made of headings alone keeps one chunk
+  per heading, as before. Markdown, `.pptx` and the other formats are unchanged.
+
+- **The first `groove index` or `rebuild_index` of this version re-reads every unchanged `.docx`
+  once**, as the first run of 1.16.0 did, and says so with the same line: only the documents that had
+  such an empty heading are re-embedded, and the others take the fast path again from the next run.
+  **If you run `groove serve`, restart it on this version first, then call `rebuild_index` or run
+  `groove index` once.** See [ADR-0028](docs/decisions/0028-reread-unchanged-docx-once-per-index.md).
+
 ## [1.16.0] - 2026-10-03
 
 ### Changed
