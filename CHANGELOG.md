@@ -14,6 +14,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-10-07
+
+### Fixed
+
+- **Tokio is now required at 1.52.1 or later.** Tokio 1.52.0 has a regression in its blocking
+  pool ([tokio-rs/tokio#8056](https://github.com/tokio-rs/tokio/issues/8056), reverted in 1.52.1)
+  that can leave a `spawn_blocking` task queued until another one is submitted. groove runs its MCP
+  tool bodies on that pool, so a search on an otherwise idle `groove serve` could go unanswered.
+  The workspace now asks for `tokio = "1.52.1"` and the lock file pins 1.52.1. (thanks @alexvanolst)
+
 ## [1.17.0] - 2026-10-07
 
 ### Changed
@@ -6011,7 +6021,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.17.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.17.1...HEAD
+[1.17.1]: https://github.com/alphabet-h/grooveseek/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/alphabet-h/grooveseek/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/alphabet-h/grooveseek/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/alphabet-h/grooveseek/compare/v1.14.0...v1.15.0
