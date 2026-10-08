@@ -976,16 +976,24 @@ pub(crate) mod fixture {
         Spelled,
     }
 
+    impl HeadingIds {
+        /// The styleId this form gives a heading of `level`: `1` when numbered, `Heading1`
+        /// when spelled.
+        pub(crate) fn style_id(self, level: impl std::fmt::Display) -> String {
+            match self {
+                HeadingIds::Numbered => level.to_string(),
+                HeadingIds::Spelled => format!("Heading{level}"),
+            }
+        }
+    }
+
     /// A document of `paragraphs`, whose heading styles are numbered `1` .. `3`, written with
     /// its headings named as `ids` says and titled `title`.
     fn headed_docx(paragraphs: &[(Option<&str>, &str)], ids: HeadingIds, title: &str) -> Vec<u8> {
         let renamed: Vec<(Option<String>, &str)> = paragraphs
             .iter()
             .map(|(id, text)| {
-                let id = id.map(|n| match ids {
-                    HeadingIds::Numbered => n.to_string(),
-                    HeadingIds::Spelled => format!("Heading{n}"),
-                });
+                let id = id.map(|n| ids.style_id(n));
                 (id, *text)
             })
             .collect();
@@ -2544,13 +2552,12 @@ mod tests {
         paragraphs
             .iter()
             .map(|(level, text)| {
-                let id = level.map(|n| {
-                    if numbered {
-                        n.to_string()
-                    } else {
-                        format!("Heading{n}")
-                    }
-                });
+                let ids = if numbered {
+                    HeadingIds::Numbered
+                } else {
+                    HeadingIds::Spelled
+                };
+                let id = level.map(|n| ids.style_id(n));
                 (id, *text)
             })
             .collect()
