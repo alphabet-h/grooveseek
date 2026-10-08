@@ -5060,6 +5060,42 @@ mod tests {
         }
     }
 
+    /// feature-63 T7s (AC10), spelled: the same document with its headings named `Heading1` /
+    /// `Heading2` and no styles part, so the spelling rule finds them, gives
+    /// [`get_document`](KbServer::get_document) the same content: the chapter's title where it
+    /// stood, and not the sections' own headings.
+    #[test]
+    fn a_document_response_puts_a_folded_spelled_chapter_where_it_stood() {
+        use crate::parser::docx::fixture::{self, HeadingIds};
+        let registry =
+            Registry::from_enabled(&["md".to_string(), "docx".to_string()]).expect("md + docx");
+        let resp = build_document_response(
+            &registry,
+            "quarry.docx",
+            "docx",
+            &fixture::folded_chapter_docx_as(HeadingIds::Spelled),
+        )
+        .expect("the document parses");
+        assert_eq!(
+            resp.content,
+            format!(
+                "{}\n\n{}\n{}\n\n{}",
+                fixture::FOLD_PREFACE,
+                fixture::FOLD_CHAPTER,
+                fixture::FOLD_FIRST_BODY,
+                fixture::FOLD_SECOND_BODY
+            ),
+            "a spelled chapter folds where it stood"
+        );
+        for heading in [fixture::FOLD_FIRST, fixture::FOLD_SECOND] {
+            assert!(
+                !resp.content.contains(heading),
+                "spelled {heading}: {:?}",
+                resp.content
+            );
+        }
+    }
+
     /// A registry over Markdown and PDF whose decompression cap is `decompressed`
     /// and whose raw caps are the defaults.
     fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
