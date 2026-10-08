@@ -574,14 +574,91 @@ fn fold_empty_heading_sections(sections: Vec<DocxSection>) -> Vec<DocxSection> {
     kept
 }
 
+/// (feature-64) The row being read at one table level of [`parse_document_xml`]: the field
+/// each closed cell left and the cell that is open, if any.
+#[derive(Default)]
+struct TableRow {
+    /// One field per closed cell, in document order: its paragraphs joined with a space, `""`
+    /// for a cell with no text.
+    fields: Vec<String>,
+    /// The cell between its `<w:tc>` and `</w:tc>`.
+    open: Option<OpenCell>,
+}
+
+/// (feature-64) A cell of a [`TableRow`] that has not closed yet.
+#[derive(Default)]
+struct OpenCell {
+    /// Its paragraphs so far, each trimmed and not empty.
+    paragraphs: Vec<String>,
+    /// Whether part of the row was already written out while this cell was open, by a heading
+    /// in it or a table nested in it. Such a cell adds a field at `</w:tc>` only when text
+    /// came after that point.
+    split: bool,
+}
+
+impl TableRow {
+    /// `</w:tc>` (and a `<w:tc>` that finds a cell still open): the open cell becomes a field
+    /// -- its paragraphs joined with a space, `""` when it had none -- unless it was
+    /// [split](OpenCell::split) and nothing came after.
+    fn close_cell(&mut self) {
+        if let Some(cell) = self.open.take()
+            && !(cell.split && cell.paragraphs.is_empty())
+        {
+            self.fields.push(cell.paragraphs.join(" "));
+        }
+    }
+
+    /// `</w:tr>`: the row's fields, its open cell closed first, leaving the row empty.
+    fn end_row(&mut self) -> Vec<String> {
+        self.close_cell();
+        std::mem::take(&mut self.fields)
+    }
+}
+
+/// (feature-64) The line a table row adds to a section's body: its fields joined with a tab,
+/// a single field being its text alone, or `None` when every field is empty.
+fn row_line(fields: &[String]) -> Option<String> {
+    if fields.iter().all(|field| field.is_empty()) {
+        None
+    } else {
+        Some(fields.join("\t"))
+    }
+}
+
+/// (feature-64) Add `line` to a section's `body` as one more line: after a `\n` when the body
+/// has text already. A body paragraph of [`parse_document_xml`] and a table row
+/// ([`push_table_line`]) are both added to the body through this.
+fn push_body_line(body: &mut String, line: &str) {
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.push_str(line);
+}
+
+/// (feature-64) Add the [`row_line`] of `fields` to the last section's body the way a body
+/// paragraph is added in [`parse_document_xml`] ([`push_body_line`]), and not at all while
+/// `excluded`.
+fn push_table_line(sections: &mut [DocxSection], excluded: bool, fields: &[String]) {
+    if excluded {
+        return;
+    }
+    let Some(line) = row_line(fields) else {
+        return;
+    };
+    let last = sections.last_mut().expect("sections is never empty");
+    push_body_line(&mut last.body, &line);
+}
+
 /// `word/document.xml` を段落 (`<w:p>`) 単位で読み、見出し段落を見出し境界として Markdown 同様の
 /// 階層チャンクに変換する。段落が見出しかどうかは、その `<w:pStyle>` を
 /// [`heading_level_from_attr`] が `styles` (`word/styles.xml` の style 表、使えなければ `None`)
 /// で決める (feature-62)。
 ///
-/// 表 (`w:tbl`) 内のテキストも専用ハンドリングはしない: OOXML 上は
-/// `w:tbl > w:tr > w:tc > w:p > w:r > w:t` と入れ子になっているだけなので、
-/// 通常の `<w:p>` 境界処理だけで現在のセクション本文に自然に取り込まれる。
+/// (feature-64) A table (`w:tbl`) is written one row per line: each cell's paragraphs are
+/// joined with a space into one field ([`OpenCell`]), the fields of a row with a tab
+/// ([`row_line`]), an empty cell keeping its place as an empty field and a row of empty cells
+/// adding nothing ([`push_table_line`]). A paragraph outside every `<w:tc>` takes the path a
+/// body paragraph always took, so a document without a table is read as before.
 ///
 /// (feature-63) Which sections become chunks, and where a heading with no body text goes, is
 /// [`fold_empty_heading_sections`]'s.
@@ -614,6 +691,9 @@ fn parse_document_xml(
     // 実装 (docx はフラット段落列を集めてから chunk 化する構造のため)。exclude
     // された見出しも積む (E-6 の docx 版)。
     let mut stack: Vec<(u8, String)> = Vec::new();
+    // (feature-64) One entry per `<w:tbl>` open around the reader, innermost last. Empty outside
+    // tables, where every paragraph takes the path it always took.
+    let mut tables: Vec<TableRow> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -624,6 +704,20 @@ fn parse_document_xml(
                 }
                 b"pStyle" => para_style = heading_level_from_attr(&e, styles),
                 b"t" => in_text = true,
+                b"tbl" => tables.push(TableRow::default()),
+                b"tr" => {
+                    // D3: a row left open before this one is written out, not dropped.
+                    if let Some(row) = tables.last_mut() {
+                        let left = row.end_row();
+                        push_table_line(&mut sections, excluded, &left);
+                    }
+                }
+                b"tc" => {
+                    if let Some(row) = tables.last_mut() {
+                        row.close_cell();
+                        row.open = Some(OpenCell::default());
+                    }
+                }
                 // `<w:br></w:br>` の形で来ることもある。Empty 版と同じ扱い。
                 name => push_intra_paragraph_separator(name, &mut para_text),
             },
@@ -634,6 +728,13 @@ fn parse_document_xml(
                 // `<w:pStyle w:val="Heading1"/>` は自己終端タグで来ることが多い。
                 if name == b"pStyle" {
                     para_style = heading_level_from_attr(&e, styles);
+                } else if name == b"tc" {
+                    // (feature-64) `<w:tc/>`: an empty cell. `<w:tr/>` and `<w:tbl/>` add
+                    // nothing and fall through below.
+                    if let Some(row) = tables.last_mut() {
+                        row.close_cell();
+                        row.fields.push(String::new());
+                    }
                 } else {
                     push_intra_paragraph_separator(name, &mut para_text);
                 }
@@ -658,6 +759,9 @@ fn parse_document_xml(
                 b"t" => in_text = false,
                 b"p" => {
                     let text = para_text.trim().to_string();
+                    // (feature-64) Inside an open cell a body paragraph is the cell's, not the
+                    // section's.
+                    let in_cell = tables.last().is_some_and(|row| row.open.is_some());
                     if let Some(level) = para_style {
                         // stack を pop → 祖先確定 → この見出しを push (exclude でも積む = E-6)。
                         while let Some((l, _)) = stack.last() {
@@ -685,12 +789,31 @@ fn parse_document_xml(
                                 body: String::new(),
                             });
                         }
+                    } else if in_cell && !text.is_empty() {
+                        if let Some(cell) = tables.last_mut().and_then(|row| row.open.as_mut()) {
+                            cell.paragraphs.push(text);
+                        }
                     } else if !excluded && !text.is_empty() {
                         let last = sections.last_mut().expect("sections is never empty");
-                        if !last.body.is_empty() {
-                            last.body.push('\n');
-                        }
-                        last.body.push_str(&text);
+                        push_body_line(&mut last.body, &text);
+                    }
+                }
+                b"tc" => {
+                    if let Some(row) = tables.last_mut() {
+                        row.close_cell();
+                    }
+                }
+                b"tr" => {
+                    if let Some(row) = tables.last_mut() {
+                        let fields = row.end_row();
+                        push_table_line(&mut sections, excluded, &fields);
+                    }
+                }
+                b"tbl" => {
+                    // D3: a row left open at `</w:tbl>` is written out, not dropped.
+                    if let Some(mut row) = tables.pop() {
+                        let left = row.end_row();
+                        push_table_line(&mut sections, excluded, &left);
                     }
                 }
                 _ => {}
@@ -3027,5 +3150,124 @@ mod tests {
             contents(&doc),
             vec!["Overview\nkettle passage under the repeated heading"]
         );
+    }
+
+    /// feature-64: a `<w:p>` styled `Heading{level}`, which [`parse_raw_both`] also reads
+    /// numbered under [`word2010_ja_styles`].
+    fn heading_para(level: u8, text: &str) -> String {
+        format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading{level}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    }
+
+    /// feature-64: an unstyled `<w:p>` holding `text` (`""` is a paragraph with no text).
+    fn body_para(text: &str) -> String {
+        format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>")
+    }
+
+    /// feature-64: a `<w:tbl>` of `rows`, each cell one [`body_para`] of its text.
+    fn grid_of(rows: &[&[&str]]) -> String {
+        let mut xml = String::from("<w:tbl>");
+        for row in rows {
+            xml.push_str("<w:tr>");
+            for cell in *row {
+                xml.push_str(&format!("<w:tc>{}</w:tc>", body_para(cell)));
+            }
+            xml.push_str("</w:tr>");
+        }
+        xml.push_str("</w:tbl>");
+        xml
+    }
+
+    /// feature-64 T1 (AC1): each row is one line, its cells separated by a tab.
+    #[test]
+    fn a_table_row_is_one_line_with_its_cells_tab_separated() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["alder", "birch"], &["cedar", "damson"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(outline(&doc), vec![(Some("Tariff"), Some(2))]);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\ncedar\tdamson"]);
+    }
+
+    /// feature-64 T2 (AC2): an empty cell keeps its column as an empty field, at the start,
+    /// in the middle or at the end of a row; a `w:vMerge` continue cell, whose paragraph is
+    /// self-closing, is an empty field too.
+    #[test]
+    fn an_empty_cell_keeps_its_column() {
+        let body = format!(
+            "{}{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["alder", "", "cedar"], &["", "birch"], &["damson", ""]]),
+            concat!(
+                "<w:tbl>",
+                r#"<w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>elm</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>fir</w:t></w:r></w:p></w:tc></w:tr>"#,
+                "<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t>gum</w:t></w:r></w:p></w:tc></w:tr>",
+                "</w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(
+            contents(&doc),
+            vec!["alder\t\tcedar\n\tbirch\ndamson\t\nelm\tfir\n\tgum"]
+        );
+    }
+
+    /// feature-64 T3 (AC3): a row whose cells are all empty or blank adds no line.
+    #[test]
+    fn a_row_of_empty_cells_adds_no_line() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["alder", "birch"], &["", " "], &["cedar", "damson"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\ncedar\tdamson"]);
+    }
+
+    /// feature-64 Review Focus 1: the property elements Word writes around a table -- table
+    /// properties and grid, a header-row mark, a cell width and a horizontal span -- add
+    /// neither text nor a field. A spanned cell is written once (R1.4).
+    #[test]
+    fn table_properties_add_nothing_to_the_row() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl>",
+                r#"<w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/></w:tblPr>"#,
+                r#"<w:tblGrid><w:gridCol w:w="4000"/><w:gridCol w:w="4000"/></w:tblGrid>"#,
+                r#"<w:tr><w:trPr><w:tblHeader/></w:trPr>"#,
+                r#"<w:tc><w:tcPr><w:tcW w:w="4000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>alder</w:t></w:r></w:p></w:tc>"#,
+                r#"<w:tc><w:tcPr><w:tcW w:w="4000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>birch</w:t></w:r></w:p></w:tc>"#,
+                "</w:tr>",
+                r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>cedar</w:t></w:r></w:p></w:tc></w:tr>"#,
+                "</w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\ncedar"]);
+    }
+
+    /// feature-64 Review Focus 3: a cell inside a content control (`w:sdt`), as Word writes
+    /// a form field, is still one field of its row; a self-closing `<w:tc/>` is an empty one
+    /// (R1.1).
+    #[test]
+    fn a_cell_wrapped_in_a_content_control_is_still_a_cell() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl><w:tr>",
+                "<w:sdt><w:sdtPr/><w:sdtContent><w:tc><w:p><w:r><w:t>alder</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt>",
+                "<w:tc/>",
+                "<w:tc><w:p><w:r><w:t>birch</w:t></w:r></w:p></w:tc>",
+                "</w:tr><w:tr/></w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\t\tbirch"]);
     }
 }
