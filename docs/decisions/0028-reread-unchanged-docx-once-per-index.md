@@ -62,6 +62,11 @@ the catch-up open for every other one.
   is not at its value, and the final transaction writes both, the heading key
   first. The pass itself is unchanged. PR #346; `CHANGELOG.md`, v1.17.0 →
   Changed.
+  *(2026-10-09, v1.18.0)* A third key, `index_meta.docx_table_policy`
+  (`tab-joined-rows`), opens the same pass for the change that writes each
+  table row as one line. The final transaction writes it after the other two.
+  When only this key is stale, the notice names the table change instead.
+  `CHANGELOG.md`, v1.18.0 → Changed.
 - After the deletion sweep, in one transaction, every `.docx` row this run did
   not settle — the scan skipped it, it failed to parse, the endpoint refused
   it, or its bytes changed under the read — gets the content hash
@@ -92,6 +97,10 @@ the catch-up open for every other one.
   the per-row column (option 1) is the general form.
   *(2026-10-07, v1.17.0)* Also revisit it when `.docx` needs a third key of
   this kind; v1.17.0 brought it to two.
+  *(2026-10-09, v1.18.0)* A third key came with v1.18.0, and the per-row
+  column was not taken: it needs a schema change, and the tests pin the two
+  keys' values and that dropping the section key reopens the pass. Revisit at
+  a fourth.
 - **Tests hold it**: `grooveseek/src/indexer.rs` (the re-read, the predicate,
   the marker), `grooveseek/src/db.rs` (the key and the overwrite),
   `grooveseek/src/indexer/progress.rs` (the notice) and

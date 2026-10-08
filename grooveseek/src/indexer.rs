@@ -3057,15 +3057,18 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// [`FRONTMATTER_POLICY`], and a key of its own, since the two passes cover different files and
 /// do different work (ADR-0028).
 ///
-/// (feature-63) The pass also runs while [`DOCX_SECTION_POLICY`] is not recorded at its
-/// value (absent or another value).
+/// (feature-63, feature-64) The pass also runs while [`DOCX_SECTION_POLICY`] or
+/// [`DOCX_TABLE_POLICY`] is not recorded at its value (absent or another value): it runs while
+/// any of the three keys is not at its value, and the final transaction writes all three, this
+/// one first.
 pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
 
 /// (feature-63) Recorded in `index_meta.docx_section_policy` beside [`DOCX_HEADING_POLICY`],
-/// in the same transaction, once every `.docx` row of the index has been settled under the
-/// rule that folds a heading with no body text into the next section that has one (instead of
-/// a chunk with an empty body). Absence or another value opens the same one-time pass the
-/// heading key does (ADR-0028): [`rebuild_index`] runs it when either key is not at its value.
+/// in the same transaction and after it, once every `.docx` row of the index has been settled
+/// under the rule that folds a heading with no body text into the next section that has one
+/// (instead of a chunk with an empty body). Absence or another value opens the same one-time
+/// pass the heading key does (ADR-0028): [`rebuild_index`] runs it when any of the three keys,
+/// this one, [`DOCX_HEADING_POLICY`] and [`DOCX_TABLE_POLICY`], is not at its value.
 ///
 /// A key of its own rather than a new value of [`DOCX_HEADING_POLICY`], which stays what
 /// v1.16.0 recorded; the two answer different questions about the same rows.
