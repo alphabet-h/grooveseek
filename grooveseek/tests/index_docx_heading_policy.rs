@@ -2045,6 +2045,18 @@ mod fold_pass {
                 .all(|t| !t.contains(B_FIRST) && !t.contains(B_SECOND)),
             "the clean document was not: {embedded:?}"
         );
+        // AC16, directly: the headings of `headings_alone_docx` reach no embed request, and
+        // neither does an empty input.
+        for heading in ["Summit", "Ridge"] {
+            assert!(
+                embedded.iter().all(|t| !t.contains(heading)),
+                "the outline document was not re-embedded ({heading}): {embedded:?}"
+            );
+        }
+        assert!(
+            embedded.iter().all(|t| !t.is_empty()),
+            "no empty input was embedded: {embedded:?}"
+        );
         assert_eq!(content_hash(&fx, "b-clean.docx"), Some(sha256_hex(&clean)));
         assert_eq!(
             content_hash(&fx, "c-outline.docx"),
