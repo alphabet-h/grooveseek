@@ -2773,7 +2773,8 @@ mod table_pass {
     }
 
     /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
-    /// `groove index` wires it, reporting to `progress`.
+    /// `groove index` wires it, reporting to the
+    /// [`grooveseek::indexer::progress::ProgressReporter`] it is given.
     ///
     /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
     fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
