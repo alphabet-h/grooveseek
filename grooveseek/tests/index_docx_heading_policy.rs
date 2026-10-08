@@ -2219,4 +2219,70 @@ mod fold_pass {
         );
         assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
     }
+
+    /// feature-63 I5b (AC21): with both keys absent, the watcher's reindex of a changed docx
+    /// and its rename of one with changed content leave both absent -- unlike I9, which pins
+    /// the heading key on the reindex path alone, and I5, which removes the section key alone.
+    #[test]
+    fn the_watcher_records_neither_key_when_both_are_absent() {
+        if run_in_hermetic_child("fold_pass::the_watcher_records_neither_key_when_both_are_absent")
+        {
+            return;
+        }
+        let fx = docx_kb("groove-f63-i5b");
+        let draft = document_xml(&[(None, PREFACE)]);
+        write_bytes(
+            &fx,
+            "draft.docx",
+            &docx(&[("word/document.xml", draft.as_bytes())]),
+        );
+        write_bytes(&fx, "old.docx", &rules_docx("Ledger"));
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        delete_meta(&fx, SECTION_KEY);
+        delete_meta(&fx, HEADING_KEY);
+
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+        let kb = fx.kb().canonicalize().expect("canonical kb");
+        let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+        write_bytes(&fx, "draft.docx", &rules_docx("Draft"));
+        let changed = reindex_single_file(&db, &mut embedder, &kb, "draft.docx", None, &registry)
+            .expect("reindex the changed document");
+        assert_eq!(
+            changed,
+            SingleResult::Updated {
+                chunks: 7,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            (meta(&fx, HEADING_KEY), meta(&fx, SECTION_KEY)),
+            (None, None),
+            "the watcher's reindex writes neither the heading key nor the section key"
+        );
+
+        std::fs::remove_file(fx.kb().join("old.docx")).expect("move the old document away");
+        write_bytes(
+            &fx,
+            "moved.docx",
+            &rules_docx_with("Ledger", AMENDED_PREFACE),
+        );
+        let renamed = rename_single_file(
+            &db,
+            &mut embedder,
+            &kb,
+            "old.docx",
+            "moved.docx",
+            None,
+            &registry,
+        )
+        .expect("rename with changed content");
+        assert_eq!(renamed, RenameOutcome::RenamedAndReindexed { chunks: 7 });
+        assert_eq!(
+            (meta(&fx, HEADING_KEY), meta(&fx, SECTION_KEY)),
+            (None, None),
+            "the watcher's rename writes neither the heading key nor the section key"
+        );
+    }
 }
