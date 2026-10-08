@@ -2597,16 +2597,19 @@ mod tests {
     }
 
     /// [`parse_both`] for a `<w:body>` written out by hand: `body` names its heading styles
-    /// `Heading1` / `Heading2` and is parsed as written, without a styles part, and again with
-    /// them numbered `1` / `2` under [`word2010_ja_styles`]. Both must split identically; the
-    /// first is returned.
+    /// `Heading1` .. `Heading3` and is parsed as written, without a styles part, and again with
+    /// them numbered `1` .. `3` under [`word2010_ja_styles`], which defines no deeper level.
+    /// Both must split identically; the first is returned.
     fn parse_raw_both(body: &str) -> ParsedDocument {
         let spelled = DocxParser::default()
             .parse_bytes(&wrap_document_xml(body), "docs/ledger.docx", &[])
             .expect("a generated document parses");
-        let numbered_body = body
-            .replace(r#"w:val="Heading1""#, r#"w:val="1""#)
-            .replace(r#"w:val="Heading2""#, r#"w:val="2""#);
+        let numbered_body = (1..=3).fold(body.to_string(), |acc, level| {
+            acc.replace(
+                &format!(r#"w:val="{}""#, HeadingIds::Spelled.style_id(level)),
+                &format!(r#"w:val="{}""#, HeadingIds::Numbered.style_id(level)),
+            )
+        });
         assert_ne!(numbered_body, body, "the body names its heading styles");
         let doc = document_xml_from_body(&numbered_body);
         let styles = styles_xml(&word2010_ja_styles());
