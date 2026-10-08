@@ -155,11 +155,11 @@ phase が **release を構成する最終 PR** だった場合のみ:
 
 cycle 完了時に必ず:
 
-- `.dev/knowledge/<feature-NN>-summary.md` 作成 (結果サマリ / 設計判断 / ハマりどころ / 工程まとめ / 後続候補)
+- `.dev/knowledge/<feature-NN>-summary.md` 作成 (結果サマリ / 設計判断 / ハマりどころ / 工程まとめ / 後続候補)。**controller が書く** (この指示を受け取り、かつ書けるのは controller だけ。subagent の Write は名前に `summary` を含む file で拒否され得る。anthropics/claude-code#44657)
 - `.dev/feature-ideas.md` の対応 ID を `done` マーク + done line に PR 番号と merge 日付を追記
 - `/full-audit` を回した場合は `.dev/archive/<date>-cycle/audit-todos.md` に deferred items を整理
 
-上の 3 つはどれも `.dev/` 配下 = git untracked なので commit には乗らない (= subagent prompt で必ず明示する)。
+上の 3 つはどれも `.dev/` 配下 = git untracked なので commit には乗らない (subagent に渡す後の 2 つは、そのことを subagent prompt で必ず明示する)。
 
 `CHANGELOG.md` はこの Phase では触らない。entry は変更した PR 自身が `[Unreleased]` に足し、`[X.Y.Z]` への畳み込みは Phase 7 step 1 が持つ。**release 見出しにも entry にも PR 番号は付けない** — 付いている行は無い (via: `grep -c '^## .*(#' CHANGELOG.md` / `grep -c '^- .*(#[0-9]' CHANGELOG.md`)。PR 番号は散文の中で経緯として書く時だけ現れる。`.claude/` だけを触る PR は entry 自体を書かない (#220 / #222 / #238 の型)。
 
