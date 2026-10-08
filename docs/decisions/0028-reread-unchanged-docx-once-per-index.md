@@ -57,6 +57,11 @@ the catch-up open for every other one.
   remove the row, which is counted as skipped, the way `--force` would leave
   none. A `.docx` whose content changed takes the ordinary path, and a rename
   that is already forced stays forced.
+  *(2026-10-07, v1.17.0)* A second key, `index_meta.docx_section_policy`
+  (`fold-empty-headings`), now opens the same pass: it runs while either key
+  is not at its value, and the final transaction writes both, the heading key
+  first. The pass itself is unchanged. PR #346; `CHANGELOG.md`, v1.17.0 →
+  Changed.
 - After the deletion sweep, in one transaction, every `.docx` row this run did
   not settle — the scan skipped it, it failed to parse, the endpoint refused
   it, or its bytes changed under the read — gets the content hash
@@ -85,6 +90,8 @@ the catch-up open for every other one.
   recorded, which only `--force` undoes. A downgrade does the same.
 - **Revisit when** a later change needs the same catch-up for another format:
   the per-row column (option 1) is the general form.
+  *(2026-10-07, v1.17.0)* Also revisit it when `.docx` needs a third key of
+  this kind; v1.17.0 brought it to two.
 - **Tests hold it**: `grooveseek/src/indexer.rs` (the re-read, the predicate,
   the marker), `grooveseek/src/db.rs` (the key and the overwrite),
   `grooveseek/src/indexer/progress.rs` (the notice) and
