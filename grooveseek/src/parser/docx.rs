@@ -1269,6 +1269,31 @@ pub(crate) mod fixture {
         }
         headed_docx(&paragraphs, ids, RULES_TITLE)
     }
+
+    /// The heading of [`table_docx`] (feature-64, AC13).
+    pub(crate) const TABLE_HEADING: &str = "Tariff";
+    /// The cells of [`table_docx`], row by row, sharing no word with [`TABLE_HEADING`].
+    pub(crate) const TABLE_ROWS: [[&str; 2]; 2] = [["alder", "birch"], ["cedar", "damson"]];
+
+    /// [`TABLE_HEADING`] styled `Heading1`, with no styles part, over a table of
+    /// [`TABLE_ROWS`], each cell one paragraph.
+    pub(crate) fn table_docx() -> Vec<u8> {
+        let mut body = format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{TABLE_HEADING}</w:t></w:r></w:p><w:tbl>"#
+        );
+        for row in TABLE_ROWS {
+            body.push_str("<w:tr>");
+            for cell in row {
+                body.push_str(&format!(
+                    "<w:tc><w:p><w:r><w:t>{cell}</w:t></w:r></w:p></w:tc>"
+                ));
+            }
+            body.push_str("</w:tr>");
+        }
+        body.push_str("</w:tbl>");
+        let doc = document_xml_from_body(&body);
+        docx_with_parts(&[("word/document.xml", doc.as_bytes())])
+    }
 }
 
 // ===========================================================================
@@ -3604,5 +3629,21 @@ mod tests {
         );
         let doc = parse_raw_both(&body);
         assert_eq!(contents(&doc), vec!["alder\tbirch\ncedar\ndamson\nelm"]);
+    }
+
+    /// feature-64 T12r (AC13, D5): the read entry writes a table's rows the way the index
+    /// entry does.
+    #[test]
+    fn the_read_entry_writes_table_rows_the_same_way() {
+        let bytes = table_docx();
+        let index = DocxParser::default()
+            .parse_bytes(&bytes, "tariff.docx", &[])
+            .unwrap();
+        let read = DocxParser::default()
+            .parse_bytes_for_read(&bytes, "tariff.docx", &[])
+            .unwrap();
+        assert_eq!(outline(&read), outline(&index));
+        assert_eq!(contents(&read), contents(&index));
+        assert_eq!(contents(&read), vec!["alder\tbirch\ncedar\tdamson"]);
     }
 }
