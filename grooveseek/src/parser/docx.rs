@@ -613,6 +613,22 @@ impl TableRow {
         self.close_cell();
         std::mem::take(&mut self.fields)
     }
+
+    /// (feature-64, R1.5 / R1.6 / R1.7) The fields gathered so far, taken out: the closed
+    /// cells', then the open cell's paragraphs as one more field when it has any. The open cell
+    /// stays open, marked [split](OpenCell::split), so it adds a field at `</w:tc>` only for
+    /// text that comes after.
+    fn take_so_far(&mut self) -> Vec<String> {
+        let mut fields = std::mem::take(&mut self.fields);
+        if let Some(cell) = self.open.as_mut() {
+            if !cell.paragraphs.is_empty() {
+                fields.push(cell.paragraphs.join(" "));
+                cell.paragraphs.clear();
+            }
+            cell.split = true;
+        }
+        fields
+    }
 }
 
 /// (feature-64) The line a table row adds to a section's body: its fields joined with a tab,
@@ -647,6 +663,16 @@ fn push_table_line(sections: &mut [DocxSection], excluded: bool, fields: &[Strin
     };
     let last = sections.last_mut().expect("sections is never empty");
     push_body_line(&mut last.body, &line);
+}
+
+/// (feature-64) [`push_intra_paragraph_separator`], except that inside an open cell (`in_cell`)
+/// a `<w:br/>` / `<w:cr/>` is a space, so a table row stays one line. One space per element;
+/// runs are not folded.
+fn push_paragraph_separator(local_name: &[u8], in_cell: bool, para_text: &mut String) {
+    match local_name {
+        b"br" | b"cr" if in_cell => para_text.push(' '),
+        _ => push_intra_paragraph_separator(local_name, para_text),
+    }
 }
 
 /// `word/document.xml` を段落 (`<w:p>`) 単位で読み、見出し段落を見出し境界として Markdown 同様の
@@ -704,7 +730,17 @@ fn parse_document_xml(
                 }
                 b"pStyle" => para_style = heading_level_from_attr(&e, styles),
                 b"t" => in_text = true,
-                b"tbl" => tables.push(TableRow::default()),
+                b"tbl" => {
+                    // R1.6: a table inside a cell writes out the outer row so far first, so
+                    // the text stays in document order.
+                    if let Some(row) = tables.last_mut()
+                        && row.open.is_some()
+                    {
+                        let so_far = row.take_so_far();
+                        push_table_line(&mut sections, excluded, &so_far);
+                    }
+                    tables.push(TableRow::default());
+                }
                 b"tr" => {
                     // D3: a row left open before this one is written out, not dropped.
                     if let Some(row) = tables.last_mut() {
@@ -719,7 +755,10 @@ fn parse_document_xml(
                     }
                 }
                 // `<w:br></w:br>` の形で来ることもある。Empty 版と同じ扱い。
-                name => push_intra_paragraph_separator(name, &mut para_text),
+                name => {
+                    let in_cell = tables.last().is_some_and(|row| row.open.is_some());
+                    push_paragraph_separator(name, in_cell, &mut para_text);
+                }
             },
             Ok(Event::Empty(e)) => {
                 // `e.name()` は一時値なので、`as_ref()` の借用元を束縛しておく。
@@ -736,7 +775,8 @@ fn parse_document_xml(
                         row.fields.push(String::new());
                     }
                 } else {
-                    push_intra_paragraph_separator(name, &mut para_text);
+                    let in_cell = tables.last().is_some_and(|row| row.open.is_some());
+                    push_paragraph_separator(name, in_cell, &mut para_text);
                 }
             }
             Ok(Event::Text(t)) if in_text => {
@@ -763,6 +803,12 @@ fn parse_document_xml(
                     // section's.
                     let in_cell = tables.last().is_some_and(|row| row.open.is_some());
                     if let Some(level) = para_style {
+                        // R1.5: a heading inside a cell writes out its row so far into the
+                        // section it closes, before that section is closed.
+                        if in_cell && let Some(row) = tables.last_mut() {
+                            let so_far = row.take_so_far();
+                            push_table_line(&mut sections, excluded, &so_far);
+                        }
                         // stack を pop → 祖先確定 → この見出しを push (exclude でも積む = E-6)。
                         while let Some((l, _)) = stack.last() {
                             if *l >= level {
@@ -824,6 +870,12 @@ fn parse_document_xml(
             _ => {}
         }
         buf.clear();
+    }
+
+    // R1.7: a document cut off inside a table keeps what was read of it, innermost row first.
+    while let Some(mut row) = tables.pop() {
+        let so_far = row.take_so_far();
+        push_table_line(&mut sections, excluded, &so_far);
     }
 
     fold_empty_heading_sections(sections)
@@ -3269,5 +3321,288 @@ mod tests {
         );
         let doc = parse_raw_both(&body);
         assert_eq!(contents(&doc), vec!["alder\t\tbirch"]);
+    }
+
+    /// feature-64 T4 (AC5): a cell's paragraphs join with a space, an empty one adds nothing,
+    /// and a line break or carriage return inside a cell is a space, so the row stays one line.
+    #[test]
+    fn paragraphs_and_breaks_in_a_cell_join_with_a_space() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl><w:tr>",
+                "<w:tc><w:p><w:r><w:t>alder</w:t></w:r></w:p><w:p></w:p><w:p><w:r><w:t>birch</w:t></w:r></w:p></w:tc>",
+                "<w:tc><w:p><w:r><w:t>cedar</w:t><w:br/><w:t>damson</w:t><w:cr/><w:t>elm</w:t></w:r></w:p></w:tc>",
+                "</w:tr></w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder birch\tcedar damson elm"]);
+    }
+
+    /// feature-64 T5 (AC6): a tab inside a cell stays a tab, which a reader cannot tell from
+    /// the cell boundary.
+    #[test]
+    fn a_tab_in_a_cell_stays_a_tab() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl><w:tr>",
+                "<w:tc><w:p><w:r><w:t>alder</w:t><w:tab/><w:t>birch</w:t></w:r></w:p></w:tc>",
+                "<w:tc><w:p><w:r><w:t>cedar</w:t></w:r></w:p></w:tc>",
+                "</w:tr></w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\tcedar"]);
+    }
+
+    /// feature-64 Review Focus 4: a cell holding only a tab trims to nothing and keeps its
+    /// column as an empty field.
+    #[test]
+    fn a_cell_holding_only_a_tab_is_an_empty_field() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl><w:tr>",
+                "<w:tc><w:p><w:r><w:t>alder</w:t></w:r></w:p></w:tc>",
+                "<w:tc><w:p><w:r><w:tab/></w:r></w:p></w:tc>",
+                "<w:tc><w:p><w:r><w:t>birch</w:t></w:r></w:p></w:tc>",
+                "</w:tr></w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\t\tbirch"]);
+    }
+
+    /// feature-64 T6 (AC7): a heading alone in a cell writes out the row before it into the
+    /// section it closes and opens its own; the cells after it are the new section's line,
+    /// and the heading's own cell adds no field on either side.
+    #[test]
+    fn a_heading_in_a_cell_splits_the_row_where_it_stands() {
+        let body = format!(
+            "{}<w:tbl><w:tr><w:tc>{}</w:tc><w:tc>{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            heading_para(2, "Quota"),
+            body_para("birch")
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(
+            outline(&doc),
+            vec![(Some("Tariff"), Some(2)), (Some("Quota"), Some(3))]
+        );
+        assert_eq!(contents(&doc), vec!["alder", "birch"]);
+    }
+
+    /// feature-64 T6b (AC7b): the paragraphs before a heading in its cell close the row on
+    /// the old section's side; those after it open the new section's line.
+    #[test]
+    fn paragraphs_around_a_heading_in_a_cell_stay_on_their_side() {
+        let body = format!(
+            "{}<w:tbl><w:tr><w:tc>{}</w:tc><w:tc>{}{}{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            body_para("cedar"),
+            heading_para(2, "Quota"),
+            body_para("damson"),
+            body_para("birch")
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tcedar", "damson\tbirch"]);
+    }
+
+    /// feature-64 T6c (AC7c): a heading in a cell of a nested table splits that inner row at
+    /// its own `</w:tr>`, and the outer row's rest follows; the text stays in document order.
+    #[test]
+    fn a_heading_in_a_nested_cell_keeps_document_order() {
+        let inner = format!(
+            "<w:tbl><w:tr><w:tc>{}{}{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            body_para("cedar"),
+            heading_para(2, "Quota"),
+            body_para("damson"),
+            body_para("elm")
+        );
+        let body = format!(
+            "{}<w:tbl><w:tr><w:tc>{}{inner}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            body_para("birch")
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(
+            outline(&doc),
+            vec![(Some("Tariff"), Some(2)), (Some("Quota"), Some(3))]
+        );
+        assert_eq!(contents(&doc), vec!["alder\ncedar", "damson\telm\nbirch"]);
+    }
+
+    /// feature-64 T7 (AC8): a nested table loses no text, and its rows stand between the outer
+    /// cell's text before it and the outer row's text after it. The separators are not pinned.
+    #[test]
+    fn a_nested_table_keeps_its_text_in_document_order() {
+        let body = format!(
+            "{}<w:tbl><w:tr><w:tc>{}{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            grid_of(&[&["cedar", "damson"]]),
+            body_para("birch")
+        );
+        let doc = parse_raw_both(&body);
+        let content = contents(&doc).concat();
+        for word in ["alder", "cedar", "damson", "birch"] {
+            assert_eq!(content.matches(word).count(), 1, "{word}: {content:?}");
+        }
+        let at = |word: &str| content.find(word).expect("present");
+        assert!(at("alder") < at("cedar"), "{content:?}");
+        assert!(at("damson") < at("birch"), "{content:?}");
+    }
+
+    /// feature-64 T8 (AC9): a table between two paragraphs is separated from each by one
+    /// newline.
+    #[test]
+    fn a_table_sits_between_paragraphs_with_one_newline() {
+        let body = format!(
+            "{}{}{}{}",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            grid_of(&[&["birch", "cedar"]]),
+            body_para("damson")
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\nbirch\tcedar\ndamson"]);
+    }
+
+    /// feature-64 T9 (AC10): outside a cell nothing changes -- a line break is a newline and a
+    /// tab a tab, in a body paragraph and in a paragraph that sits in a table but outside
+    /// every `<w:tc>` (R1.7).
+    #[test]
+    fn breaks_and_tabs_outside_a_table_are_unchanged() {
+        let body = format!(
+            "{}{}{}",
+            heading_para(1, "Tariff"),
+            "<w:p><w:r><w:t>alder</w:t><w:br/><w:t>birch</w:t><w:tab/><w:t>cedar</w:t></w:r></w:p>",
+            concat!(
+                "<w:tbl>",
+                "<w:p><w:r><w:t>elm</w:t><w:br/><w:t>fir</w:t></w:r></w:p>",
+                "<w:tr><w:tc><w:p><w:r><w:t>gum</w:t></w:r></w:p></w:tc></w:tr>",
+                "</w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\nbirch\tcedar\nelm\nfir\ngum"]);
+    }
+
+    /// feature-64 T10 (AC11) and Review Focus 5: the rows under an excluded heading are in no
+    /// chunk and not in `raw_content`; an excluded heading inside a cell drops the cells after
+    /// it and keeps the ones before it in the section it closes.
+    #[test]
+    fn rows_under_an_excluded_heading_are_dropped() {
+        let body = format!(
+            "{}{}{}{}{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["alder", "birch"]]),
+            heading_para(1, "Secret"),
+            grid_of(&[&["cedar", "damson"]]),
+            heading_para(1, "Quota"),
+            grid_of(&[&["elm", "fir"]])
+        );
+        let doc = DocxParser::default()
+            .parse_bytes(&wrap_document_xml(&body), "docs/ledger.docx", &["Secret"])
+            .expect("a generated document parses");
+        assert_eq!(
+            outline(&doc),
+            vec![(Some("Tariff"), Some(2)), (Some("Quota"), Some(2))]
+        );
+        assert_eq!(contents(&doc), vec!["alder\tbirch", "elm\tfir"]);
+        for word in ["cedar", "damson"] {
+            assert!(
+                !doc.raw_content.contains(word),
+                "{word}: {:?}",
+                doc.raw_content
+            );
+        }
+
+        let in_cell = format!(
+            "{}<w:tbl><w:tr><w:tc>{}</w:tc><w:tc>{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>{}{}",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            heading_para(2, "Secret"),
+            body_para("cedar"),
+            heading_para(1, "Quota"),
+            grid_of(&[&["elm"]])
+        );
+        let doc = DocxParser::default()
+            .parse_bytes(
+                &wrap_document_xml(&in_cell),
+                "docs/ledger.docx",
+                &["Secret"],
+            )
+            .expect("a generated document parses");
+        assert_eq!(contents(&doc), vec!["alder", "elm"]);
+        assert!(!doc.raw_content.contains("cedar"), "{:?}", doc.raw_content);
+    }
+
+    /// feature-64 T11 (AC12): XML that ends inside a table keeps the closed cells and the open
+    /// cell's closed paragraphs, whether quick-xml stops with an error (a tag cut short) or at
+    /// the end of input (no closing tags); a paragraph cut short adds nothing. Cut inside a
+    /// nested table, the inner row comes after what the outer row wrote out before it.
+    #[test]
+    fn a_row_cut_short_by_broken_xml_keeps_its_closed_cells() {
+        let head = concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            "<w:body><w:tbl><w:tr>",
+            "<w:tc><w:p><w:r><w:t>alder</w:t></w:r></w:p></w:tc>",
+            "<w:tc><w:p><w:r><w:t>birch</w:t></w:r></w:p>",
+        );
+        for tail in ["<w:p><w:r><w:t>cedar", "<w:p><w:r><w:t"] {
+            let bytes = docx_with_raw_document_xml(&format!("{head}{tail}"));
+            let doc = DocxParser::default()
+                .parse_bytes(&bytes, "broken.docx", &[])
+                .expect("a cut document still parses");
+            assert_eq!(contents(&doc), vec!["alder\tbirch"], "tail {tail:?}");
+        }
+
+        let nested = concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            "<w:body><w:tbl><w:tr>",
+            "<w:tc><w:p><w:r><w:t>elm</w:t></w:r></w:p></w:tc>",
+            "<w:tc><w:tbl><w:tr>",
+            "<w:tc><w:p><w:r><w:t>fir</w:t></w:r></w:p></w:tc>",
+            "<w:tc><w:p><w:r><w:t>gum</w:t></w:r></w:p>",
+        );
+        let doc = DocxParser::default()
+            .parse_bytes(&docx_with_raw_document_xml(nested), "broken.docx", &[])
+            .expect("a cut document still parses");
+        assert_eq!(contents(&doc), vec!["elm\nfir\tgum"]);
+    }
+
+    /// feature-64 Review Focus 6 (D3): a table whose structure is off -- a `<w:tc>` that starts
+    /// before the open one closes, a `<w:tr>` that starts before the open one closes, a cell
+    /// with no `<w:tr>` around it -- loses no text: each word appears exactly once. The open
+    /// cell closes at the next `<w:tc>`, the open row is written out at the next `<w:tr>`, and
+    /// a row still open at `</w:tbl>` is written out there.
+    #[test]
+    fn unclosed_rows_and_cells_lose_no_text() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>alder</w:t></w:r></w:p>",
+                "<w:tc><w:p><w:r><w:t>birch</w:t></w:r></w:p></w:tc>",
+                "</w:tc></w:tr></w:tbl>",
+                "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cedar</w:t></w:r></w:p></w:tc>",
+                "<w:tr><w:tc><w:p><w:r><w:t>damson</w:t></w:r></w:p></w:tc></w:tr>",
+                "</w:tr></w:tbl>",
+                "<w:tbl><w:tc><w:p><w:r><w:t>elm</w:t></w:r></w:p></w:tc></w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\ncedar\ndamson\nelm"]);
     }
 }
