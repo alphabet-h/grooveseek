@@ -57,7 +57,7 @@ gap from general knowledge without marking it as outside the knowledge base.";
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 pub struct SummarizeTopicArgs {
-    /// The topic to summarize, as it appears in `list_topics` (e.g. "mcp").
+    /// The topic to summarize, as the topic-listing tool reports it (e.g. "mcp").
     pub topic: String,
 }
 
