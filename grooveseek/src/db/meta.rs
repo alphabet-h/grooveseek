@@ -343,6 +343,32 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.docx_table_policy` (feature-64): how the `.docx` tables of this index were
+    /// written, recorded beside `docx_section_policy` by [`crate::indexer::rebuild_index`].
+    /// `None` = never recorded, which is every index written before each table row became one
+    /// line with its cells separated by tabs.
+    pub fn read_docx_table_policy(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'docx_table_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records `index_meta.docx_table_policy` (feature-64), replacing any value already
+    /// there (INSERT OR REPLACE).
+    pub fn write_docx_table_policy(&self, policy: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_table_policy', ?1)",
+            params![policy],
+        )?;
+        Ok(())
+    }
+
     /// `index_meta.declared_fields` (feature-58): the sorted JSON array of key
     /// names `groove-schema.toml` declared when the index was last completed.
     /// `None` = never recorded, which is every index written before 1.9.0.

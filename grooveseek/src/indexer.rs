@@ -981,11 +981,16 @@ pub fn rebuild_index(
     // split before headings were read from `word/styles.xml` re-reads each unchanged one once
     // ([`DOCX_HEADING_POLICY`], ADR-0028). `--force` re-parses everything anyway.
     // (feature-63) So does one whose rows were cut before a heading with no body text was
-    // folded into the next section ([`DOCX_SECTION_POLICY`]). Read here, once, before the
-    // loop; the run does not read either key again.
-    let refresh_docx = !force
-        && (db.read_docx_heading_policy()?.as_deref() != Some(DOCX_HEADING_POLICY)
-            || db.read_docx_section_policy()?.as_deref() != Some(DOCX_SECTION_POLICY));
+    // folded into the next section ([`DOCX_SECTION_POLICY`]).
+    // (feature-64) And one whose tables were written before each row became one line
+    // ([`DOCX_TABLE_POLICY`]). When the other two keys are at their values and only this one is
+    // not, the notice names the table change ([`docx_table_reread_notice`]). The three keys are
+    // read here, once, before the loop; the run does not read them again.
+    let heading_current = db.read_docx_heading_policy()?.as_deref() == Some(DOCX_HEADING_POLICY);
+    let section_current = db.read_docx_section_policy()?.as_deref() == Some(DOCX_SECTION_POLICY);
+    let table_current = db.read_docx_table_policy()?.as_deref() == Some(DOCX_TABLE_POLICY);
+    let refresh_docx = !force && !(heading_current && section_current && table_current);
+    let tables_alone_stale = heading_current && section_current;
 
     // (feature-58) The keys the schema declares are what `document_fields` holds.
     // `schema` was already loaded above, before the destructive reset, from the
@@ -1208,7 +1213,12 @@ pub fn rebuild_index(
     // Announced before the loop, so a run that takes long re-embedding says why even if it is
     // stopped.
     if !rereads.is_empty() {
-        progress.announce(&docx_reread_notice(rereads.len()));
+        let notice = if tables_alone_stale {
+            docx_table_reread_notice(rereads.len())
+        } else {
+            docx_reread_notice(rereads.len())
+        };
+        progress.announce(&notice);
     }
 
     // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
@@ -1495,6 +1505,9 @@ pub fn rebuild_index(
         // (feature-63) After the heading key, in the same transaction: a run that fails on
         // either write records neither.
         db.write_docx_section_policy(DOCX_SECTION_POLICY)?;
+        // (feature-64) Last, in the same transaction: a run that fails on an earlier write, or
+        // on this one, records none of the three.
+        db.write_docx_table_policy(DOCX_TABLE_POLICY)?;
         tx.commit()?;
     }
     progress.finish();
@@ -1738,6 +1751,15 @@ fn rereads_unchanged_docx(
 fn docx_reread_notice(n: usize) -> String {
     format!(
         "Re-reading {n} unchanged .docx document(s) once: headings now come from word/styles.xml; only documents whose sections change are re-embedded"
+    )
+}
+
+/// (feature-64) The line the one-time `.docx` pass writes instead of [`docx_reread_notice`] when
+/// the heading and section keys are at their values and only [`DOCX_TABLE_POLICY`] is not, so
+/// the reason it gives is the one that applies. ASCII only, and it opens the same way.
+fn docx_table_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .docx document(s) once: table rows are now one line each, cells separated by tabs; only documents whose sections change are re-embedded"
     )
 }
 
@@ -3035,19 +3057,34 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// [`FRONTMATTER_POLICY`], and a key of its own, since the two passes cover different files and
 /// do different work (ADR-0028).
 ///
-/// (feature-63) The pass also runs while [`DOCX_SECTION_POLICY`] is not recorded at its
-/// value (absent or another value).
+/// (feature-63, feature-64) The pass also runs while [`DOCX_SECTION_POLICY`] or
+/// [`DOCX_TABLE_POLICY`] is not recorded at its value (absent or another value): it runs while
+/// any of the three keys is not at its value, and the final transaction writes all three, this
+/// one first.
 pub(crate) const DOCX_HEADING_POLICY: &str = "styles-name-basedon";
 
 /// (feature-63) Recorded in `index_meta.docx_section_policy` beside [`DOCX_HEADING_POLICY`],
-/// in the same transaction, once every `.docx` row of the index has been settled under the
-/// rule that folds a heading with no body text into the next section that has one (instead of
-/// a chunk with an empty body). Absence or another value opens the same one-time pass the
-/// heading key does (ADR-0028): [`rebuild_index`] runs it when either key is not at its value.
+/// in the same transaction and after it, once every `.docx` row of the index has been settled
+/// under the rule that folds a heading with no body text into the next section that has one
+/// (instead of a chunk with an empty body). Absence or another value opens the same one-time
+/// pass the heading key does (ADR-0028): [`rebuild_index`] runs it when any of the three keys,
+/// this one, [`DOCX_HEADING_POLICY`] and [`DOCX_TABLE_POLICY`], is not at its value.
 ///
 /// A key of its own rather than a new value of [`DOCX_HEADING_POLICY`], which stays what
 /// v1.16.0 recorded; the two answer different questions about the same rows.
 pub(crate) const DOCX_SECTION_POLICY: &str = "fold-empty-headings";
+
+/// (feature-64) Recorded in `index_meta.docx_table_policy` beside [`DOCX_HEADING_POLICY`] and
+/// [`DOCX_SECTION_POLICY`], in the same transaction and after them, once every `.docx` row of
+/// the index has been settled under the rule that writes each table row as one line, its cells
+/// separated by tabs. Absence or another value opens the same one-time pass the other two keys
+/// do; when it is the only stale one, the pass announces itself with
+/// [`docx_table_reread_notice`].
+///
+/// A key of its own rather than a new value of either older key, whose values tests pin and
+/// whose absence alone is pinned to reopen the pass. ADR-0028 records the third key and why the
+/// per-row column it names as the general form was not taken.
+pub(crate) const DOCX_TABLE_POLICY: &str = "tab-joined-rows";
 
 /// (feature-62) The `content_hash` a `.docx` row carries when the one-time pass of
 /// [`DOCX_HEADING_POLICY`] could not settle it: skipped by the scan, failed to parse, refused
@@ -6842,6 +6879,19 @@ mod tests {
             notice,
             "Re-reading 3 unchanged .docx document(s) once: headings now come from word/styles.xml; only documents whose sections change are re-embedded"
         );
+        assert!(notice.is_ascii());
+    }
+
+    /// feature-64 U1 (AC22): the table notice names the count and the change, opens as
+    /// [`docx_reread_notice`] does, and is ASCII, since it goes to stderr.
+    #[test]
+    fn the_table_reread_notice_counts_the_documents_in_ascii() {
+        let notice = docx_table_reread_notice(3);
+        assert_eq!(
+            notice,
+            "Re-reading 3 unchanged .docx document(s) once: table rows are now one line each, cells separated by tabs; only documents whose sections change are re-embedded"
+        );
+        assert!(notice.starts_with("Re-reading 3 unchanged .docx document(s) once:"));
         assert!(notice.is_ascii());
     }
 

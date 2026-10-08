@@ -5096,6 +5096,29 @@ mod tests {
         }
     }
 
+    /// feature-64 T12 (AC13, R2): [`get_document`](KbServer::get_document)'s content for a
+    /// docx with a table holds each row on one line, its cells separated by a tab, and not the
+    /// heading over it.
+    #[test]
+    fn get_document_returns_docx_table_rows_as_lines() {
+        use crate::parser::docx::fixture;
+        let registry =
+            Registry::from_enabled(&["md".to_string(), "docx".to_string()]).expect("md + docx");
+        let resp =
+            build_document_response(&registry, "tariff.docx", "docx", &fixture::table_docx())
+                .expect("the document parses");
+        let rows: Vec<String> = fixture::TABLE_ROWS
+            .iter()
+            .map(|row| row.join("\t"))
+            .collect();
+        assert_eq!(resp.content, rows.join("\n"));
+        assert!(
+            !resp.content.contains(fixture::TABLE_HEADING),
+            "{:?}",
+            resp.content
+        );
+    }
+
     /// A registry over Markdown and PDF whose decompression cap is `decompressed`
     /// and whose raw caps are the defaults.
     fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
