@@ -162,11 +162,11 @@ item named". Link the module and leave the item in prose — `` the gate in
 item's visibility so a sentence can point at it.
 
 A second case is a doc comment that is not only rustdoc: `///` on the fields of
-an MCP tool's argument struct, which schemars copies verbatim into the JSON
-schema `description` the client reads (the struct's own `///` is stripped from
-the schema before it is sent, so the usual rule holds there). There a link
-reaches the client as literal `` [`foo`] `` brackets, and a name in plain
-backticks is the unchecked form this rule exists to remove, so neither is
+an MCP tool's argument struct, which schemars turns into the JSON schema
+`description` the client reads, markup untouched (the struct's own `///` is
+stripped from the schema before it is sent, so the usual rule holds there).
+There a link reaches the client as literal `` [`foo`] `` brackets, and a name in
+plain backticks is the unchecked form this rule exists to remove, so neither is
 allowed: name no function, type, constant or module of this tree in that
 comment, and say what it does instead — "the topic-listing tool", not the
 method behind it. A sentence that has to name a tool goes in the
