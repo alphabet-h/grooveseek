@@ -80,7 +80,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 **controller = この session のモデル**。controller が自分で手を動かすのは次だけ:
 
 - user 確認 (AskUserQuestion)
-- kuriya / 台帳 / handoff / memory の bookkeeping
+- kuriya / 台帳 / handoff / memory の bookkeeping (feature-flow Phase 8 の `.dev/knowledge/<feature-NN>-summary.md` もここで書く)
 - レビュー指摘を fix に写す前の根拠 grep (指摘が事実か自分で見る)
 - merge / push / tag の判断
 - 想定外 state の検知
