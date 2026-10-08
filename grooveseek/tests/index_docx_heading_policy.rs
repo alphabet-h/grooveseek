@@ -2301,10 +2301,19 @@ mod fold_pass {
 /// rather than opened up, which would edit that module.
 mod table_pass {
     use super::*;
-    use crate::common::embed_mock::DOC_MODEL;
-    use grooveseek::db::Database;
+    use crate::common::embed_mock::{DOC_MODEL, hermetic};
+    use crate::common::temp::TempRoot;
+    use grooveseek::config::Config;
+    use grooveseek::db::{ContextMode, Database};
+    use grooveseek::embedder::Embedder;
+    use grooveseek::indexer::progress::{ProgressEvent, ProgressMode, ProgressReporter};
+    use grooveseek::indexer::{
+        IndexResult, SingleResult, load_declared_schema, rebuild_index, reindex_single_file,
+    };
     use rusqlite::{Connection, OptionalExtension};
     use sha2::{Digest, Sha256};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
     const HEADING_KEY: &str = "docx_heading_policy";
     const SECTION_KEY: &str = "docx_section_policy";
@@ -2715,5 +2724,179 @@ mod table_pass {
         assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
         assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
         assert_eq!(meta(&fx, TABLE_KEY).as_deref(), Some(TABLE_POLICY));
+    }
+
+    /// Set on the child [`run_in_hermetic_child`] starts, so the child runs the test body.
+    const HERMETIC_CHILD: &str = "GROOVE_F64_HERMETIC_CHILD";
+
+    /// Run the test `name` (with its module path) again in a child of this test binary under
+    /// the environment [`crate::common::embed_mock::hermetic`] pins; the copies [`super::reread_pass`]
+    /// and [`super::fold_pass`] hold are private to them. `true` in the parent, after the child
+    /// passed exactly one test; `false` in the child.
+    ///
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn run_in_hermetic_child(name: &str) -> bool {
+        if std::env::var_os(HERMETIC_CHILD).is_some() {
+            return false;
+        }
+        let cache = TempRoot::new("groove-f64-fastembed");
+        let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+        cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(HERMETIC_CHILD, "1");
+        hermetic(&mut cmd, cache.path());
+        let out = cmd.output().expect("run the test in a child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} failed in the child:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child ran no test named {name}:\n{stdout}\n{stderr}"
+        );
+        assert_dir_empty(cache.path());
+        true
+    }
+
+    /// The index and the embedder under `cfg`, opened the way `groove index` opens them.
+    ///
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
+        let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
+        let db_path = grooveseek::resolve_db_path(fx.kb());
+        let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
+        db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
+            .expect("embedding meta");
+        let embedder = Embedder::with_settings(embedding).expect("build the embedder");
+        (db, embedder)
+    }
+
+    /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
+    /// `groove index` wires it, reporting to `progress`.
+    ///
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
+        let kb = fx.kb();
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(kb).expect("parser registry");
+        let schema = load_declared_schema(kb).expect("groove-schema.toml");
+        let (db, mut embedder) = open_in_process(fx, &cfg);
+        rebuild_index(
+            &db,
+            &mut embedder,
+            kb,
+            schema,
+            false,
+            cfg.exclude_headings.as_deref(),
+            &cfg.resolve_exclude_dirs(),
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+    }
+
+    /// feature-64 I6 (AC16): the shape desktop sees -- a callback reporter, `force=false` --
+    /// hears `Indexed` for the document whose table rows are rejoined and `Unchanged` for the
+    /// one without a table.
+    #[test]
+    fn a_rejoined_docx_reports_indexed_and_a_table_free_one_unchanged() {
+        if run_in_hermetic_child(
+            "table_pass::a_rejoined_docx_reports_indexed_and_a_table_free_one_unchanged",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f64-i6");
+        let grid = grid_docx();
+        write_bytes(&fx, "a-grid.docx", &grid);
+        write_bytes(&fx, "b-clean.docx", &clean_docx());
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        write_v1171_grid_rows(&fx, "a-grid.docx", &grid);
+        delete_meta(&fx, TABLE_KEY);
+
+        let log: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let reporter = ProgressReporter::with_callback(Box::new(move |ev| {
+            let seen = match ev {
+                ProgressEvent::Indexed { rel, .. } => Some((rel.to_string(), "indexed")),
+                ProgressEvent::Unchanged { rel, .. } => Some((rel.to_string(), "unchanged")),
+                _ => None,
+            };
+            if let Some(seen) = seen {
+                sink.lock().expect("log").push(seen);
+            }
+        }));
+        rebuild_in_process(&fx, reporter).expect("second run");
+        assert_eq!(
+            *log.lock().expect("log"),
+            vec![
+                ("a-grid.docx".to_string(), "indexed"),
+                ("b-clean.docx".to_string(), "unchanged"),
+            ]
+        );
+        assert_eq!(
+            column(&fx, "a-grid.docx", "content"),
+            vec![Some(grid_new_content())]
+        );
+        assert_eq!(meta(&fx, TABLE_KEY).as_deref(), Some(TABLE_POLICY));
+    }
+
+    /// feature-64 I7 (AC21): the watcher records no table key. It leaves an unchanged
+    /// document's v1.17.1 rows alone and writes a changed one a row per line.
+    #[test]
+    fn the_watcher_rejoins_a_changed_docx_and_records_no_table_generation() {
+        if run_in_hermetic_child(
+            "table_pass::the_watcher_rejoins_a_changed_docx_and_records_no_table_generation",
+        ) {
+            return;
+        }
+        let fx = docx_kb("groove-f64-i7");
+        let grid = grid_docx();
+        write_bytes(&fx, "kept.docx", &grid);
+        let draft = document_xml(&[(None, PREFACE)]);
+        write_bytes(
+            &fx,
+            "draft.docx",
+            &docx(&[("word/document.xml", draft.as_bytes())]),
+        );
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        write_v1171_grid_rows(&fx, "kept.docx", &grid);
+        delete_meta(&fx, TABLE_KEY);
+
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+        let kb = fx.kb().canonicalize().expect("canonical kb");
+        let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+        let unchanged = reindex_single_file(&db, &mut embedder, &kb, "kept.docx", None, &registry)
+            .expect("reindex the unchanged document");
+        assert_eq!(unchanged, SingleResult::Unchanged);
+        assert_eq!(
+            column(&fx, "kept.docx", "content"),
+            vec![Some(grid_old_content())],
+            "the watcher runs no pass"
+        );
+
+        write_bytes(&fx, "draft.docx", &grid);
+        let changed = reindex_single_file(&db, &mut embedder, &kb, "draft.docx", None, &registry)
+            .expect("reindex the changed document");
+        assert_eq!(
+            changed,
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            column(&fx, "draft.docx", "content"),
+            vec![Some(grid_new_content())]
+        );
+        assert_eq!(
+            meta(&fx, TABLE_KEY),
+            None,
+            "the watcher records no generation"
+        );
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
     }
 }
