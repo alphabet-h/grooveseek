@@ -24,7 +24,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **The first `groove index` or `rebuild_index` of this version re-reads every unchanged `.docx`
   once**, as the first runs of 1.16.0 and 1.17.0 did. Coming from 1.17.x, the notice says
   `table rows are now one line each, cells separated by tabs`; from an older version it keeps the
-  1.16.0 wording. Only documents with a table whose rows change are re-embedded. **If you run
+  1.16.0 wording. Only documents whose sections change are re-embedded. **If you run
   `groove serve`, restart it on this version first, then call `rebuild_index` or run `groove index`
   once.** See [ADR-0028](docs/decisions/0028-reread-unchanged-docx-once-per-index.md).
 
