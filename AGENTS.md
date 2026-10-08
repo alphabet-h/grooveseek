@@ -160,3 +160,18 @@ module**, which Rust does not let you name from here and rustdoc reports as "no
 item named". Link the module and leave the item in prose — `` the gate in
 [`crate::watcher`] ... `should_process_parts` `` — rather than widening the
 item's visibility so a sentence can point at it.
+
+A second case is a doc comment that is not only rustdoc: `///` on an MCP tool's
+argument struct and its fields, which schemars copies verbatim into the JSON
+schema `description` the client reads. There a link reaches the client as
+literal `` [`foo`] `` brackets, and a name in plain backticks is the unchecked
+form this rule exists to remove, so neither is allowed: name no function, type,
+constant or module of this tree in that comment, and say what it does instead —
+"the topic-listing tool", not the method behind it. A sentence that has to name
+a tool goes in the `#[tool(description = "...")]` string, which is not rustdoc.
+The argument names themselves — the struct's fields, like `` `path_globs` `` —
+stay in backticks: a field is not one of the four kinds this rule links, and its
+name is exactly what the client sends. `server.rs` named a method in plain prose
+in the `SearchParams` docs for `category` and `topic`, and the review that
+caught it could not take the usual fix, because the link would have shown up in
+every client's schema.
