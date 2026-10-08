@@ -1844,9 +1844,10 @@ mod fold_pass {
         chunks
     }
 
-    /// Replace `rel`'s rows with the ones v1.16.0 wrote for `bytes` (a [`rules_docx`]), under
-    /// the hash of `bytes`, through the public write API, so the unchanged fast path keeps them.
-    fn write_v116_rules_rows(fx: &Fixture, rel: &str, bytes: &[u8]) {
+    /// Replace `rel`'s rows with the ones v1.16.0 wrote for `bytes` (a [`rules_docx`] titled
+    /// `title`), under the hash of `bytes`, through the public write API, so the unchanged fast
+    /// path keeps them.
+    fn write_v116_rules_rows(fx: &Fixture, rel: &str, title: &str, bytes: &[u8]) {
         let path = fx.layout.root().join(".groove.db");
         let db = Database::open(&path.to_string_lossy()).expect("open the index");
         db.delete_document(rel)
@@ -1854,7 +1855,7 @@ mod fold_pass {
         let id = db
             .upsert_document(
                 rel,
-                Some(RULES_TITLE),
+                Some(title),
                 None,
                 None,
                 None,
@@ -1994,7 +1995,7 @@ mod fold_pass {
         write_bytes(&fx, "b-clean.docx", &clean);
         write_bytes(&fx, "c-outline.docx", &outline);
         index_stderr(&fx);
-        write_v116_rules_rows(&fx, "a-rules.docx", &rules);
+        write_v116_rules_rows(&fx, "a-rules.docx", RULES_TITLE, &rules);
         assert_eq!(
             empty_chunks(&fx, "a-rules.docx"),
             3,
@@ -2098,7 +2099,7 @@ mod fold_pass {
         write_bytes(&fx, "a-rules.docx", &rules);
         write_bytes(&fx, "b-clean.docx", &clean_docx());
         rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
-        write_v116_rules_rows(&fx, "a-rules.docx", &rules);
+        write_v116_rules_rows(&fx, "a-rules.docx", RULES_TITLE, &rules);
         delete_meta(&fx, SECTION_KEY);
 
         let log: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2147,8 +2148,8 @@ mod fold_pass {
             &docx(&[("word/document.xml", draft.as_bytes())]),
         );
         rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
-        write_v116_rules_rows(&fx, "kept.docx", &rules);
-        write_v116_rules_rows(&fx, "old.docx", &ledger);
+        write_v116_rules_rows(&fx, "kept.docx", RULES_TITLE, &rules);
+        write_v116_rules_rows(&fx, "old.docx", "Ledger", &ledger);
         delete_meta(&fx, SECTION_KEY);
 
         let cfg = Config::load_from(&fx.config).expect("load groove.toml");
