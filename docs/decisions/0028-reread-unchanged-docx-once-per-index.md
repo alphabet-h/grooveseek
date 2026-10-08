@@ -66,7 +66,7 @@ the catch-up open for every other one.
   (`tab-joined-rows`), opens the same pass for the change that writes each
   table row as one line. The final transaction writes it after the other two.
   When only this key is stale, the notice names the table change instead.
-  `CHANGELOG.md`, v1.18.0 → Changed.
+  PR #353; `CHANGELOG.md`, v1.18.0 → Changed.
 - After the deletion sweep, in one transaction, every `.docx` row this run did
   not settle — the scan skipped it, it failed to parse, the endpoint refused
   it, or its bytes changed under the read — gets the content hash
