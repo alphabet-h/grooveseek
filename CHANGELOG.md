@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-09
+
 ### Changed
 
 - **`.docx` tables are indexed one row per line, with the cells of a row separated by tabs**, the way
@@ -6035,7 +6037,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.17.1...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/alphabet-h/grooveseek/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/alphabet-h/grooveseek/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/alphabet-h/grooveseek/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/alphabet-h/grooveseek/compare/v1.15.0...v1.16.0

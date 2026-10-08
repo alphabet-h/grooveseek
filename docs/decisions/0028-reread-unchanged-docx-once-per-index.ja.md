@@ -53,7 +53,7 @@ run で — 正しく分かれている文書を再 embedding せず、読めな
   PR #346、`CHANGELOG.md` の v1.17.0 → Changed。
   *(2026-10-09、v1.18.0)* 3 本目の key `index_meta.docx_table_policy`
   (`tab-joined-rows`) が、表の行を 1 行に書く変更のために同じ pass を開く。最後の transaction でこの key を他の 2 本の後に書く。
-  この key だけが古い時、告知は表の変更を名指す文になる。`CHANGELOG.md` の v1.18.0 → Changed。
+  この key だけが古い時、告知は表の変更を名指す文になる。PR #353、`CHANGELOG.md` の v1.18.0 → Changed。
 - 削除の掃き出しの後、1 つの transaction で、この run で決着しなかった `.docx` の行 — 走査で
   skip された、parse に失敗した、endpoint に拒まれた、読む間に bytes が変わった — の content hash
   を `awaiting-reparse` にし、key を書く。印はその時点で行が何を持っていても書く。cancel された
