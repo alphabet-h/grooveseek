@@ -1880,9 +1880,15 @@ mod fold_pass {
         }
     }
 
+    /// The headings of [`headings_alone_docx`], styled `1` and `3` in that order.
+    const OUTLINE_HEADINGS: [&str; 2] = ["Summit", "Ridge"];
+
     /// Headings alone, with no body text: a document R2 keeps a chunk per heading for.
     fn headings_alone_docx() -> Vec<u8> {
-        let doc = document_xml(&[(Some("1"), "Summit"), (Some("3"), "Ridge")]);
+        let doc = document_xml(&[
+            (Some("1"), OUTLINE_HEADINGS[0]),
+            (Some("3"), OUTLINE_HEADINGS[1]),
+        ]);
         let styles = styles_xml(&word2010_ja_styles());
         let core = core_xml("Outline");
         docx(&[
@@ -2048,7 +2054,7 @@ mod fold_pass {
         );
         // AC16, directly: the headings of `headings_alone_docx` reach no embed request, and
         // neither does an empty input.
-        for heading in ["Summit", "Ridge"] {
+        for heading in OUTLINE_HEADINGS {
             assert!(
                 embedded.iter().all(|t| !t.contains(heading)),
                 "the outline document was not re-embedded ({heading}): {embedded:?}"
