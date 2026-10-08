@@ -98,6 +98,14 @@ An ADR is never edited to reflect a reversal and never deleted. To change a
 decision, add a new ADR and set the old one's status to
 `superseded by ADR-NNNN`. The discarded reasoning is the point of the record.
 
+*(2026-10-08)* A later release may change a fact an ADR states without
+reversing its decision — a second key beside the one it names, a limitation
+it lists that has since been retired. That is recorded in place as a note
+that carries its date and version, as ADR-0020 and ADR-0028 do: the `Status`
+line stays, and the decision's own text is left as written. "Only the
+`Status` line changes over time" above speaks of the decision, not of such
+notes.
+
 Statuses used: `proposed`, `accepted`, `rejected`, `deprecated`,
 `superseded by ADR-NNNN`.
 

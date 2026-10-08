@@ -47,6 +47,10 @@ run で — 正しく分かれている文書を再 embedding せず、読めな
   一致すればそのままで再 embedding しない、違えば普通の経路で書く、chunk が 1 つも無ければ行を
   消して skip に数える (`--force` なら行が残らないのと同じ)。内容の変わった `.docx` は普通の経路、
   既に強制されている rename は強制のまま。
+  *(2026-10-07、v1.17.0)* 2 本目の key `index_meta.docx_section_policy`
+  (`fold-empty-headings`) も同じ pass を開く: どちらかの key が現行値でない間 pass は走り、
+  最後の transaction で heading key、section key の順に両方を書く。pass の中身は変わらない。
+  PR #346、`CHANGELOG.md` の v1.17.0 → Changed。
 - 削除の掃き出しの後、1 つの transaction で、この run で決着しなかった `.docx` の行 — 走査で
   skip された、parse に失敗した、endpoint に拒まれた、読む間に bytes が変わった — の content hash
   を `awaiting-reparse` にし、key を書く。印はその時点で行が何を持っていても書く。cancel された
@@ -67,6 +71,7 @@ run で — 正しく分かれている文書を再 embedding せず、読めな
   読まないので、新しい版の daemon は `rebuild_index` を 1 回待つ。前の版のままの daemon は、key の
   記録後も編集された `.docx` を旧規則で書き続け、それは `--force` でしか戻らない。downgrade も同じ。
 - **見直す時**: 別の形式でも同じ追いつきが要る変更が来た時。行ごとの列 (選択肢 1) が一般形。
+  *(2026-10-07、v1.17.0)* `.docx` に同じ種類の key が 3 本目に要る時も見直す。v1.17.0 で 2 本になった。
 - **test が守る場所**: `grooveseek/src/indexer.rs` (読み直し、述語、印)、`grooveseek/src/db.rs`
   (key と上書き)、`grooveseek/src/indexer/progress.rs` (告知行)、
   `grooveseek/tests/index_docx_heading_policy.rs` (run、cancel、callback、watcher)。
