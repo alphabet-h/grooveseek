@@ -2292,3 +2292,428 @@ mod fold_pass {
         );
     }
 }
+
+/// feature-64: a `.docx` table is indexed one row per line, its cells separated by a tab, and
+/// an index written before that re-reads its unchanged `.docx` once more under a third
+/// generation key, `docx_table_policy`, beside the unchanged `docx_heading_policy` and
+/// `docx_section_policy`. Appended to this file so it uses the docx builders above; the DB
+/// helpers of [`fold_pass`] are private to it, so the ones this module needs are repeated here
+/// rather than opened up, which would edit that module.
+mod table_pass {
+    use super::*;
+    use crate::common::embed_mock::DOC_MODEL;
+    use grooveseek::db::Database;
+    use rusqlite::{Connection, OptionalExtension};
+    use sha2::{Digest, Sha256};
+
+    const HEADING_KEY: &str = "docx_heading_policy";
+    const SECTION_KEY: &str = "docx_section_policy";
+    const TABLE_KEY: &str = "docx_table_policy";
+    /// The values of the two keys this feature leaves as they were.
+    const HEADING_POLICY: &str = "styles-name-basedon";
+    const SECTION_POLICY: &str = "fold-empty-headings";
+    const TABLE_POLICY: &str = "tab-joined-rows";
+    const AWAITING: &str = "awaiting-reparse";
+    /// What the notice says when the table key alone is stale.
+    const TABLE_NOTICE: &str = "table rows are now one line each, cells separated by tabs";
+    /// What it says otherwise, as it has since feature-62.
+    const OLD_NOTICE: &str = "headings now come from word/styles.xml";
+
+    /// The heading of [`grid_docx`], styled `Heading1` with no styles part.
+    const GRID_HEADING: &str = "Discount";
+    /// The cells of [`grid_docx`], row by row, sharing no word with the other documents here.
+    const GRID_ROWS: [[&str; 2]; 3] = [
+        ["Rate", "Approver"],
+        ["five percent", "section chief"],
+        ["ten percent", "managing director"],
+    ];
+
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn db(fx: &Fixture) -> Connection {
+        Connection::open(fx.layout.root().join(".groove.db")).expect("open the index")
+    }
+
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn meta(fx: &Fixture, key: &str) -> Option<String> {
+        db(fx)
+            .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .expect("read index_meta")
+    }
+
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn delete_meta(fx: &Fixture, key: &str) {
+        db(fx)
+            .execute("DELETE FROM index_meta WHERE key = ?1", [key])
+            .expect("delete an index_meta key");
+    }
+
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn content_hash(fx: &Fixture, rel: &str) -> Option<String> {
+        db(fx)
+            .query_row(
+                "SELECT content_hash FROM documents WHERE path = ?1",
+                [rel],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("read content_hash")
+    }
+
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// The `name` column of `rel`'s chunks, in chunk order.
+    /// Copy of the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn column(fx: &Fixture, rel: &str, name: &str) -> Vec<Option<String>> {
+        let conn = db(fx);
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT c.{name} FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.path = ?1 ORDER BY c.chunk_index"
+            ))
+            .expect("prepare");
+        stmt.query_map([rel], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    }
+
+    /// The AC1 document of feature-62 ([`numeric_heading_docx`]): no table, so this feature
+    /// changes nothing in it.
+    fn clean_docx() -> Vec<u8> {
+        numeric_heading_docx(TITLE, &[])
+    }
+
+    /// [`GRID_HEADING`] over a table of [`GRID_ROWS`], each cell one paragraph: one chunk.
+    fn grid_docx() -> Vec<u8> {
+        let mut body = format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{GRID_HEADING}</w:t></w:r></w:p><w:tbl>"#
+        );
+        for row in GRID_ROWS {
+            body.push_str("<w:tr>");
+            for cell in row {
+                body.push_str(&format!(
+                    "<w:tc><w:p><w:r><w:t>{cell}</w:t></w:r></w:p></w:tc>"
+                ));
+            }
+            body.push_str("</w:tr>");
+        }
+        body.push_str("</w:tbl>");
+        let doc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}"><w:body>{body}</w:body></w:document>"#
+        );
+        docx(&[("word/document.xml", doc.as_bytes())])
+    }
+
+    /// The content this version writes for [`grid_docx`]: a line per row, cells tab-joined.
+    fn grid_new_content() -> String {
+        GRID_ROWS
+            .iter()
+            .map(|row| row.join("\t"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The content v1.17.1 wrote for [`grid_docx`]: a line per cell.
+    fn grid_old_content() -> String {
+        GRID_ROWS.concat().join("\n")
+    }
+
+    /// Replace `rel`'s rows with the ones v1.17.1 wrote for `bytes` (a [`grid_docx`]), under
+    /// the hash of `bytes`, through the public write API, so the unchanged fast path keeps them.
+    fn write_v1171_grid_rows(fx: &Fixture, rel: &str, bytes: &[u8]) {
+        let path = fx.layout.root().join(".groove.db");
+        let db = Database::open(&path.to_string_lossy()).expect("open the index");
+        db.delete_document(rel)
+            .expect("drop the rows this version wrote");
+        let id = db
+            .upsert_document(
+                rel,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                &sha256_hex(bytes),
+                bytes.len() as u64,
+            )
+            .expect("a v1.17.1 row");
+        db.insert_chunk(
+            id,
+            0,
+            Some(GRID_HEADING),
+            Some(2),
+            &grid_old_content(),
+            None,
+            &[0.125_f32; DIM],
+            1.0,
+        )
+        .expect("a v1.17.1 chunk");
+    }
+
+    /// feature-64 I1 (AC14): a new index records all three generations, the two older ones at
+    /// the values they always had, announces nothing, and writes the table one row per line.
+    #[test]
+    fn a_new_index_records_all_three_docx_generations() {
+        let fx = docx_kb("groove-f64-i1");
+        write_bytes(&fx, "a-grid.docx", &grid_docx());
+        let stderr = index_stderr(&fx);
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        assert_eq!(meta(&fx, TABLE_KEY).as_deref(), Some(TABLE_POLICY));
+        assert_eq!(
+            column(&fx, "a-grid.docx", "content"),
+            vec![Some(grid_new_content())]
+        );
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-64 I2 (AC15〜AC17): an index whose table rows v1.17.1 wrote, with the heading
+    /// and section keys at their values and no table key, re-reads its unchanged `.docx` once,
+    /// says so with the table notice, rewrites and re-embeds only the document with a table,
+    /// records all three keys, and takes the fast path from the next run.
+    #[test]
+    fn a_v1171_index_rejoins_its_table_rows_once() {
+        let fx = docx_kb("groove-f64-i2");
+        let grid = grid_docx();
+        let clean = clean_docx();
+        write_bytes(&fx, "a-grid.docx", &grid);
+        write_bytes(&fx, "b-clean.docx", &clean);
+        index_stderr(&fx);
+        write_v1171_grid_rows(&fx, "a-grid.docx", &grid);
+
+        let control = index_stderr(&fx);
+        assert!(!control.contains("Re-reading"), "{control}");
+        assert!(control.contains("(0 updated, "), "{control}");
+        assert_eq!(
+            column(&fx, "a-grid.docx", "content"),
+            vec![Some(grid_old_content())],
+            "with all three keys at their value the old rows stay on the fast path"
+        );
+
+        delete_meta(&fx, TABLE_KEY);
+        let before = fx.mock.requests().len();
+        let second = index_stderr(&fx);
+        assert!(
+            second.contains(&format!(
+                "Re-reading 2 unchanged .docx document(s) once: {TABLE_NOTICE}"
+            )),
+            "{second}"
+        );
+        assert!(!second.contains(OLD_NOTICE), "{second}");
+        assert!(second.contains("(1 updated, "), "{second}");
+        assert_eq!(
+            column(&fx, "a-grid.docx", "content"),
+            vec![Some(grid_new_content())]
+        );
+        let embedded: Vec<String> = fx
+            .requests_since(before)
+            .iter()
+            .filter(|r| r.model() == Some(DOC_MODEL))
+            .flat_map(|r| r.inputs())
+            .collect();
+        assert!(
+            embedded.iter().any(|t| t.contains(&grid_new_content())),
+            "the grid was re-embedded: {embedded:?}"
+        );
+        assert!(
+            embedded
+                .iter()
+                .all(|t| !t.contains(B_FIRST) && !t.contains(B_SECOND)),
+            "the document without a table was not: {embedded:?}"
+        );
+        assert_eq!(content_hash(&fx, "b-clean.docx"), Some(sha256_hex(&clean)));
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        assert_eq!(meta(&fx, TABLE_KEY).as_deref(), Some(TABLE_POLICY));
+
+        let before = fx.mock.requests().len();
+        let third = index_stderr(&fx);
+        assert!(!third.contains("Re-reading"), "{third}");
+        assert!(third.contains("(0 updated, "), "{third}");
+        assert!(
+            fx.requests_since(before)
+                .iter()
+                .all(|r| r.model() != Some(DOC_MODEL)),
+            "nothing is embedded once the pass is recorded"
+        );
+        assert_dir_empty(&fx.cache);
+    }
+
+    /// feature-64 I3 (AC18): when the heading or section key is stale too -- all three gone,
+    /// as in an index older than v1.16.0, or the section key alone gone beside a current table
+    /// key -- the one pass keeps the notice it always had and catches up with the tables in the
+    /// same run.
+    #[test]
+    fn a_v116_index_catches_up_on_all_three_in_one_pass() {
+        let cases: [(&str, &[&str]); 2] = [
+            ("all", &[HEADING_KEY, SECTION_KEY, TABLE_KEY]),
+            ("section", &[SECTION_KEY]),
+        ];
+        for (case, stale) in cases {
+            let fx = docx_kb(&format!("groove-f64-i3-{case}"));
+            let grid = grid_docx();
+            write_bytes(&fx, "a-grid.docx", &grid);
+            write_bytes(&fx, "b-clean.docx", &clean_docx());
+            index_stderr(&fx);
+            write_v1171_grid_rows(&fx, "a-grid.docx", &grid);
+            for key in stale {
+                delete_meta(&fx, key);
+            }
+
+            let second = index_stderr(&fx);
+            assert!(
+                second.contains(&format!(
+                    "Re-reading 2 unchanged .docx document(s) once: {OLD_NOTICE}"
+                )),
+                "({case}) {second}"
+            );
+            assert!(!second.contains(TABLE_NOTICE), "({case}) {second}");
+            assert!(second.contains("(1 updated, "), "({case}) {second}");
+            assert_eq!(
+                column(&fx, "a-grid.docx", "content"),
+                vec![Some(grid_new_content())],
+                "({case})"
+            );
+            assert_eq!(
+                meta(&fx, HEADING_KEY).as_deref(),
+                Some(HEADING_POLICY),
+                "({case})"
+            );
+            assert_eq!(
+                meta(&fx, SECTION_KEY).as_deref(),
+                Some(SECTION_POLICY),
+                "({case})"
+            );
+            assert_eq!(
+                meta(&fx, TABLE_KEY).as_deref(),
+                Some(TABLE_POLICY),
+                "({case})"
+            );
+
+            let third = index_stderr(&fx);
+            assert!(!third.contains("Re-reading"), "({case}) {third}");
+            assert_dir_empty(&fx.cache);
+        }
+    }
+
+    /// feature-64 I4 (AC19): `--force` records all three generations without the notice.
+    #[test]
+    fn a_forced_run_records_the_table_generation() {
+        let fx = docx_kb("groove-f64-i4");
+        write_bytes(&fx, "a-grid.docx", &grid_docx());
+        index_stderr(&fx);
+        delete_meta(&fx, TABLE_KEY);
+
+        let out = fx.index_force();
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("Re-reading"), "{stderr}");
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        assert_eq!(meta(&fx, TABLE_KEY).as_deref(), Some(TABLE_POLICY));
+        assert_eq!(
+            column(&fx, "a-grid.docx", "content"),
+            vec![Some(grid_new_content())]
+        );
+    }
+
+    /// The decompression budget of the failing run: a document over it fails to parse.
+    const DEC_CAP: usize = 16_384;
+
+    /// A knowledge base for the failing run: `a-bloat.docx`, whose `word/document.xml` alone
+    /// is over [`DEC_CAP`], and `b-tidy.docx`, a document within it; indexed once under the
+    /// default caps, then left with the heading and section keys at their values and no table
+    /// key, under [`DEC_CAP`].
+    /// Adapted from the helper of the same name in [`super::fold_pass`] (existing tests are not edited).
+    fn failing_run_kb(prefix: &str) -> (Fixture, String) {
+        let fx = docx_kb(prefix);
+        let bloat_doc = pad_to(
+            &document_xml(&[(Some("1"), H_FIRST), (None, B_FIRST)]),
+            "</w:body>",
+            DEC_CAP + 1,
+        );
+        let bloat = docx(&[("word/document.xml", bloat_doc.as_bytes())]);
+        write_bytes(&fx, "a-bloat.docx", &bloat);
+        write_bytes(&fx, "b-tidy.docx", &numeric_heading_docx("Ledger", &[]));
+        index_stderr(&fx);
+        delete_meta(&fx, TABLE_KEY);
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        configure(
+            &fx,
+            "",
+            MD_AND_DOCX,
+            &format!("[index]\nmax_decompressed_size = {DEC_CAP}\n"),
+        );
+        (fx, sha256_hex(&bloat))
+    }
+
+    /// feature-64 I5 (AC20): the write of the table key fails, so the run returns an error and
+    /// records nothing -- no table key, no row marked. With the trigger gone the next run
+    /// announces the table pass, marks the row it cannot read, and records all three keys.
+    #[test]
+    fn a_run_whose_table_key_fails_records_no_table_generation() {
+        let (fx, bloat_hash) = failing_run_kb("groove-f64-i5");
+        {
+            let conn = db(&fx);
+            conn.execute_batch("CREATE TRIGGER inject_table_policy_failure BEFORE INSERT ON index_meta WHEN NEW.key = 'docx_table_policy' BEGIN SELECT RAISE(ABORT, 'injected table policy failure'); END;")
+                .expect("create the trigger");
+            let probe = conn
+                .execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_table_policy', 'probe')",
+                    [],
+                )
+                .expect_err("premise: the trigger stops the table key");
+            assert!(
+                probe.to_string().contains("injected table policy failure"),
+                "{probe}"
+            );
+        }
+
+        let out = fx.run_index();
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("injected table policy failure"), "{stderr}");
+        assert_eq!(
+            meta(&fx, TABLE_KEY),
+            None,
+            "the failed run records no table key"
+        );
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        let marked: i64 = db(&fx)
+            .query_row(
+                "SELECT count(*) FROM documents WHERE content_hash = ?1",
+                [AWAITING],
+                |r| r.get(0),
+            )
+            .expect("count marks");
+        assert_eq!(marked, 0, "the failed run marks nothing");
+        assert_eq!(
+            content_hash(&fx, "a-bloat.docx").as_deref(),
+            Some(bloat_hash.as_str())
+        );
+
+        db(&fx)
+            .execute_batch("DROP TRIGGER inject_table_policy_failure;")
+            .expect("drop the trigger");
+        let next = index_stderr(&fx);
+        assert!(
+            next.contains(&format!(
+                "Re-reading 2 unchanged .docx document(s) once: {TABLE_NOTICE}"
+            )),
+            "{next}"
+        );
+        assert_eq!(content_hash(&fx, "a-bloat.docx").as_deref(), Some(AWAITING));
+        assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+        assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
+        assert_eq!(meta(&fx, TABLE_KEY).as_deref(), Some(TABLE_POLICY));
+    }
+}

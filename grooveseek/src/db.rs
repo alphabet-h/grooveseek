@@ -8266,6 +8266,39 @@ mod tests {
         );
     }
 
+    /// feature-64 M1 (AC23): the docx table generation is a key of its own beside the heading,
+    /// section and frontmatter ones, and writing it leaves them alone.
+    #[test]
+    fn docx_table_policy_round_trips_beside_the_other_docx_policies() {
+        let db = db_with_384();
+        assert_eq!(db.read_docx_table_policy().unwrap(), None);
+        db.write_frontmatter_policy("tag-unparsed").unwrap();
+        db.write_docx_heading_policy("styles-name-basedon").unwrap();
+        db.write_docx_section_policy("fold-empty-headings").unwrap();
+        db.write_docx_table_policy("tab-joined-rows").unwrap();
+        assert_eq!(
+            db.read_docx_table_policy().unwrap().as_deref(),
+            Some("tab-joined-rows")
+        );
+        db.write_docx_table_policy("next").unwrap();
+        assert_eq!(
+            db.read_docx_table_policy().unwrap().as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            db.read_docx_section_policy().unwrap().as_deref(),
+            Some("fold-empty-headings")
+        );
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some("styles-name-basedon")
+        );
+        assert_eq!(
+            db.read_frontmatter_policy().unwrap().as_deref(),
+            Some("tag-unparsed")
+        );
+    }
+
     /// feature-62: overwriting the content hash touches the named rows' hash and nothing
     /// else -- not the chunks, not another row -- and a path without a row is skipped.
     #[test]
