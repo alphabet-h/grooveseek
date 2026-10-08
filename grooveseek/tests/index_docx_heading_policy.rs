@@ -1844,9 +1844,10 @@ mod fold_pass {
         chunks
     }
 
-    /// Replace `rel`'s rows with the ones v1.16.0 wrote for `bytes` (a [`rules_docx`]), under
-    /// the hash of `bytes`, through the public write API, so the unchanged fast path keeps them.
-    fn write_v116_rules_rows(fx: &Fixture, rel: &str, bytes: &[u8]) {
+    /// Replace `rel`'s rows with the ones v1.16.0 wrote for `bytes` (a [`rules_docx`] titled
+    /// `title`), under the hash of `bytes`, through the public write API, so the unchanged fast
+    /// path keeps them.
+    fn write_v116_rules_rows(fx: &Fixture, rel: &str, title: &str, bytes: &[u8]) {
         let path = fx.layout.root().join(".groove.db");
         let db = Database::open(&path.to_string_lossy()).expect("open the index");
         db.delete_document(rel)
@@ -1854,7 +1855,7 @@ mod fold_pass {
         let id = db
             .upsert_document(
                 rel,
-                Some(RULES_TITLE),
+                Some(title),
                 None,
                 None,
                 None,
@@ -1879,9 +1880,15 @@ mod fold_pass {
         }
     }
 
+    /// The headings of [`headings_alone_docx`], styled `1` and `3` in that order.
+    const OUTLINE_HEADINGS: [&str; 2] = ["Summit", "Ridge"];
+
     /// Headings alone, with no body text: a document R2 keeps a chunk per heading for.
     fn headings_alone_docx() -> Vec<u8> {
-        let doc = document_xml(&[(Some("1"), "Summit"), (Some("3"), "Ridge")]);
+        let doc = document_xml(&[
+            (Some("1"), OUTLINE_HEADINGS[0]),
+            (Some("3"), OUTLINE_HEADINGS[1]),
+        ]);
         let styles = styles_xml(&word2010_ja_styles());
         let core = core_xml("Outline");
         docx(&[
@@ -1994,7 +2001,7 @@ mod fold_pass {
         write_bytes(&fx, "b-clean.docx", &clean);
         write_bytes(&fx, "c-outline.docx", &outline);
         index_stderr(&fx);
-        write_v116_rules_rows(&fx, "a-rules.docx", &rules);
+        write_v116_rules_rows(&fx, "a-rules.docx", RULES_TITLE, &rules);
         assert_eq!(
             empty_chunks(&fx, "a-rules.docx"),
             3,
@@ -2045,6 +2052,18 @@ mod fold_pass {
                 .all(|t| !t.contains(B_FIRST) && !t.contains(B_SECOND)),
             "the clean document was not: {embedded:?}"
         );
+        // AC16, directly: the headings of `headings_alone_docx` reach no embed request, and
+        // neither does an empty input.
+        for heading in OUTLINE_HEADINGS {
+            assert!(
+                embedded.iter().all(|t| !t.contains(heading)),
+                "the outline document was not re-embedded ({heading}): {embedded:?}"
+            );
+        }
+        assert!(
+            embedded.iter().all(|t| !t.is_empty()),
+            "no empty input was embedded: {embedded:?}"
+        );
         assert_eq!(content_hash(&fx, "b-clean.docx"), Some(sha256_hex(&clean)));
         assert_eq!(
             content_hash(&fx, "c-outline.docx"),
@@ -2086,7 +2105,7 @@ mod fold_pass {
         write_bytes(&fx, "a-rules.docx", &rules);
         write_bytes(&fx, "b-clean.docx", &clean_docx());
         rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
-        write_v116_rules_rows(&fx, "a-rules.docx", &rules);
+        write_v116_rules_rows(&fx, "a-rules.docx", RULES_TITLE, &rules);
         delete_meta(&fx, SECTION_KEY);
 
         let log: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2135,8 +2154,8 @@ mod fold_pass {
             &docx(&[("word/document.xml", draft.as_bytes())]),
         );
         rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
-        write_v116_rules_rows(&fx, "kept.docx", &rules);
-        write_v116_rules_rows(&fx, "old.docx", &ledger);
+        write_v116_rules_rows(&fx, "kept.docx", RULES_TITLE, &rules);
+        write_v116_rules_rows(&fx, "old.docx", "Ledger", &ledger);
         delete_meta(&fx, SECTION_KEY);
 
         let cfg = Config::load_from(&fx.config).expect("load groove.toml");
@@ -2205,5 +2224,71 @@ mod fold_pass {
             "the watcher records no generation"
         );
         assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
+    }
+
+    /// feature-63 I5b (AC21): with both keys absent, the watcher's reindex of a changed docx
+    /// and its rename of one with changed content leave both absent -- unlike I9, which pins
+    /// the heading key on the reindex path alone, and I5, which removes the section key alone.
+    #[test]
+    fn the_watcher_records_neither_key_when_both_are_absent() {
+        if run_in_hermetic_child("fold_pass::the_watcher_records_neither_key_when_both_are_absent")
+        {
+            return;
+        }
+        let fx = docx_kb("groove-f63-i5b");
+        let draft = document_xml(&[(None, PREFACE)]);
+        write_bytes(
+            &fx,
+            "draft.docx",
+            &docx(&[("word/document.xml", draft.as_bytes())]),
+        );
+        write_bytes(&fx, "old.docx", &rules_docx("Ledger"));
+        rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+        delete_meta(&fx, SECTION_KEY);
+        delete_meta(&fx, HEADING_KEY);
+
+        let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+        let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+        let kb = fx.kb().canonicalize().expect("canonical kb");
+        let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+        write_bytes(&fx, "draft.docx", &rules_docx("Draft"));
+        let changed = reindex_single_file(&db, &mut embedder, &kb, "draft.docx", None, &registry)
+            .expect("reindex the changed document");
+        assert_eq!(
+            changed,
+            SingleResult::Updated {
+                chunks: 7,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            (meta(&fx, HEADING_KEY), meta(&fx, SECTION_KEY)),
+            (None, None),
+            "the watcher's reindex writes neither the heading key nor the section key"
+        );
+
+        std::fs::remove_file(fx.kb().join("old.docx")).expect("move the old document away");
+        write_bytes(
+            &fx,
+            "moved.docx",
+            &rules_docx_with("Ledger", AMENDED_PREFACE),
+        );
+        let renamed = rename_single_file(
+            &db,
+            &mut embedder,
+            &kb,
+            "old.docx",
+            "moved.docx",
+            None,
+            &registry,
+        )
+        .expect("rename with changed content");
+        assert_eq!(renamed, RenameOutcome::RenamedAndReindexed { chunks: 7 });
+        assert_eq!(
+            (meta(&fx, HEADING_KEY), meta(&fx, SECTION_KEY)),
+            (None, None),
+            "the watcher's rename writes neither the heading key nor the section key"
+        );
     }
 }

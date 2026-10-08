@@ -976,16 +976,24 @@ pub(crate) mod fixture {
         Spelled,
     }
 
+    impl HeadingIds {
+        /// The styleId this form gives a heading of `level`: `1` when numbered, `Heading1`
+        /// when spelled.
+        pub(crate) fn style_id(self, level: impl std::fmt::Display) -> String {
+            match self {
+                HeadingIds::Numbered => level.to_string(),
+                HeadingIds::Spelled => format!("Heading{level}"),
+            }
+        }
+    }
+
     /// A document of `paragraphs`, whose heading styles are numbered `1` .. `3`, written with
     /// its headings named as `ids` says and titled `title`.
     fn headed_docx(paragraphs: &[(Option<&str>, &str)], ids: HeadingIds, title: &str) -> Vec<u8> {
         let renamed: Vec<(Option<String>, &str)> = paragraphs
             .iter()
             .map(|(id, text)| {
-                let id = id.map(|n| match ids {
-                    HeadingIds::Numbered => n.to_string(),
-                    HeadingIds::Spelled => format!("Heading{n}"),
-                });
+                let id = id.map(|n| ids.style_id(n));
                 (id, *text)
             })
             .collect();
@@ -2544,13 +2552,12 @@ mod tests {
         paragraphs
             .iter()
             .map(|(level, text)| {
-                let id = level.map(|n| {
-                    if numbered {
-                        n.to_string()
-                    } else {
-                        format!("Heading{n}")
-                    }
-                });
+                let ids = if numbered {
+                    HeadingIds::Numbered
+                } else {
+                    HeadingIds::Spelled
+                };
+                let id = level.map(|n| ids.style_id(n));
                 (id, *text)
             })
             .collect()
@@ -2590,16 +2597,19 @@ mod tests {
     }
 
     /// [`parse_both`] for a `<w:body>` written out by hand: `body` names its heading styles
-    /// `Heading1` / `Heading2` and is parsed as written, without a styles part, and again with
-    /// them numbered `1` / `2` under [`word2010_ja_styles`]. Both must split identically; the
-    /// first is returned.
+    /// `Heading1` .. `Heading3` and is parsed as written, without a styles part, and again with
+    /// them numbered `1` .. `3` under [`word2010_ja_styles`], which defines no deeper level.
+    /// Both must split identically; the first is returned.
     fn parse_raw_both(body: &str) -> ParsedDocument {
         let spelled = DocxParser::default()
             .parse_bytes(&wrap_document_xml(body), "docs/ledger.docx", &[])
             .expect("a generated document parses");
-        let numbered_body = body
-            .replace(r#"w:val="Heading1""#, r#"w:val="1""#)
-            .replace(r#"w:val="Heading2""#, r#"w:val="2""#);
+        let numbered_body = (1..=3).fold(body.to_string(), |acc, level| {
+            acc.replace(
+                &format!(r#"w:val="{}""#, HeadingIds::Spelled.style_id(level)),
+                &format!(r#"w:val="{}""#, HeadingIds::Numbered.style_id(level)),
+            )
+        });
         assert_ne!(numbered_body, body, "the body names its heading styles");
         let doc = document_xml_from_body(&numbered_body);
         let styles = styles_xml(&word2010_ja_styles());

@@ -307,7 +307,8 @@ impl Database {
             .optional()?)
     }
 
-    /// `index_meta.docx_heading_policy` を記録する (INSERT OR REPLACE、feature-62)。
+    /// Records `index_meta.docx_heading_policy` (feature-62), replacing any value already
+    /// there (INSERT OR REPLACE).
     pub fn write_docx_heading_policy(&self, policy: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_heading_policy', ?1)",
@@ -332,7 +333,8 @@ impl Database {
             .optional()?)
     }
 
-    /// `index_meta.docx_section_policy` を記録する (INSERT OR REPLACE、feature-63)。
+    /// Records `index_meta.docx_section_policy` (feature-63), replacing any value already
+    /// there (INSERT OR REPLACE).
     pub fn write_docx_section_policy(&self, policy: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_section_policy', ?1)",
