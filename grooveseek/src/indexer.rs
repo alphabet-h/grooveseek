@@ -1522,11 +1522,10 @@ pub fn rebuild_index(
     // over every row of a one-time pass (ADR-0029) this run could not settle: the ones the loop
     // marked, and the ones the scan skipped, which the loop never saw. One transaction, so the
     // key is never there without the marks (I-1). The marks are written over whatever the
-    // rows hold now,
-    // unconditionally: a row another process wrote since the loop is marked too, and re-read
-    // once more, rather than an old-rule row being kept (ADR-0028). `--force` rewrote every
-    // row, so it marks none. The counts in `result` read rows, not hashes, so the marks do not
-    // change them.
+    // rows hold now, unconditionally: a row another process wrote since the loop is marked too,
+    // and re-read once more, rather than an old-rule row being kept (ADR-0028). `--force`
+    // rewrote every row, so it marks none. The counts in `result` read rows, not hashes, so the
+    // marks do not change them.
     if force || any_stale {
         if any_stale {
             for rel in &skipped_paths {
@@ -1677,9 +1676,9 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
 /// A changed file whose new chunks match keeps its embeddings and has only its metadata
 /// rewritten ([`index_single_disk_entry`]).
 ///
-/// (feature-62) The one-time `.docx` pass ([`Reindex::Reparse`]) asks the same question of
+/// (feature-62) The one-time pass (ADR-0029, [`Reindex::Reparse`]) asks the same question of
 /// an unchanged document it re-read: matching chunks mean the row already splits the way the
-/// new heading rule does (AGENTS.md "One question gets one implementation").
+/// new rule does (AGENTS.md "One question gets one implementation").
 fn stored_chunks_match(
     db: &Database,
     rel: &str,
@@ -1732,7 +1731,7 @@ const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 /// two reads, so nothing about the retained row has been learned, and the skip keeps the
 /// check pending for the next run (codex P2, round 5).
 ///
-/// (feature-62) The one-time `.docx` pass returns it too, and there it means something else:
+/// (feature-62) The one-time pass (ADR-0029) returns it too, and there it means something else:
 /// for a [`Reindex::Reparse`] entry the skip leaves the row unsettled, so the end-of-run step
 /// gives it [`HASH_AWAITING_REPARSE`].
 const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
@@ -1879,8 +1878,8 @@ enum Reindex {
         check_frontmatter: bool,
         refresh_fields: bool,
     },
-    /// (feature-62) Read and parse a file whose hash matches: the one-time `.docx` pass of
-    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`]). Unlike [`Reindex::Incremental`], a matching
+    /// (feature-62) Read and parse a file whose hash matches: the one-time pass (ADR-0029) of
+    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`], [`PPTX_TABLE_BREAK_POLICY`]). Unlike [`Reindex::Incremental`], a matching
     /// hash does not return early; unlike [`Reindex::Force`], chunks that still match the row's
     /// are neither re-embedded nor written. Chunks that differ are written the ordinary way, and
     /// no chunks at all drop the row, since `--force` would leave none.
@@ -3187,8 +3186,8 @@ pub(crate) const DOCX_TABLE_POLICY: &str = "tab-joined-rows";
 /// format, so a stale key of one format never re-reads the other's rows (ADR-0029).
 pub(crate) const PPTX_TABLE_BREAK_POLICY: &str = "tab-joined-rows-kept-breaks";
 
-/// (feature-62) The `content_hash` a row of a one-time pass (ADR-0029) carries when that pass
-/// (first [`DOCX_HEADING_POLICY`]'s) could not settle it: skipped by the scan, failed to parse,
+/// (feature-62 introduced it for the `.docx` pass) The `content_hash` a row of a one-time pass
+/// (ADR-0029) carries when that pass could not settle it: skipped by the scan, failed to parse,
 /// refused by the endpoint, or changed under the read. No file hashes to it -- a SHA-256 here is 64
 /// lowercase hex digits ([`sha256_hex_bytes`]) -- so the unchanged fast path never matches it,
 /// and every later run reads the file the way it reads a changed one until it can be indexed.

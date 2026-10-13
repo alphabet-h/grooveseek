@@ -40,7 +40,6 @@ ADR-0028 が `.docx` で解いたのと同じ問題で、ADR-0028 の見直し�
 
 - 追いつきが要る形式ごとに `index_meta` の key を持つ: `.docx` は今の 3 本 (ADR-0028)、`.pptx` は
   `pptx_table_break_policy` (`tab-joined-rows-kept-breaks`)。
-  <!-- via: grep -o "docx_[a-z]*_policy" grooveseek/src/db/meta.rs | sort -u -->
 - 行を読み直すかは 1 つの述語 `rereads_unchanged_as(extension, stale, …)` が決める: その形式の
   pass が走っている、その形式の parser が書いた行である、hash が走査の hash と一致する。
   `rereads_unchanged_docx` はその `.docx` の場合。

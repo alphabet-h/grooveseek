@@ -25,9 +25,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   are unchanged.
 - **The first `groove index` or `rebuild_index` of this version re-reads every unchanged `.pptx`
   once**, announced as `Re-reading N unchanged .pptx document(s) once: ...`. Only decks whose
-  slides change are re-embedded, and no `.docx` is re-read. **If you run `groove serve`, restart it
-  on this version first, then call `rebuild_index` or run `groove index` once.** See
-  [ADR-0029](docs/decisions/0029-reread-unchanged-documents-once-per-format.md).
+  slides change are re-embedded, and this change re-reads no `.docx`. **If you run
+  `groove serve`, restart it on this version first, then call `rebuild_index` or run
+  `groove index` once.** See [ADR-0029](docs/decisions/0029-reread-unchanged-documents-once-per-format.md).
 
 ## [1.18.0] - 2026-10-09
 

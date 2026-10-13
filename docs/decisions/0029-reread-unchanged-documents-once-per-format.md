@@ -49,7 +49,6 @@ form.
 - Each format that needs a catch-up has its own key in `index_meta`:
   `.docx` keeps its three (ADR-0028), `.pptx` gets
   `pptx_table_break_policy` (`tab-joined-rows-kept-breaks`).
-  <!-- via: grep -o "docx_[a-z]*_policy" grooveseek/src/db/meta.rs | sort -u -->
 - One predicate, `rereads_unchanged_as(extension, stale, …)`, decides whether a
   row is re-read: that format's pass is running, the row was written by that
   format's parser, and its hash is the scan's. `rereads_unchanged_docx` is its

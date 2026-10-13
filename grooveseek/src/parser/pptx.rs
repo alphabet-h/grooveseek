@@ -478,15 +478,11 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                 ),
                 b"tbl" => {
                     // A table inside a table writes out the row so far first (R1.7).
-                    if let Some(open) = row.take() {
-                        push_row(&mut body, open);
-                    }
+                    flush_row(&mut body, &mut row);
                     in_table = true;
                 }
                 b"tr" if in_table => {
-                    if let Some(open) = row.take() {
-                        push_row(&mut body, open);
-                    }
+                    flush_row(&mut body, &mut row);
                     row = Some(PptxRow::default());
                 }
                 b"tc" if in_table => row
@@ -555,15 +551,9 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                         open.close_cell();
                     }
                 }
-                b"tr" if in_table => {
-                    if let Some(open) = row.take() {
-                        push_row(&mut body, open);
-                    }
-                }
+                b"tr" if in_table => flush_row(&mut body, &mut row),
                 b"tbl" if in_table => {
-                    if let Some(open) = row.take() {
-                        push_row(&mut body, open);
-                    }
+                    flush_row(&mut body, &mut row);
                     in_table = false;
                 }
                 _ => {}
@@ -577,9 +567,7 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
     }
     // (feature-65, R1.7) A row the XML cut short keeps its closed cells and the closed
     // paragraphs of its open cell, as if that cell had closed.
-    if let Some(open) = row.take() {
-        push_row(&mut body, open);
-    }
+    flush_row(&mut body, &mut row);
     (title, body)
 }
 
@@ -679,6 +667,15 @@ fn push_row(body: &mut String, row: PptxRow) {
             body.push('\n');
         }
         body.push_str(&line);
+    }
+}
+
+/// (feature-65) Write out the row being read, if any, through [`push_row`], and leave `row`
+/// empty: what a `<a:tr>`, `</a:tr>`, `</a:tbl>`, a nested `<a:tbl>` and the end of the slide
+/// do in [`parse_slide_xml`].
+fn flush_row(body: &mut String, row: &mut Option<PptxRow>) {
+    if let Some(open) = row.take() {
+        push_row(body, open);
     }
 }
 
