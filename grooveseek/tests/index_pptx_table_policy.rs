@@ -12,11 +12,20 @@
 mod common;
 
 use common::embed_cli::{DIM, Fixture, fixture, stderr_of};
-use common::embed_mock::{DOC_MODEL, assert_dir_empty, openai_config_toml};
-use grooveseek::db::Database;
+use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic, openai_config_toml};
+use common::temp::TempRoot;
+use grooveseek::config::Config;
+use grooveseek::db::{ContextMode, Database};
+use grooveseek::embedder::Embedder;
+use grooveseek::indexer::progress::{ProgressEvent, ProgressMode, ProgressReporter};
+use grooveseek::indexer::{
+    IndexResult, SingleResult, load_declared_schema, rebuild_index, reindex_single_file,
+};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 use zip::write::SimpleFileOptions;
 
 const P_NS: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
@@ -614,4 +623,179 @@ fn both_passes_mark_the_rows_they_cannot_read() {
     for (key, value) in DOCX_KEYS {
         assert_eq!(meta(&fx, key).as_deref(), Some(value), "{key}");
     }
+}
+
+/// Set on the child [`run_in_hermetic_child`] starts, so the child runs the test body.
+const HERMETIC_CHILD: &str = "GROOVE_F65_HERMETIC_CHILD";
+
+/// Run the test `name` again in a child of this test binary under the environment
+/// [`common::embed_mock::hermetic`] pins. `true` in the parent, after the child passed exactly
+/// one test; `false` in the child.
+///
+/// Copy of the helper of the same name in `tests/index_docx_heading_policy.rs`, whose copies
+/// are private to its modules.
+fn run_in_hermetic_child(name: &str) -> bool {
+    if std::env::var_os(HERMETIC_CHILD).is_some() {
+        return false;
+    }
+    let cache = TempRoot::new("groove-f65-fastembed");
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(HERMETIC_CHILD, "1");
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("run the test in a child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed in the child:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the child ran no test named {name}:\n{stdout}\n{stderr}"
+    );
+    assert_dir_empty(cache.path());
+    true
+}
+
+/// The index and the embedder under `cfg`, opened the way `groove index` opens them.
+fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
+    let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
+    let db_path = grooveseek::resolve_db_path(fx.kb());
+    let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
+    db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
+        .expect("embedding meta");
+    let embedder = Embedder::with_settings(embedding).expect("build the embedder");
+    (db, embedder)
+}
+
+/// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
+/// `groove index` wires it, reporting to the
+/// [`grooveseek::indexer::progress::ProgressReporter`] it is given.
+fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
+    let kb = fx.kb();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(kb).expect("parser registry");
+    let schema = load_declared_schema(kb).expect("groove-schema.toml");
+    let (db, mut embedder) = open_in_process(fx, &cfg);
+    rebuild_index(
+        &db,
+        &mut embedder,
+        kb,
+        schema,
+        false,
+        cfg.exclude_headings.as_deref(),
+        &cfg.resolve_exclude_dirs(),
+        &registry,
+        progress,
+        ContextMode::Off,
+    )
+}
+
+/// feature-65 I5 (AC17): the shape desktop sees -- a callback reporter, `force=false` -- hears
+/// `Indexed` for the deck whose table rows are rejoined and `Unchanged` for the deck without a
+/// table and for the `.docx`, whose rows in the form before feature-64 stay as they were.
+#[test]
+fn a_rejoined_pptx_reports_indexed_and_the_rest_unchanged() {
+    if run_in_hermetic_child("a_rejoined_pptx_reports_indexed_and_the_rest_unchanged") {
+        return;
+    }
+    let fx = kb("groove-f65-i5");
+    let (grid, sheet) = (grid_pptx(), sheet_docx());
+    write_bytes(&fx, "a-grid.pptx", &grid);
+    write_bytes(&fx, "b-plain.pptx", &plain_pptx());
+    write_bytes(&fx, "c-sheet.docx", &sheet);
+    rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+    write_old_rows(&fx, "a-grid.pptx", &grid, "Slide 1", &grid_old_content());
+    write_old_rows(
+        &fx,
+        "c-sheet.docx",
+        &sheet,
+        SHEET_HEADING,
+        &sheet_old_content(),
+    );
+    delete_meta(&fx, PPTX_KEY);
+
+    let log: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    let reporter = ProgressReporter::with_callback(Box::new(move |ev| {
+        let seen = match ev {
+            ProgressEvent::Indexed { rel, .. } => Some((rel.to_string(), "indexed")),
+            ProgressEvent::Unchanged { rel, .. } => Some((rel.to_string(), "unchanged")),
+            _ => None,
+        };
+        if let Some(seen) = seen {
+            sink.lock().expect("log").push(seen);
+        }
+    }));
+    rebuild_in_process(&fx, reporter).expect("second run");
+    let mut seen = log.lock().expect("log").clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("a-grid.pptx".to_string(), "indexed"),
+            ("b-plain.pptx".to_string(), "unchanged"),
+            ("c-sheet.docx".to_string(), "unchanged"),
+        ]
+    );
+    assert_eq!(
+        column(&fx, "a-grid.pptx", "content"),
+        vec![Some(grid_new_content())]
+    );
+    assert_eq!(
+        column(&fx, "c-sheet.docx", "content"),
+        vec![Some(sheet_old_content())]
+    );
+    assert_eq!(meta(&fx, PPTX_KEY).as_deref(), Some(PPTX_POLICY));
+}
+
+/// feature-65 I7 (AC22): the watcher records no pptx key. It leaves an unchanged deck's v1.18.0
+/// rows alone and writes a changed one a row per line.
+#[test]
+fn the_watcher_rejoins_a_changed_pptx_and_records_no_generation() {
+    if run_in_hermetic_child("the_watcher_rejoins_a_changed_pptx_and_records_no_generation") {
+        return;
+    }
+    let fx = kb("groove-f65-i7");
+    let grid = grid_pptx();
+    write_bytes(&fx, "kept.pptx", &grid);
+    write_bytes(&fx, "draft.pptx", &plain_pptx());
+    rebuild_in_process(&fx, ProgressReporter::new(ProgressMode::Quiet)).expect("first run");
+    write_old_rows(&fx, "kept.pptx", &grid, "Slide 1", &grid_old_content());
+    delete_meta(&fx, PPTX_KEY);
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+    let unchanged = reindex_single_file(&db, &mut embedder, &kb, "kept.pptx", None, &registry)
+        .expect("reindex the unchanged deck");
+    assert_eq!(unchanged, SingleResult::Unchanged);
+    assert_eq!(
+        column(&fx, "kept.pptx", "content"),
+        vec![Some(grid_old_content())],
+        "the watcher runs no pass"
+    );
+
+    write_bytes(&fx, "draft.pptx", &grid);
+    let changed = reindex_single_file(&db, &mut embedder, &kb, "draft.pptx", None, &registry)
+        .expect("reindex the changed deck");
+    assert_eq!(
+        changed,
+        SingleResult::Updated {
+            chunks: 1,
+            frontmatter_unparsed: false
+        }
+    );
+    assert_eq!(
+        column(&fx, "draft.pptx", "content"),
+        vec![Some(grid_new_content())]
+    );
+    assert_eq!(
+        meta(&fx, PPTX_KEY),
+        None,
+        "the watcher records no generation"
+    );
 }
