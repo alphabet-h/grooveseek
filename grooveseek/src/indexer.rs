@@ -1879,10 +1879,11 @@ enum Reindex {
         refresh_fields: bool,
     },
     /// (feature-62) Read and parse a file whose hash matches: the one-time pass (ADR-0029) of
-    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`], [`PPTX_TABLE_BREAK_POLICY`]). Unlike [`Reindex::Incremental`], a matching
-    /// hash does not return early; unlike [`Reindex::Force`], chunks that still match the row's
-    /// are neither re-embedded nor written. Chunks that differ are written the ordinary way, and
-    /// no chunks at all drop the row, since `--force` would leave none.
+    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`], [`PPTX_TABLE_BREAK_POLICY`]). Unlike
+    /// [`Reindex::Incremental`], a matching hash does not return early; unlike
+    /// [`Reindex::Force`], chunks that still match the row's are neither re-embedded nor
+    /// written. Chunks that differ are written the ordinary way, and no chunks at all drop the
+    /// row, since `--force` would leave none.
     Reparse,
 }
 
