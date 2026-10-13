@@ -27,9 +27,11 @@
 #   7  round limit reached; nothing was posted (trap 16 / 28)
 #   8  could not read the PR before posting (gh api failed); nothing was posted
 #   9  a round delta could not be computed (jq failed); the round's findings are
-#      unknown, so nothing is reported as converged (trap 59); or, at timeout, the
-#      trigger's reactions could not be read, so whether codex received it is unknown
-#      (do not re-trigger automatically). The trigger is posted in both cases
+#      unknown, so nothing is reported as converged (trap 59); or a GitHub read after
+#      the trigger failed / came back empty (reactions at timeout, the final reviews /
+#      issue comments / inline comments / head sha), or a count derived from them is not
+#      a number. No verdict is printed. The trigger is posted in every case; for the
+#      read failures do not re-trigger automatically (stderr says which one)
 #
 # Output contract (AGENTS.md "Results go to stdout, diagnostics to stderr"):
 #   stdout = the review itself (baseline on first invocation, Step 4 summary, Step 5 render)
@@ -210,9 +212,30 @@ json_delta() {   # $1 = prev の JSON file, $2 = cur の JSON file, $3 = 比較�
 require_delta() {   # $1 = 値, $2 = 何の delta か
   case "$1" in
     '') diag "ABORT: ${2} could not be computed (jq failed, trap 59)."
-        diag "Action: re-run this round. Do NOT read the empty list as 'no findings'."
+        diag "Action: re-run this round (the trigger is already posted; a re-run posts a new one and counts as a round). Do NOT read the empty list as 'no findings'."
         exit 9;;
   esac
+}
+
+# trigger 投稿 *後* の読み取りの失敗 (PR #356 のローカル Codex、high / medium x2)。
+# 不変条件: **trigger 後の GitHub の読み取りが 1 つでも失敗 / 空なら、判定 (CONVERGED / WARN /
+# exit 3/4/5/10 / exit 0) を出さずに exit 9。** 投稿前の abort_unreadable (exit 8) と違い、
+# credit は既に消えている。読めなかった値を `[]` / 0 / 空として先へ進むと、sentinel 1 つで
+# CONVERGED になる・P0/P1 を 0 と数える・届いた trigger を「届いていない」と読む。
+# 自動で再 trigger させない: 届いていた trigger に重ねると 1 round を捨てる。
+# 対象の一覧 (呼び出し点ごとの表) は PR #356 の本文。poll 中 (Phase A / B) の一時失敗は対象外 —
+# 次の poll で取り直し、判定に使う値は Step 4 で取り直してここを通す。
+# top level から呼ぶこと (罠 54)。
+abort_after_trigger() {   # $1 = 何が読めなかったか
+  diag "ABORT: could not read ${1} after the trigger was posted (gh api or jq failed). The round's result is unknown."
+  diag "The trigger (comment id=${TRIGGER_COMMENT_ID:-unknown}) is already posted. Do NOT re-trigger automatically: a re-run posts again and uses a round."
+  diag "Action: read the 3 endpoints by hand (gh api repos/${OWNER_REPO}/pulls/${PR}/comments, .../pulls/${PR}/reviews, repos/${OWNER_REPO}/issues/${PR}/comments) and the trigger's reactions, then decide or escalate. Do NOT read an empty list as 'no findings'."
+  exit 9
+}
+# 判定に使う数は、jq が落ちると空になり `[ "" -gt 0 ]` は偽、`$(( + 0 ))` は 0 で、どちらも
+# 収束側に倒れる (罠 59 と同じ形)。数字でなければ読めなかった扱い。
+require_count() {   # $1 = 値, $2 = 何の数か
+  case "$1" in ''|*[!0-9]*) abort_after_trigger "$2";; esac
 }
 
 # snapshot を delta 用のファイルに落とす。`printf '%s'` は末尾に改行を足さない —
@@ -386,13 +409,11 @@ while true; do
     # 罠 47: reaction が 1 つも無い = **trigger が届いていない** (実測 8 回中 2 回、
     # PR #162 round 4 / 8)。stale connector ではないので、再 trigger すれば復帰する。
     # **`exit 3` で stale connector と診断する前に必ず reaction を見る。**
-    if ! BOT_REACTIONS=$(read_bot_reactions); then
-      diag "ABORT: could not read the trigger comment's reactions (gh api failed). Acknowledgement is unknown."
-      diag "The trigger (comment id=${TRIGGER_COMMENT_ID}) is already posted. Do NOT re-trigger automatically: a re-run posts again and uses a round."
-      diag "Action: read the 3 endpoints by hand (gh api repos/${OWNER_REPO}/pulls/${PR}/comments, .../pulls/${PR}/reviews, repos/${OWNER_REPO}/issues/${PR}/comments) and the reactions, then decide or escalate."
-      exit 9
-    fi
-    if [ "$(printf '%s' "$BOT_REACTIONS" | jq '[.[] | select(. == "eyes" or . == "+1")] | length')" = "0" ]; then
+    BOT_REACTIONS=$(read_bot_reactions) \
+      || abort_after_trigger "the trigger comment's reactions (acknowledgement is unknown)"
+    ACK_COUNT=$(printf '%s' "$BOT_REACTIONS" | jq '[.[] | select(. == "eyes" or . == "+1")] | length')
+    require_count "$ACK_COUNT" "the count of codex's eyes / +1 reactions"
+    if [ "$ACK_COUNT" = "0" ]; then
       diag "WARN: trigger comment has no reaction - codex never received it (trap 47)."
       diag "Action: re-trigger on the same commit (once, automatically; then escalate)."
       exit 5
@@ -461,8 +482,16 @@ done
 # 出ていた場合、current round が new review/inline を出して new issue comment が
 # 無い state でも `LATEST_ISSUE_BODY` は prior round の sentinel を拾い続けて
 # SENTINEL_MATCH=true → false-converge する。
-LATEST_REVIEW=$(snapshot_reviews | jq '.[-1]')
-CUR_ISSUES_FRESH=$(snapshot_issues)
+# 判定に使う 3 endpoint と head sha は **ここで 1 回ずつ読み、戻り値を見る** (abort_after_trigger)。
+# 以前は reviews を 2 回 (Layer 1 用と delta 用) 別々に読み、どちらも戻り値を捨てていたので、
+# 失敗が `[]` になって sentinel 1 つで CONVERGED になり得た (PR #356 のローカル Codex、high)。
+# 1 回にまとめたので、Layer 1 の state と review 本文の delta が同じ snapshot を指す。
+CUR_REVIEWS_FRESH=$(snapshot_reviews) || abort_after_trigger "the reviews"
+CUR_ISSUES_FRESH=$(snapshot_issues) || abort_after_trigger "the issue comments"
+CUR_INLINE_FRESH=$(snapshot_inline) || abort_after_trigger "the inline comments"
+HEAD_SHA=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha) || abort_after_trigger "the head sha"
+case "$HEAD_SHA" in ''|*[!0-9a-f]*) abort_after_trigger "the head sha (got '${HEAD_SHA}')";; esac
+LATEST_REVIEW=$(printf '%s' "$CUR_REVIEWS_FRESH" | jq '.[-1]') || abort_after_trigger "the latest review"
 NEW_ISSUES=$(json_delta "$(stash_json "$PREV_ISSUES" prev_issues.json)" \
                         "$(stash_json "$CUR_ISSUES_FRESH" cur_issues.json)" updated_at)
 require_delta "$NEW_ISSUES" "the issue-comment delta"
@@ -470,8 +499,8 @@ require_delta "$NEW_ISSUES" "the issue-comment delta"
 # 前提にしている multi-write そのもの) ので、`.[-1]` だけ見ると先に来た方の
 # sentinel / terminal error を落とす。特に terminal error を落とすと「retry しても
 # 無駄」を retry し続ける。全部繋ぐ。
-LATEST_ISSUE_BODY=$(echo "$NEW_ISSUES" | jq -r 'map(.body // "") | join("\n---\n")')
-HEAD_SHA=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha)
+LATEST_ISSUE_BODY=$(echo "$NEW_ISSUES" | jq -r 'map(.body // "") | join("\n---\n")') \
+  || abort_after_trigger "the issue-comment bodies of this round"
 
 # 罠 10: error string detect → terminal failure、retry しない。
 # 罠 56: **quota 切れも terminal**。実測 (PR #181 round 3): "You have reached your
@@ -490,6 +519,8 @@ REF_ERROR_COMMENTS=$(echo "$NEW_ISSUES" | jq --arg re "$TRANSIENT_REF_PATTERN" \
   '[.[] | .body // "" | select(test($re))] | length')
 OTHER_TERMINAL_COMMENTS=$(echo "$NEW_ISSUES" | jq --arg re "$TRANSIENT_REF_PATTERN" --arg term "$TERMINAL_ERROR_PATTERN" \
   '[.[] | .body // "" | select(test($term) and (test($re) | not))] | length')
+require_count "$REF_ERROR_COMMENTS" "the count of git-ref error comments"
+require_count "$OTHER_TERMINAL_COMMENTS" "the count of terminal error comments"
 if [ "$REF_ERROR_COMMENTS" -gt 0 ] && [ "$OTHER_TERMINAL_COMMENTS" -eq 0 ]; then
   diag "TRANSIENT: codex could not see the PR head yet (trap 60). Body follows on stdout."
   diag "Action: confirm the head sha exists (gh api repos/${OWNER_REPO}/commits/${HEAD_SHA}), then re-trigger once with a body file. It counts as a round."
@@ -532,7 +563,6 @@ COMMIT_FRESH=$([ "$REVIEW_COMMIT" = "$HEAD_SHA" ] && echo "true" || echo "false"
 # 罠 29 (codex P2 round 3 on PR #54): id 単独の set diff は **edit を miss する** —
 #   codex が既存 inline (= 同じ id) の body を update して P-badge を追加 / 昇格する
 #   case で false-converge する。`(id, updated_at)` の compound key で diff を取る。
-CUR_INLINE_FRESH=$(snapshot_inline)
 NEW_INLINE=$(json_delta "$(stash_json "$PREV_INLINE" prev_inline.json)" \
                         "$(stash_json "$CUR_INLINE_FRESH" cur_inline.json)" updated_at)
 require_delta "$NEW_INLINE" "the inline-comment delta"
@@ -544,25 +574,31 @@ require_delta "$NEW_INLINE" "the inline-comment delta"
 # とおり re-review で新 submission が出ない round があり、`LATEST_REVIEW` が前 round の
 # ままだと修正済みの指摘を数え続けて収束しない (codex P2 round 8 on PR #164)。
 NEW_REVIEWS=$(json_delta "$(stash_json "$PREV_REVIEWS" prev_reviews.json)" \
-                         "$(stash_json "$(snapshot_reviews)" cur_reviews.json)" submitted_at)
+                         "$(stash_json "$CUR_REVIEWS_FRESH" cur_reviews.json)" submitted_at)
 require_delta "$NEW_REVIEWS" "the review-body delta"
 # 罠 34 が記録しているとおり **1 round に review submission が複数来る**。`.[-1]` だけ
 # 数えると、先の submission に P0/P1 があって最後のに badge が無い round で
 # `P0_P1_TAGS_PRESENT=0` になり、**blocking な指摘を持ったまま収束**する
 # (codex P1 round 8 on PR #164)。この round の body を全部繋いでから数える。
-REVIEW_BODY=$(echo "$NEW_REVIEWS" | jq -r 'map(.body // "") | join("\n---\n")')
+REVIEW_BODY=$(echo "$NEW_REVIEWS" | jq -r 'map(.body // "") | join("\n---\n")') \
+  || abort_after_trigger "the review bodies of this round"
 body_badges() { printf '%s' "$REVIEW_BODY" | grep -o "$1" | wc -l | tr -d ' '; }
-P0_P1_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P0 Badge") or contains("![P1 Badge"))] | length') \
-  + $(body_badges '!\[P0 Badge') + $(body_badges '!\[P1 Badge') ))
+# inline の badge 数は jq の出力を一度受けて検査してから足す (空は `$(( + 0 ))` で 0 になる)。
+inline_badges() { echo "$NEW_INLINE" | jq "[.[] | .body | select($1)] | length"; }
+INLINE_P0P1=$(inline_badges 'contains("![P0 Badge") or contains("![P1 Badge")')
+INLINE_P2=$(inline_badges 'contains("![P2 Badge")')
+INLINE_P3=$(inline_badges 'contains("![P3 Badge")')
+require_count "$INLINE_P0P1" "the count of inline P0/P1 badges"
+require_count "$INLINE_P2" "the count of inline P2 badges"
+require_count "$INLINE_P3" "the count of inline P3 badges"
+P0_P1_TAGS_PRESENT=$(( INLINE_P0P1 + $(body_badges '!\[P0 Badge') + $(body_badges '!\[P1 Badge') ))
 # 罠 17 / 罠 23: 公式 docs は P0/P1 only と書いているが実例で P2 も surface する。
-P2_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P2 Badge"))] | length') \
-  + $(body_badges '!\[P2 Badge') ))
+P2_TAGS_PRESENT=$(( INLINE_P2 + $(body_badges '!\[P2 Badge') ))
 # 罠 23 が P2 で一度広げた形が、P3 で再発した (PR #177): P0/P1/P2 だけ数えて
 # `P2=0` を「指摘なし」と読みかけたが、来ていたのは中身の正しい **P3** だった。
 # **badge の集合を列挙で決め打ちしない。** P3 も数え、Step 5 では badge の
 # 有無を問わず round の inline を全部出す (= 未知の badge も人の目に入る)。
-P3_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P3 Badge"))] | length') \
-  + $(body_badges '!\[P3 Badge') ))
+P3_TAGS_PRESENT=$(( INLINE_P3 + $(body_badges '!\[P3 Badge') ))
 
 # 罠 57: **Layer 1 だけ round scope が掛かっていなかった。** 罠 27 (inline) /
 # 罠 33 (issue) / 罠 49 (review body) で 3 つとも delta にしたのに、`STATE_OK` は
@@ -572,10 +608,14 @@ P3_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("!
 # 実測 (PR #181 round 3): 新しい commit を push して trigger した round の産物が
 # 「quota に達した」の 1 コメントだけだったのに **CONVERGED (Layer 1 + 2)** を出した。
 # **その round の産物が 3 endpoint とも 0 件なら、収束の証拠はどこにも無い。**
+N_NEW_INLINE=$(echo "$NEW_INLINE" | jq 'length')
+N_NEW_REVIEWS=$(echo "$NEW_REVIEWS" | jq 'length')
+N_NEW_ISSUES=$(echo "$NEW_ISSUES" | jq 'length')
+require_count "$N_NEW_INLINE" "the count of new inline comments"
+require_count "$N_NEW_REVIEWS" "the count of new reviews"
+require_count "$N_NEW_ISSUES" "the count of new issue comments"
 ROUND_EMPTY=false
-if [ "$(echo "$NEW_INLINE" | jq 'length')" = "0" ] \
-  && [ "$(echo "$NEW_REVIEWS" | jq 'length')" = "0" ] \
-  && [ "$(echo "$NEW_ISSUES" | jq 'length')" = "0" ]; then
+if [ "$N_NEW_INLINE" = "0" ] && [ "$N_NEW_REVIEWS" = "0" ] && [ "$N_NEW_ISSUES" = "0" ]; then
   ROUND_EMPTY=true
 fi
 
@@ -588,7 +628,7 @@ fi
 
 echo "=== Step 4 summary ==="
 echo "round=${ROUND}/${MAX_ROUNDS} first_invocation=${FIRST_INVOCATION} head=${HEAD_SHA} review_state=${REVIEW_STATE} commit_fresh=${COMMIT_FRESH} state_ok=${STATE_OK}"
-echo "new_inline=$(echo "$NEW_INLINE" | jq 'length') new_reviews=$(echo "$NEW_REVIEWS" | jq 'length') new_issues=$(echo "$NEW_ISSUES" | jq 'length') round_empty=${ROUND_EMPTY}"
+echo "new_inline=${N_NEW_INLINE} new_reviews=${N_NEW_REVIEWS} new_issues=${N_NEW_ISSUES} round_empty=${ROUND_EMPTY}"
 echo "P0P1=${P0_P1_TAGS_PRESENT} P2=${P2_TAGS_PRESENT} P3=${P3_TAGS_PRESENT} sentinel=${SENTINEL_MATCH}"
 
 # 統合判定: Layer 3 sentinel **単独で converged OK**、Layer 1 / Layer 2 は補強情報。
@@ -648,5 +688,7 @@ echo "=== Inline, this round - ALL of them, badge or not ==="
 echo "$NEW_INLINE" | jq -r 'if length == 0 then "(none this round)" else .[] | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---" end'
 echo ""
 echo "=== Top-level issue comments by codex (full) ==="
-snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
+# Step 4 で検査済みの snapshot から出す。ここで読み直すと、その失敗を見ないまま exit 0 に
+# なり (PR #356 のローカル Codex、medium)、成功しても判定とは別の時点の一覧を出す。
+printf '%s' "$CUR_ISSUES_FRESH" | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 exit 0
