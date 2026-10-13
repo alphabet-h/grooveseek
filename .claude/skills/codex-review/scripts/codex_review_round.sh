@@ -133,13 +133,14 @@ bad_body_file() {   # $1 = 理由
 TRIGGER_BODY_SNAPSHOT=""
 if [ -n "$TRIGGER_BODY_FILE" ]; then
   TRIGGER_BODY_SNAPSHOT="${ROUND_TMP}/trigger-body.snapshot"
+  # cat の stderr は locale 依存で非 ASCII になり得るので捨て、理由は bad_body_file の ASCII 行で出す (罠 52)。
   if [ "$TRIGGER_BODY_FILE" = "-" ]; then
-    cat > "$TRIGGER_BODY_SNAPSHOT" || bad_body_file "could not read stdin"
+    cat > "$TRIGGER_BODY_SNAPSHOT" 2>/dev/null || bad_body_file "could not read stdin"
   else
     [ -e "$TRIGGER_BODY_FILE" ] || bad_body_file "does not exist"
     [ -f "$TRIGGER_BODY_FILE" ] || bad_body_file "is not a regular file"
     [ -r "$TRIGGER_BODY_FILE" ] || bad_body_file "is not readable"
-    cat -- "$TRIGGER_BODY_FILE" > "$TRIGGER_BODY_SNAPSHOT" || bad_body_file "could not be copied"
+    cat -- "$TRIGGER_BODY_FILE" > "$TRIGGER_BODY_SNAPSHOT" 2>/dev/null || bad_body_file "could not be copied"
   fi
   # 以下は snapshot だけを見る (元の file はもう読まない)。
   [ -s "$TRIGGER_BODY_SNAPSHOT" ] || bad_body_file "is empty"
