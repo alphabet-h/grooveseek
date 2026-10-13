@@ -81,7 +81,7 @@ QUIET_WINDOW_SEC=180            # 罠 34: 同一 commit への 2 本目を 144 �
 BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
 # kuriya trap #410: codex は PR に 1 本の「Codex Review Summary」issue comment を持ち、
 # round ごとに Running → Completed と edit する (2026-10-06〜)。中身は進捗の表だけで指摘も
-# sentinel も無い。snapshot_issues で除外する (下)。
+# sentinel も無い。1 行目が `<!-- ${CODEX_SUMMARY_MARKER} -->` の comment を snapshot_issues で除外する (下)。
 CODEX_SUMMARY_MARKER="codex-pull-request-review-summary"
 
 # The script lives at <repo>/.claude/skills/codex-review/scripts/; resolve the
@@ -204,9 +204,12 @@ snapshot_reviews() {
 #   quiet window が早く満了する (PR #356 r1 で INDETERMINATE)、② 毎 round NEW_ISSUES に入って
 #   ROUND_EMPTY が true にならない (罠 57 の安全装置が死ぬ)。key / delta / sentinel /
 #   ROUND_EMPTY / 表示はすべてこの関数を通るので、ここで揃う (罠 53)。
+#   判定は **本文の先頭 (前置の空白・改行は許す) が marker の HTML コメント行**のときだけ。
+#   `contains` にすると、marker を引用しただけの本物の指摘 (この script 自身の review) まで落とす。
+#   `\s` ではなく `[[:space:]]` なのは、二重引用符の中で backslash の段数を数えずに済むから。
 snapshot_issues() {
   gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | select((.body // \"\") | contains(\"${CODEX_SUMMARY_MARKER}\") | not) | {id, updated_at, body}]" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | select((.body // \"\") | test(\"^[[:space:]]*<!-- ${CODEX_SUMMARY_MARKER} -->\") | not) | {id, updated_at, body}]" \
     | jq -s "add // [] | sort_by(.id)"
 }
 
