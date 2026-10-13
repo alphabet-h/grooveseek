@@ -101,6 +101,11 @@ the catch-up open for every other one.
   column was not taken: it needs a schema change, and the tests pin the two
   keys' values and that dropping the section key reopens the pass. Revisit at
   a fourth.
+  *(2026-10-14, v1.19.0)* `.pptx` came to need the same catch-up, and
+  [ADR-0029](0029-reread-unchanged-documents-once-per-format.md) replaces the
+  sentence above that names the per-row column as the general form: a policy
+  key per format and one predicate over (extension, stale) are the general
+  form now. PR #NNN.
 - **Tests hold it**: `grooveseek/src/indexer.rs` (the re-read, the predicate,
   the marker), `grooveseek/src/db.rs` (the key and the overwrite),
   `grooveseek/src/indexer/progress.rs` (the notice) and

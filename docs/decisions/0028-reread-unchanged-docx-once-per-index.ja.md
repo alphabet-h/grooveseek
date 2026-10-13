@@ -77,6 +77,7 @@ run で — 正しく分かれている文書を再 embedding せず、読めな
   *(2026-10-07、v1.17.0)* `.docx` に同じ種類の key が 3 本目に要る時も見直す。v1.17.0 で 2 本になった。
   *(2026-10-09、v1.18.0)* v1.18.0 で 3 本目が来たが、行ごとの列は取らなかった: schema の変更が要り、既存の test が 2 本の key の値と
   「section key を消すと pass が開く」を固定している。4 本目で再判定する。
+  *(2026-10-14、v1.19.0)* `.pptx` に同じ追いつきが要ったので、[ADR-0029](0029-reread-unchanged-documents-once-per-format.ja.md) が上の「行ごとの列が一般形」の一文を置き換えた: 形式ごとの policy key と (拡張子, 古いか) の組で回す述語が今の一般形。PR #NNN。
 - **test が守る場所**: `grooveseek/src/indexer.rs` (読み直し、述語、印)、`grooveseek/src/db.rs`
   (key と上書き)、`grooveseek/src/indexer/progress.rs` (告知行)、
   `grooveseek/tests/index_docx_heading_policy.rs` (run、cancel、callback、watcher)。
