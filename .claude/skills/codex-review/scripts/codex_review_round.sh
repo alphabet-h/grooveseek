@@ -4,7 +4,13 @@
 # convergence with three layers, and print the round's findings.
 #
 # Usage:
-#   codex_review_round.sh <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]
+#   codex_review_round.sh [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]
+#     -R / --repo owner/repo the GitHub repo the PR lives in. Omitted: $GH_REPO if set,
+#                            else the repo this script is checked out in (unchanged default).
+#                            Every read, the round count and the post all use this one repo
+#                            (kuriya trap #409 / #238)
+#     --dry-run              do every read (repo, PR, baselines, trigger history, round number),
+#                            print them on stdout, and exit 0 before posting anything
 #     max_rounds             default 3; the round number is derived from the PR's own
 #                            `@codex review` history, so the limit holds across processes
 #     per_round_timeout_sec  default 600 (wall-clock for Phase A + Phase B)
@@ -12,7 +18,7 @@
 #
 # Exit codes:
 #   0  round complete - read the `CONVERGED=true|false` line on stdout
-#   2  bad arguments
+#   2  bad arguments (including -R and $GH_REPO naming different repos)
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
 #   4  codex returned a terminal error body; retry will not help (trap 10 / 56)
 #  10  codex could not see the PR head yet ("Provided git ref ... does not exist"); re-trigger once (trap 60)
@@ -38,12 +44,30 @@
 # PR #222). With it the callers below can `|| abort_unreadable`.
 set -u -o pipefail
 
-PR="${1:?PR number required}"
+usage() {
+  printf 'usage: %s [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]\n' "$0" >&2
+  exit 2
+}
+REPO_ARG=""
+DRY_RUN=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -R|--repo) [ $# -ge 2 ] && [ -n "$2" ] || usage; REPO_ARG="$2"; shift 2;;
+    --repo=*)  REPO_ARG="${1#--repo=}"; [ -n "$REPO_ARG" ] || usage; shift;;
+    --dry-run) DRY_RUN=true; shift;;
+    --) shift; break;;
+    -*) usage;;
+    *) break;;
+  esac
+done
+[ $# -ge 1 ] && [ $# -le 4 ] || usage
+PR="$1"
 MAX_ROUNDS="${2:-3}"            # 罠 16: cost-aware (25 credits x round)。/feature-flow は 5 を渡す (罠 28)
 PER_ROUND_TIMEOUT="${3:-600}"   # 罠 9: wall-clock timeout で stale connector を検知
 TRIGGER_BODY_FILE="${4:-}"
+case "$PR" in ''|*[!0-9]*) usage;; esac
 case "$MAX_ROUNDS$PER_ROUND_TIMEOUT" in
-  *[!0-9]*|'') printf 'usage: %s <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]\n' "$0" >&2; exit 2;;
+  *[!0-9]*|'') usage;;
 esac
 QUIET_WINDOW_SEC=180            # 罠 34: 同一 commit への 2 本目を 144 秒後に観測、+ 安全率
 BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
@@ -78,7 +102,47 @@ abort_unreadable() {
   exit 8
 }
 
-OWNER_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || abort_unreadable "the repository name"
+# ---- which repo (kuriya trap #409 / #238) ----
+# 不変条件: **投稿 (gh pr comment)・読み取り (gh api repos/...)・round の数え方が
+# すべて同じ 1 つの repo を見る。** #409 (2026-10-13): `GH_REPO=<別 repo>` で打つと
+# `gh pr comment` は GH_REPO に従って別 repo の PR に投稿したが、引数なしの
+# `gh repo view` は GH_REPO を見ず cwd の repo (= この script の checkout) を返したので、
+# baseline / 履歴 / polling は **同じ番号の別の PR** を読み「baseline none」「600s 無応答」を出した。
+# 決め方は 1 か所: `-R` > `$GH_REPO` > checkout の repo。`-R` と `$GH_REPO` が両方あって
+# 食い違えば、どちらを信じるか推測せず exit 2。決めた repo は `GH_REPO` に export し直し、
+# `gh pr comment` にも `-R` で明示する (env と引数の二重化で、片方の取りこぼしを残さない)。
+# `gh repo view <repo>` で正規化する: 大文字小文字・`github.com/` 付きの形を nameWithOwner に揃え、
+# 存在しない repo はここで止まる。github.com 以外の host は `gh api` が同じ host に行く
+# 保証が無い (GH_HOST 次第) ので受けない。
+resolve_repo() {   # $1 = repo 指定 (空なら checkout の repo)。stdout に "nameWithOwner url"
+  if [ -n "$1" ]; then
+    gh repo view "$1" --json nameWithOwner,url --jq '.nameWithOwner + " " + .url'
+  else
+    env -u GH_REPO gh repo view --json nameWithOwner,url --jq '.nameWithOwner + " " + .url'
+  fi
+}
+if [ -n "$REPO_ARG" ] && [ -n "${GH_REPO:-}" ]; then
+  ARG_RESOLVED=$(resolve_repo "$REPO_ARG") || abort_unreadable "the repository named by -R (${REPO_ARG})"
+  ENV_RESOLVED=$(resolve_repo "$GH_REPO") || abort_unreadable "the repository named by GH_REPO (${GH_REPO})"
+  if [ "${ARG_RESOLVED%% *}" != "${ENV_RESOLVED%% *}" ]; then
+    diag "ABORT: -R ${REPO_ARG} and GH_REPO=${GH_REPO} name different repositories. Nothing was posted."
+    diag "Action: drop one of them (unset GH_REPO, or pass the same repo to -R)."
+    exit 2
+  fi
+  REPO_RESOLVED=$ARG_RESOLVED
+else
+  REPO_RESOLVED=$(resolve_repo "${REPO_ARG:-${GH_REPO:-}}") || abort_unreadable "the repository name"
+fi
+OWNER_REPO=${REPO_RESOLVED%% *}
+case "${REPO_RESOLVED#* }" in
+  https://github.com/*) ;;
+  *) diag "ABORT: ${OWNER_REPO} is not on github.com (url: ${REPO_RESOLVED#* }); only github.com is supported."
+     exit 2;;
+esac
+export GH_REPO="$OWNER_REPO"
+# PR がその repo に実在することを投稿前に確かめる (番号が issue / 別 repo の PR を指していたら止める)。
+PR_URL=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .html_url) || abort_unreadable "PR #${PR} in ${OWNER_REPO}"
+diag "repo ${OWNER_REPO} / PR ${PR_URL}"
 
 # ---- snapshot helpers ----
 # 罠 8: per_page=30 で saturate するので `--paginate` + `?per_page=100`。
@@ -167,7 +231,7 @@ stash_json() {   # $1 = JSON 文字列, $2 = ファイル名 (ROUND_TMP から�
 post_trigger() {   # $@ = gh pr comment の body 指定 (--body / --body-file)
   local url id attempt
   for attempt in 1 2 3; do
-    url=$(gh pr comment "$PR" "$@") && break
+    url=$(gh pr comment "$PR" -R "$OWNER_REPO" "$@") && break   # trap #409: 読み取りと同じ repo
     diag "  (trigger POST failed, attempt ${attempt}/3)"
     sleep 20
   done
@@ -218,6 +282,17 @@ FIRST_INVOCATION=$([ "${PRIOR_TRIGGERS}" = "0" ] && echo true || echo false)
 # 上限に達していたら **投稿する前に** 止める (投稿してからでは 1 round 分の credit が消える)。
 ROUND=$(( PRIOR_TRIGGERS + 1 ))
 diag "round ${ROUND}/${MAX_ROUNDS} (prior @codex review triggers on this PR: ${PRIOR_TRIGGERS}, first invocation: ${FIRST_INVOCATION})"
+
+# --dry-run: 投稿を伴わずに「どの repo のどの PR を読み、何 round 目と数えたか」を確かめる口。
+# 上限判定 (exit 7) より前に置く — 上限に達した PR でも読み取りの正しさは確かめられるように。
+# 投稿しないので round を消費しない。結果なので stdout。
+if [ "$DRY_RUN" = "true" ]; then
+  echo "DRY_RUN repo=${OWNER_REPO} pr=${PR} url=${PR_URL}"
+  echo "head=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha) prior_triggers=${PRIOR_TRIGGERS} round=${ROUND}/${MAX_ROUNDS} would_stop_at_limit=$([ "$ROUND" -gt "$MAX_ROUNDS" ] && echo true || echo false) first_invocation=${FIRST_INVOCATION}"
+  echo "baseline_inline=$(echo "$PREV_INLINE" | jq length) baseline_reviews=$(echo "$PREV_REVIEWS" | jq length) baseline_issues=$(echo "$PREV_ISSUES" | jq length)"
+  diag "DRY RUN: nothing was posted."
+  exit 0
+fi
 if [ "$ROUND" -gt "$MAX_ROUNDS" ]; then
   diag "STOP: round limit reached (${PRIOR_TRIGGERS} trigger(s) already posted, max_rounds=${MAX_ROUNDS}). Nothing was posted."
   diag "Action: report to the user. Do not re-run with a larger limit on your own."
@@ -392,7 +467,7 @@ OTHER_TERMINAL_COMMENTS=$(echo "$NEW_ISSUES" | jq --arg re "$TRANSIENT_REF_PATTE
   '[.[] | .body // "" | select(test($term) and (test($re) | not))] | length')
 if [ "$REF_ERROR_COMMENTS" -gt 0 ] && [ "$OTHER_TERMINAL_COMMENTS" -eq 0 ]; then
   diag "TRANSIENT: codex could not see the PR head yet (trap 60). Body follows on stdout."
-  diag "Action: confirm the head sha exists (gh api repos/<o>/<r>/commits/<sha>), then re-trigger once with a body file. It counts as a round."
+  diag "Action: confirm the head sha exists (gh api repos/${OWNER_REPO}/commits/${HEAD_SHA}), then re-trigger once with a body file. It counts as a round."
   echo "$LATEST_ISSUE_BODY"
   exit 10
 fi
