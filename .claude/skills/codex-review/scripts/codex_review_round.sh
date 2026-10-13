@@ -52,8 +52,11 @@ REPO_ARG=""
 DRY_RUN=false
 while [ $# -gt 0 ]; do
   case "$1" in
-    -R|--repo) [ $# -ge 2 ] && [ -n "$2" ] || usage; REPO_ARG="$2"; shift 2;;
-    --repo=*)  REPO_ARG="${1#--repo=}"; [ -n "$REPO_ARG" ] || usage; shift;;
+    # 値が `-` で始まる (`-R --dry-run 356`) なら option の取り違え。gh に flag として渡さず usage で止める。
+    -R|--repo) [ $# -ge 2 ] || usage; REPO_ARG="$2"; shift 2
+               case "$REPO_ARG" in ''|-*) usage;; esac;;
+    --repo=*)  REPO_ARG="${1#--repo=}"; shift
+               case "$REPO_ARG" in ''|-*) usage;; esac;;
     --dry-run) DRY_RUN=true; shift;;
     --) shift; break;;
     -*) usage;;
@@ -112,8 +115,11 @@ abort_unreadable() {
 # 食い違えば、どちらを信じるか推測せず exit 2。決めた repo は `GH_REPO` に export し直し、
 # `gh pr comment` にも `-R` で明示する (env と引数の二重化で、片方の取りこぼしを残さない)。
 # `gh repo view <repo>` で正規化する: 大文字小文字・`github.com/` 付きの形を nameWithOwner に揃え、
-# 存在しない repo はここで止まる。github.com 以外の host は `gh api` が同じ host に行く
-# 保証が無い (GH_HOST 次第) ので受けない。
+# 存在しない repo はここで止まる。github.com 以外の host は受けない: `gh api` の行き先は
+# GH_HOST で決まるので、呼び出し側の GH_HOST が別 host を指していると、下の host 判定
+# (url が github.com) と実際の読み書き先がずれ得る。**解決の前に GH_HOST を github.com に固定**し、
+# 以後の gh 呼び出しをすべて github.com に向ける。
+export GH_HOST=github.com
 resolve_repo() {   # $1 = repo 指定 (空なら checkout の repo)。stdout に "nameWithOwner url"
   if [ -n "$1" ]; then
     gh repo view "$1" --json nameWithOwner,url --jq '.nameWithOwner + " " + .url'
@@ -286,9 +292,13 @@ diag "round ${ROUND}/${MAX_ROUNDS} (prior @codex review triggers on this PR: ${P
 # --dry-run: 投稿を伴わずに「どの repo のどの PR を読み、何 round 目と数えたか」を確かめる口。
 # 上限判定 (exit 7) より前に置く — 上限に達した PR でも読み取りの正しさは確かめられるように。
 # 投稿しないので round を消費しない。結果なので stdout。
+# head の取得は top level で受ける: echo の中の `$( )` だと失敗しても空のまま exit 0 になり、
+# 「読めた」と「読めなかった」が見分けられない (罠 54 と同じ形)。
 if [ "$DRY_RUN" = "true" ]; then
+  DRY_HEAD=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha) || abort_unreadable "the head sha"
+  [ -n "$DRY_HEAD" ] || abort_unreadable "the head sha"
   echo "DRY_RUN repo=${OWNER_REPO} pr=${PR} url=${PR_URL}"
-  echo "head=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha) prior_triggers=${PRIOR_TRIGGERS} round=${ROUND}/${MAX_ROUNDS} would_stop_at_limit=$([ "$ROUND" -gt "$MAX_ROUNDS" ] && echo true || echo false) first_invocation=${FIRST_INVOCATION}"
+  echo "head=${DRY_HEAD} prior_triggers=${PRIOR_TRIGGERS} round=${ROUND}/${MAX_ROUNDS} would_stop_at_limit=$([ "$ROUND" -gt "$MAX_ROUNDS" ] && echo true || echo false) first_invocation=${FIRST_INVOCATION}"
   echo "baseline_inline=$(echo "$PREV_INLINE" | jq length) baseline_reviews=$(echo "$PREV_REVIEWS" | jq length) baseline_issues=$(echo "$PREV_ISSUES" | jq length)"
   diag "DRY RUN: nothing was posted."
   exit 0

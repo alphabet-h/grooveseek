@@ -1,7 +1,7 @@
 ---
 name: codex-review
 description: push 前に doc comment の名前を洗い、ローカルの Codex (adversarial-review) で前掃除してから、PR で `@codex review` を trigger し、3 endpoint (inline / reviews / issue) を `(id, updated_at)` set diff で同時 polling、state-base convergence + P0/P1 absence + sentinel text の 3 layer で判定、wall-clock timeout / error string detect / cost-aware retry cap で hardening したオーケストレータ
-argument-hint: [-R owner/repo] <PR#> [max_rounds] [per_round_timeout_sec]
+argument-hint: [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec]
 ---
 
 # /codex-review
@@ -14,8 +14,10 @@ detection + 結果 fetch + 整形** する。`/feature-flow` Phase 6 の sub-ste
 一覧は数えずに引く: `grep -oE '罠 [0-9]+' .claude/skills/codex-review/scripts/codex_review_round.sh | sort -u`
 (番号の由来: `.dev/knowledge/codex-review-loop-pitfalls.md`)。
 
-引数: `<PR#>` 必須 / `<max_rounds>` default **3** (罠 16: 25 credits × 3) / `<per_round_timeout_sec>` default 600 (罠 9)。
-3 つとも **そのまま script に渡す**。round 番号は script が PR の `@codex review` 投稿履歴から導くので、
+引数: option `-R owner/repo` / `--dry-run` (どちらも任意、**`<PR#>` より前に置く**) と、位置引数
+`<PR#>` 必須 / `<max_rounds>` default **3** (罠 16: 25 credits × 3) / `<per_round_timeout_sec>` default 600 (罠 9)。
+受けたものは option も位置引数も **そのまま、同じ順で script に渡す** (位置引数の 4 番目の body file は
+controller が re-review round で足す、下記)。round 番号は script が PR の `@codex review` 投稿履歴から導くので、
 上限は process を跨いで効く (controller が数えなくてよい、数えてはいけない)。
 前提: `gh auth status` OK、repo に codex connector app install 済。destructive 操作なし (GitHub へ comment を post するだけ)。
 
@@ -27,7 +29,8 @@ detection + 結果 fetch + 整形** する。`/feature-flow` Phase 6 の sub-ste
 
 決めた 1 つの repo を、投稿 (`gh pr comment -R`)・3 endpoint の読み取り・round の数え方 (trigger 履歴)・
 head sha の全部が使う。`-R` と `GH_REPO` が両方あって別の repo を指すと **exit 2 で何も投稿しない**。
-github.com 以外の host も exit 2。PR がその repo に無ければ exit 8 (投稿前)。stderr 1 行目の
+github.com 以外の host も exit 2。script は repo を決める前に `GH_HOST=github.com` を export するので、
+呼び出し側の `GH_HOST` が別 host を指していても読み書きは github.com に行く。PR がその repo に無ければ exit 8 (投稿前)。stderr 1 行目の
 `repo <owner/repo> / PR <url>` で、どこを見ているかを確かめる。
 #409 では `GH_REPO` を付けて打ったら投稿は別 repo の PR、読み取りは kb-mcp の同番号 PR になり、
 「baseline none」と「600 秒無応答」が出た。引数なしの `gh repo view` は `GH_REPO` を見ないので、
@@ -261,7 +264,7 @@ S=<scratchpad>
 bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds> 600 > "$S/r1.out" 2> "$S/r1.err"; echo exit=$?
 ```
 
-re-review round (P0/P1 を fix して push した後) は **body file を第 3 引数に渡す**。本文は
+re-review round (P0/P1 を fix して push した後) は **body file を 4 番目の位置引数に渡す** (`<PR#>` `<max_rounds>` `<per_round_timeout_sec>` の次。option は数えない)。本文は
 `@codex review` で始め、続けて fix sketch。**`@codex` を本文中で bare word でも使わない、
 verb は `review` のみ** (罠 15 / 18)。heredoc ではなく Write で file にしてから渡す:
 
@@ -289,7 +292,7 @@ PR の `@codex review` 投稿履歴から導く。stderr の `round N/M` 行で�
 | exit 5 | trigger に reaction が 1 つも無い = 届いていない (罠 47、実測 8 回中 2 回) | 同じ commit に再 trigger (自動 1 回)。2 回目も届かなければ user 報告。届かなかった trigger も履歴上は 1 round と数える (安全側) |
 | exit 6 | trigger の POST が 3 回失敗 (罠 50) | 待たずに abort。数分置いて再実行 |
 | exit 7 | `max_rounds` に到達、**何も投稿していない** (罠 16 / 28) | user に報告 (続行 / 妥協 / scope 縮小の判断)。自分で上限を上げて再実行しない |
-| exit 2 | 引数の誤り。**`-R` と `GH_REPO` が別の repo を指している**、または github.com 以外の host も含む。何も投稿していない | どちらか一方にして打ち直す |
+| exit 2 | 引数の誤り (stderr に usage)。未知の option、`-R` の値が無い / `-` で始まる、位置引数が数字でない / 多すぎる、**`-R` と `GH_REPO` が別の repo を指している**、github.com 以外の host。何も投稿していない | usage を見て直して打ち直す — option は `<PR#>` より前に置く、`-R` と `GH_REPO` はどちらか一方にする |
 | exit 8 | 投稿前の読み取り (repo 名 / PR の存在 / baseline / trigger 履歴) で `gh api` が失敗、**何も投稿していない** | `gh auth status` / rate limit、`-R` の repo と PR 番号の組を確認して再実行 |
 | exit 9 | round の delta を計算できなかった (罠 59)。**trigger は投稿済み** | そのまま再実行。**空欄を「指摘なし」と読まない** — 判定材料が無いだけ |
 | exit 10 | `Provided git ref <sha> does not exist` — push 直後の trigger で codex 側にまだ ref が無い (罠 60、PR #258 / #265 / #293 で 3 回)。本文は exit 4 と同じ語彙だが transient | `gh api repos/<o>/<r>/commits/<sha>` で head の存在を確かめ、body file 付きで **1 回だけ** 再 trigger (1 round と数える)。**2 回目も exit 10 なら止めて user 報告** (stdout / stderr を残す。#293 は 5 分空けた再 trigger も同じ本文だった = 待ち時間の根拠が無い。次に打つなら新しい push の後か、user が時刻を決める)。避けるには push と `gh pr create` の間を空ける。同じ round に quota 等の terminal 本文が並ぶと exit 4 が勝つ (script が comment ごとに分類) |
