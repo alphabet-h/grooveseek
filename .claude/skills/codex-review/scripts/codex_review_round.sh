@@ -40,7 +40,11 @@
 #   6  trigger POST failed 3 times; do not wait, re-run later (trap 50)
 #   7  round limit reached; nothing was posted (trap 16 / 28)
 #   8  a read before posting failed, or a value built from it (count, round number,
-#      head, URL, baseline text) failed or is not the expected shape; nothing was posted
+#      head, URL, baseline text) failed or is not the expected shape; nothing was posted.
+#      Also: the temporary directory could not be created (`ABORT: could not create a
+#      temporary directory.`) or resolved to an absolute path (`ABORT: could not resolve
+#      the temporary directory <path>.`), before any GitHub read - fix TMPDIR / its
+#      write permission and re-run
 #   9  a round delta could not be computed (jq failed); the round's findings are
 #      unknown, so nothing is reported as converged (trap 59); or a GitHub read after
 #      the trigger failed / came back empty (reactions at timeout, the final reviews /
