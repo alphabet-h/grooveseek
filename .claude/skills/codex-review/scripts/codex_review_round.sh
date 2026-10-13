@@ -109,14 +109,21 @@ diag() { printf '%s\n' "$*" >&2; }
 # `mktemp -d` の絶対パス — この script は repo root へ cd しているので、相対パスで
 # 書くと作業ツリーに残骸を落とす。EXIT trap で必ず消すので、どの exit code で
 # 抜けても残らない。trigger_body_file の snapshot も同じ dir に置く (trap は 1 本だけ)。
+# trap は mktemp より **前に** 張る (PR #358 のローカル Codex、medium): 作成から trap までの間
+# (下の絶対 path 解決を含む) に中断されても dir が残らないように。ROUND_TMP が空の間は何もしない。
+# INT / TERM / HUP は別に trap しない: Git Bash (bash 5) は signal で終わる時も EXIT trap を
+# 実行することを実測した (PR #358 の作業中、3 signal とも marker file が書かれた)。
+cleanup_round_tmp() { if [ -n "$ROUND_TMP" ]; then rm -rf "$ROUND_TMP"; fi; }
+ROUND_TMP=""
+trap cleanup_round_tmp EXIT
 ROUND_TMP=$(mktemp -d) || { diag "ABORT: could not create a temporary directory."; exit 8; }
 # 呼び出し側の TMPDIR が相対 (例 `TMPDIR=tmp`) だと mktemp は相対 path を返す。下で repo root へ
 # cd した後に snapshot / json / EXIT trap が別の場所を指さないよう、cd 前に絶対 path へ解決する
 # (PR #358 の codex r1、P2)。`$( )` の中の cd なので、この script の cwd は動かない。
+# 解決できなければ exit 8 で抜け、生の (cd 前なので有効な) path の削除は trap に任せる。
 ROUND_TMP_ABS=$(cd "$ROUND_TMP" && pwd) || {
-  rm -rf "$ROUND_TMP"; diag "ABORT: could not resolve the temporary directory ${ROUND_TMP}."; exit 8; }
-ROUND_TMP=$ROUND_TMP_ABS
-trap 'rm -rf "$ROUND_TMP"' EXIT
+  diag "ABORT: could not resolve the temporary directory ${ROUND_TMP}."; exit 8; }
+ROUND_TMP=$ROUND_TMP_ABS   # 差し替えの前後どちらでも ROUND_TMP は同じ実在 dir を指す
 
 bad_body_file() {   # $1 = 理由
   diag "ABORT: trigger_body_file ${TRIGGER_BODY_FILE}: $1. Nothing was posted."
