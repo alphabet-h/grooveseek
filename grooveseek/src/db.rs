@@ -8299,6 +8299,45 @@ mod tests {
         );
     }
 
+    /// feature-65 M1 (AC24): the pptx generation is a key of its own beside the docx and
+    /// frontmatter ones, and writing it leaves them alone.
+    #[test]
+    fn pptx_table_break_policy_round_trips_beside_the_docx_policies() {
+        let db = db_with_384();
+        assert_eq!(db.read_pptx_table_break_policy().unwrap(), None);
+        db.write_frontmatter_policy("tag-unparsed").unwrap();
+        db.write_docx_heading_policy("styles-name-basedon").unwrap();
+        db.write_docx_section_policy("fold-empty-headings").unwrap();
+        db.write_docx_table_policy("tab-joined-rows").unwrap();
+        db.write_pptx_table_break_policy("tab-joined-rows-kept-breaks")
+            .unwrap();
+        assert_eq!(
+            db.read_pptx_table_break_policy().unwrap().as_deref(),
+            Some("tab-joined-rows-kept-breaks")
+        );
+        db.write_pptx_table_break_policy("next").unwrap();
+        assert_eq!(
+            db.read_pptx_table_break_policy().unwrap().as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            db.read_docx_table_policy().unwrap().as_deref(),
+            Some("tab-joined-rows")
+        );
+        assert_eq!(
+            db.read_docx_section_policy().unwrap().as_deref(),
+            Some("fold-empty-headings")
+        );
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some("styles-name-basedon")
+        );
+        assert_eq!(
+            db.read_frontmatter_policy().unwrap().as_deref(),
+            Some("tag-unparsed")
+        );
+    }
+
     /// feature-62: overwriting the content hash touches the named rows' hash and nothing
     /// else -- not the chunks, not another row -- and a path without a row is skipped.
     #[test]
