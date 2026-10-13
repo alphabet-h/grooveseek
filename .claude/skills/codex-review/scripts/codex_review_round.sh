@@ -110,6 +110,12 @@ diag() { printf '%s\n' "$*" >&2; }
 # 書くと作業ツリーに残骸を落とす。EXIT trap で必ず消すので、どの exit code で
 # 抜けても残らない。trigger_body_file の snapshot も同じ dir に置く (trap は 1 本だけ)。
 ROUND_TMP=$(mktemp -d) || { diag "ABORT: could not create a temporary directory."; exit 8; }
+# 呼び出し側の TMPDIR が相対 (例 `TMPDIR=tmp`) だと mktemp は相対 path を返す。下で repo root へ
+# cd した後に snapshot / json / EXIT trap が別の場所を指さないよう、cd 前に絶対 path へ解決する
+# (PR #358 の codex r1、P2)。`$( )` の中の cd なので、この script の cwd は動かない。
+ROUND_TMP_ABS=$(cd "$ROUND_TMP" && pwd) || {
+  rm -rf "$ROUND_TMP"; diag "ABORT: could not resolve the temporary directory ${ROUND_TMP}."; exit 8; }
+ROUND_TMP=$ROUND_TMP_ABS
 trap 'rm -rf "$ROUND_TMP"' EXIT
 
 bad_body_file() {   # $1 = 理由
