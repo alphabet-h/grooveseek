@@ -425,6 +425,8 @@ fn resolve_relative_target(base_dir: &str, target: &str) -> String {
 /// own; a `<a:tbl>` inside a table, which the schema does not allow, writes the outer row so far
 /// and is read as a table of its own, after which the reader is outside any table. A paragraph
 /// outside every `<a:tc>` takes the path a paragraph always took.
+/// A line break (`<a:br>`) is a newline outside a table, a space inside a cell, and a space in
+/// the title the heading takes ([`push_line_break`]).
 fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, String) {
     super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
@@ -442,6 +444,9 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
     // `<a:p>` (段落) スコープ状態。sp 内外を問わず段落単位でテキストを蓄積し、
     // `</a:p>` で title / body / セルへの振り分けを行う。
     let mut para_text = String::new();
+    // (feature-65) The paragraph as the heading reads it: each `<a:br>` a space rather than a
+    // newline ([`push_line_break`]). Without a break it is `para_text`.
+    let mut para_title = String::new();
     let mut in_text = false;
 
     // (feature-65) Whether the reader is inside a `<a:tbl>`, and the row being read there.
@@ -461,8 +466,16 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                         sp_is_title = true;
                     }
                 }
-                b"p" => para_text.clear(),
+                b"p" => {
+                    para_text.clear();
+                    para_title.clear();
+                }
                 b"t" => in_text = true,
+                b"br" => push_line_break(
+                    &mut para_text,
+                    &mut para_title,
+                    open_cell_mut(in_table, &mut row).is_some(),
+                ),
                 b"tbl" => {
                     // A table inside a table writes out the row so far first (R1.7).
                     if let Some(open) = row.take() {
@@ -487,6 +500,11 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                         sp_is_title = true;
                     }
                 }
+                b"br" => push_line_break(
+                    &mut para_text,
+                    &mut para_title,
+                    open_cell_mut(in_table, &mut row).is_some(),
+                ),
                 b"tc" if in_table => {
                     let open = row.get_or_insert_with(PptxRow::default);
                     open.open_cell(cell_kind(&e));
@@ -498,13 +516,17 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
             // (`decode()`) と entity unescape (`escape::unescape()`) を分離した
             // (docx.rs Task 3.4 前例踏襲)。
             Ok(Event::Text(t)) if in_text => {
-                para_text.push_str(&decode_text(&t));
+                let text = decode_text(&t);
+                para_text.push_str(&text);
+                para_title.push_str(&text);
             }
             // quick-xml 0.38+ は entity 参照 (`&amp;` 等) を `Event::Text` に含めず
             // `Event::GeneralRef` として別 event で届ける。ここを処理しないと
             // `<a:t>A&amp;B</a:t>` の "&" が欠落する (docx.rs 同様の必須処理)。
             Ok(Event::GeneralRef(r)) if in_text => {
-                para_text.push_str(&super::ooxml::resolve_general_ref(&r));
+                let text = super::ooxml::resolve_general_ref(&r);
+                para_text.push_str(&text);
+                para_title.push_str(&text);
             }
             Ok(Event::End(e)) => match super::ooxml_local(e.name().as_ref()) {
                 b"t" => in_text = false,
@@ -518,7 +540,7 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                             // テキストも embed 対象の content (body) に残す (上の
                             // doc comment 参照)。
                             if in_sp && sp_is_title && title.is_none() {
-                                title = Some(trimmed.to_string());
+                                title = Some(para_title.trim().to_string());
                             }
                             if !body.is_empty() {
                                 body.push('\n');
@@ -667,6 +689,14 @@ fn open_cell_mut(in_table: bool, row: &mut Option<PptxRow>) -> Option<&mut PptxC
         return None;
     }
     row.as_mut().and_then(|r| r.open.as_mut())
+}
+
+/// (feature-65, R2) What a `<a:br>` adds to the paragraph being read: a newline to the text the
+/// body gets, or a space inside a table cell so the row stays one line; and a space to the
+/// text the heading gets, so a slide title stays one line.
+fn push_line_break(para_text: &mut String, para_title: &mut String, in_cell: bool) {
+    para_text.push(if in_cell { ' ' } else { '\n' });
+    para_title.push(' ');
 }
 
 /// `<p:ph>` の `type` 属性が title placeholder (`"title"` / `"ctrTitle"`) か
@@ -1715,5 +1745,98 @@ mod tests {
             read.chunks[0].content,
             "overview\napple\tbirch\ncedar\tdune"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-65: line breaks
+    // -----------------------------------------------------------------------
+
+    /// feature-65 P5 (AC5): a cell's paragraphs and the line breaks inside them join with a
+    /// space, in both forms of `<a:br>`, and the row stays one line.
+    #[test]
+    fn paragraphs_and_breaks_in_a_pptx_cell_join_with_a_space() {
+        let first = cell_with(
+            "",
+            &[
+                &run_of("xenial"),
+                "",
+                &format!("{}<a:br/>{}", run_of("yonder"), run_of("zephyr")),
+            ],
+        );
+        let second = cell_with(
+            "",
+            &[&format!(
+                r#"{}<a:br><a:rPr lang="en-US"/></a:br>{}"#,
+                run_of("wal"),
+                run_of("nut")
+            )],
+        );
+        let tree = table_of(&[vec![first, second]]);
+        assert_eq!(only_chunk(&tree).content, "xenial yonder zephyr\twal nut");
+    }
+
+    /// feature-65 P7 (AC7): outside a table a line break is a newline, in both forms of
+    /// `<a:br>`; the spaces around it stay, two breaks leave an empty line, and breaks at
+    /// either end of the paragraph go with its trim.
+    #[test]
+    fn a_line_break_outside_a_table_is_a_newline() {
+        let tree = shape_of(&[
+            &format!("{}<a:br/>{}", run_of("alpha "), run_of(" beta")),
+            &format!(
+                r#"{}<a:br><a:rPr lang="en-US"/></a:br>{}"#,
+                run_of("gamma"),
+                run_of("delta")
+            ),
+            &format!("{}<a:br/><a:br/>{}", run_of("x"), run_of("y")),
+            &format!("<a:br/>{}<a:br/>", run_of("z")),
+        ]);
+        assert_eq!(
+            only_chunk(&tree).content,
+            "alpha \n beta\ngamma\ndelta\nx\n\ny\nz"
+        );
+    }
+
+    /// feature-65 P8 (AC8): a line break in the title is a space in the heading and a newline
+    /// in the content.
+    #[test]
+    fn a_line_break_in_the_title_is_a_space_in_the_heading() {
+        let tree = format!(
+            "{}{}",
+            title_shape(&format!(
+                "{}<a:br/>{}",
+                run_of("Quarterly"),
+                run_of("Review")
+            )),
+            shape_of(&[&run_of("Agenda")])
+        );
+        let chunk = only_chunk(&tree);
+        assert_eq!(chunk.heading.as_deref(), Some("Slide 1: Quarterly Review"));
+        assert_eq!(chunk.content, "Quarterly\nReview\nAgenda");
+    }
+
+    /// feature-65 P9 (AC9): a tab stop list (`a:tabLst > a:tab`) defines tab positions and adds
+    /// nothing to the text.
+    #[test]
+    fn a_tab_stop_list_adds_nothing() {
+        let tree = shape_of(&[
+            &format!(
+                r#"<a:pPr><a:tabLst><a:tab pos="914400" algn="l"/></a:tabLst></a:pPr>{}"#,
+                run_of("ledger")
+            ),
+            &run_of("margin"),
+        ]);
+        assert_eq!(only_chunk(&tree).content, "ledger\nmargin");
+    }
+
+    /// feature-65 P12 (AC12): the notes keep their reading: a line break in a notes paragraph
+    /// adds nothing, its runs joined with a space as before.
+    #[test]
+    fn notes_keep_their_reading() {
+        let slide = slide_with(&shape_of(&[&run_of("anchor")]));
+        let notes = shape_of(&[&format!("{}<a:br/>{}", run_of("note"), run_of("line"))]);
+        let doc = PptxParser::default()
+            .parse_bytes(&deck_with_notes(&slide, &notes), "notes.pptx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks[0].content, "anchor\n\n[notes]\nnote line");
     }
 }
