@@ -22,12 +22,17 @@
 #
 # Exit codes:
 #   0  round complete - read the `CONVERGED=true|false` line on stdout
-#   2  bad arguments (including -R and $GH_REPO naming different repos, and a
-#      trigger_body_file that is missing / not a regular file / unreadable / empty
-#      (an empty stdin for `-` included) / whose first line does not start with
-#      `@codex review`); checked before any GitHub read, --dry-run included; nothing
-#      was posted. Failing to create the temporary directory (where the body snapshot
-#      lives) is exit 8, as before, also before any GitHub read
+#   2  bad arguments; nothing was posted. stderr differs by cause:
+#      - an unknown option / a bad -R value / a non-numeric or extra positional
+#        argument: the usage line
+#      - -R and $GH_REPO naming different repos, or a repo not on github.com:
+#        an `ABORT: ...` line + `Action: ...` line
+#      - a trigger_body_file that is missing / not a regular file / unreadable /
+#        empty (an empty stdin for `-` included) / whose first line does not start
+#        with `@codex review`: `ABORT: trigger_body_file ...` + `Action: ...`;
+#        checked before any GitHub read, --dry-run included
+#      Failing to create the temporary directory (where the body snapshot lives) is
+#      exit 8, as before, also before any GitHub read
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
 #   4  codex returned a terminal error body; retry will not help (trap 10 / 56)
 #  10  codex could not see the PR head yet ("Provided git ref ... does not exist"); re-trigger once (trap 60)
@@ -116,12 +121,13 @@ diag() { printf '%s\n' "$*" >&2; }
 cleanup_round_tmp() { if [ -n "$ROUND_TMP" ]; then rm -rf "$ROUND_TMP"; fi; }
 ROUND_TMP=""
 trap cleanup_round_tmp EXIT
-ROUND_TMP=$(mktemp -d) || { diag "ABORT: could not create a temporary directory."; exit 8; }
+# mktemp / cd 自身の stderr は locale 依存で非 ASCII になり得るので捨て、ASCII の ABORT 行だけを出す (罠 52)。
+ROUND_TMP=$(mktemp -d 2>/dev/null) || { diag "ABORT: could not create a temporary directory."; exit 8; }
 # 呼び出し側の TMPDIR が相対 (例 `TMPDIR=tmp`) だと mktemp は相対 path を返す。下で repo root へ
 # cd した後に snapshot / json / EXIT trap が別の場所を指さないよう、cd 前に絶対 path へ解決する
 # (PR #358 の codex r1、P2)。`$( )` の中の cd なので、この script の cwd は動かない。
 # 解決できなければ exit 8 で抜け、生の (cd 前なので有効な) path の削除は trap に任せる。
-ROUND_TMP_ABS=$(cd "$ROUND_TMP" && pwd) || {
+ROUND_TMP_ABS=$(cd "$ROUND_TMP" 2>/dev/null && pwd) || {
   diag "ABORT: could not resolve the temporary directory ${ROUND_TMP}."; exit 8; }
 ROUND_TMP=$ROUND_TMP_ABS   # 差し替えの前後どちらでも ROUND_TMP は同じ実在 dir を指す
 
