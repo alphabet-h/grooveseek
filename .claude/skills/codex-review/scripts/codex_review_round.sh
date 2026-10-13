@@ -79,6 +79,10 @@ case "$MAX_ROUNDS$PER_ROUND_TIMEOUT" in
 esac
 QUIET_WINDOW_SEC=180            # 罠 34: 同一 commit への 2 本目を 144 秒後に観測、+ 安全率
 BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
+# kuriya trap #410: codex は PR に 1 本の「Codex Review Summary」issue comment を持ち、
+# round ごとに Running → Completed と edit する (2026-10-06〜)。中身は進捗の表だけで指摘も
+# sentinel も無い。1 行目全体が `<!-- ${CODEX_SUMMARY_MARKER} -->` の comment を snapshot_issues で除外する (下)。
+CODEX_SUMMARY_MARKER="codex-pull-request-review-summary"
 
 # The script lives at <repo>/.claude/skills/codex-review/scripts/; resolve the
 # repo from there so it works from any cwd and any checkout location.
@@ -195,9 +199,20 @@ snapshot_reviews() {
     --jq "[.[] | select(.user.login==\"${BOT}\") | {id, state, submitted_at, commit_id, body}]" \
     | jq -s "add // [] | sort_by(.id)"
 }
+# kuriya trap #410: Review Summary comment (CODEX_SUMMARY_MARKER) は **ここで 1 回だけ** 落とす。
+#   残すと Running への edit が (id, updated_at) の差分になり、① Phase A が結果より先に抜けて
+#   quiet window が早く満了する (PR #356 r1 で INDETERMINATE)、② 毎 round NEW_ISSUES に入って
+#   ROUND_EMPTY が true にならない (罠 57 の安全装置が死ぬ)。key / delta / sentinel /
+#   ROUND_EMPTY / 表示はすべてこの関数を通るので、ここで揃う (罠 53)。
+#   判定は **本文の 1 行目全体が marker の HTML コメント**のときだけ: 前後に許すのは横の空白
+#   ([[:blank:]]) だけで、`-->` の後は改行か本文の終わり。`contains`・行末を見ない形・先頭の改行を
+#   飛ばす形 ([[:space:]]) だと、marker を引用した本物の指摘 (この script 自身の review) まで落とす
+#   (ローカル Codex r1 / r2 / r3)。観察した summary は 1 行目がこの行そのもの (comment 6147442307)。
+#   escape は 3 段 (bash の二重引用符 → jq 文字列 → Oniguruma): `\r` `\n` は bash を素通りして
+#   jq が CR / LF にし、`\$` は bash が `$` にする。`\s` を避けて POSIX class を使うのも同じ理由。
 snapshot_issues() {
   gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}]" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | select((.body // \"\") | test(\"^[[:blank:]]*<!-- ${CODEX_SUMMARY_MARKER} -->[[:blank:]]*(\r?\n|\$)\") | not) | {id, updated_at, body}]" \
     | jq -s "add // [] | sort_by(.id)"
 }
 

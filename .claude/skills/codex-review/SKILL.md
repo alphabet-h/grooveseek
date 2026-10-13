@@ -391,4 +391,8 @@ CLAUDE.local.md guardrail「5 round 経過で user 報告」と揃えて **明�
 - 公式: [Codex GitHub integration](https://developers.openai.com/codex/integrations/github) /
   [Codex pricing](https://developers.openai.com/codex/pricing) /
   [GitHub REST: pull request reviews](https://docs.github.com/en/rest/pulls/reviews)
-- 既知の制限: GraphQL 移行 (1 query で 3 endpoint) は未評価。bot login が変わったら script の `BOT` を更新
+- 既知の制限: GraphQL 移行 (1 query で 3 endpoint) は未評価。bot login が変わったら script の `BOT` を更新。
+  codex の「Codex Review Summary」issue comment (round ごとに Running → Completed と edit される) は
+  script が除外している (判定は本文の 1 行目全体が `<!-- codex-pull-request-review-summary -->` のときだけ。前後の横の空白は許すが、先頭の改行は飛ばさない。同じ行に文が続く・2 行目以降で引用する指摘は落とさない) —
+  marker の文言が変わると INDETERMINATE が再発するので
+  `CODEX_SUMMARY_MARKER` を更新 (kuriya trap #410)
