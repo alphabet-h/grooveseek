@@ -25,8 +25,8 @@
 #   2  bad arguments; nothing was posted. stderr differs by cause:
 #      - an unknown option / a bad -R value / a non-numeric or extra positional
 #        argument: the usage line
-#      - -R and $GH_REPO naming different repos, or a repo not on github.com:
-#        an `ABORT: ...` line + `Action: ...` line
+#      - -R and $GH_REPO naming different repos: an `ABORT: ...` line + `Action: ...` line
+#      - a repo not on github.com: an `ABORT: ...` line only
 #      - a trigger_body_file that is missing / not a regular file / unreadable /
 #        empty (an empty stdin for `-` included) / whose first line does not start
 #        with `@codex review`: `ABORT: trigger_body_file ...` + `Action: ...`;
