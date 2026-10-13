@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-14
 - Deciders: project owner
-- Applies to: v1.19.0 (PR #NNN)
+- Applies to: v1.19.0 (PR #359)
 
 ## Context and problem
 
