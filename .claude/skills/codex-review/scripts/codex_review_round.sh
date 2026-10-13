@@ -14,11 +14,16 @@
 #     max_rounds             default 3; the round number is derived from the PR's own
 #                            `@codex review` history, so the limit holds across processes
 #     per_round_timeout_sec  default 600 (wall-clock for Phase A + Phase B)
-#     trigger_body_file      re-review body (`@codex review` + fix sketch); omit for round 1
+#     trigger_body_file      re-review body (`@codex review` + fix sketch); omit for round 1.
+#                            Must be a non-empty readable regular file whose first line
+#                            starts with `@codex review`, else exit 2 before anything else
 #
 # Exit codes:
 #   0  round complete - read the `CONVERGED=true|false` line on stdout
-#   2  bad arguments (including -R and $GH_REPO naming different repos)
+#   2  bad arguments (including -R and $GH_REPO naming different repos, and a
+#      trigger_body_file that is missing / not a regular file / unreadable / empty /
+#      whose first line does not start with `@codex review`); checked before any
+#      GitHub read, --dry-run included; nothing was posted
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
 #   4  codex returned a terminal error body; retry will not help (trap 10 / 56)
 #  10  codex could not see the PR head yet ("Provided git ref ... does not exist"); re-trigger once (trap 60)
@@ -77,6 +82,36 @@ case "$PR" in ''|*[!0-9]*) usage;; esac
 case "$MAX_ROUNDS$PER_ROUND_TIMEOUT" in
   *[!0-9]*|'') usage;;
 esac
+# trigger_body_file は引数の段階で検査する (repo 解決・GitHub の読み取りより前、--dry-run でも)。
+# 検査しないと、存在しない / 読めない / 空の file が Step 2 の `gh pr comment --body-file` の
+# 失敗として post_trigger の 20 秒 x 3 回 retry に入り、exit 6 (「後で再実行」= 罠 50) になる。
+# 原因は引数なので、待たせずに exit 2 で止める。何も投稿しない。
+# 本文が `@codex review` で始まらないものも同じ exit 2 (罠 15 / 18): mention の無い comment は
+# codex に届かず、投稿して 1 round を数えた上で exit 5 (罠 47) と誤診する。
+# 相対 path はここで絶対 path にする: 下で repo root へ cd するので、呼び出し側の cwd 基準の
+# path が gh に渡る時には別の file を指す (または存在しない)。
+# diag (下) はまだ定義前なので printf で直に stderr へ書く (ASCII のみ、罠 52)。
+bad_body_file() {   # $1 = 理由
+  printf '%s\n' "ABORT: trigger_body_file ${TRIGGER_BODY_FILE}: $1. Nothing was posted." >&2
+  printf '%s\n' "Action: write the re-review body (first line starts with @codex review) to a file and pass its path." >&2
+  exit 2
+}
+if [ -n "$TRIGGER_BODY_FILE" ]; then
+  case "$TRIGGER_BODY_FILE" in
+    /*|[A-Za-z]:[/\\]*) ;;
+    *) TRIGGER_BODY_FILE="$PWD/$TRIGGER_BODY_FILE";;
+  esac
+  [ -e "$TRIGGER_BODY_FILE" ] || bad_body_file "does not exist"
+  [ -f "$TRIGGER_BODY_FILE" ] || bad_body_file "is not a regular file"
+  [ -r "$TRIGGER_BODY_FILE" ] || bad_body_file "is not readable"
+  [ -s "$TRIGGER_BODY_FILE" ] || bad_body_file "is empty"
+  IFS= read -r BODY_FIRST_LINE < "$TRIGGER_BODY_FILE" || [ -n "${BODY_FIRST_LINE:-}" ] \
+    || bad_body_file "could not read its first line"
+  case "$BODY_FIRST_LINE" in
+    '@codex review'|'@codex review'[[:space:]]*) ;;   # [[:space:]] は CRLF の \r も含む
+    *) bad_body_file "the first line does not start with @codex review (trap 15)";;
+  esac
+fi
 QUIET_WINDOW_SEC=180            # 罠 34: 同一 commit への 2 本目を 144 秒後に観測、+ 安全率
 BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
 # kuriya trap #410: codex は PR に 1 本の「Codex Review Summary」issue comment を持ち、
