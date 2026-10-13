@@ -204,14 +204,15 @@ snapshot_reviews() {
 #   quiet window が早く満了する (PR #356 r1 で INDETERMINATE)、② 毎 round NEW_ISSUES に入って
 #   ROUND_EMPTY が true にならない (罠 57 の安全装置が死ぬ)。key / delta / sentinel /
 #   ROUND_EMPTY / 表示はすべてこの関数を通るので、ここで揃う (罠 53)。
-#   判定は **本文の最初の行 (前置の空白・改行は許す) 全体が marker の HTML コメント**のときだけ
-#   (`-->` の後は横の空白だけ、続けて改行か本文の終わり)。`contains` や行末を見ない形だと、
-#   marker を引用した本物の指摘 (この script 自身の review) まで落とす (ローカル Codex r1 / r2)。
+#   判定は **本文の 1 行目全体が marker の HTML コメント**のときだけ: 前後に許すのは横の空白
+#   ([[:blank:]]) だけで、`-->` の後は改行か本文の終わり。`contains`・行末を見ない形・先頭の改行を
+#   飛ばす形 ([[:space:]]) だと、marker を引用した本物の指摘 (この script 自身の review) まで落とす
+#   (ローカル Codex r1 / r2 / r3)。観察した summary は 1 行目がこの行そのもの (comment 6147442307)。
 #   escape は 3 段 (bash の二重引用符 → jq 文字列 → Oniguruma): `\r` `\n` は bash を素通りして
-#   jq が CR / LF にし、`\$` は bash が `$` にする。`\s` を避けて `[[:space:]]` を使うのも同じ理由。
+#   jq が CR / LF にし、`\$` は bash が `$` にする。`\s` を避けて POSIX class を使うのも同じ理由。
 snapshot_issues() {
   gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | select((.body // \"\") | test(\"^[[:space:]]*<!-- ${CODEX_SUMMARY_MARKER} -->[[:blank:]]*(\r?\n|\$)\") | not) | {id, updated_at, body}]" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | select((.body // \"\") | test(\"^[[:blank:]]*<!-- ${CODEX_SUMMARY_MARKER} -->[[:blank:]]*(\r?\n|\$)\") | not) | {id, updated_at, body}]" \
     | jq -s "add // [] | sort_by(.id)"
 }
 
