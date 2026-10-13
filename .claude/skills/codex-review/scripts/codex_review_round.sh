@@ -25,7 +25,8 @@
 #   5  trigger comment got no reaction = codex never received it (trap 47)
 #   6  trigger POST failed 3 times; do not wait, re-run later (trap 50)
 #   7  round limit reached; nothing was posted (trap 16 / 28)
-#   8  could not read the PR before posting (gh api failed); nothing was posted
+#   8  a read before posting failed, or a value built from it (count, round number,
+#      head, URL, baseline text) failed or is not the expected shape; nothing was posted
 #   9  a round delta could not be computed (jq failed); the round's findings are
 #      unknown, so nothing is reported as converged (trap 59); or a GitHub read after
 #      the trigger failed / came back empty (reactions at timeout, the final reviews /
@@ -103,10 +104,18 @@ trap 'rm -rf "$ROUND_TMP"' EXIT
 # 素通りする (codex P2 round 2 on PR #222)。polling 中の一時失敗はここでは扱わない —
 # そちらは罠 48 の二重確認が吸収する (投稿後に abort すると 1 round 分の credit が消える)。
 # top level から呼ぶこと: `$( )` の中では `exit` がサブシェルしか終わらせない (罠 54)。
+# 対象は GitHub の読み取りだけでなく、**それを元に jq で作る値** (件数・本文・round 数・head・URL)
+# も同じ (PR #356 のローカル Codex round 3、high / medium): page を足す jq が落ちて round 数が空に
+# なると `$(( + 1 ))` = round 1 で上限を素通りし、dry-run の件数が空でも exit 0 になっていた。
+# 呼び出し点ごとの表は PR #356 の本文 ("Reads before the trigger")。
 abort_unreadable() {
-  diag "ABORT: could not read $1 (gh api failed). Nothing was posted."
+  diag "ABORT: could not read $1 (gh api or jq failed). Nothing was posted."
   diag "Action: check gh auth status / rate limit, then re-run."
   exit 8
+}
+# 数であるべき値の検査 (投稿前の版)。投稿後の require_count と同じ形で、出口だけ exit 8。
+require_count_before_trigger() {   # $1 = 値, $2 = 何の数か
+  case "$1" in ''|*[!0-9]*) abort_unreadable "$2 (got '${1}')";; esac
 }
 
 # ---- which repo (kuriya trap #409 / #238) ----
@@ -143,6 +152,12 @@ if [ -n "$REPO_ARG" ] && [ -n "${GH_REPO:-}" ]; then
 else
   REPO_RESOLVED=$(resolve_repo "${REPO_ARG:-${GH_REPO:-}}") || abort_unreadable "the repository name"
 fi
+# 成功して出力が空 / 形が違う時は「読めなかった」(exit 8)。そのまま分解すると OWNER_REPO が空になり、
+# 下の host 判定が exit 2 (引数の誤り) を出して原因を取り違える。
+case "$REPO_RESOLVED" in
+  ?*/?*' https://'?*) ;;
+  *) abort_unreadable "the repository name (got '${REPO_RESOLVED}')";;
+esac
 OWNER_REPO=${REPO_RESOLVED%% *}
 case "${REPO_RESOLVED#* }" in
   https://github.com/*) ;;
@@ -152,6 +167,7 @@ esac
 export GH_REPO="$OWNER_REPO"
 # PR がその repo に実在することを投稿前に確かめる (番号が issue / 別 repo の PR を指していたら止める)。
 PR_URL=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .html_url) || abort_unreadable "PR #${PR} in ${OWNER_REPO}"
+case "$PR_URL" in https://?*) ;; *) abort_unreadable "the URL of PR #${PR} in ${OWNER_REPO} (got '${PR_URL}')";; esac
 diag "repo ${OWNER_REPO} / PR ${PR_URL}"
 
 # ---- snapshot helpers ----
@@ -301,7 +317,9 @@ PREV_ISSUES=$(snapshot_issues) || abort_unreadable "the issue-comment baseline"
 # (codex P2 round 2 on PR #222: 失敗 = 0 = round 1 で、上限を素通りして投稿していた)。
 TRIGGER_HISTORY=$(gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
   --jq '[.[] | select(.body | startswith("@codex review"))] | length') || abort_unreadable "the trigger history"
-PRIOR_TRIGGERS=$(printf '%s\n' "$TRIGGER_HISTORY" | jq -s 'add // 0')
+# 集計の jq も同じ: 落ちると空 → `$(( + 1 ))` = round 1 で上限を素通りする (PR #356 ローカル Codex、high)。
+PRIOR_TRIGGERS=$(printf '%s\n' "$TRIGGER_HISTORY" | jq -s 'add // 0') || abort_unreadable "the trigger count"
+require_count_before_trigger "$PRIOR_TRIGGERS" "the trigger count"
 FIRST_INVOCATION=$([ "${PRIOR_TRIGGERS}" = "0" ] && echo true || echo false)
 
 # 罠 16 / 罠 28 (codex P2 on PR #222): max_rounds を「宣言」しても、round 数を誰も
@@ -320,11 +338,19 @@ diag "round ${ROUND}/${MAX_ROUNDS} (prior @codex review triggers on this PR: ${P
 # head の取得は top level で受ける: echo の中の `$( )` だと失敗しても空のまま exit 0 になり、
 # 「読めた」と「読めなかった」が見分けられない (罠 54 と同じ形)。
 if [ "$DRY_RUN" = "true" ]; then
+  # 出す値は全部先に作って検査し、成功の行は検査が全部通ってから出す (件数の jq が落ちても
+  # exit 0 で空の件数を出していた。PR #356 ローカル Codex、medium)。
   DRY_HEAD=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha) || abort_unreadable "the head sha"
-  [ -n "$DRY_HEAD" ] || abort_unreadable "the head sha"
+  case "$DRY_HEAD" in ''|*[!0-9a-f]*) abort_unreadable "the head sha (got '${DRY_HEAD}')";; esac
+  N_BASE_INLINE=$(printf '%s' "$PREV_INLINE" | jq length) || abort_unreadable "the inline-comment baseline count"
+  N_BASE_REVIEWS=$(printf '%s' "$PREV_REVIEWS" | jq length) || abort_unreadable "the review baseline count"
+  N_BASE_ISSUES=$(printf '%s' "$PREV_ISSUES" | jq length) || abort_unreadable "the issue-comment baseline count"
+  require_count_before_trigger "$N_BASE_INLINE" "the inline-comment baseline count"
+  require_count_before_trigger "$N_BASE_REVIEWS" "the review baseline count"
+  require_count_before_trigger "$N_BASE_ISSUES" "the issue-comment baseline count"
   echo "DRY_RUN repo=${OWNER_REPO} pr=${PR} url=${PR_URL}"
   echo "head=${DRY_HEAD} prior_triggers=${PRIOR_TRIGGERS} round=${ROUND}/${MAX_ROUNDS} would_stop_at_limit=$([ "$ROUND" -gt "$MAX_ROUNDS" ] && echo true || echo false) first_invocation=${FIRST_INVOCATION}"
-  echo "baseline_inline=$(echo "$PREV_INLINE" | jq length) baseline_reviews=$(echo "$PREV_REVIEWS" | jq length) baseline_issues=$(echo "$PREV_ISSUES" | jq length)"
+  echo "baseline_inline=${N_BASE_INLINE} baseline_reviews=${N_BASE_REVIEWS} baseline_issues=${N_BASE_ISSUES}"
   diag "DRY RUN: nothing was posted."
   exit 0
 fi
@@ -352,10 +378,16 @@ fi
 # 「初回ではない」と判断して永久に出さなくなる** — trigger comment が記録して
 # いるのは「実行が始まったこと」であって「baseline を読んだこと」ではない
 # (codex P1 on PR #179)。ここで出せば、その後どこで落ちても表示済み。
+# 整形は変数で受けて検査してから出す: jq が落ちたまま投稿へ進むと、次の run は
+# `PRIOR_TRIGGERS > 0` で初回ではなくなり、**この baseline は二度と出ない** (PR #356 の表)。
 if [ "$FIRST_INVOCATION" = "true" ]; then
+  BASE_INLINE_TEXT=$(printf '%s' "$PREV_INLINE" | jq -r 'if length == 0 then "(baseline inline: none)" else .[] | "[baseline] \(.path):\(.line // .original_line)\n\(.body)\n---" end') \
+    || abort_unreadable "the inline-comment baseline (rendering)"
+  BASE_REVIEWS_TEXT=$(printf '%s' "$PREV_REVIEWS" | jq -r 'if length == 0 then "(baseline review bodies: none)" else .[] | "[baseline] state=\(.state) commit=\(.commit_id)\n\(.body)\n---" end') \
+    || abort_unreadable "the review baseline (rendering)"
   echo "=== Baseline before this run - the review GitHub ran when the PR opened (trap 51) ==="
-  echo "$PREV_INLINE" | jq -r 'if length == 0 then "(baseline inline: none)" else .[] | "[baseline] \(.path):\(.line // .original_line)\n\(.body)\n---" end'
-  echo "$PREV_REVIEWS" | jq -r 'if length == 0 then "(baseline review bodies: none)" else .[] | "[baseline] state=\(.state) commit=\(.commit_id)\n\(.body)\n---" end'
+  printf '%s\n' "$BASE_INLINE_TEXT"
+  printf '%s\n' "$BASE_REVIEWS_TEXT"
   diag "NOTE: baseline shown above. An empty round diff does not mean nothing was found."
 fi
 
