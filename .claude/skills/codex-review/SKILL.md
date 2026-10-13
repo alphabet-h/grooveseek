@@ -1,7 +1,7 @@
 ---
 name: codex-review
 description: push 前に doc comment の名前を洗い、ローカルの Codex (adversarial-review) で前掃除してから、PR で `@codex review` を trigger し、3 endpoint (inline / reviews / issue) を `(id, updated_at)` set diff で同時 polling、state-base convergence + P0/P1 absence + sentinel text の 3 layer で判定、wall-clock timeout / error string detect / cost-aware retry cap で hardening したオーケストレータ
-argument-hint: <PR#> [max_rounds] [per_round_timeout_sec]
+argument-hint: [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec]
 ---
 
 # /codex-review
@@ -14,10 +14,42 @@ detection + 結果 fetch + 整形** する。`/feature-flow` Phase 6 の sub-ste
 一覧は数えずに引く: `grep -oE '罠 [0-9]+' .claude/skills/codex-review/scripts/codex_review_round.sh | sort -u`
 (番号の由来: `.dev/knowledge/codex-review-loop-pitfalls.md`)。
 
-引数: `<PR#>` 必須 / `<max_rounds>` default **3** (罠 16: 25 credits × 3) / `<per_round_timeout_sec>` default 600 (罠 9)。
-3 つとも **そのまま script に渡す**。round 番号は script が PR の `@codex review` 投稿履歴から導くので、
+引数: option `-R owner/repo` / `--dry-run` (どちらも任意、**`<PR#>` より前に置く**) と、位置引数
+`<PR#>` 必須 / `<max_rounds>` default **3** (罠 16: 25 credits × 3) / `<per_round_timeout_sec>` default 600 (罠 9)。
+受けたものは option も位置引数も **そのまま、同じ順で script に渡す** (位置引数の 4 番目の body file は
+controller が re-review round で足す、下記)。round 番号は script が PR の `@codex review` 投稿履歴から導くので、
 上限は process を跨いで効く (controller が数えなくてよい、数えてはいけない)。
 前提: `gh auth status` OK、repo に codex connector app install 済。destructive 操作なし (GitHub へ comment を post するだけ)。
+
+**対象の repo の決め方** (script の `-R` / `--repo`、kuriya trap #409 / #238):
+
+1. `-R owner/repo` を渡せばその repo
+2. 無ければ環境変数 `GH_REPO`
+3. どちらも無ければ **script が置かれている checkout の repo** (= kb-mcp。従来どおり。cwd ではない)
+
+決めた 1 つの repo を、投稿 (`gh pr comment -R`)・3 endpoint の読み取り・round の数え方 (trigger 履歴)・
+head sha の全部が使う。`-R` と `GH_REPO` が両方あって別の repo を指すと **exit 2 で何も投稿しない**。
+github.com 以外の host も exit 2。script は repo を決める前に `GH_HOST=github.com` を export するので、
+呼び出し側の `GH_HOST` が別 host を指していても読み書きは github.com に行く。PR がその repo に無ければ exit 8 (投稿前)。stderr 1 行目の
+`repo <owner/repo> / PR <url>` で、どこを見ているかを確かめる。
+#409 では `GH_REPO` を付けて打ったら投稿は別 repo の PR、読み取りは kb-mcp の同番号 PR になり、
+「baseline none」と「600 秒無応答」が出た。引数なしの `gh repo view` は `GH_REPO` を見ないので、
+script は repo を自分で解決してから `GH_REPO` に export し直している。
+
+**`--dry-run`**: repo の解決・PR の確認・baseline・trigger 履歴・round 番号まで読み、stdout に
+`DRY_RUN repo=… pr=… url=…` / `head=… prior_triggers=… round=N/M would_stop_at_limit=…` /
+`baseline_inline=… baseline_reviews=… baseline_issues=…` を出して **投稿せずに exit 0**。round を消費しない。
+別 repo の PR に初めて向ける時は、本番の round の前に
+`bash .claude/skills/codex-review/scripts/codex_review_round.sh -R alphabet-h/grooveseek-desktop --dry-run 25`
+を 1 回打って、repo と round 番号を確かめる。
+
+**別 repo の PR では、下の 2 つの push 前の手順の扱いが変わる**:
+
+- 次節の doc comment の sweep script は **kb-mcp 専用** — kb-mcp の Rust tree の item index と
+  `AGENTS.md` の rule 5 が前提で、diff も kb-mcp の checkout で `main...HEAD` を取る。
+  別 repo では打たない (その repo に同等の規則と道具があればそちら)
+- ローカルの Codex の前掃除は、**`--cwd` をその repo の checkout の絶対パスに、`--base` をその repo の
+  base branch に**変える。kb-mcp の checkout のまま打つと kb-mcp の diff を review する
 
 ## push する前に doc comment の名前を洗う
 
@@ -230,7 +262,7 @@ S=<scratchpad>
 bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds> 600 > "$S/r1.out" 2> "$S/r1.err"; echo exit=$?
 ```
 
-re-review round (P0/P1 を fix して push した後) は **body file を第 3 引数に渡す**。本文は
+re-review round (P0/P1 を fix して push した後) は **body file を 4 番目の位置引数に渡す** (`<PR#>` `<max_rounds>` `<per_round_timeout_sec>` の次。option は数えない)。本文は
 `@codex review` で始め、続けて fix sketch。**`@codex` を本文中で bare word でも使わない、
 verb は `review` のみ** (罠 15 / 18)。heredoc ではなく Write で file にしてから渡す:
 
@@ -239,7 +271,10 @@ bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds
 ```
 
 round ごとに別プロセスで、状態は持たない。初回かどうか (罠 51) も今が何 round 目か (罠 16 / 28) も
-PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M` で確認できる。
+PR の `@codex review` 投稿履歴から導く。stderr の `round N/M` 行で確認できる。
+
+別 repo の PR は、上の 2 つの形の `<PR#>` の前に `-R owner/repo` を足す (round ごとに毎回。状態を
+持たないので、round 2 で付け忘れると kb-mcp の同番号 PR を読む)。
 
 ## 結果の読み方
 
@@ -255,8 +290,9 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 | exit 5 | trigger に reaction が 1 つも無い = 届いていない (罠 47、実測 8 回中 2 回) | 同じ commit に再 trigger (自動 1 回)。2 回目も届かなければ user 報告。届かなかった trigger も履歴上は 1 round と数える (安全側) |
 | exit 6 | trigger の POST が 3 回失敗 (罠 50) | 待たずに abort。数分置いて再実行 |
 | exit 7 | `max_rounds` に到達、**何も投稿していない** (罠 16 / 28) | user に報告 (続行 / 妥協 / scope 縮小の判断)。自分で上限を上げて再実行しない |
-| exit 8 | 投稿前の読み取り (repo 名 / baseline / trigger 履歴) で `gh api` が失敗、**何も投稿していない** | `gh auth status` / rate limit を確認して再実行 |
-| exit 9 | round の delta を計算できなかった (罠 59)。**trigger は投稿済み** | そのまま再実行。**空欄を「指摘なし」と読まない** — 判定材料が無いだけ |
+| exit 2 | 引数の誤り (stderr に usage)。未知の option、`-R` の値が無い / `-` で始まる、位置引数が数字でない / 多すぎる、**`-R` と `GH_REPO` が別の repo を指している**、github.com 以外の host。何も投稿していない | usage を見て直して打ち直す — option は `<PR#>` より前に置く、`-R` と `GH_REPO` はどちらか一方にする |
+| exit 8 | **投稿前の判定材料が読めなかった。何も投稿していない** (round も消費していない)。GitHub の読み取り (repo 名 / PR の存在と URL / baseline / trigger 履歴 / dry-run の head) の失敗に加えて、それを元に jq で作る値 (trigger の数 = round 番号、baseline の件数と表示、head、URL) が失敗した、または数字・形が合わない場合も含む。dry-run も成功の行を出す前にここで止まる。stderr の `ABORT: could not read …` が何かを言う | `gh auth status` / rate limit、`-R` の repo と PR 番号の組を確認して再実行 (投稿していないので、再実行で round は増えない) |
+| exit 9 | **trigger は投稿済み**で、trigger 後の判定材料が読めなかった。判定 (`CONVERGED` / `WARN` / exit 3 / 4 / 5 / 10) は出していない。原因は stderr の `ABORT:` 行で分かれる: ① round の delta を計算できなかった (罠 59、`... could not be computed`) / ② trigger 後の GitHub の読み取りが失敗した、または空だった (`could not read ... after the trigger was posted`)。対象は timeout 時の trigger comment の reactions (= codex が受け取ったか不明)、Step 4 で読む reviews / issue comments / inline comments / head sha、およびそれらから数えた値。poll 中の一時失敗は次の poll で取り直すので、ここには来ない。reactions が読めて bot の `eyes` / `+1` が無ければ exit 5 で、こちらにはならない | どちらも **空欄を「指摘なし」と読まない** — 判定材料が無いだけ。① は再実行してよい (**再実行は新しい trigger を投稿し、1 round と数える**)。② は **自動で再 trigger しない** — 届いていた trigger に重ねて 1 round を捨てかねない。stderr に出る 3 endpoint と reactions を手で読み、codex が答えていればその内容で判断、答えも reaction も確かめられなければ user 報告 |
 | exit 10 | `Provided git ref <sha> does not exist` — push 直後の trigger で codex 側にまだ ref が無い (罠 60、PR #258 / #265 / #293 で 3 回)。本文は exit 4 と同じ語彙だが transient | `gh api repos/<o>/<r>/commits/<sha>` で head の存在を確かめ、body file 付きで **1 回だけ** 再 trigger (1 round と数える)。**2 回目も exit 10 なら止めて user 報告** (stdout / stderr を残す。#293 は 5 分空けた再 trigger も同じ本文だった = 待ち時間の根拠が無い。次に打つなら新しい push の後か、user が時刻を決める)。避けるには push と `gh pr create` の間を空ける。同じ round に quota 等の terminal 本文が並ぶと exit 4 が勝つ (script が comment ごとに分類) |
 
 `=== Inline, this round - ALL of them ===` は badge の有無を問わず全部出す (罠 23: 列挙の外に指摘が来る)。
