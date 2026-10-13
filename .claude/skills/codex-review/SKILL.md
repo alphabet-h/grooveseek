@@ -39,11 +39,9 @@ script は repo を自分で解決してから `GH_REPO` に export し直して
 **`--dry-run`**: repo の解決・PR の確認・baseline・trigger 履歴・round 番号まで読み、stdout に
 `DRY_RUN repo=… pr=… url=…` / `head=… prior_triggers=… round=N/M would_stop_at_limit=…` /
 `baseline_inline=… baseline_reviews=… baseline_issues=…` を出して **投稿せずに exit 0**。round を消費しない。
-別 repo の PR に初めて向ける時は、本番の round の前に 1 回打って repo と round 番号を確かめる:
-
-```bash
-bash .claude/skills/codex-review/scripts/codex_review_round.sh -R alphabet-h/grooveseek-desktop --dry-run 25
-```
+別 repo の PR に初めて向ける時は、本番の round の前に
+`bash .claude/skills/codex-review/scripts/codex_review_round.sh -R alphabet-h/grooveseek-desktop --dry-run 25`
+を 1 回打って、repo と round 番号を確かめる。
 
 **別 repo の PR では、下の 2 つの push 前の手順の扱いが変わる**:
 
