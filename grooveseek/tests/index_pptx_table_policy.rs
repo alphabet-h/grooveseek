@@ -4,7 +4,7 @@
 //! re-reads its own rows only: a stale `.pptx` key never re-reads a `.docx`, nor the other way.
 //!
 //! Each test drives a knowledge base of generated `.pptx` and `.docx` files against the mock
-//! endpoint of [`common::embed_cli`], so nothing downloads a model. The helpers of
+//! endpoint of [`crate::common::embed_cli`], so nothing downloads a model. The helpers of
 //! `tests/index_docx_heading_policy.rs` are private to its modules, so the ones needed here are
 //! repeated rather than opened up, which would edit those modules. The file names, the slide
 //! text and the cells share no word.

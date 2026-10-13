@@ -5119,8 +5119,8 @@ mod tests {
         );
     }
 
-    /// feature-65 P13 (AC14): the `content` `get_document` returns for a `.pptx` with a table
-    /// holds each row on one line, its cells separated by a tab.
+    /// feature-65 P13 (AC14): the `content` [`get_document`](KbServer::get_document) returns for
+    /// a `.pptx` with a table holds each row on one line, its cells separated by a tab.
     #[test]
     fn get_document_returns_pptx_table_rows_as_lines() {
         use std::io::Write;
