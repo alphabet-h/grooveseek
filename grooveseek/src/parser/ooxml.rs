@@ -454,6 +454,18 @@ pub(crate) fn resolve_general_ref(r: &BytesRef) -> String {
     }
 }
 
+/// A table row as one line of a chunk body: its fields joined with a tab, a single field being
+/// its text alone, or `None` when every field is empty. The docx parser (feature-64) and the
+/// pptx parser (feature-65) both write a table row through this, so the two formats cannot
+/// disagree about what a row looks like.
+pub(crate) fn row_line(fields: &[String]) -> Option<String> {
+    if fields.iter().all(|field| field.is_empty()) {
+        None
+    } else {
+        Some(fields.join("\t"))
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

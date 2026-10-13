@@ -163,7 +163,13 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDoc
             index: chunks.len(),
             heading: Some(heading),
             level: Some(2),
-            content: content.trim().to_string(),
+            // (feature-65, R1.10) Trim every whitespace but the tab, so a table row at either
+            // end of the slide keeps its empty fields. A slide without a table cannot start or
+            // end with a tab: every paragraph is trimmed before it is added (`parse_slide_xml`)
+            // and the notes are trimmed too, so its content is what `trim()` gave.
+            content: content
+                .trim_matches(|c: char| c.is_whitespace() && c != '\t')
+                .to_string(),
             context,
             line_range: None,
             symbol_kind: None,
@@ -398,20 +404,27 @@ fn resolve_relative_target(base_dir: &str, target: &str) -> String {
 ///   `<p:ph type="ctrTitle"/>` — ECMA-376 では表紙スライド (title slide
 ///   layout) の title placeholder は `ctrTitle` になる) を含む `<p:sp>` の
 ///   a:t 連結テキスト。
-/// - body: **全ての** `<a:p>` (段落) の a:t 連結テキストを、段落単位の
+/// - body: 表の外の**全ての** `<a:p>` (段落) の a:t 連結テキストを、段落単位の
 ///   改行区切りで連結したもの (title placeholder 配下も含む — indexer
 ///   (`indexer.rs`) が embed するのは `Chunk::content` のみで `heading` は
 ///   embed 対象外なので、title 段落を body から除外すると title-only
 ///   スライドが semantic search で拾えなくなる。よって title/body は
 ///   排他ではなく、title 段落は heading にも content にも両方現れる)。
-///   `<p:sp>` 内の通常テキストだけでなく `<p:graphicFrame><a:tbl>` (表)
-///   セル内の a:t も同じ `<a:p>` 構造 (`a:tc > a:txBody > a:p`) を持つため
-///   区別なく拾う。
 ///
 ///   (旧実装は `<p:sp>` の Start/End でのみ本文バッファを flush していたため、
 ///   sp の外側にある表のテキストが「次の sp の Start で握り潰される」/
 ///   「最後の sp の後ろだと一度も flush されない」のいずれかで silent drop
 ///   されるバグがあった。`<a:p>` 単位の flush に変えることで解消している。)
+///
+/// (feature-65) A table (`<a:tbl>`) is written one row per line, in the document order of its
+/// `<p:graphicFrame>`: each cell's paragraphs are joined with a space into one field
+/// ([`PptxCell`]), the fields of a row with a tab ([`super::ooxml::row_line`]), an empty cell
+/// keeping its place as an empty field and a row of empty cells adding nothing ([`push_row`]).
+/// A merge is written once ([`CellKind`]). A row the XML cuts short keeps its closed cells and
+/// the closed paragraphs of the open one; a `<a:tc>` outside any `<a:tr>` opens a row of its
+/// own; a `<a:tbl>` inside a table, which the schema does not allow, writes the outer row so far
+/// and is read as a table of its own, after which the reader is outside any table. A paragraph
+/// outside every `<a:tc>` takes the path a paragraph always took.
 fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, String) {
     super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
@@ -427,9 +440,14 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
     let mut sp_is_title = false;
 
     // `<a:p>` (段落) スコープ状態。sp 内外を問わず段落単位でテキストを蓄積し、
-    // `</a:p>` で title / body への振り分けを行う。
+    // `</a:p>` で title / body / セルへの振り分けを行う。
     let mut para_text = String::new();
     let mut in_text = false;
+
+    // (feature-65) Whether the reader is inside a `<a:tbl>`, and the row being read there.
+    // Outside tables neither is set, and every paragraph takes the path it always took.
+    let mut in_table = false;
+    let mut row: Option<PptxRow> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -445,13 +463,37 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                 }
                 b"p" => para_text.clear(),
                 b"t" => in_text = true,
+                b"tbl" => {
+                    // A table inside a table writes out the row so far first (R1.7).
+                    if let Some(open) = row.take() {
+                        push_row(&mut body, open);
+                    }
+                    in_table = true;
+                }
+                b"tr" if in_table => {
+                    if let Some(open) = row.take() {
+                        push_row(&mut body, open);
+                    }
+                    row = Some(PptxRow::default());
+                }
+                b"tc" if in_table => row
+                    .get_or_insert_with(PptxRow::default)
+                    .open_cell(cell_kind(&e)),
                 _ => {}
             },
-            Ok(Event::Empty(e)) => {
-                if super::ooxml_local(e.name().as_ref()) == b"ph" && in_sp && ph_type_is_title(&e) {
-                    sp_is_title = true;
+            Ok(Event::Empty(e)) => match super::ooxml_local(e.name().as_ref()) {
+                b"ph" => {
+                    if in_sp && ph_type_is_title(&e) {
+                        sp_is_title = true;
+                    }
                 }
-            }
+                b"tc" if in_table => {
+                    let open = row.get_or_insert_with(PptxRow::default);
+                    open.open_cell(cell_kind(&e));
+                    open.close_cell();
+                }
+                _ => {}
+            },
             // quick-xml 0.41 は `BytesText::unescape()` を廃止し、encoding decode
             // (`decode()`) と entity unescape (`escape::unescape()`) を分離した
             // (docx.rs Task 3.4 前例踏襲)。
@@ -469,19 +511,39 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                 b"p" => {
                     let trimmed = para_text.trim();
                     if !trimmed.is_empty() {
-                        // title 判定と body 追加は排他にしない: title 段落の
-                        // テキストも embed 対象の content (body) に残す (上の
-                        // doc comment 参照)。
-                        if in_sp && sp_is_title && title.is_none() {
-                            title = Some(trimmed.to_string());
+                        if let Some(cell) = open_cell_mut(in_table, &mut row) {
+                            cell.paragraphs.push(trimmed.to_string());
+                        } else {
+                            // title 判定と body 追加は排他にしない: title 段落の
+                            // テキストも embed 対象の content (body) に残す (上の
+                            // doc comment 参照)。
+                            if in_sp && sp_is_title && title.is_none() {
+                                title = Some(trimmed.to_string());
+                            }
+                            if !body.is_empty() {
+                                body.push('\n');
+                            }
+                            body.push_str(trimmed);
                         }
-                        if !body.is_empty() {
-                            body.push('\n');
-                        }
-                        body.push_str(trimmed);
                     }
                 }
                 b"sp" => in_sp = false,
+                b"tc" if in_table => {
+                    if let Some(open) = row.as_mut() {
+                        open.close_cell();
+                    }
+                }
+                b"tr" if in_table => {
+                    if let Some(open) = row.take() {
+                        push_row(&mut body, open);
+                    }
+                }
+                b"tbl" if in_table => {
+                    if let Some(open) = row.take() {
+                        push_row(&mut body, open);
+                    }
+                    in_table = false;
+                }
                 _ => {}
             },
             Ok(Event::Eof) => break,
@@ -491,7 +553,120 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
         }
         buf.clear();
     }
+    // (feature-65, R1.7) A row the XML cut short keeps its closed cells and the closed
+    // paragraphs of its open cell, as if that cell had closed.
+    if let Some(open) = row.take() {
+        push_row(&mut body, open);
+    }
     (title, body)
+}
+
+/// (feature-65) What a cell of a `<a:tbl>` row adds to the row ([`PptxRow::close_cell`]), from
+/// its `hMerge` / `vMerge` attributes ([`cell_kind`]).
+#[derive(Clone, Copy)]
+enum CellKind {
+    /// A cell of its own, the origin of a merge included: its text is one field.
+    Plain,
+    /// Covered by the cell above (`vMerge` true, `hMerge` not): an empty field. PowerPoint does
+    /// not show the text left in it, so it is not written.
+    VerticalContinuation,
+    /// Covered by the cell to its left (`hMerge` true): no field, and its text is not written.
+    /// The origin's `gridSpan` adds nothing either, so a merge is written once.
+    Covered,
+}
+
+/// (feature-65) A cell of a [`PptxRow`] between its `<a:tc>` and `</a:tc>`.
+struct PptxCell {
+    kind: CellKind,
+    /// Its paragraphs so far, each trimmed and not empty.
+    paragraphs: Vec<String>,
+}
+
+/// (feature-65) The `<a:tr>` [`parse_slide_xml`] is reading: the field each closed cell left
+/// and the cell that is open, if any.
+#[derive(Default)]
+struct PptxRow {
+    fields: Vec<String>,
+    open: Option<PptxCell>,
+}
+
+impl PptxRow {
+    /// `<a:tc>`: closes a cell still open (a `<a:tc>` before the last one's `</a:tc>`) and
+    /// opens one of `kind`.
+    fn open_cell(&mut self, kind: CellKind) {
+        self.close_cell();
+        self.open = Some(PptxCell {
+            kind,
+            paragraphs: Vec::new(),
+        });
+    }
+
+    /// `</a:tc>`: the open cell becomes a field as its [`CellKind`] says: a plain cell its
+    /// paragraphs joined with a space (`""` when it has none), a cell covered from above `""`,
+    /// a cell covered from the left nothing.
+    fn close_cell(&mut self) {
+        if let Some(cell) = self.open.take() {
+            match cell.kind {
+                CellKind::Plain => self.fields.push(cell.paragraphs.join(" ")),
+                CellKind::VerticalContinuation => self.fields.push(String::new()),
+                CellKind::Covered => {}
+            }
+        }
+    }
+
+    /// `</a:tr>`: the row's fields, its open cell closed first.
+    fn end_row(mut self) -> Vec<String> {
+        self.close_cell();
+        self.fields
+    }
+}
+
+/// (feature-65) Whether an `xsd:boolean` attribute value is true: `1` or `true`, the
+/// surrounding whitespace dropped. Any other value is false, so a value this does not know
+/// writes the cell rather than dropping its text.
+fn xsd_true(raw: &[u8]) -> bool {
+    matches!(raw.trim_ascii(), b"1" | b"true")
+}
+
+/// (feature-65) The [`CellKind`] of a `<a:tc>`, from its `hMerge` and `vMerge` attributes read
+/// by local name. `hMerge` wins when both are set.
+fn cell_kind(e: &quick_xml::events::BytesStart) -> CellKind {
+    let (mut covered, mut continuation) = (false, false);
+    for attr in e.attributes().flatten() {
+        match super::ooxml_local(attr.key.as_ref()) {
+            b"hMerge" => covered = xsd_true(&attr.value),
+            b"vMerge" => continuation = xsd_true(&attr.value),
+            _ => {}
+        }
+    }
+    if covered {
+        CellKind::Covered
+    } else if continuation {
+        CellKind::VerticalContinuation
+    } else {
+        CellKind::Plain
+    }
+}
+
+/// (feature-65) Add `row`'s line ([`super::ooxml::row_line`]) to `body` the way a paragraph is
+/// added in [`parse_slide_xml`]: after a `\n` when the body has text already. A row whose
+/// fields are all empty adds nothing.
+fn push_row(body: &mut String, row: PptxRow) {
+    if let Some(line) = super::ooxml::row_line(&row.end_row()) {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&line);
+    }
+}
+
+/// (feature-65) The cell a paragraph closing now belongs to: the open cell of the row being
+/// read inside a `<a:tbl>`, or `None` outside one.
+fn open_cell_mut(in_table: bool, row: &mut Option<PptxRow>) -> Option<&mut PptxCell> {
+    if !in_table {
+        return None;
+    }
+    row.as_mut().and_then(|r| r.open.as_mut())
 }
 
 /// `<p:ph>` の `type` 属性が title placeholder (`"title"` / `"ctrTitle"`) か
@@ -1064,5 +1239,481 @@ mod tests {
             .expect("the read path keeps the default budget");
         assert_eq!(read.frontmatter.title.as_deref(), Some("Deck"));
         assert_eq!(read.chunks.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-65: tables one row per line
+    // -----------------------------------------------------------------------
+
+    /// feature-65: a slide whose `<p:spTree>` holds `tree`.
+    fn slide_with(tree: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{tree}</p:spTree></p:cSld></p:sld>"#
+        )
+    }
+
+    /// feature-65: a shape holding one `<a:p>` per entry of `paragraphs`, each the inner XML of
+    /// its paragraph (runs, breaks, properties).
+    fn shape_of(paragraphs: &[&str]) -> String {
+        let body: String = paragraphs
+            .iter()
+            .map(|p| format!("<a:p>{p}</a:p>"))
+            .collect();
+        format!("<p:sp><p:txBody><a:bodyPr/><a:lstStyle/>{body}</p:txBody></p:sp>")
+    }
+
+    /// feature-65: a title placeholder shape holding one `<a:p>` of inner XML `paragraph`.
+    fn title_shape(paragraph: &str) -> String {
+        format!(
+            r#"<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:bodyPr/><a:p>{paragraph}</a:p></p:txBody></p:sp>"#
+        )
+    }
+
+    /// feature-65: one run of `text`.
+    fn run_of(text: &str) -> String {
+        format!("<a:r><a:t>{text}</a:t></a:r>")
+    }
+
+    /// feature-65: a cell with `attrs` on its `<a:tc>` and one `<a:p>` per entry of
+    /// `paragraphs` (inner XML, as [`shape_of`] takes them). No `paragraphs` is the one empty
+    /// paragraph PowerPoint writes in an empty cell.
+    fn cell_with(attrs: &str, paragraphs: &[&str]) -> String {
+        let body: String = if paragraphs.is_empty() {
+            r#"<a:p><a:endParaRPr lang="en-US"/></a:p>"#.to_string()
+        } else {
+            paragraphs
+                .iter()
+                .map(|p| format!("<a:p>{p}</a:p>"))
+                .collect()
+        };
+        format!("<a:tc{attrs}><a:txBody><a:bodyPr/><a:lstStyle/>{body}</a:txBody><a:tcPr/></a:tc>")
+    }
+
+    /// feature-65: a plain cell of `text`; `""` is an empty cell.
+    fn cell(text: &str) -> String {
+        if text.is_empty() {
+            cell_with("", &[])
+        } else {
+            cell_with("", &[&run_of(text)])
+        }
+    }
+
+    /// feature-65: a `<p:graphicFrame>` holding a table of `rows`, each a list of `<a:tc>` XML,
+    /// with the table properties and grid PowerPoint writes before the rows.
+    fn table_of(rows: &[Vec<String>]) -> String {
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let grid: String = (0..columns)
+            .map(|_| r#"<a:gridCol w="1828800"/>"#)
+            .collect();
+        let body: String = rows
+            .iter()
+            .map(|r| format!(r#"<a:tr h="370840">{}</a:tr>"#, r.concat()))
+            .collect();
+        format!(
+            r#"<p:graphicFrame><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1" bandRow="1"/><a:tblGrid>{grid}</a:tblGrid>{body}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#
+        )
+    }
+
+    /// feature-65: the one chunk the parser makes of a deck whose one slide holds `tree`.
+    fn only_chunk(tree: &str) -> crate::parser::Chunk {
+        let bytes = make_pptx_single_slide(&slide_with(tree));
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "deck.pptx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 1, "{:?}", doc.chunks);
+        doc.chunks.into_iter().next().unwrap()
+    }
+
+    /// feature-65: a deck of one slide (`slide_xml`) whose notes slide holds `notes_tree`,
+    /// tied by the slide's rels the way PowerPoint ties them.
+    fn deck_with_notes(slide_xml: &str, notes_tree: &str) -> Vec<u8> {
+        let notes = format!(
+            r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{notes_tree}</p:spTree></p:cSld></p:notes>"#
+        );
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#;
+        pptx_of(&[
+            ("ppt/slides/slide1.xml", slide_xml.as_bytes()),
+            ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
+            ("ppt/notesSlides/notesSlide1.xml", notes.as_bytes()),
+        ])
+    }
+
+    /// feature-65 P1 (AC1): a 2x2 table after a paragraph is a line per row, its cells
+    /// separated by a tab.
+    #[test]
+    fn a_pptx_table_row_is_one_line_with_its_cells_tab_separated() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("overview")]),
+            table_of(&[
+                vec![cell("apple"), cell("birch")],
+                vec![cell("cedar"), cell("dune")],
+            ])
+        );
+        assert_eq!(
+            only_chunk(&tree).content,
+            "overview\napple\tbirch\ncedar\tdune"
+        );
+    }
+
+    /// feature-65 P2 (AC2): an empty cell keeps its column as an empty field, at the start, in
+    /// the middle or at the end of a row; `<a:tc/>` is an empty cell too.
+    #[test]
+    fn an_empty_pptx_cell_keeps_its_column() {
+        let tree = format!(
+            "{}{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[
+                vec![cell("alpha"), cell(""), cell("cobalt")],
+                vec![cell(""), cell("bronze")],
+                vec![cell("ashen"), cell("")],
+                vec![cell("xenon"), "<a:tc/>".to_string()],
+            ]),
+            shape_of(&[&run_of("tail")])
+        );
+        assert_eq!(
+            only_chunk(&tree).content,
+            "lead\nalpha\t\tcobalt\n\tbronze\nashen\t\nxenon\t\ntail"
+        );
+    }
+
+    /// feature-65 P3 (AC3): a row whose cells are all empty or blank adds no line.
+    #[test]
+    fn a_pptx_row_of_empty_cells_adds_no_line() {
+        let tree = format!(
+            "{}{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[
+                vec![cell("amber"), cell("basil")],
+                vec![cell(""), cell_with("", &[&run_of(" ")])],
+                vec![cell("cumin"), cell("dill")],
+            ]),
+            shape_of(&[&run_of("tail")])
+        );
+        assert_eq!(
+            only_chunk(&tree).content,
+            "lead\namber\tbasil\ncumin\tdill\ntail"
+        );
+    }
+
+    /// feature-65 P4 (AC4): a row of one cell is that cell's text alone.
+    #[test]
+    fn a_one_cell_pptx_row_is_its_text() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[vec![cell("xylem")], vec![cell("yarrow")]])
+        );
+        assert_eq!(only_chunk(&tree).content, "lead\nxylem\nyarrow");
+    }
+
+    /// feature-65 P6 (AC6): a merge is written once. A cell covered from the left (`hMerge`)
+    /// adds no field; one covered from above (`vMerge`) is an empty field; `true` reads as `1`;
+    /// `0` and `false` are plain cells; a cell with both flags adds no field.
+    #[test]
+    fn merged_pptx_cells_are_written_once() {
+        let tree = format!(
+            "{}{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[
+                vec![
+                    cell_with(r#" gridSpan="2""#, &[&run_of("granite")]),
+                    cell_with(r#" hMerge="1""#, &[]),
+                    cell("hazel"),
+                ],
+                vec![
+                    cell_with(r#" vMerge="1""#, &[]),
+                    cell("kiwi"),
+                    cell("maple"),
+                ],
+                vec![
+                    cell_with(r#" gridSpan="2""#, &[&run_of("nickel")]),
+                    cell_with(r#" hMerge="true""#, &[]),
+                    cell("olive"),
+                ],
+                vec![
+                    cell_with(r#" vMerge="true""#, &[]),
+                    cell_with(r#" hMerge="0""#, &[&run_of("pewter")]),
+                    cell_with(r#" hMerge="false""#, &[&run_of("quartz")]),
+                ],
+                vec![
+                    cell("russet"),
+                    cell_with(r#" hMerge="1" vMerge="1""#, &[]),
+                    cell("sable"),
+                ],
+            ]),
+            shape_of(&[&run_of("tail")])
+        );
+        assert_eq!(
+            only_chunk(&tree).content,
+            "lead\ngranite\thazel\n\tkiwi\tmaple\nnickel\tolive\n\tpewter\tquartz\nrusset\tsable\ntail"
+        );
+    }
+
+    /// feature-65 P6b (AC6b): text left in a covered cell, which PowerPoint does not show, is
+    /// not written; the cell covered from above still keeps its empty field.
+    #[test]
+    fn text_left_in_a_covered_pptx_cell_is_not_written() {
+        let tree = format!(
+            "{}{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[
+                vec![
+                    cell("umber"),
+                    cell_with(r#" hMerge="1""#, &[&run_of("mauve")]),
+                ],
+                vec![
+                    cell_with(r#" vMerge="1""#, &[&run_of("navy")]),
+                    cell("ochre"),
+                ],
+            ]),
+            shape_of(&[&run_of("tail")])
+        );
+        let content = only_chunk(&tree).content;
+        assert_eq!(content, "lead\number\n\tochre\ntail");
+        assert!(
+            !content.contains("mauve") && !content.contains("navy"),
+            "{content:?}"
+        );
+    }
+
+    /// feature-65 P10 (AC10): (a) a row the XML cuts short keeps its closed cells and the closed
+    /// paragraphs of the open one; (b) an open cell covered from above is an empty field;
+    /// (c) a cell outside any `<a:tr>` opens a row of its own; (d) a table inside a table, which
+    /// the schema does not allow, writes the outer row so far first and loses no text.
+    #[test]
+    fn a_pptx_row_cut_short_keeps_its_closed_cells() {
+        let open = concat!(
+            r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>"#,
+            r#"<p:sp><p:txBody><a:p><a:r><a:t>lead</a:t></a:r></a:p></p:txBody></p:sp>"#,
+            r#"<p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr>"#,
+        );
+        let content_of = |xml: &str| {
+            let doc = PptxParser::default()
+                .parse_bytes(&make_pptx_single_slide(xml), "cut.pptx", &[])
+                .unwrap();
+            doc.chunks[0].content.clone()
+        };
+
+        let cut = format!(
+            r#"{open}{}<a:tc><a:txBody><a:p><a:r><a:t>berry</a:t></a:r></a:p><a:p><a:r><a:t>cutoff"#,
+            cell("apple")
+        );
+        assert_eq!(content_of(&cut), "lead\napple\tberry", "(a)");
+
+        let cut_covered = format!(
+            r#"{open}{}<a:tc vMerge="1"><a:txBody><a:p><a:r><a:t>hidden"#,
+            cell("fig")
+        );
+        assert_eq!(content_of(&cut_covered), "lead\nfig\t", "(b)");
+
+        let rowless_table = format!(
+            "<p:graphicFrame><a:graphic><a:graphicData><a:tbl>{}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>",
+            cell("lone")
+        );
+        let rowless = format!("{}{rowless_table}", shape_of(&[&run_of("lead")]));
+        assert_eq!(only_chunk(&rowless).content, "lead\nlone", "(c)");
+
+        let nested = format!(
+            "<p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p>{}</a:p></a:txBody><a:tbl><a:tr>{}{}</a:tr></a:tbl></a:tc>{}</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>",
+            run_of("outer1"),
+            cell("inner1"),
+            cell("inner2"),
+            cell("outer2")
+        );
+        assert_eq!(
+            only_chunk(&nested).content,
+            "outer1\ninner1\tinner2\nouter2",
+            "(d)"
+        );
+    }
+
+    /// feature-65 P11 (AC11): a slide with neither a table nor a line break reads as it did
+    /// before this feature: heading, content and the joined bodies, byte for byte.
+    #[test]
+    fn a_slide_without_tables_or_breaks_reads_as_before() {
+        let slide = slide_with(&format!(
+            "{}{}",
+            title_shape(&run_of("Harvest Report")),
+            shape_of(&[&run_of("  lead\tmid  "), &run_of("second line")])
+        ));
+        let notes = shape_of(&[&run_of("wheat"), &run_of("barley")]);
+        let doc = PptxParser::default()
+            .parse_bytes(&deck_with_notes(&slide, &notes), "harvest.pptx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(
+            doc.chunks[0].heading.as_deref(),
+            Some("Slide 1: Harvest Report")
+        );
+        let expected = "Harvest Report\nlead\tmid\nsecond line\n\n[notes]\nwheat barley";
+        assert_eq!(doc.chunks[0].content, expected);
+        assert_eq!(doc.raw_content, expected);
+    }
+
+    /// feature-65 P14 (AC27a): a table at the start of a slide keeps the tab of its leading
+    /// empty field.
+    #[test]
+    fn a_leading_empty_cell_survives_at_the_start_of_a_slide() {
+        let tree = table_of(&[
+            vec![cell(""), cell("birch")],
+            vec![cell("cedar"), cell("dune")],
+        ]);
+        assert_eq!(only_chunk(&tree).content, "\tbirch\ncedar\tdune");
+    }
+
+    /// feature-65 P15 (AC27b): a table at the end of a slide without notes keeps the tab of its
+    /// trailing empty field.
+    #[test]
+    fn a_trailing_empty_cell_survives_at_the_end_of_a_slide() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("preamble")]),
+            table_of(&[vec![cell("ashen"), cell("")]])
+        );
+        assert_eq!(only_chunk(&tree).content, "preamble\nashen\t");
+    }
+
+    /// feature-65 P16 (AC28): a slide of notes alone reads as before.
+    #[test]
+    fn a_notes_only_slide_reads_as_before() {
+        let bytes = deck_with_notes(&slide_with(""), &shape_of(&[&run_of("quill")]));
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "notes.pptx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Slide 1"));
+        assert_eq!(doc.chunks[0].content, "[notes]\nquill");
+    }
+
+    /// feature-65 P17 (AC30): a merge flag is true for `1` and `true` only, with the
+    /// surrounding whitespace dropped; `yes`, `TRUE` and `""` are plain cells whose text is
+    /// written.
+    #[test]
+    fn merge_flags_read_only_xsd_boolean_true() {
+        let tree = format!(
+            "{}{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[
+                vec![
+                    cell("apricot"),
+                    cell_with(r#" hMerge=" 1 ""#, &[]),
+                    cell("bramble"),
+                ],
+                vec![cell_with(r#" vMerge=" true""#, &[]), cell("chestnut")],
+                vec![
+                    cell_with(r#" hMerge="yes""#, &[&run_of("damson")]),
+                    cell_with(r#" hMerge="TRUE""#, &[&run_of("elder")]),
+                    cell_with(r#" vMerge="""#, &[&run_of("fennel")]),
+                ],
+            ]),
+            shape_of(&[&run_of("tail")])
+        );
+        assert_eq!(
+            only_chunk(&tree).content,
+            "lead\napricot\tbramble\n\tchestnut\ndamson\telder\tfennel\ntail"
+        );
+    }
+
+    /// feature-65 P18 (AC31): a paragraph after a table is a line of its own.
+    #[test]
+    fn a_paragraph_after_a_table_is_its_own_line() {
+        let tree = format!(
+            "{}{}",
+            table_of(&[vec![cell("apple"), cell("birch")]]),
+            shape_of(&[&run_of("quince")])
+        );
+        assert_eq!(only_chunk(&tree).content, "apple\tbirch\nquince");
+    }
+
+    /// feature-65 Review Focus 1: a table inside a group shape is read the same way.
+    #[test]
+    fn a_table_inside_a_group_is_read_the_same_way() {
+        let tree = format!(
+            "<p:grpSp><p:nvGrpSpPr/><p:grpSpPr/>{}{}</p:grpSp>",
+            shape_of(&[&run_of("legend")]),
+            table_of(&[
+                vec![cell("apple"), cell("birch")],
+                vec![cell("cedar"), cell("dune")],
+            ])
+        );
+        assert_eq!(
+            only_chunk(&tree).content,
+            "legend\napple\tbirch\ncedar\tdune"
+        );
+    }
+
+    /// feature-65 Review Focus 2: an entity and a field in a cell stay in its one field.
+    #[test]
+    fn entities_and_fields_in_a_cell_stay_in_its_field() {
+        let fielded = cell_with(
+            "",
+            &[
+                r#"<a:r><a:t>R&amp;D</a:t></a:r><a:fld id="{0F7D0E7C-2A4B-4C6A-9A63-1C4F0E7B9A10}" type="slidenum"><a:t>7</a:t></a:fld>"#,
+            ],
+        );
+        let tree = table_of(&[vec![fielded, cell("budget")]]);
+        assert_eq!(only_chunk(&tree).content, "R&D7\tbudget");
+    }
+
+    /// feature-65 Review Focus 3: two tables on one slide stay in document order, and the
+    /// trailing empty field of the second keeps its tab before the notes.
+    #[test]
+    fn two_tables_and_notes_keep_their_order() {
+        let slide = slide_with(&format!(
+            "{}{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[vec![cell("apple"), cell("birch")]]),
+            table_of(&[vec![cell("cedar"), cell("")]])
+        ));
+        let bytes = deck_with_notes(&slide, &shape_of(&[&run_of("quill")]));
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "two.pptx", &[])
+            .unwrap();
+        assert_eq!(
+            doc.chunks[0].content,
+            "lead\napple\tbirch\ncedar\t\n\n[notes]\nquill"
+        );
+    }
+
+    /// feature-65 Review Focus 4: a cell without a text body, which the schema allows, is an
+    /// empty field.
+    #[test]
+    fn a_cell_without_a_text_body_is_an_empty_field() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[vec!["<a:tc><a:tcPr/></a:tc>".to_string(), cell("xenon")]])
+        );
+        assert_eq!(only_chunk(&tree).content, "lead\n\txenon");
+    }
+
+    /// feature-65 P13r (AC14): the read entry writes a table the same way the index does.
+    #[test]
+    fn the_read_entry_writes_pptx_table_rows_the_same_way() {
+        let bytes = make_pptx_single_slide(&slide_with(&format!(
+            "{}{}",
+            shape_of(&[&run_of("overview")]),
+            table_of(&[
+                vec![cell("apple"), cell("birch")],
+                vec![cell("cedar"), cell("dune")],
+            ])
+        )));
+        let parser = PptxParser::default();
+        let index = parser.parse_bytes(&bytes, "deck.pptx", &[]).unwrap();
+        let read = parser
+            .parse_bytes_for_read(&bytes, "deck.pptx", &[])
+            .unwrap();
+        let shape = |doc: &crate::parser::ParsedDocument| -> Vec<(Option<String>, String)> {
+            doc.chunks
+                .iter()
+                .map(|c| (c.heading.clone(), c.content.clone()))
+                .collect()
+        };
+        assert_eq!(shape(&read), shape(&index));
+        assert_eq!(
+            read.chunks[0].content,
+            "overview\napple\tbirch\ncedar\tdune"
+        );
     }
 }

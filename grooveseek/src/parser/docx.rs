@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
+use super::ooxml::row_line;
 use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
 
 pub struct DocxParser {
@@ -628,16 +629,6 @@ impl TableRow {
             cell.split = true;
         }
         fields
-    }
-}
-
-/// (feature-64) The line a table row adds to a section's body: its fields joined with a tab,
-/// a single field being its text alone, or `None` when every field is empty.
-fn row_line(fields: &[String]) -> Option<String> {
-    if fields.iter().all(|field| field.is_empty()) {
-        None
-    } else {
-        Some(fields.join("\t"))
     }
 }
 

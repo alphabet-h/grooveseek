@@ -5119,6 +5119,37 @@ mod tests {
         );
     }
 
+    /// feature-65 P13 (AC14): the `content` `get_document` returns for a `.pptx` with a table
+    /// holds each row on one line, its cells separated by a tab.
+    #[test]
+    fn get_document_returns_pptx_table_rows_as_lines() {
+        use std::io::Write;
+        let slide = concat!(
+            r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>"#,
+            r#"<p:sp><p:txBody><a:p><a:r><a:t>overview</a:t></a:r></a:p></p:txBody></p:sp>"#,
+            r#"<p:graphicFrame><a:graphic><a:graphicData><a:tbl>"#,
+            r#"<a:tr><a:tc><a:txBody><a:p><a:r><a:t>apple</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>birch</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#,
+            r#"<a:tr><a:tc><a:txBody><a:p><a:r><a:t>cedar</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>dune</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#,
+            r#"</a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#,
+        );
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            zip.start_file(
+                "ppt/slides/slide1.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("start the slide");
+            zip.write_all(slide.as_bytes()).expect("write the slide");
+            zip.finish().expect("finish the zip");
+        }
+        let registry =
+            Registry::from_enabled(&["md".to_string(), "pptx".to_string()]).expect("md + pptx");
+        let resp = build_document_response(&registry, "deck.pptx", "pptx", &bytes)
+            .expect("the deck parses");
+        assert_eq!(resp.content, "overview\napple\tbirch\ncedar\tdune");
+    }
+
     /// A registry over Markdown and PDF whose decompression cap is `decompressed`
     /// and whose raw caps are the defaults.
     fn md_and_pdf_registry_inflating_to(decompressed: crate::parser::FileSizeLimit) -> Registry {
