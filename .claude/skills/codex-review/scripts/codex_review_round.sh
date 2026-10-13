@@ -27,7 +27,9 @@
 #   7  round limit reached; nothing was posted (trap 16 / 28)
 #   8  could not read the PR before posting (gh api failed); nothing was posted
 #   9  a round delta could not be computed (jq failed); the round's findings are
-#      unknown, so nothing is reported as converged (trap 59)
+#      unknown, so nothing is reported as converged (trap 59); or, at timeout, the
+#      trigger's reactions could not be read, so whether codex received it is unknown
+#      (do not re-trigger automatically). The trigger is posted in both cases
 #
 # Output contract (AGENTS.md "Results go to stdout, diagnostics to stderr"):
 #   stdout = the review itself (baseline on first invocation, Step 4 summary, Step 5 render)
@@ -363,9 +365,16 @@ key_reviews() { snapshot_reviews | jq -c '[.[] | {id, submitted_at}]'; }
 
 # 罠 46: `eyes` は「受け取った / 着手した」、`+1` は「レビュー済み・指摘なし」。
 # **種類で判定する** — login だけで数えると着手の合図が合格に見える。
-reaction() {   # $1 = "+1" | "eyes"
-  gh api "repos/${OWNER_REPO}/issues/comments/${TRIGGER_COMMENT_ID}/reactions" \
-    --jq "[.[] | select(.user.login==\"${BOT}\" and .content==\"$1\")] | length" 2>/dev/null || echo 0
+# 罠 8 / 31 と同じく `--paginate` + `?per_page=100` で全 page を読み、外側の `jq -s` で 1 つの
+# array に合わせてから数える (既定の 1 page = 30 件だけでは bot の reaction を取りこぼし得る)。
+# **読めなかったことを 0 件にしない** (PR #356 のローカル Codex、medium): 失敗を 0 に変えると
+# transient / rate limit / 権限の失敗が exit 5 (= 届いていない) になり、controller が同じ commit に
+# 再 trigger して 1 round を捨てる。失敗は戻り値で返し、呼び出し側 (top level、罠 54) で exit 9 に落とす。
+read_bot_reactions() {   # stdout = bot が付けた reaction の content の JSON array
+  local out
+  out=$(gh api --paginate "repos/${OWNER_REPO}/issues/comments/${TRIGGER_COMMENT_ID}/reactions?per_page=100" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | .content]" | jq -sc 'add // []') || return 1
+  case "$out" in '['*']') printf '%s\n' "$out";; *) return 1;; esac
 }
 
 PREV_KI=$(key_inline); PREV_KS=$(key_issues); PREV_KR=$(key_reviews)
@@ -377,7 +386,13 @@ while true; do
     # 罠 47: reaction が 1 つも無い = **trigger が届いていない** (実測 8 回中 2 回、
     # PR #162 round 4 / 8)。stale connector ではないので、再 trigger すれば復帰する。
     # **`exit 3` で stale connector と診断する前に必ず reaction を見る。**
-    if [ "$(reaction eyes)" = "0" ] && [ "$(reaction +1)" = "0" ]; then
+    if ! BOT_REACTIONS=$(read_bot_reactions); then
+      diag "ABORT: could not read the trigger comment's reactions (gh api failed). Acknowledgement is unknown."
+      diag "The trigger (comment id=${TRIGGER_COMMENT_ID}) is already posted. Do NOT re-trigger automatically: a re-run posts again and uses a round."
+      diag "Action: read the 3 endpoints by hand (gh api repos/${OWNER_REPO}/pulls/${PR}/comments, .../pulls/${PR}/reviews, repos/${OWNER_REPO}/issues/${PR}/comments) and the reactions, then decide or escalate."
+      exit 9
+    fi
+    if [ "$(printf '%s' "$BOT_REACTIONS" | jq '[.[] | select(. == "eyes" or . == "+1")] | length')" = "0" ]; then
       diag "WARN: trigger comment has no reaction - codex never received it (trap 47)."
       diag "Action: re-trigger on the same commit (once, automatically; then escalate)."
       exit 5
