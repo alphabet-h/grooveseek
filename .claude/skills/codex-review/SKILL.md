@@ -265,8 +265,10 @@ bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds
 re-review round (P0/P1 を fix して push した後) は **body file を 4 番目の位置引数に渡す** (`<PR#>` `<max_rounds>` `<per_round_timeout_sec>` の次。option は数えない)。本文は
 `@codex review` で始め、続けて fix sketch。**`@codex` を本文中で bare word でも使わない、
 verb は `review` のみ** (罠 15 / 18)。heredoc ではなく Write で file にしてから渡す。
-file が無い / 空 / 1 行目が `@codex review` で始まらない時は、script が投稿前に exit 2 で止める
-(相対 path は呼び出し側の cwd 基準で解決する):
+`-` を渡すと stdin を本文にする (`gh pr comment --body-file -` と同じ)。script は本文を起動直後に
+1 回だけ一時 dir の snapshot へ copy し、検査も投稿もその snapshot で行う (検査後に元 file が消えたり
+書き換わったりしても、検査した本文がそのまま投稿される)。file が無い / 空 (stdin が空も) / 1 行目が
+`@codex review` で始まらない時は、GitHub を読む前に exit 2 で止める (相対 path は呼び出し側の cwd 基準):
 
 ```bash
 bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds> 600 "$S/r2-body.md" > "$S/r2.out" 2> "$S/r2.err"; echo exit=$?
@@ -292,7 +294,7 @@ PR の `@codex review` 投稿履歴から導く。stderr の `round N/M` 行で�
 | exit 5 | trigger に reaction が 1 つも無い = 届いていない (罠 47、実測 8 回中 2 回) | 同じ commit に再 trigger (自動 1 回)。2 回目も届かなければ user 報告。届かなかった trigger も履歴上は 1 round と数える (安全側) |
 | exit 6 | trigger の POST が 3 回失敗 (罠 50) | 待たずに abort。数分置いて再実行 |
 | exit 7 | `max_rounds` に到達、**何も投稿していない** (罠 16 / 28) | user に報告 (続行 / 妥協 / scope 縮小の判断)。自分で上限を上げて再実行しない |
-| exit 2 | 引数の誤り (stderr に usage)。未知の option、`-R` の値が無い / `-` で始まる、位置引数が数字でない / 多すぎる、**`-R` と `GH_REPO` が別の repo を指している**、github.com 以外の host、**body file が存在しない / 通常 file でない / 読めない / 空 / 1 行目が `@codex review` で始まらない** (body file の検査は GitHub を読む前、`--dry-run` でも行う。stderr は `ABORT: trigger_body_file ...`)。何も投稿していない | usage を見て直して打ち直す — option は `<PR#>` より前に置く、`-R` と `GH_REPO` はどちらか一方にする、body file は Write で書き直して path を確かめる |
+| exit 2 | 引数の誤り (stderr に usage)。未知の option、`-R` の値が無い / `-` で始まる、位置引数が数字でない / 多すぎる、**`-R` と `GH_REPO` が別の repo を指している**、github.com 以外の host、**body file が存在しない / 通常 file でない / 読めない / 空 (`-` で stdin が空も) / 1 行目が `@codex review` で始まらない** (body file の検査は GitHub を読む前、`--dry-run` でも行う。stderr は `ABORT: trigger_body_file ...`)。何も投稿していない | usage を見て直して打ち直す — option は `<PR#>` より前に置く、`-R` と `GH_REPO` はどちらか一方にする、body file は Write で書き直して path を確かめる |
 | exit 8 | **投稿前の判定材料が読めなかった。何も投稿していない** (round も消費していない)。GitHub の読み取り (repo 名 / PR の存在と URL / baseline / trigger 履歴 / dry-run の head) の失敗に加えて、それを元に jq で作る値 (trigger の数 = round 番号、baseline の件数と表示、head、URL) が失敗した、または数字・形が合わない場合も含む。dry-run も成功の行を出す前にここで止まる。stderr の `ABORT: could not read …` が何かを言う | `gh auth status` / rate limit、`-R` の repo と PR 番号の組を確認して再実行 (投稿していないので、再実行で round は増えない) |
 | exit 9 | **trigger は投稿済み**で、trigger 後の判定材料が読めなかった。判定 (`CONVERGED` / `WARN` / exit 3 / 4 / 5 / 10) は出していない。原因は stderr の `ABORT:` 行で分かれる: ① round の delta を計算できなかった (罠 59、`... could not be computed`) / ② trigger 後の GitHub の読み取りが失敗した、または空だった (`could not read ... after the trigger was posted`)。対象は timeout 時の trigger comment の reactions (= codex が受け取ったか不明)、Step 4 で読む reviews / issue comments / inline comments / head sha、およびそれらから数えた値。poll 中の一時失敗は次の poll で取り直すので、ここには来ない。reactions が読めて bot の `eyes` / `+1` が無ければ exit 5 で、こちらにはならない | どちらも **空欄を「指摘なし」と読まない** — 判定材料が無いだけ。① は再実行してよい (**再実行は新しい trigger を投稿し、1 round と数える**)。② は **自動で再 trigger しない** — 届いていた trigger に重ねて 1 round を捨てかねない。stderr に出る 3 endpoint と reactions を手で読み、codex が答えていればその内容で判断、答えも reaction も確かめられなければ user 報告 |
 | exit 10 | `Provided git ref <sha> does not exist` — push 直後の trigger で codex 側にまだ ref が無い (罠 60、PR #258 / #265 / #293 で 3 回)。本文は exit 4 と同じ語彙だが transient | `gh api repos/<o>/<r>/commits/<sha>` で head の存在を確かめ、body file 付きで **1 回だけ** 再 trigger (1 round と数える)。**2 回目も exit 10 なら止めて user 報告** (stdout / stderr を残す。#293 は 5 分空けた再 trigger も同じ本文だった = 待ち時間の根拠が無い。次に打つなら新しい push の後か、user が時刻を決める)。避けるには push と `gh pr create` の間を空ける。同じ round に quota 等の terminal 本文が並ぶと exit 4 が勝つ (script が comment ごとに分類) |

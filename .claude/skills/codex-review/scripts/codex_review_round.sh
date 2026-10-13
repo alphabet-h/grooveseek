@@ -15,15 +15,19 @@
 #                            `@codex review` history, so the limit holds across processes
 #     per_round_timeout_sec  default 600 (wall-clock for Phase A + Phase B)
 #     trigger_body_file      re-review body (`@codex review` + fix sketch); omit for round 1.
-#                            Must be a non-empty readable regular file whose first line
-#                            starts with `@codex review`, else exit 2 before anything else
+#                            A readable regular file, or `-` for stdin. It is copied once into
+#                            a private snapshot; the snapshot must be non-empty and its first
+#                            line must start with `@codex review`, else exit 2 before any
+#                            GitHub read. The snapshot (not the original path) is what is posted
 #
 # Exit codes:
 #   0  round complete - read the `CONVERGED=true|false` line on stdout
 #   2  bad arguments (including -R and $GH_REPO naming different repos, and a
-#      trigger_body_file that is missing / not a regular file / unreadable / empty /
-#      whose first line does not start with `@codex review`); checked before any
-#      GitHub read, --dry-run included; nothing was posted
+#      trigger_body_file that is missing / not a regular file / unreadable / empty
+#      (an empty stdin for `-` included) / whose first line does not start with
+#      `@codex review`); checked before any GitHub read, --dry-run included; nothing
+#      was posted. Failing to create the temporary directory (where the body snapshot
+#      lives) is exit 8, as before, also before any GitHub read
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
 #   4  codex returned a terminal error body; retry will not help (trap 10 / 56)
 #  10  codex could not see the PR head yet ("Provided git ref ... does not exist"); re-trigger once (trap 60)
@@ -88,24 +92,46 @@ esac
 # 原因は引数なので、待たせずに exit 2 で止める。何も投稿しない。
 # 本文が `@codex review` で始まらないものも同じ exit 2 (罠 15 / 18): mention の無い comment は
 # codex に届かず、投稿して 1 round を数えた上で exit 5 (罠 47) と誤診する。
-# 相対 path はここで絶対 path にする: 下で repo root へ cd するので、呼び出し側の cwd 基準の
-# path が gh に渡る時には別の file を指す (または存在しない)。
-# diag (下) はまだ定義前なので printf で直に stderr へ書く (ASCII のみ、罠 52)。
+# 検査した bytes と投稿する bytes を同一にする (PR #358 のローカル Codex、high: TOCTOU)。
+# 元の path を検査して後で gh に読ませると、その間に削除されれば exit 6 が再発し、差し替えられれば
+# mention の無い本文を投稿して 1 round を消費する。そこで本文を **1 回だけ** ROUND_TMP の中の
+# snapshot へ copy し、検査も投稿 (Step 2 の --body-file) も snapshot に対して行う。
+# copy は下の cd より前なので、相対 path は呼び出し側の cwd 基準のまま読める (絶対化は不要)。
+# `-` は gh pr comment --body-file と同じく stdin (PR #358 のローカル Codex、medium)。
+# stdin も snapshot に読み込んで同じ検査にかける。
+
+# 進捗と警告は stderr、ASCII のみ (罠 52: AGENTS.md "Results go to stdout,
+# diagnostics to stderr"、および CP932 コンソールでの mojibake 回避)。この script の
+# *結果* は review の中身なので、それだけが stdout に出る。
+diag() { printf '%s\n' "$*" >&2; }
+
+# 罠 59: snapshot は **ファイル経由で** jq に渡す (下の json_delta)。置き場は
+# `mktemp -d` の絶対パス — この script は repo root へ cd しているので、相対パスで
+# 書くと作業ツリーに残骸を落とす。EXIT trap で必ず消すので、どの exit code で
+# 抜けても残らない。trigger_body_file の snapshot も同じ dir に置く (trap は 1 本だけ)。
+ROUND_TMP=$(mktemp -d) || { diag "ABORT: could not create a temporary directory."; exit 8; }
+trap 'rm -rf "$ROUND_TMP"' EXIT
+
 bad_body_file() {   # $1 = 理由
-  printf '%s\n' "ABORT: trigger_body_file ${TRIGGER_BODY_FILE}: $1. Nothing was posted." >&2
-  printf '%s\n' "Action: write the re-review body (first line starts with @codex review) to a file and pass its path." >&2
+  diag "ABORT: trigger_body_file ${TRIGGER_BODY_FILE}: $1. Nothing was posted."
+  diag "Action: write the re-review body (first line starts with @codex review) to a file and pass its path (or - for stdin)."
   exit 2
 }
+TRIGGER_BODY_SNAPSHOT=""
 if [ -n "$TRIGGER_BODY_FILE" ]; then
-  case "$TRIGGER_BODY_FILE" in
-    /*|[A-Za-z]:[/\\]*) ;;
-    *) TRIGGER_BODY_FILE="$PWD/$TRIGGER_BODY_FILE";;
-  esac
-  [ -e "$TRIGGER_BODY_FILE" ] || bad_body_file "does not exist"
-  [ -f "$TRIGGER_BODY_FILE" ] || bad_body_file "is not a regular file"
-  [ -r "$TRIGGER_BODY_FILE" ] || bad_body_file "is not readable"
-  [ -s "$TRIGGER_BODY_FILE" ] || bad_body_file "is empty"
-  IFS= read -r BODY_FIRST_LINE < "$TRIGGER_BODY_FILE" || [ -n "${BODY_FIRST_LINE:-}" ] \
+  TRIGGER_BODY_SNAPSHOT="${ROUND_TMP}/trigger-body.snapshot"
+  if [ "$TRIGGER_BODY_FILE" = "-" ]; then
+    cat > "$TRIGGER_BODY_SNAPSHOT" || bad_body_file "could not read stdin"
+  else
+    [ -e "$TRIGGER_BODY_FILE" ] || bad_body_file "does not exist"
+    [ -f "$TRIGGER_BODY_FILE" ] || bad_body_file "is not a regular file"
+    [ -r "$TRIGGER_BODY_FILE" ] || bad_body_file "is not readable"
+    cat -- "$TRIGGER_BODY_FILE" > "$TRIGGER_BODY_SNAPSHOT" || bad_body_file "could not be copied"
+  fi
+  # 以下は snapshot だけを見る (元の file はもう読まない)。
+  [ -s "$TRIGGER_BODY_SNAPSHOT" ] || bad_body_file "is empty"
+  BODY_FIRST_LINE=""
+  IFS= read -r BODY_FIRST_LINE < "$TRIGGER_BODY_SNAPSHOT" || [ -n "$BODY_FIRST_LINE" ] \
     || bad_body_file "could not read its first line"
   case "$BODY_FIRST_LINE" in
     '@codex review'|'@codex review'[[:space:]]*) ;;   # [[:space:]] は CRLF の \r も含む
@@ -125,17 +151,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel) || exit 1
 cd "$REPO_DIR" || exit 1
 
-# 進捗と警告は stderr、ASCII のみ (罠 52: AGENTS.md "Results go to stdout,
-# diagnostics to stderr"、および CP932 コンソールでの mojibake 回避)。この script の
-# *結果* は review の中身なので、それだけが stdout に出る。
-diag() { printf '%s\n' "$*" >&2; }
-
-# 罠 59: snapshot は **ファイル経由で** jq に渡す (下の json_delta)。置き場は
-# `mktemp -d` の絶対パス — この script は repo root へ cd しているので、相対パスで
-# 書くと作業ツリーに残骸を落とす。EXIT trap で必ず消すので、どの exit code で
-# 抜けても残らない。
-ROUND_TMP=$(mktemp -d) || { diag "ABORT: could not create a temporary directory."; exit 8; }
-trap 'rm -rf "$ROUND_TMP"' EXIT
+# diag と ROUND_TMP (一時 dir + EXIT trap) は上、引数の検査の直前で作っている
+# (trigger_body_file の snapshot を同じ dir に置くため)。
 
 # 投稿 *前* の読み取り (repo 名 / baseline / trigger 履歴) が失敗したら、投稿せずに
 # 止める。読めなかった結果を「空」として先へ進むと、baseline が空 = 既存の指摘が全部
@@ -449,8 +466,9 @@ fi
 # 届いていない」が、無応答を stale connector と誤診しないための唯一の signal。
 # **round ごとに取り直す**: 前 round の comment の reaction を見ていると、
 # 届いていない round を「届いた」と読む。
-if [ -n "$TRIGGER_BODY_FILE" ]; then
-  TRIGGER_COMMENT_ID=$(post_trigger --body-file "$TRIGGER_BODY_FILE") || exit 6
+# body file は引数の段階で取った snapshot を渡す (検査した bytes = 投稿する bytes、上の TOCTOU の節)。
+if [ -n "$TRIGGER_BODY_SNAPSHOT" ]; then
+  TRIGGER_COMMENT_ID=$(post_trigger --body-file "$TRIGGER_BODY_SNAPSHOT") || exit 6
 else
   TRIGGER_COMMENT_ID=$(post_trigger --body "@codex review") || exit 6
 fi
