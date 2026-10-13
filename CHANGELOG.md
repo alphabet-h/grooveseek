@@ -14,6 +14,21 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **`.pptx` tables are indexed one row per line, with the cells of a row separated by tabs**, the
+  way `.docx` and `.xlsx` rows already are, and **a line break inside a `.pptx` paragraph is kept
+  as a newline** instead of gluing the words around it together. An empty cell keeps its place as
+  an empty field, a row of empty cells is left out, the paragraphs and line breaks inside a cell
+  are joined with a space, and a merged cell is written once. A slide title with a line break
+  keeps it as a space. Slides without a table or a line break, speaker notes and the other formats
+  are unchanged.
+- **The first `groove index` or `rebuild_index` of this version re-reads every unchanged `.pptx`
+  once**, announced as `Re-reading N unchanged .pptx document(s) once: ...`. Only decks whose
+  slides change are re-embedded, and this change re-reads no `.docx`. **If you run
+  `groove serve`, restart it on this version first, then call `rebuild_index` or run
+  `groove index` once.** See [ADR-0029](docs/decisions/0029-reread-unchanged-documents-once-per-format.md).
+
 ## [1.18.0] - 2026-10-09
 
 ### Changed

@@ -991,6 +991,25 @@ pub fn rebuild_index(
     let table_current = db.read_docx_table_policy()?.as_deref() == Some(DOCX_TABLE_POLICY);
     let refresh_docx = !force && !(heading_current && section_current && table_current);
     let tables_alone_stale = heading_current && section_current;
+    // (feature-65) `.pptx` has a pass of its own, opened by its own key
+    // ([`PPTX_TABLE_BREAK_POLICY`], ADR-0029): an index whose `.pptx` rows were written before
+    // table rows became one line and line breaks were kept re-reads each unchanged one once.
+    // Each pass re-reads and marks only its own format's rows, so a stale key of one format
+    // never touches the other's.
+    let pptx_current =
+        db.read_pptx_table_break_policy()?.as_deref() == Some(PPTX_TABLE_BREAK_POLICY);
+    let refresh_pptx = !force && !pptx_current;
+    let passes = [
+        OncePass {
+            extension: "docx",
+            stale: refresh_docx,
+        },
+        OncePass {
+            extension: "pptx",
+            stale: refresh_pptx,
+        },
+    ];
+    let any_stale = passes.iter().any(|p| p.stale);
 
     // (feature-58) The keys the schema declares are what `document_fields` holds.
     // `schema` was already loaded above, before the destructive reset, from the
@@ -1204,21 +1223,37 @@ pub fn rebuild_index(
 
     // (feature-62) Which unchanged `.docx` documents the one-time pass re-reads: decided once,
     // after the renames above, since a renamed row is under its new path now.
+    // (feature-65) And which unchanged `.pptx` ones, counted apart for their own notice.
     let mut rereads: HashSet<String> = HashSet::new();
+    let (mut docx_rereads, mut pptx_rereads) = (0_usize, 0_usize);
     for entry in &disk_entries {
         if rereads_unchanged_docx(refresh_docx, db, registry, entry, &renamed_new_paths)? {
             rereads.insert(entry.rel.clone());
+            docx_rereads += 1;
+        } else if rereads_unchanged_as(
+            "pptx",
+            refresh_pptx,
+            db,
+            registry,
+            entry,
+            &renamed_new_paths,
+        )? {
+            rereads.insert(entry.rel.clone());
+            pptx_rereads += 1;
         }
     }
     // Announced before the loop, so a run that takes long re-embedding says why even if it is
-    // stopped.
-    if !rereads.is_empty() {
+    // stopped: the `.docx` line first, then the `.pptx` one.
+    if docx_rereads > 0 {
         let notice = if tables_alone_stale {
-            docx_table_reread_notice(rereads.len())
+            docx_table_reread_notice(docx_rereads)
         } else {
-            docx_reread_notice(rereads.len())
+            docx_reread_notice(docx_rereads)
         };
         progress.announce(&notice);
+    }
+    if pptx_rereads > 0 {
+        progress.announce(&pptx_reread_notice(pptx_rereads));
     }
 
     // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
@@ -1245,10 +1280,11 @@ pub fn rebuild_index(
             }
         }
     }
-    // (feature-62) The `.docx` rows this run's pass did not bring in line with the new heading
-    // rule. Marked at the end, after the sweep -- never inside the loop, so a run that stops
-    // midway leaves every hash as it was (I-4).
-    let mut unsettled_docx: HashSet<String> = HashSet::new();
+    // (feature-62) The rows of a one-time pass (ADR-0029) that this run did not bring in line
+    // with the new rules. Marked at the end, after the sweep -- never inside the loop, so a run
+    // that stops midway leaves every hash as it was (I-4).
+    // (feature-65) Rows of any stale pass ([`stale_row`]), not only `.docx` ones.
+    let mut unsettled: HashSet<String> = HashSet::new();
 
     // 2. Process each file
     //
@@ -1316,7 +1352,7 @@ pub fn rebuild_index(
         // by the re-read. Anything else -- a parse failure, a refusal, bytes that changed under
         // the read, a skip on the ordinary path -- leaves a row the old rule wrote, which the end
         // of the run marks. A row already gone (a cross-parser rename settled above) needs none.
-        if refresh_docx {
+        if any_stale {
             let settled = match &single_result {
                 SingleResult::Updated { .. } => true,
                 SingleResult::Unchanged => mode == Reindex::Reparse,
@@ -1325,8 +1361,8 @@ pub fn rebuild_index(
                 }
                 SingleResult::MetadataRefreshed { .. } | SingleResult::Refused => false,
             };
-            if !settled && indexed_hash_for(db, registry, &entry.rel, "docx")?.is_some() {
-                unsettled_docx.insert(entry.rel.clone());
+            if !settled && stale_row(&passes, db, registry, &entry.rel)? {
+                unsettled.insert(entry.rel.clone());
             }
         }
         match single_result {
@@ -1483,31 +1519,38 @@ pub fn rebuild_index(
     // (feature-62) Recorded last -- after the deletion sweep, for the reason the frontmatter
     // key is, and after every other step of the run that can fail, so a run that returns an
     // `Err` or stops at a check point never records it (I-4) -- together with the placeholder
-    // over every `.docx` row this run could not settle: the ones the loop marked, and the ones
-    // the scan skipped, which the loop never saw. One transaction, so the key is never there
-    // without the marks (I-1). The marks are written over whatever the rows hold now,
-    // unconditionally: a row another process wrote since the loop is marked too, and re-read
-    // once more, rather than an old-rule row being kept (ADR-0028). `--force` rewrote every
-    // row, so it marks none. The counts in `result` read rows, not hashes, so the marks do not
-    // change them.
-    if force || refresh_docx {
-        if refresh_docx {
+    // over every row of a one-time pass (ADR-0029) this run could not settle: the ones the loop
+    // marked, and the ones the scan skipped, which the loop never saw. One transaction, so the
+    // key is never there without the marks (I-1). The marks are written over whatever the
+    // rows hold now, unconditionally: a row another process wrote since the loop is marked too,
+    // and re-read once more, rather than an old-rule row being kept (ADR-0028). `--force`
+    // rewrote every row, so it marks none. The counts in `result` read rows, not hashes, so the
+    // marks do not change them.
+    if force || any_stale {
+        if any_stale {
             for rel in &skipped_paths {
-                if indexed_hash_for(db, registry, rel, "docx")?.is_some() {
-                    unsettled_docx.insert(rel.clone());
+                if stale_row(&passes, db, registry, rel)? {
+                    unsettled.insert(rel.clone());
                 }
             }
         }
-        let marked: Vec<&str> = unsettled_docx.iter().map(String::as_str).collect();
+        let marked: Vec<&str> = unsettled.iter().map(String::as_str).collect();
         let tx = db.begin_transaction()?;
         db.overwrite_content_hash(&marked, HASH_AWAITING_REPARSE)?;
-        db.write_docx_heading_policy(DOCX_HEADING_POLICY)?;
-        // (feature-63) After the heading key, in the same transaction: a run that fails on
-        // either write records neither.
-        db.write_docx_section_policy(DOCX_SECTION_POLICY)?;
-        // (feature-64) Last, in the same transaction: a run that fails on an earlier write, or
-        // on this one, records none of the three.
-        db.write_docx_table_policy(DOCX_TABLE_POLICY)?;
+        if force || refresh_docx {
+            db.write_docx_heading_policy(DOCX_HEADING_POLICY)?;
+            // (feature-63) After the heading key, in the same transaction: a run that fails on
+            // either write records neither.
+            db.write_docx_section_policy(DOCX_SECTION_POLICY)?;
+            // (feature-64) After them, in the same transaction: a run that fails on an earlier
+            // write, or on this one, records none of the three.
+            db.write_docx_table_policy(DOCX_TABLE_POLICY)?;
+        }
+        if force || refresh_pptx {
+            // (feature-65) Last, in the same transaction: a run that fails on a `.docx` key or
+            // on this one records no key and no mark (ADR-0029).
+            db.write_pptx_table_break_policy(PPTX_TABLE_BREAK_POLICY)?;
+        }
         tx.commit()?;
     }
     progress.finish();
@@ -1633,9 +1676,9 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
 /// A changed file whose new chunks match keeps its embeddings and has only its metadata
 /// rewritten ([`index_single_disk_entry`]).
 ///
-/// (feature-62) The one-time `.docx` pass ([`Reindex::Reparse`]) asks the same question of
+/// (feature-62) The one-time pass (ADR-0029, [`Reindex::Reparse`]) asks the same question of
 /// an unchanged document it re-read: matching chunks mean the row already splits the way the
-/// new heading rule does (AGENTS.md "One question gets one implementation").
+/// new rule does (AGENTS.md "One question gets one implementation").
 fn stored_chunks_match(
     db: &Database,
     rel: &str,
@@ -1688,7 +1731,7 @@ const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 /// two reads, so nothing about the retained row has been learned, and the skip keeps the
 /// check pending for the next run (codex P2, round 5).
 ///
-/// (feature-62) The one-time `.docx` pass returns it too, and there it means something else:
+/// (feature-62) The one-time pass (ADR-0029) returns it too, and there it means something else:
 /// for a [`Reindex::Reparse`] entry the skip leaves the row unsettled, so the end-of-run step
 /// gives it [`HASH_AWAITING_REPARSE`].
 const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
@@ -1702,8 +1745,9 @@ const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
 /// for good, and the hash is what says whether the bytes that were read this run are the ones
 /// the row was written from.
 ///
-/// (feature-62) The one-time `.docx` pass asks it with `"docx"`: which rows it re-reads
-/// ([`rereads_unchanged_docx`]) and, at the end of the run, which rows it could not settle.
+/// (feature-62) Each one-time pass (ADR-0029) asks it with its format's extension: which rows
+/// it re-reads ([`rereads_unchanged_as`]) and, at the end of the run, which rows it could not
+/// settle ([`stale_row`]).
 fn indexed_hash_for(
     db: &Database,
     registry: &Registry,
@@ -1731,6 +1775,8 @@ fn indexed_hash_for(
 ///
 /// The one predicate both the per-document mode and the count in [`docx_reread_notice`] come
 /// from; [`rebuild_index`] asks it once per entry and keeps the answer.
+///
+/// (feature-65) The `.docx` case of [`rereads_unchanged_as`], which every format's pass asks.
 fn rereads_unchanged_docx(
     refresh_docx: bool,
     db: &Database,
@@ -1738,11 +1784,48 @@ fn rereads_unchanged_docx(
     entry: &DiskEntry,
     renamed_new_paths: &HashSet<String>,
 ) -> Result<bool> {
-    if !refresh_docx || renamed_new_paths.contains(&entry.rel) {
+    rereads_unchanged_as("docx", refresh_docx, db, registry, entry, renamed_new_paths)
+}
+
+/// (feature-65) Whether the one-time pass of the format whose parser reports `extension`
+/// re-reads `entry` ([`Reindex::Reparse`], ADR-0029): that pass is running (`stale`), the entry
+/// is not already re-read by force (`renamed_new_paths`), and the index holds a row that
+/// format's parser wrote for it ([`indexed_hash_for`]), whose hash is the scan's.
+fn rereads_unchanged_as(
+    extension: &str,
+    stale: bool,
+    db: &Database,
+    registry: &Registry,
+    entry: &DiskEntry,
+    renamed_new_paths: &HashSet<String>,
+) -> Result<bool> {
+    if !stale || renamed_new_paths.contains(&entry.rel) {
         return Ok(false);
     }
-    let row = indexed_hash_for(db, registry, &entry.rel, "docx")?;
+    let row = indexed_hash_for(db, registry, &entry.rel, extension)?;
     Ok(row.is_some_and(|row| row == entry.hash))
+}
+
+/// (feature-65) One format's one-time re-read pass in [`rebuild_index`] (ADR-0029): the parser
+/// whose rows it re-reads, by [`crate::parser::Parser::extension`], and whether that format's
+/// policy keys are stale (absent or another value) in this index.
+#[derive(Clone, Copy, Debug)]
+struct OncePass {
+    extension: &'static str,
+    stale: bool,
+}
+
+/// (feature-65) Whether a row the run did not settle gets [`HASH_AWAITING_REPARSE`]: the index
+/// holds a row for `rel` that the parser of a [stale](OncePass::stale) pass in `passes` wrote.
+/// The rows of a format whose keys are at their value keep their hash, whatever another
+/// format's pass does.
+fn stale_row(passes: &[OncePass], db: &Database, registry: &Registry, rel: &str) -> Result<bool> {
+    for pass in passes.iter().filter(|p| p.stale) {
+        if indexed_hash_for(db, registry, rel, pass.extension)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// (feature-62) The line the one-time `.docx` pass writes before the document loop, through
@@ -1760,6 +1843,15 @@ fn docx_reread_notice(n: usize) -> String {
 fn docx_table_reread_notice(n: usize) -> String {
     format!(
         "Re-reading {n} unchanged .docx document(s) once: table rows are now one line each, cells separated by tabs; only documents whose sections change are re-embedded"
+    )
+}
+
+/// (feature-65) The line the one-time `.pptx` pass writes before the document loop, after the
+/// `.docx` one when both passes run. ASCII only, and it opens the way [`docx_reread_notice`]
+/// does.
+fn pptx_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .pptx document(s) once: table rows are now one line each, cells separated by tabs, and line breaks are kept; only documents whose slides change are re-embedded"
     )
 }
 
@@ -1786,11 +1878,12 @@ enum Reindex {
         check_frontmatter: bool,
         refresh_fields: bool,
     },
-    /// (feature-62) Read and parse a file whose hash matches: the one-time `.docx` pass of
-    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`]). Unlike [`Reindex::Incremental`], a matching
-    /// hash does not return early; unlike [`Reindex::Force`], chunks that still match the row's
-    /// are neither re-embedded nor written. Chunks that differ are written the ordinary way, and
-    /// no chunks at all drop the row, since `--force` would leave none.
+    /// (feature-62) Read and parse a file whose hash matches: the one-time pass (ADR-0029) of
+    /// [`rebuild_index`] ([`DOCX_HEADING_POLICY`], [`PPTX_TABLE_BREAK_POLICY`]). Unlike
+    /// [`Reindex::Incremental`], a matching hash does not return early; unlike
+    /// [`Reindex::Force`], chunks that still match the row's are neither re-embedded nor
+    /// written. Chunks that differ are written the ordinary way, and no chunks at all drop the
+    /// row, since `--force` would leave none.
     Reparse,
 }
 
@@ -3086,9 +3179,17 @@ pub(crate) const DOCX_SECTION_POLICY: &str = "fold-empty-headings";
 /// per-row column it names as the general form was not taken.
 pub(crate) const DOCX_TABLE_POLICY: &str = "tab-joined-rows";
 
-/// (feature-62) The `content_hash` a `.docx` row carries when the one-time pass of
-/// [`DOCX_HEADING_POLICY`] could not settle it: skipped by the scan, failed to parse, refused
-/// by the endpoint, or changed under the read. No file hashes to it -- a SHA-256 here is 64
+/// (feature-65) Recorded in `index_meta.pptx_table_break_policy` once every `.pptx` row of the
+/// index has been settled under the rules that write each table row as one line, its cells
+/// separated by tabs, and read `<a:br>` as a line break. Absence or another value opens the
+/// one-time `.pptx` pass, which re-reads `.pptx` rows only and announces itself with
+/// [`pptx_reread_notice`]; the final transaction writes the key after the `.docx` ones. A key per
+/// format, so a stale key of one format never re-reads the other's rows (ADR-0029).
+pub(crate) const PPTX_TABLE_BREAK_POLICY: &str = "tab-joined-rows-kept-breaks";
+
+/// (feature-62 introduced it for the `.docx` pass) The `content_hash` a row of a one-time pass
+/// (ADR-0029) carries when that pass could not settle it: skipped by the scan, failed to parse,
+/// refused by the endpoint, or changed under the read. No file hashes to it -- a SHA-256 here is 64
 /// lowercase hex digits ([`sha256_hex_bytes`]) -- so the unchanged fast path never matches it,
 /// and every later run reads the file the way it reads a changed one until it can be indexed.
 /// Rename detection also reads the hash; ADR-0028 records the
@@ -6893,6 +6994,93 @@ mod tests {
         );
         assert!(notice.starts_with("Re-reading 3 unchanged .docx document(s) once:"));
         assert!(notice.is_ascii());
+    }
+
+    /// feature-65 U1 (AC23): the pptx notice names the count and the change, opens as the docx
+    /// ones do, and is ASCII, since it goes to stderr.
+    #[test]
+    fn the_pptx_reread_notice_counts_the_documents_in_ascii() {
+        let notice = pptx_reread_notice(3);
+        assert_eq!(
+            notice,
+            "Re-reading 3 unchanged .pptx document(s) once: table rows are now one line each, cells separated by tabs, and line breaks are kept; only documents whose slides change are re-embedded"
+        );
+        assert!(notice.starts_with("Re-reading 3 unchanged .pptx document(s) once:"));
+        assert!(notice.is_ascii());
+    }
+
+    /// feature-65 U2 (AC26): the general predicate re-reads a row of its own format only, by
+    /// the parser rather than the spelling; [`stale_row`] marks only rows of a stale pass.
+    #[test]
+    fn the_general_reread_predicate_follows_each_format() {
+        let db = Database::open_in_memory().unwrap();
+        let registry =
+            Registry::from_enabled(&["md".into(), "docx".into(), "pptx".into()]).unwrap();
+        for (rel, hash) in [
+            ("deck.PPTX", "h-deck"),
+            ("memo.docx", "h-memo"),
+            ("edited.pptx", "h-old"),
+            ("moved.pptx", "h-moved"),
+        ] {
+            db.upsert_document(rel, None, None, None, None, &[], None, hash, 1)
+                .unwrap();
+        }
+        let none: HashSet<String> = HashSet::new();
+        let renamed: HashSet<String> = ["moved.pptx".to_string()].into_iter().collect();
+        let asks = |ext: &str, rel: &str, hash: &str, stale: bool, forced: &HashSet<String>| {
+            rereads_unchanged_as(ext, stale, &db, &registry, &mk_entry(rel, hash), forced).unwrap()
+        };
+        assert!(
+            asks("pptx", "deck.PPTX", "h-deck", true, &none),
+            "upper case is a pptx too"
+        );
+        assert!(
+            !asks("pptx", "memo.docx", "h-memo", true, &none),
+            "a docx is not the pptx pass's"
+        );
+        assert!(
+            !asks("pptx", "edited.pptx", "h-new", true, &none),
+            "a changed file takes the ordinary path"
+        );
+        assert!(
+            !asks("pptx", "fresh.pptx", "h-fresh", true, &none),
+            "no row, nothing to re-read"
+        );
+        assert!(
+            !asks("pptx", "moved.pptx", "h-moved", true, &renamed),
+            "a forced rename is re-read already"
+        );
+        assert!(
+            !asks("pptx", "deck.PPTX", "h-deck", false, &none),
+            "the pass is not running"
+        );
+        assert!(asks("docx", "memo.docx", "h-memo", true, &none));
+
+        let docx_stale = [
+            OncePass {
+                extension: "docx",
+                stale: true,
+            },
+            OncePass {
+                extension: "pptx",
+                stale: false,
+            },
+        ];
+        assert!(stale_row(&docx_stale, &db, &registry, "memo.docx").unwrap());
+        assert!(!stale_row(&docx_stale, &db, &registry, "deck.PPTX").unwrap());
+        let pptx_stale = [
+            OncePass {
+                extension: "docx",
+                stale: false,
+            },
+            OncePass {
+                extension: "pptx",
+                stale: true,
+            },
+        ];
+        assert!(!stale_row(&pptx_stale, &db, &registry, "memo.docx").unwrap());
+        assert!(stale_row(&pptx_stale, &db, &registry, "deck.PPTX").unwrap());
+        assert!(!stale_row(&pptx_stale, &db, &registry, "absent.pptx").unwrap());
     }
 
     /// Whether `s` has the shape of [`sha256_hex_bytes`]: 64 lowercase hex digits.

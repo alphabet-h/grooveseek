@@ -369,6 +369,32 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.pptx_table_break_policy` (feature-65): how the `.pptx` tables and line breaks
+    /// of this index were written, recorded by [`crate::indexer::rebuild_index`] after the
+    /// `.docx` keys. `None` = never recorded, which is every index written before each table
+    /// row became one line and `<a:br>` a line break.
+    pub fn read_pptx_table_break_policy(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'pptx_table_break_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records `index_meta.pptx_table_break_policy` (feature-65), replacing any value already
+    /// there (INSERT OR REPLACE).
+    pub fn write_pptx_table_break_policy(&self, policy: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('pptx_table_break_policy', ?1)",
+            params![policy],
+        )?;
+        Ok(())
+    }
+
     /// `index_meta.declared_fields` (feature-58): the sorted JSON array of key
     /// names `groove-schema.toml` declared when the index was last completed.
     /// `None` = never recorded, which is every index written before 1.9.0.
