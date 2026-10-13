@@ -79,6 +79,10 @@ case "$MAX_ROUNDS$PER_ROUND_TIMEOUT" in
 esac
 QUIET_WINDOW_SEC=180            # 罠 34: 同一 commit への 2 本目を 144 秒後に観測、+ 安全率
 BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
+# kuriya trap #410: codex は PR に 1 本の「Codex Review Summary」issue comment を持ち、
+# round ごとに Running → Completed と edit する (2026-10-06〜)。中身は進捗の表だけで指摘も
+# sentinel も無い。snapshot_issues で除外する (下)。
+CODEX_SUMMARY_MARKER="codex-pull-request-review-summary"
 
 # The script lives at <repo>/.claude/skills/codex-review/scripts/; resolve the
 # repo from there so it works from any cwd and any checkout location.
@@ -195,9 +199,14 @@ snapshot_reviews() {
     --jq "[.[] | select(.user.login==\"${BOT}\") | {id, state, submitted_at, commit_id, body}]" \
     | jq -s "add // [] | sort_by(.id)"
 }
+# kuriya trap #410: Review Summary comment (CODEX_SUMMARY_MARKER) は **ここで 1 回だけ** 落とす。
+#   残すと Running への edit が (id, updated_at) の差分になり、① Phase A が結果より先に抜けて
+#   quiet window が早く満了する (PR #356 r1 で INDETERMINATE)、② 毎 round NEW_ISSUES に入って
+#   ROUND_EMPTY が true にならない (罠 57 の安全装置が死ぬ)。key / delta / sentinel /
+#   ROUND_EMPTY / 表示はすべてこの関数を通るので、ここで揃う (罠 53)。
 snapshot_issues() {
   gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}]" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | select((.body // \"\") | contains(\"${CODEX_SUMMARY_MARKER}\") | not) | {id, updated_at, body}]" \
     | jq -s "add // [] | sort_by(.id)"
 }
 
