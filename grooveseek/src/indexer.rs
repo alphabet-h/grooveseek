@@ -990,7 +990,7 @@ pub fn rebuild_index(
     let section_current = db.read_docx_section_policy()?.as_deref() == Some(DOCX_SECTION_POLICY);
     let table_current = db.read_docx_table_policy()?.as_deref() == Some(DOCX_TABLE_POLICY);
     let refresh_docx = !force && !(heading_current && section_current && table_current);
-    let tables_alone_stale = heading_current && section_current;
+    let tables_alone_stale = heading_current && section_current && !table_current;
     // (feature-65) `.pptx` has a pass of its own, opened by its own key
     // ([`PPTX_TABLE_BREAK_POLICY`], ADR-0029): an index whose `.pptx` rows were written before
     // table rows became one line and line breaks were kept re-reads each unchanged one once.
