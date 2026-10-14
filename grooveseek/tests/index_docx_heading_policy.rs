@@ -2900,4 +2900,12 @@ mod table_pass {
         assert_eq!(meta(&fx, HEADING_KEY).as_deref(), Some(HEADING_POLICY));
         assert_eq!(meta(&fx, SECTION_KEY).as_deref(), Some(SECTION_POLICY));
     }
+
+    // No Static-mode (`[contextual] enabled = true`) twin of these tests. `rebuild_index`
+    // opens the `.docx` pass on one expression over the three keys, and which key is stale
+    // only picks the notice, so the re-read decision does not depend on the context mode.
+    // What Static mode pins today is the heading key: feature-62 I2s
+    // (`reread_pass::an_unchanged_docx_whose_sections_match_is_not_re_embedded_in_static_mode`)
+    // uses a document without a table. A stale table key with legacy grid rows under Static
+    // mode is not exercised here.
 }
