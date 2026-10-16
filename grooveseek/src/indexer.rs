@@ -1562,15 +1562,15 @@ pub fn rebuild_index(
             // either write records neither.
             db.write_docx_section_policy(DOCX_SECTION_POLICY)?;
             // (feature-64) After them, in the same transaction: a run that fails on an earlier
-            // write, or on this one, records none of the three.
+            // write, or on this one, records none of the `.docx` keys.
             db.write_docx_table_policy(DOCX_TABLE_POLICY)?;
             // (feature-66) After the table key, in the same transaction: a run that fails on an
             // earlier `.docx` key never reaches it, and one that fails on it records none.
             db.write_docx_table_rows_policy(DOCX_TABLE_ROWS_POLICY)?;
         }
         if force || refresh_pptx {
-            // (feature-65) Last, in the same transaction: a run that fails on a `.docx` key or
-            // on this one records no key and no mark (ADR-0029).
+            // (feature-65) After the `.docx` keys, in the same transaction: a run that fails on
+            // a `.docx` key or on this one records no key and no mark (ADR-0029).
             db.write_pptx_table_break_policy(PPTX_TABLE_BREAK_POLICY)?;
             // (feature-66) Last, in the same transaction (ADR-0030).
             db.write_pptx_table_rows_policy(PPTX_TABLE_ROWS_POLICY)?;
