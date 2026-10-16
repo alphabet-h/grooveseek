@@ -173,6 +173,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDoc
             context,
             line_range: None,
             symbol_kind: None,
+            table_rows: None,
         });
     }
 

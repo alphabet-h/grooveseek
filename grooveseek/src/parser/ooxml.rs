@@ -466,6 +466,59 @@ pub(crate) fn row_line(fields: &[String]) -> Option<String> {
     }
 }
 
+/// (feature-66) A table row's line in a body as a parser wrote it: `[start, end)` in bytes and
+/// the number of its table in the document (`.docx`) or slide (`.pptx`) as read, before
+/// [`chunk_table_rows`] numbers the tables per chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawRowSpan {
+    pub(crate) table: usize,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+/// (feature-66) Add a table row's `line` ([`row_line`]) to `body` as one more line -- after a
+/// `\n` when the body has text already, the way both parsers add a paragraph -- and record where
+/// it went in `spans`, under the raw number `table`. The docx parser and the pptx parser write
+/// every table row through this, so a row is marked exactly where it is written.
+pub(crate) fn push_row_line(
+    body: &mut String,
+    spans: &mut Vec<RawRowSpan>,
+    table: usize,
+    line: &str,
+) {
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let start = body.len();
+    body.push_str(line);
+    spans.push(RawRowSpan {
+        table,
+        start,
+        end: body.len(),
+    });
+}
+
+/// (feature-66) The [`crate::parser::Chunk::table_rows`] of a chunk whose rows sit at `spans`:
+/// in order of `start`, each table renumbered by the order it first appears in the chunk, from
+/// 0, so a table that wrote no row, or wrote its rows into another chunk, leaves no gap. `None`
+/// when an offset or a number does not fit a `u32`: not computed, rather than wrong.
+pub(crate) fn chunk_table_rows(spans: &[RawRowSpan]) -> Option<Vec<super::TableRowSpan>> {
+    let mut ordered = spans.to_vec();
+    ordered.sort_by_key(|span| span.start);
+    let mut numbers: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(ordered.len());
+    for span in ordered {
+        let next = u32::try_from(numbers.len()).ok()?;
+        let table = *numbers.entry(span.table).or_insert(next);
+        out.push(super::TableRowSpan {
+            table,
+            start: u32::try_from(span.start).ok()?,
+            end: u32::try_from(span.end).ok()?,
+        });
+    }
+    Some(out)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -737,5 +790,68 @@ mod tests {
             read_optional_zip_part(&mut archive, "<test>", "fits.xml", &mut budget, cap, "-");
         assert_eq!(fits, Some(b"<fits/>".to_vec()));
         assert_eq!(budget, 17);
+    }
+
+    /// feature-66 (R1.2): tables are renumbered per chunk by first appearance, in the order of
+    /// `start`, whatever their raw numbers; a nested table's number need not grow monotonically.
+    #[test]
+    fn chunk_table_rows_numbers_tables_by_first_appearance() {
+        use crate::parser::row_span;
+        let raw = |table, start, end| RawRowSpan { table, start, end };
+        assert_eq!(chunk_table_rows(&[]), Some(vec![]));
+        assert_eq!(
+            chunk_table_rows(&[raw(4, 0, 5), raw(7, 6, 18), raw(4, 19, 24)]),
+            Some(vec![
+                row_span(0, 0, 5),
+                row_span(1, 6, 18),
+                row_span(0, 19, 24)
+            ])
+        );
+        assert_eq!(
+            chunk_table_rows(&[raw(2, 12, 20), raw(0, 0, 11)]),
+            Some(vec![row_span(0, 0, 11), row_span(1, 12, 20)]),
+            "ordered by start"
+        );
+    }
+
+    /// feature-66 (R1.1): an offset past `u32` leaves the chunk not computed.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_span_past_u32_is_not_computed() {
+        let far = u32::MAX as usize + 1;
+        assert_eq!(
+            chunk_table_rows(&[RawRowSpan {
+                table: 0,
+                start: far,
+                end: far + 3
+            }]),
+            None
+        );
+    }
+
+    /// feature-66: a row line goes after a newline only when the body has text, and its span
+    /// covers the line alone.
+    #[test]
+    fn push_row_line_marks_the_line_it_adds() {
+        let (mut body, mut spans) = (String::new(), Vec::new());
+        push_row_line(&mut body, &mut spans, 3, "alder\tbirch");
+        body.push_str("\npreface");
+        push_row_line(&mut body, &mut spans, 3, "\tcedar");
+        assert_eq!(body, "alder\tbirch\npreface\n\tcedar");
+        assert_eq!(
+            spans,
+            vec![
+                RawRowSpan {
+                    table: 3,
+                    start: 0,
+                    end: 11
+                },
+                RawRowSpan {
+                    table: 3,
+                    start: 20,
+                    end: 26
+                },
+            ]
+        );
     }
 }
