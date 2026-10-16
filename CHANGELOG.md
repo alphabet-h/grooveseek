@@ -14,6 +14,27 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **Each `.docx` and `.pptx` chunk now records where its table rows are**, and the Rust library
+  returns it as `SearchResult::table_rows` (`Option<Vec<TableRowSpan>>`: byte ranges into
+  `content`, one per table row, each with its table's number in the chunk). `None` means not
+  computed: other formats, and rows written before this version. The index keeps it in a new
+  nullable column, `chunks.table_rows`. The MCP `search` / `get_connection_graph` responses,
+  `get_document` and `resources/read` are unchanged. **`SearchResult` has a new field, so Rust
+  code that builds one with a struct literal needs `table_rows: None`.** See
+  [ADR-0030](docs/decisions/0030-mark-table-rows-per-chunk.md).
+
+### Changed
+
+- **The first `groove index` or `rebuild_index` of this version re-reads every unchanged `.docx`
+  and `.pptx` once** to record their table rows, announced as `Re-reading N unchanged .docx
+  document(s) once: table rows are now marked in each chunk; ...` (and the same for `.pptx`).
+  The chunk text does not change, so nothing is re-embedded and nothing is counted as updated.
+  **If you run `groove serve`, restart it on the new version first**: a daemon still on the
+  previous version writes edited `.docx` and `.pptx` files without their table rows after the
+  re-read, and they stay that way until the next edit or `--force`.
+
 ## [1.19.0] - 2026-10-14
 
 ### Changed

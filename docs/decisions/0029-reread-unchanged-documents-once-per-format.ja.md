@@ -60,6 +60,8 @@ ADR-0028 が `.docx` で解いたのと同じ問題で、ADR-0028 の見直し�
   された `.pptx` を旧規則で書き続け、それは `--force` でしか戻らない。
 - **見直す時**: 1 つの形式に同じ種類の key が 4 本目に要る時 (ADR-0028 の `.docx` の条件を引き継ぐ)、
   または 3 つ目の形式に追いつきが要る時。
+  *(2026-10-17, v1.20.0)* `.docx` に 4 本目の key が要り、この条件に当たった。形式ごとの key を
+  維持した理由は [ADR-0030](0030-mark-table-rows-per-chunk.ja.md)。
 - **test が守る場所**: `grooveseek/src/indexer.rs` (述語と告知)、`grooveseek/src/db.rs` (key)、
   `grooveseek/tests/index_pptx_table_policy.rs` (run、形式をまたぐ場合、書き込みの失敗、callback、
   watcher)。
