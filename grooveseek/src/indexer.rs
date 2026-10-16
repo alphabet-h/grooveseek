@@ -2262,6 +2262,9 @@ fn index_single_disk_entry(
 /// [`crate::parser::Chunk::line_range`] and [`crate::parser::Chunk::symbol_kind`] as
 /// [`crate::db::CodeMeta`].
 ///
+/// (feature-66) And [`crate::parser::Chunk::table_rows`], in the same insert as the text it
+/// describes.
+///
 /// This is the one place a parsed chunk becomes a row. Indexing calls it with the embeddings
 /// the model produced; `tests/code_formats_light.rs` calls it with constants, so that what a
 /// pull request checks is the same write path the binary runs and not a copy of it (codex P1
@@ -2321,7 +2324,7 @@ pub fn write_parsed_document(
             ContextMode::Static => chunk.context.as_deref(),
             ContextMode::Off => None,
         };
-        db.insert_chunk_with_code(
+        db.insert_chunk_with_table_rows(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
@@ -2334,6 +2337,7 @@ pub fn write_parsed_document(
                 line_range: chunk.line_range,
                 symbol_kind: chunk.symbol_kind.as_deref(),
             },
+            chunk.table_rows.as_deref(),
         )?;
     }
     Ok(doc_id)
@@ -7133,5 +7137,74 @@ mod tests {
             db.get_document_hash("quarry.docx").unwrap(),
             Some(entry.hash.clone())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-66: chunks.table_rows
+    // -----------------------------------------------------------------------
+
+    /// feature-66: the JSON `chunks.table_rows` holds for the one chunk of
+    /// [`crate::parser::docx::fixture::table_docx`] (`"alder\tbirch\ncedar\tdamson"`).
+    const TARIFF_ROWS_JSON: &str =
+        r#"[{"table":0,"start":0,"end":11},{"table":0,"start":12,"end":24}]"#;
+
+    /// feature-66: what the registry's parser for `ext` makes of `bytes`, under the default
+    /// exclusions [`index_single_disk_entry`] uses when none are configured.
+    fn parse_doc(
+        registry: &Registry,
+        ext: &str,
+        rel: &str,
+        bytes: &[u8],
+    ) -> crate::parser::ParsedDocument {
+        use crate::parser::ParserExt;
+        registry
+            .by_extension(ext)
+            .unwrap()
+            .parse_bytes(bytes, rel, crate::parser::DEFAULT_EXCLUDED_HEADINGS)
+            .unwrap()
+    }
+
+    /// feature-66 (R5.2): the one write path stores each chunk's table rows: the parse's for a
+    /// docx, NULL for Markdown.
+    #[test]
+    fn a_written_document_keeps_its_table_rows() {
+        use crate::parser::docx::fixture::table_docx;
+        let db = reparse_db();
+        let registry = docx_registry();
+        let cases: [(&str, &str, Vec<u8>, Option<String>); 2] = [
+            (
+                "tariff.docx",
+                "docx",
+                table_docx(),
+                Some(TARIFF_ROWS_JSON.to_string()),
+            ),
+            (
+                "harbour.md",
+                "md",
+                b"# Harbour\n\nquiet harbour notes\n".to_vec(),
+                None,
+            ),
+        ];
+        for (rel, ext, bytes, expected) in cases {
+            let parsed = parse_doc(&registry, ext, rel, &bytes);
+            let parser = registry.by_extension(ext).unwrap();
+            let embeddings = vec![vec![0.6_f32, 0.8]; parsed.chunks.len()];
+            write_parsed_document(
+                &db,
+                rel,
+                &parsed,
+                parser,
+                &embeddings,
+                ContextMode::Off,
+                "h",
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+            let stored = db.chunk_table_rows_for_path(rel).unwrap();
+            assert!(!stored.is_empty(), "{rel}");
+            assert!(stored.iter().all(|s| *s == expected), "{rel}: {stored:?}");
+        }
     }
 }

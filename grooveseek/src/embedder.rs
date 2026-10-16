@@ -2799,6 +2799,7 @@ mod tests {
             date: None,
             tags: Vec::new(),
             context_text: context_text.map(str::to_string),
+            table_rows: None,
         }
     }
 
@@ -2842,6 +2843,7 @@ mod tests {
             date: None,
             tags: Vec::new(),
             context_text: None,
+            table_rows: None,
         };
         let candidates = vec![
             (1i64, mk("天気予報の話題です")),
