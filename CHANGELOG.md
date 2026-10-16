@@ -38,6 +38,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   previous version writes edited `.docx` and `.pptx` files without their table rows after the
   re-read, and they stay that way until the next edit or `--force`.
 
+### Security
+
+- **`rustls` was updated 0.23.45 → 0.23.46 and `quinn-proto` 0.11.16 → 0.11.19 to clear
+  RUSTSEC-2026-0338 through RUSTSEC-2026-0342 (`quinn-proto`) and RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349 (`rustls`).** Both are transitive. `rustls` is reached through `reqwest`
+  (the `openai-compatible` embedding client and `groove-tray`'s HTTP client) and through `ureq`,
+  which `hf-hub` uses to fetch embedding models — outbound HTTP clients only; no GrooveSeek code
+  terminates TLS as a server. `quinn-proto` is listed in `Cargo.lock` but `cargo tree` finds no
+  path to it on any target, so no shipped binary builds it. No other crate moved.
+
 ## [1.19.0] - 2026-10-14
 
 ### Changed

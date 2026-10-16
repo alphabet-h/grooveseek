@@ -6884,7 +6884,7 @@ Used by:
 - ring 0.17.14 (https://github.com/briansmith/ring)
 - rustix 1.1.4 (https://github.com/bytecodealliance/rustix)
 - rustls-native-certs 0.8.3 (https://github.com/rustls/rustls-native-certs)
-- rustls 0.23.45 (https://github.com/rustls/rustls)
+- rustls 0.23.46 (https://github.com/rustls/rustls)
 - scopeguard 1.2.0 (https://github.com/bluss/scopeguard)
 - security-framework-sys 2.17.0 (https://github.com/kornelski/rust-security-framework)
 - security-framework 3.7.0 (https://github.com/kornelski/rust-security-framework)
