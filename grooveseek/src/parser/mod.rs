@@ -165,12 +165,18 @@ pub struct TableRowSpan {
     pub end: u32,
 }
 
-/// (feature-66) Whether `spans` can be laid over `content`: each is non-empty, inside it and on
-/// char boundaries, and they are in order without touching (spec R1.3 1 and 3). The read side
-/// of the index answers `None` for a stored value that fails this, so a reader can slice
-/// `content` by every span it is given without a check of its own.
+/// (feature-66) Whether `spans` keep the [`TableRowSpan`] contract over `content` (spec R1.3 1, 3,
+/// 4 and 5): each is non-empty, inside it and on char boundaries; each starts at the start of a
+/// line and ends at the end of one; they are in order without touching; and the tables are
+/// numbered by first appearance from 0 without a gap (a span may return to an earlier table, as
+/// the outer table does around a nested one). A `\n` inside a span is allowed: a cell's own
+/// newline stays inside its row (spec §9 U2). The read side of the index answers `None` for a
+/// stored value that fails this, so a reader can rely on every span it is given without a check
+/// of its own.
 pub(crate) fn table_rows_fit(content: &str, spans: &[TableRowSpan]) -> bool {
+    let bytes = content.as_bytes();
     let mut previous_end: Option<usize> = None;
+    let mut tables = 0_u32;
     for span in spans {
         let (start, end) = (span.start as usize, span.end as usize);
         if start >= end
@@ -178,8 +184,14 @@ pub(crate) fn table_rows_fit(content: &str, spans: &[TableRowSpan]) -> bool {
             || !content.is_char_boundary(start)
             || !content.is_char_boundary(end)
             || previous_end.is_some_and(|previous| previous >= start)
+            || (start != 0 && bytes[start - 1] != b'\n')
+            || (end != bytes.len() && bytes[end] != b'\n')
+            || span.table > tables
         {
             return false;
+        }
+        if span.table == tables {
+            tables += 1;
         }
         previous_end = Some(end);
     }
@@ -192,9 +204,10 @@ pub(crate) fn row_span(table: u32, start: u32, end: u32) -> TableRowSpan {
     TableRowSpan { table, start, end }
 }
 
-/// (feature-66) Assert spec R1.3 1-5 of `chunk`'s table rows: present, fitting the content
-/// ([`table_rows_fit`]), each covering whole lines, and the tables numbered by first appearance
-/// without gaps.
+/// (feature-66) Assert spec R1.3 1, 3, 4 and 5 of `chunk`'s table rows: present and keeping the
+/// contract over the content, by the same check the read side of the index runs
+/// ([`table_rows_fit`]: fitting the content, each covering whole lines, and the tables numbered
+/// by first appearance without gaps).
 #[cfg(test)]
 pub(crate) fn assert_spans_hold(chunk: &Chunk) {
     let content = &chunk.content;
@@ -204,28 +217,8 @@ pub(crate) fn assert_spans_hold(chunk: &Chunk) {
         .expect("a .docx / .pptx chunk marks its rows");
     assert!(
         table_rows_fit(content, spans),
-        "R1.3 1/3: {spans:?} in {content:?}"
+        "R1.3 1/3/4/5: {spans:?} in {content:?}"
     );
-    let bytes = content.as_bytes();
-    let mut tables = 0_u32;
-    for span in spans {
-        let (start, end) = (span.start as usize, span.end as usize);
-        assert!(
-            start == 0 || bytes[start - 1] == b'\n',
-            "R1.3 4: {span:?} does not start a line of {content:?}"
-        );
-        assert!(
-            end == bytes.len() || bytes[end] == b'\n',
-            "R1.3 4: {span:?} does not end a line of {content:?}"
-        );
-        assert!(
-            span.table <= tables,
-            "R1.3 5: {span:?} after {tables} table(s) in {spans:?}"
-        );
-        if span.table == tables {
-            tables += 1;
-        }
-    }
 }
 
 /// A fully parsed document: frontmatter + chunks + retained raw content.
@@ -1286,5 +1279,73 @@ mod tests {
             !table_rows_fit(content, &[row_span(0, 12, 17), row_span(0, 0, 11)]),
             "out of order"
         );
+    }
+
+    /// feature-66 (R1.3 4): a span that starts or ends inside a line does not fit, so a stored
+    /// value cannot hand a reader part of a line as a row.
+    #[test]
+    fn table_rows_fit_refuses_spans_that_do_not_cover_whole_lines() {
+        let content = "lead\nalder\tbirch\ncedar";
+        assert!(table_rows_fit(content, &[row_span(0, 5, 16)]));
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 6, 16)]),
+            "starts inside a line"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 5, 15)]),
+            "ends inside a line"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 17, 20)]),
+            "ends before the content's last byte"
+        );
+        assert!(table_rows_fit(content, &[row_span(0, 17, 22)]), "last line");
+    }
+
+    /// feature-66 (R1.3 3): spans that overlap or come out of order do not fit, also when each
+    /// covers whole lines.
+    #[test]
+    fn table_rows_fit_refuses_overlapping_or_unsorted_whole_line_spans() {
+        let content = "alder\nbirch\ncedar";
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 0, 11), row_span(0, 6, 11)]),
+            "overlap"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 6, 11), row_span(0, 0, 5)]),
+            "unsorted"
+        );
+    }
+
+    /// feature-66 (R1.3 5): table numbers start at 0 and never skip one; returning to an earlier
+    /// table is allowed.
+    #[test]
+    fn table_rows_fit_refuses_table_numbers_that_skip() {
+        let content = "alder\nbirch\ncedar";
+        assert!(
+            !table_rows_fit(content, &[row_span(1, 0, 5)]),
+            "numbering starts at 1"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 0, 5), row_span(2, 6, 11)]),
+            "gap 0 -> 2"
+        );
+        assert!(table_rows_fit(
+            content,
+            &[row_span(0, 0, 5), row_span(1, 6, 11), row_span(0, 12, 17)]
+        ));
+    }
+
+    /// feature-66 (R1.3 / spec §9 U2): a value with several tables fits, and so does a span over
+    /// a row whose cell text carries its own newline.
+    #[test]
+    fn table_rows_fit_accepts_several_tables_and_a_cell_newline() {
+        let content = "p\na\tb\nc\td\nq\ne\tf";
+        assert!(table_rows_fit(
+            content,
+            &[row_span(0, 2, 5), row_span(0, 6, 9), row_span(1, 12, 15)]
+        ));
+        let content = "p\nfirst\nline\tb\nq";
+        assert!(table_rows_fit(content, &[row_span(0, 2, 14)]));
     }
 }

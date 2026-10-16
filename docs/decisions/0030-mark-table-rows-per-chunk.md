@@ -61,8 +61,9 @@ For the catch-up:
   parsers return `Some` (an empty list when there is no row); every other format
   and the text fallback return `None`.
 - `chunks.table_rows TEXT` holds its JSON, NULL meaning not computed.
-  `SearchResult::table_rows` returns it after checking it fits the content; a
-  value that does not reads as `None`. `SearchHit` does not carry it.
+  `SearchResult::table_rows` returns it after checking it fits the content
+  (each span inside it, covering whole lines, in order, the tables numbered
+  from 0 without a gap); a value that does not reads as `None`. `SearchHit` does not carry it.
 - `docx_table_rows_policy` and `pptx_table_rows_policy` (`row-spans`) join the
   predicate of ADR-0029, each written last among its format's keys in the run's
   final transaction.

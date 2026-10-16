@@ -50,7 +50,7 @@ ADR-0028 と ADR-0029 は schema を変えずに、policy key で既存の索引
   `.pptx` の parser は `Some` (行が無ければ空の列) を、他の形式と抽出済みテキストの fallback は
   `None` を返す。
 - `chunks.table_rows TEXT` にその JSON を持ち、NULL は「計算していない」。`SearchResult::table_rows`
-  は本文に収まるかを確かめてから返し、収まらない値は `None` として読む。`SearchHit` は運ばない。
+  は本文に収まるか (各 span が本文の中で行全体を覆い、昇順で、表番号が 0 から飛ばずに振られているか) を確かめてから返し、収まらない値は `None` として読む。`SearchHit` は運ばない。
 - `docx_table_rows_policy` と `pptx_table_rows_policy` (`row-spans`) を ADR-0029 の述語に足し、run の
   最後の transaction でそれぞれの形式の key の最後に書く。
 - 本文が parse と一致し表の行の位置だけ違う chunk は、その列だけを再 embedding せずに書く。判定は
