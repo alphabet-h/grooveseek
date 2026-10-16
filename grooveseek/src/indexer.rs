@@ -2345,9 +2345,18 @@ fn index_single_disk_entry(
     // (feature-62) The pass found the row already split the way this parser splits it: nothing
     // to write, and the hash already matches.
     // (feature-66) Unless its table rows are not the ones this parser marks: that column alone
-    // is written, and the document still counts as unchanged.
+    // is written, and the document still counts as unchanged. Only under the hash of the bytes
+    // just parsed: the pass re-reads a row because its hash matched the scan's, and a row another
+    // writer rehashed since (newer bytes, same text) would otherwise keep rows computed from the
+    // older bytes under its new hash, which the fast path then never revisits (spec R7.7).
     if reparse && chunks_unchanged {
         return match &table_rows {
+            Some(decision) if !decision.matches && decision.stored_hash != entry.hash => {
+                Ok(SingleResult::Skipped {
+                    reason: SKIPPED_CHANGED_DURING_READ,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                })
+            }
             Some(decision) if !decision.matches => write_reparsed_table_rows(
                 db,
                 &entry.rel,
@@ -7562,6 +7571,45 @@ mod tests {
         assert_eq!(
             db.chunk_table_rows_for_path("tariff.docx").unwrap(),
             vec![Some(TARIFF_ROWS_JSON.to_string())]
+        );
+    }
+
+    /// feature-66 X1 (R7.7, review fix round 1): a re-read whose row another writer rehashed
+    /// *before* stage one read it -- the watcher indexed newer bytes with the same text -- holds
+    /// a hash that is not the entry's. The column is not written from the older bytes; the
+    /// document is a changed-during-read skip, left unsettled.
+    #[test]
+    fn a_reparse_does_not_write_table_rows_under_a_hash_that_is_not_the_entrys() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("f66-x1-prehash");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let bytes = table_docx();
+        let entry = docx_entry(&dir.0, "tariff.docx", &bytes);
+        let chunks = parse_doc(&registry, "docx", "tariff.docx", &bytes).chunks;
+        write_row(&db, "tariff.docx", &entry.hash, &chunks);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE documents SET content_hash = 'hash-another-writer-left' WHERE path = ?1",
+                ["tariff.docx"],
+            )
+            .unwrap();
+        assert_eq!(
+            reindex(&db, &registry, &entry, Reindex::Reparse),
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.chunk_table_rows_for_path("tariff.docx").unwrap(),
+            vec![None],
+            "nothing written"
+        );
+        assert_eq!(
+            db.get_document_hash("tariff.docx").unwrap().as_deref(),
+            Some("hash-another-writer-left")
         );
     }
 
