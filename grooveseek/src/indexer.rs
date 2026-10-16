@@ -984,21 +984,33 @@ pub fn rebuild_index(
     // folded into the next section ([`DOCX_SECTION_POLICY`]).
     // (feature-64) And one whose tables were written before each row became one line
     // ([`DOCX_TABLE_POLICY`]). When the other two keys are at their values and only this one is
-    // not, the notice names the table change ([`docx_table_reread_notice`]). The three keys are
-    // read here, once, before the loop; the run does not read them again.
+    // not, the notice names the table change ([`docx_table_reread_notice`]). The four `.docx` keys
+    // and the two `.pptx` keys are read here, once, before the loop; the run does not read them
+    // again.
     let heading_current = db.read_docx_heading_policy()?.as_deref() == Some(DOCX_HEADING_POLICY);
     let section_current = db.read_docx_section_policy()?.as_deref() == Some(DOCX_SECTION_POLICY);
     let table_current = db.read_docx_table_policy()?.as_deref() == Some(DOCX_TABLE_POLICY);
-    let refresh_docx = !force && !(heading_current && section_current && table_current);
+    // (feature-66) And one whose `.docx` chunks were written before they carried their table
+    // rows ([`DOCX_TABLE_ROWS_POLICY`]), the fourth `.docx` key (ADR-0030).
+    let rows_docx_current =
+        db.read_docx_table_rows_policy()?.as_deref() == Some(DOCX_TABLE_ROWS_POLICY);
+    let refresh_docx =
+        !force && !(heading_current && section_current && table_current && rows_docx_current);
     let tables_alone_stale = heading_current && section_current && !table_current;
+    let rows_docx_alone_stale =
+        heading_current && section_current && table_current && !rows_docx_current;
     // (feature-65) `.pptx` has a pass of its own, opened by its own key
     // ([`PPTX_TABLE_BREAK_POLICY`], ADR-0029): an index whose `.pptx` rows were written before
     // table rows became one line and line breaks were kept re-reads each unchanged one once.
     // Each pass re-reads and marks only its own format's rows, so a stale key of one format
     // never touches the other's.
+    // (feature-66) Its second key, [`PPTX_TABLE_ROWS_POLICY`], opens the same pass.
     let pptx_current =
         db.read_pptx_table_break_policy()?.as_deref() == Some(PPTX_TABLE_BREAK_POLICY);
-    let refresh_pptx = !force && !pptx_current;
+    let rows_pptx_current =
+        db.read_pptx_table_rows_policy()?.as_deref() == Some(PPTX_TABLE_ROWS_POLICY);
+    let refresh_pptx = !force && !(pptx_current && rows_pptx_current);
+    let rows_pptx_alone_stale = pptx_current && !rows_pptx_current;
     let passes = [
         OncePass {
             extension: "docx",
@@ -1245,7 +1257,9 @@ pub fn rebuild_index(
     // Announced before the loop, so a run that takes long re-embedding says why even if it is
     // stopped: the `.docx` line first, then the `.pptx` one.
     if docx_rereads > 0 {
-        let notice = if tables_alone_stale {
+        let notice = if rows_docx_alone_stale {
+            docx_rows_reread_notice(docx_rereads)
+        } else if tables_alone_stale {
             docx_table_reread_notice(docx_rereads)
         } else {
             docx_reread_notice(docx_rereads)
@@ -1253,7 +1267,12 @@ pub fn rebuild_index(
         progress.announce(&notice);
     }
     if pptx_rereads > 0 {
-        progress.announce(&pptx_reread_notice(pptx_rereads));
+        let notice = if rows_pptx_alone_stale {
+            pptx_rows_reread_notice(pptx_rereads)
+        } else {
+            pptx_reread_notice(pptx_rereads)
+        };
+        progress.announce(&notice);
     }
 
     // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
@@ -1545,11 +1564,16 @@ pub fn rebuild_index(
             // (feature-64) After them, in the same transaction: a run that fails on an earlier
             // write, or on this one, records none of the three.
             db.write_docx_table_policy(DOCX_TABLE_POLICY)?;
+            // (feature-66) After the table key, in the same transaction: a run that fails on an
+            // earlier `.docx` key never reaches it, and one that fails on it records none.
+            db.write_docx_table_rows_policy(DOCX_TABLE_ROWS_POLICY)?;
         }
         if force || refresh_pptx {
             // (feature-65) Last, in the same transaction: a run that fails on a `.docx` key or
             // on this one records no key and no mark (ADR-0029).
             db.write_pptx_table_break_policy(PPTX_TABLE_BREAK_POLICY)?;
+            // (feature-66) Last, in the same transaction (ADR-0030).
+            db.write_pptx_table_rows_policy(PPTX_TABLE_ROWS_POLICY)?;
         }
         tx.commit()?;
     }
@@ -2053,6 +2077,24 @@ fn docx_table_reread_notice(n: usize) -> String {
 fn pptx_reread_notice(n: usize) -> String {
     format!(
         "Re-reading {n} unchanged .pptx document(s) once: table rows are now one line each, cells separated by tabs, and line breaks are kept; only documents whose slides change are re-embedded"
+    )
+}
+
+/// (feature-66) The line the one-time `.docx` pass writes instead of [`docx_reread_notice`] when
+/// every `.docx` key but [`DOCX_TABLE_ROWS_POLICY`] is at its value. ASCII only, and it opens the
+/// same way.
+fn docx_rows_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .docx document(s) once: table rows are now marked in each chunk; only documents whose sections change are re-embedded"
+    )
+}
+
+/// (feature-66) The line the one-time `.pptx` pass writes instead of [`pptx_reread_notice`] when
+/// [`PPTX_TABLE_BREAK_POLICY`] is at its value and [`PPTX_TABLE_ROWS_POLICY`] is not. ASCII only,
+/// and it opens the same way.
+fn pptx_rows_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .pptx document(s) once: table rows are now marked in each chunk; only documents whose slides change are re-embedded"
     )
 }
 
@@ -3391,6 +3433,20 @@ pub(crate) const DOCX_TABLE_POLICY: &str = "tab-joined-rows";
 /// [`pptx_reread_notice`]; the final transaction writes the key after the `.docx` ones. A key per
 /// format, so a stale key of one format never re-reads the other's rows (ADR-0029).
 pub(crate) const PPTX_TABLE_BREAK_POLICY: &str = "tab-joined-rows-kept-breaks";
+
+/// (feature-66) Recorded in `index_meta.docx_table_rows_policy` after the three earlier `.docx`
+/// keys, in the same transaction, once every `.docx` row of the index carries its table rows
+/// (`chunks.table_rows`). Absence or another value opens the one-time `.docx` pass; when it is
+/// the only stale `.docx` key the pass announces itself with [`docx_rows_reread_notice`], and
+/// the chunk text matches, so the pass writes that column alone and re-embeds nothing. A fourth
+/// key of its own rather than a new value of an earlier one, whose values tests pin (ADR-0030).
+pub(crate) const DOCX_TABLE_ROWS_POLICY: &str = "row-spans";
+
+/// (feature-66) Recorded in `index_meta.pptx_table_rows_policy` after
+/// [`PPTX_TABLE_BREAK_POLICY`], in the same transaction, once every `.pptx` row of the index
+/// carries its table rows. Absence or another value opens the one-time `.pptx` pass, announced
+/// with [`pptx_rows_reread_notice`] when this is the only stale `.pptx` key (ADR-0030).
+pub(crate) const PPTX_TABLE_ROWS_POLICY: &str = "row-spans";
 
 /// (feature-62 introduced it for the `.docx` pass) The `content_hash` a row of a one-time pass
 /// (ADR-0029) carries when that pass could not settle it: skipped by the scan, failed to parse,
@@ -7654,5 +7710,24 @@ mod tests {
             vec![Some("[]".to_string()), None],
             "another document's rows are untouched"
         );
+    }
+
+    /// feature-66 X2 (AC25): the two notices for a stale table-rows key alone name the count and
+    /// the change, open as the earlier notices do, and are ASCII, since they go to stderr.
+    #[test]
+    fn the_rows_notices_count_the_documents_in_ascii() {
+        let docx = docx_rows_reread_notice(3);
+        assert_eq!(
+            docx,
+            "Re-reading 3 unchanged .docx document(s) once: table rows are now marked in each chunk; only documents whose sections change are re-embedded"
+        );
+        let pptx = pptx_rows_reread_notice(3);
+        assert_eq!(
+            pptx,
+            "Re-reading 3 unchanged .pptx document(s) once: table rows are now marked in each chunk; only documents whose slides change are re-embedded"
+        );
+        assert!(docx.is_ascii() && pptx.is_ascii());
+        assert_eq!(DOCX_TABLE_ROWS_POLICY, "row-spans");
+        assert_eq!(PPTX_TABLE_ROWS_POLICY, "row-spans");
     }
 }

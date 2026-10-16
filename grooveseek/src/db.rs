@@ -8599,4 +8599,40 @@ mod tests {
         assert!(!json.contains("table_rows"), "{json}");
         assert!(!json.contains("\"table\""), "{json}");
     }
+
+    /// feature-66 (R7.1): the two table-rows keys round-trip on their own, and writing them
+    /// leaves the earlier keys alone.
+    #[test]
+    fn table_rows_policies_round_trip_beside_the_other_policies() {
+        let db = db_with_384();
+        assert_eq!(db.read_docx_table_rows_policy().unwrap(), None);
+        assert_eq!(db.read_pptx_table_rows_policy().unwrap(), None);
+        db.write_docx_table_policy("tab-joined-rows").unwrap();
+        db.write_pptx_table_break_policy("tab-joined-rows-kept-breaks")
+            .unwrap();
+        db.write_docx_table_rows_policy("row-spans").unwrap();
+        assert_eq!(
+            db.read_docx_table_rows_policy().unwrap().as_deref(),
+            Some("row-spans")
+        );
+        assert_eq!(
+            db.read_pptx_table_rows_policy().unwrap(),
+            None,
+            "a key per format"
+        );
+        db.write_pptx_table_rows_policy("row-spans").unwrap();
+        db.write_pptx_table_rows_policy("next").unwrap();
+        assert_eq!(
+            db.read_pptx_table_rows_policy().unwrap().as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            db.read_docx_table_policy().unwrap().as_deref(),
+            Some("tab-joined-rows")
+        );
+        assert_eq!(
+            db.read_pptx_table_break_policy().unwrap().as_deref(),
+            Some("tab-joined-rows-kept-breaks")
+        );
+    }
 }
