@@ -650,8 +650,8 @@ impl TableRow {
 }
 
 /// (feature-64) Add `line` to a section's `body` as one more line: after a `\n` when the body
-/// has text already. A body paragraph of [`parse_document_xml`] and a table row
-/// ([`push_table_line`]) are both added to the body through this.
+/// has text already. A body paragraph of [`parse_document_xml`] is added through this; a table
+/// row ([`push_table_line`]) goes through [`push_row_line`], which joins its line the same way.
 fn push_body_line(body: &mut String, line: &str) {
     if !body.is_empty() {
         body.push('\n');

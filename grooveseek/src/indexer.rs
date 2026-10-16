@@ -1780,14 +1780,19 @@ fn stored_table_rows_match(db: &Database, rel: &str, chunks: &[crate::parser::Ch
 }
 
 /// (feature-66) Stage one ([`TableRowsDecision`]) for `rel`, whose chunk text the index holds
-/// as `chunks`. `None` when no chunk carries table rows -- every format but `.docx` and `.pptx`,
-/// whose column is left as it is -- or the index holds no row for `rel`.
+/// as `chunks`. `None` when no chunk carries table rows and `rel` is not a `.docx` or `.pptx`
+/// ([`marks_table_rows`]) -- every other format, whose column is left as it is -- or the index
+/// holds no row for `rel`.
+///
+/// A `.docx` / `.pptx` whose chunks all carry `None` (an offset past `u32`) still gets a
+/// decision, of NULL rows: its column is then written NULL, never left holding rows an older
+/// text produced under the hash this write stores.
 fn decide_table_rows(
     db: &Database,
     rel: &str,
     chunks: &[crate::parser::Chunk],
 ) -> Result<Option<TableRowsDecision>> {
-    if chunks.iter().all(|c| c.table_rows.is_none()) {
+    if chunks.iter().all(|c| c.table_rows.is_none()) && !marks_table_rows(rel) {
         return Ok(None);
     }
     let Some(stored_hash) = db.get_document_hash(rel)? else {
@@ -1798,6 +1803,16 @@ fn decide_table_rows(
         matches: stored_table_rows_match(db, rel, chunks),
         rows: chunks.iter().map(|c| c.table_rows.clone()).collect(),
     }))
+}
+
+/// (feature-66) Whether `rel` is a document whose parser marks table rows: a `.docx` or a
+/// `.pptx`, by its extension, compared without case as [`Registry::by_extension`] picks the
+/// parser.
+fn marks_table_rows(rel: &str) -> bool {
+    Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("docx") || ext.eq_ignore_ascii_case("pptx"))
 }
 
 /// (feature-66) Whether the row of `rel` still holds what stage one read: the content hash
@@ -7669,7 +7684,7 @@ mod tests {
         );
     }
 
-    /// feature-66 (carried from Task 3's review): `update_chunk_table_rows` writes each entry's
+    /// feature-66 (carried from Task 3's review): [`Database::update_chunk_table_rows`] writes each entry's
     /// JSON by chunk position, `None` as NULL, and a path with no document row is a silent
     /// no-op, as [`Database::update_chunk_code_meta`] is.
     #[test]
@@ -7710,6 +7725,82 @@ mod tests {
             vec![Some("[]".to_string()), None],
             "another document's rows are untouched"
         );
+    }
+
+    /// feature-66 (final review): a `.docx` whose chunks all carry `None` (an offset past `u32`)
+    /// still gets a decision, so a stored non-NULL column is written NULL -- through the meta
+    /// update that stores a new hash and through the re-read alike -- rather than left behind.
+    /// A Markdown document's all-`None` chunks still decide nothing.
+    #[test]
+    fn a_docx_with_no_computed_table_rows_has_its_column_written_null() {
+        use crate::parser::docx::fixture::table_docx;
+        let db = reparse_db();
+        let registry = docx_registry();
+        let mut parsed = parse_doc(&registry, "docx", "tariff.docx", &table_docx());
+        for chunk in &mut parsed.chunks {
+            chunk.table_rows = None;
+        }
+        let before = [crate::parser::row_span(0, 0, 5)];
+        let declared = DeclaredSet::Known {
+            list: &[],
+            pass: None,
+            generation: "[]",
+        };
+
+        write_row(&db, "edited.docx", "hash-before-the-edit", &parsed.chunks);
+        db.update_chunk_table_rows("edited.docx", &[Some(&before[..])])
+            .unwrap();
+        let decision = decide_table_rows(&db, "edited.docx", &parsed.chunks)
+            .unwrap()
+            .expect("a docx row decides even with no computed rows");
+        assert!(!decision.matches);
+        let entry = mk_entry("edited.docx", "hash-after-the-edit");
+        let result = write_matching_chunks_meta(
+            &db,
+            &entry,
+            &parsed,
+            Some(&decision),
+            ContextMode::Off,
+            declared,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(result, Some(SingleResult::Updated { .. })));
+        assert_eq!(
+            db.get_document_hash("edited.docx").unwrap().as_deref(),
+            Some("hash-after-the-edit")
+        );
+        assert_eq!(
+            db.chunk_table_rows_for_path("edited.docx").unwrap(),
+            vec![None]
+        );
+
+        write_row(&db, "reread.DOCX", "hash-of-these-bytes", &parsed.chunks);
+        db.update_chunk_table_rows("reread.DOCX", &[Some(&before[..])])
+            .unwrap();
+        let decision = decide_table_rows(&db, "reread.DOCX", &parsed.chunks)
+            .unwrap()
+            .expect("the extension is compared without case");
+        let result = write_reparsed_table_rows(
+            &db,
+            "reread.DOCX",
+            &decision,
+            &parsed.chunks,
+            ContextMode::Off,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, SingleResult::Unchanged);
+        assert_eq!(
+            db.chunk_table_rows_for_path("reread.DOCX").unwrap(),
+            vec![None]
+        );
+
+        let md = parse_doc(&registry, "md", "notes.md", b"# Notes\n\nplain notes\n").chunks;
+        write_row(&db, "notes.md", "h", &md);
+        assert!(decide_table_rows(&db, "notes.md", &md).unwrap().is_none());
     }
 
     /// feature-66 X2 (AC25): the two notices for a stale table-rows key alone name the count and
