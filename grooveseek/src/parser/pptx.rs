@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
+use super::ooxml::RawRowSpan;
 use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
 
 pub struct PptxParser {
@@ -115,7 +116,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDoc
             Some(b) => b,
             None => continue,
         };
-        let (title_opt, body) = parse_slide_xml(
+        let (title_opt, body, spans) = parse_slide_xml(
             &slide_xml,
             path_hint,
             &format!("ppt/slides/slide{file_n}.xml"),
@@ -159,20 +160,25 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDoc
             _ => format!("Slide {display_n}"),
         };
         let context = super::build_context(&[title.as_str(), &heading]);
+        // (feature-65, R1.10) Trim every whitespace but the tab, so a table row at either end of
+        // the slide keeps its empty fields. A slide without a table cannot start or end with a
+        // tab: every paragraph is trimmed before it is added (`parse_slide_xml`) and the notes
+        // are trimmed too, so its content is what `trim()` gave.
+        // (feature-66) The notes come after the body, so they move no span; the spans move by
+        // what the trim takes off the head ([`rows_after_trim`]).
+        let blank = |c: char| c.is_whitespace() && c != '\t';
+        let lead = content.len() - content.trim_start_matches(blank).len();
+        let kept = content.trim_matches(blank).to_string();
+        let table_rows = super::ooxml::chunk_table_rows(&rows_after_trim(spans, lead, kept.len()));
         chunks.push(Chunk {
             index: chunks.len(),
             heading: Some(heading),
             level: Some(2),
-            // (feature-65, R1.10) Trim every whitespace but the tab, so a table row at either
-            // end of the slide keeps its empty fields. A slide without a table cannot start or
-            // end with a tab: every paragraph is trimmed before it is added (`parse_slide_xml`)
-            // and the notes are trimmed too, so its content is what `trim()` gave.
-            content: content
-                .trim_matches(|c: char| c.is_whitespace() && c != '\t')
-                .to_string(),
+            content: kept,
             context,
             line_range: None,
             symbol_kind: None,
+            table_rows,
         });
     }
 
@@ -427,7 +433,15 @@ fn resolve_relative_target(base_dir: &str, target: &str) -> String {
 /// outside every `<a:tc>` takes the path a paragraph always took.
 /// A line break (`<a:br>`) is a newline outside a table, a space inside a cell, and a space in
 /// the title the heading takes ([`push_line_break`]).
-fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, String) {
+///
+/// (feature-66) The third value says where in the body each table row's line went, under the
+/// slide's own number for its table ([`push_row`]): the tables are numbered as read, a nested
+/// one taking the next number after the outer row so far is written under the outer one.
+fn parse_slide_xml(
+    xml: &[u8],
+    path_hint: &str,
+    part: &str,
+) -> (Option<String>, String, Vec<RawRowSpan>) {
     super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -453,6 +467,10 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
     // Outside tables neither is set, and every paragraph takes the path it always took.
     let mut in_table = false;
     let mut row: Option<PptxRow> = None;
+    // (feature-66) Where each row's line went, the number of the table being read and the
+    // number the next `<a:tbl>` gets.
+    let mut spans: Vec<RawRowSpan> = Vec::new();
+    let (mut table, mut next_table) = (0_usize, 0_usize);
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -478,11 +496,13 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                 ),
                 b"tbl" => {
                     // A table inside a table writes out the row so far first (R1.7).
-                    flush_row(&mut body, &mut row);
+                    flush_row(&mut body, &mut spans, table, &mut row);
+                    table = next_table;
+                    next_table += 1;
                     in_table = true;
                 }
                 b"tr" if in_table => {
-                    flush_row(&mut body, &mut row);
+                    flush_row(&mut body, &mut spans, table, &mut row);
                     row = Some(PptxRow::default());
                 }
                 b"tc" if in_table => row
@@ -551,9 +571,9 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                         open.close_cell();
                     }
                 }
-                b"tr" if in_table => flush_row(&mut body, &mut row),
+                b"tr" if in_table => flush_row(&mut body, &mut spans, table, &mut row),
                 b"tbl" if in_table => {
-                    flush_row(&mut body, &mut row);
+                    flush_row(&mut body, &mut spans, table, &mut row);
                     in_table = false;
                 }
                 _ => {}
@@ -567,8 +587,8 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
     }
     // (feature-65, R1.7) A row the XML cut short keeps its closed cells and the closed
     // paragraphs of its open cell, as if that cell had closed.
-    flush_row(&mut body, &mut row);
-    (title, body)
+    flush_row(&mut body, &mut spans, table, &mut row);
+    (title, body, spans)
 }
 
 /// (feature-65) What a cell of a `<a:tbl>` row adds to the row ([`PptxRow::close_cell`]), from
@@ -661,22 +681,51 @@ fn cell_kind(e: &quick_xml::events::BytesStart) -> CellKind {
 /// (feature-65) Add `row`'s line ([`super::ooxml::row_line`]) to `body` the way a paragraph is
 /// added in [`parse_slide_xml`]: after a `\n` when the body has text already. A row whose
 /// fields are all empty adds nothing.
-fn push_row(body: &mut String, row: PptxRow) {
+///
+/// (feature-66) Through [`super::ooxml::push_row_line`], which records where the line went in
+/// `spans` under the slide's number `table` for its table.
+fn push_row(body: &mut String, spans: &mut Vec<RawRowSpan>, table: usize, row: PptxRow) {
     if let Some(line) = super::ooxml::row_line(&row.end_row()) {
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        body.push_str(&line);
+        super::ooxml::push_row_line(body, spans, table, &line);
     }
 }
 
 /// (feature-65) Write out the row being read, if any, through [`push_row`], and leave `row`
 /// empty: what a `<a:tr>`, `</a:tr>`, `</a:tbl>`, a nested `<a:tbl>` and the end of the slide
 /// do in [`parse_slide_xml`].
-fn flush_row(body: &mut String, row: &mut Option<PptxRow>) {
+fn flush_row(
+    body: &mut String,
+    spans: &mut Vec<RawRowSpan>,
+    table: usize,
+    row: &mut Option<PptxRow>,
+) {
     if let Some(open) = row.take() {
-        push_row(body, open);
+        push_row(body, spans, table, open);
     }
+}
+
+/// (feature-66) `spans` as they sit in a chunk body that kept `kept` bytes from `lead` bytes in.
+///
+/// The trim of a slide's content (spec R1.10) can only take whitespace that is not a tab, and a
+/// row's line starts and ends with a field's text or a tab, so no span reaches a trimmed byte.
+/// One that did would be dropped rather than left pointing at the wrong text.
+fn rows_after_trim(spans: Vec<RawRowSpan>, lead: usize, kept: usize) -> Vec<RawRowSpan> {
+    spans
+        .into_iter()
+        .filter_map(|span| {
+            let inside = span.start >= lead && span.end <= lead + kept;
+            debug_assert!(
+                inside,
+                "a trim reached a table row: {span:?} outside {lead}..{}",
+                lead + kept
+            );
+            inside.then(|| RawRowSpan {
+                table: span.table,
+                start: span.start - lead,
+                end: span.end - lead,
+            })
+        })
+        .collect()
 }
 
 /// (feature-65) The cell a paragraph closing now belongs to: the open cell of the row being
@@ -1835,5 +1884,200 @@ mod tests {
             .parse_bytes(&deck_with_notes(&slide, &notes), "notes.pptx", &[])
             .unwrap();
         assert_eq!(doc.chunks[0].content, "anchor\n\n[notes]\nnote line");
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-66: where each table row sits in its chunk
+    // -----------------------------------------------------------------------
+
+    use crate::parser::{assert_spans_hold, row_span};
+
+    /// feature-66: the chunk's table rows, after asserting spec R1.3 on them.
+    fn spans_of(chunk: &crate::parser::Chunk) -> Vec<crate::parser::TableRowSpan> {
+        assert_spans_hold(chunk);
+        chunk.table_rows.clone().expect("checked above")
+    }
+
+    /// feature-66 P1 (AC1, pptx): a paragraph then a 2x2 table: each row's line is marked.
+    #[test]
+    fn pptx_table_rows_mark_their_lines() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("overview")]),
+            table_of(&[
+                vec![cell("apple"), cell("birch")],
+                vec![cell("cedar"), cell("dune")],
+            ])
+        );
+        let chunk = only_chunk(&tree);
+        assert_eq!(chunk.content, "overview\napple\tbirch\ncedar\tdune");
+        assert_eq!(
+            spans_of(&chunk),
+            vec![row_span(0, 9, 20), row_span(0, 21, 31)]
+        );
+    }
+
+    /// feature-66 P2 (AC2): a row with text at one end only is a row, its line starting or
+    /// ending with a tab, at the very start and the very end of the slide.
+    #[test]
+    fn a_row_with_one_filled_end_is_still_a_row() {
+        let chunk = only_chunk(&table_of(&[
+            vec![cell(""), cell("bronze")],
+            vec![cell("ashen"), cell("")],
+        ]));
+        assert_eq!(chunk.content, "\tbronze\nashen\t");
+        let spans = spans_of(&chunk);
+        assert_eq!(spans, vec![row_span(0, 0, 7), row_span(0, 8, 14)]);
+        let lines: Vec<&str> = spans
+            .iter()
+            .map(|s| &chunk.content[s.start as usize..s.end as usize])
+            .collect();
+        assert_eq!(lines, vec!["\tbronze", "ashen\t"]);
+    }
+
+    /// feature-66 P3 (AC2): the spans move with the whitespace trimmed off the head of a slide
+    /// and keep their raw table numbers; with nothing trimmed they stay where they were.
+    #[test]
+    fn spans_survive_the_slide_trim() {
+        let raw = |table, start, end| RawRowSpan { table, start, end };
+        assert_eq!(
+            rows_after_trim(vec![raw(3, 2, 9), raw(5, 10, 14)], 2, 12),
+            vec![raw(3, 0, 7), raw(5, 8, 12)]
+        );
+        assert_eq!(
+            rows_after_trim(vec![raw(0, 0, 7)], 0, 7),
+            vec![raw(0, 0, 7)]
+        );
+    }
+
+    /// feature-66 P4 (AC3, pptx): a raw tab in a paragraph outside a table is no row, in a
+    /// chunk that has a table too.
+    #[test]
+    fn a_pptx_tab_outside_a_table_is_not_a_row() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("lead\tmid")]),
+            table_of(&[vec![cell("cobalt"), cell("dune")]])
+        );
+        let chunk = only_chunk(&tree);
+        assert_eq!(chunk.content, "lead\tmid\ncobalt\tdune");
+        assert_eq!(spans_of(&chunk), vec![row_span(0, 9, 20)]);
+    }
+
+    /// feature-66 P5 (AC4): a row of one field is marked, though its line has no tab.
+    #[test]
+    fn a_one_field_row_is_still_a_row() {
+        let tree = format!(
+            "{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[vec![cell("xylem")], vec![cell("yarrow")]])
+        );
+        let chunk = only_chunk(&tree);
+        assert_eq!(chunk.content, "lead\nxylem\nyarrow");
+        assert_eq!(
+            spans_of(&chunk),
+            vec![row_span(0, 5, 10), row_span(0, 11, 17)]
+        );
+    }
+
+    /// feature-66 P6 (AC5, pptx): a row whose cells are all empty or blank gets no span.
+    #[test]
+    fn an_empty_pptx_row_gets_no_span() {
+        let chunk = only_chunk(&table_of(&[
+            vec![cell("amber"), cell("basil")],
+            vec![cell(""), cell_with("", &[&run_of(" ")])],
+            vec![cell("cumin"), cell("dill")],
+        ]));
+        assert_eq!(chunk.content, "amber\tbasil\ncumin\tdill");
+        assert_eq!(
+            spans_of(&chunk),
+            vec![row_span(0, 0, 11), row_span(0, 12, 22)]
+        );
+    }
+
+    /// feature-66 P9 (AC8): two tables on a slide are 0 and 1, and still 0 and 1 with a table of
+    /// empty rows between them.
+    #[test]
+    fn tables_are_numbered_by_first_appearance() {
+        let lead = shape_of(&[&run_of("lead")]);
+        let first = table_of(&[vec![cell("apple"), cell("birch")]]);
+        let hollow = table_of(&[vec![cell(""), cell("")]]);
+        let last = table_of(&[vec![cell("cedar"), cell("")]]);
+        for tree in [
+            format!("{lead}{first}{last}"),
+            format!("{lead}{first}{hollow}{last}"),
+        ] {
+            let chunk = only_chunk(&tree);
+            assert_eq!(chunk.content, "lead\napple\tbirch\ncedar\t");
+            assert_eq!(
+                spans_of(&chunk),
+                vec![row_span(0, 5, 16), row_span(1, 17, 23)]
+            );
+        }
+    }
+
+    /// feature-66 P10 (AC9): the spans end before the notes, and a tab in the notes is no row.
+    #[test]
+    fn notes_carry_no_span() {
+        let slide = slide_with(&format!(
+            "{}{}",
+            shape_of(&[&run_of("lead")]),
+            table_of(&[vec![cell("apple"), cell("birch")]])
+        ));
+        let bytes = deck_with_notes(&slide, &shape_of(&[&run_of("quill\tink")]));
+        let doc = PptxParser::default()
+            .parse_bytes(&bytes, "notes.pptx", &[])
+            .unwrap();
+        let chunk = &doc.chunks[0];
+        assert_eq!(chunk.content, "lead\napple\tbirch\n\n[notes]\nquill\tink");
+        assert_eq!(spans_of(chunk), vec![row_span(0, 5, 16)]);
+    }
+
+    /// feature-66 P11 (AC10, pptx): a slide without a table marks no row, and the fallback
+    /// [`crate::parser::Parser::parse`] over extracted text leaves the rows not computed.
+    #[test]
+    fn a_pptx_without_a_table_marks_no_row_and_the_fallback_marks_none() {
+        assert_eq!(
+            only_chunk(&shape_of(&[&run_of("lead")])).table_rows,
+            Some(vec![])
+        );
+        let fallback = PptxParser::default().parse("plain words here", "x.pptx", &[]);
+        assert_eq!(fallback.chunks[0].table_rows, None);
+    }
+
+    /// feature-66 P12 (AC11, pptx): the read entry marks the same rows as the index entry.
+    #[test]
+    fn the_read_entry_marks_the_same_pptx_rows() {
+        let bytes = make_pptx_single_slide(&slide_with(&table_of(&[vec![
+            cell("apple"),
+            cell("birch"),
+        ]])));
+        let index = PptxParser::default()
+            .parse_bytes(&bytes, "deck.pptx", &[])
+            .unwrap();
+        let read = PptxParser::default()
+            .parse_bytes_for_read(&bytes, "deck.pptx", &[])
+            .unwrap();
+        assert_eq!(read.chunks[0].table_rows, index.chunks[0].table_rows);
+        assert_eq!(spans_of(&index.chunks[0]), vec![row_span(0, 0, 11)]);
+    }
+
+    /// feature-66 P13 (AC12, pptx): a raw tab in a cell's text stays a tab, inside its row's one
+    /// span.
+    #[test]
+    fn a_tab_in_a_pptx_cell_stays_inside_its_row_span() {
+        let chunk = only_chunk(&table_of(&[vec![cell("alder\tbirch"), cell("cedar")]]));
+        assert_eq!(chunk.content, "alder\tbirch\tcedar");
+        assert_eq!(spans_of(&chunk), vec![row_span(0, 0, 17)]);
+    }
+
+    /// feature-66 Review Focus 3 (spec U2): a newline in a cell's own text stays in the content
+    /// and inside the row's span.
+    #[test]
+    fn a_newline_in_a_cell_text_stays_inside_its_span() {
+        let chunk = only_chunk(&table_of(&[vec![cell("ink\nwell"), cell("quay")]]));
+        assert_eq!(chunk.content, "ink\nwell\tquay");
+        assert_eq!(spans_of(&chunk), vec![row_span(0, 0, 13)]);
+        assert_eq!(&chunk.content[0..13], "ink\nwell\tquay");
     }
 }

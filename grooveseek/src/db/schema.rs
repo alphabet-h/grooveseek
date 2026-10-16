@@ -98,7 +98,10 @@ impl Database {
                 -- reads that NULL as: this chunk is not a definition.
                 start_line    INTEGER,
                 end_line      INTEGER,
-                symbol_kind   TEXT
+                symbol_kind   TEXT,
+                -- (feature-66) Where each table row of a .docx / .pptx chunk sits in
+                -- content, as JSON; NULL = not computed.
+                table_rows    TEXT
             );
             -- quality_score のインデックスは `ensure_quality_score_column` で
             -- 列存在保証の後にまとめて作成する (legacy DB は ALTER が
@@ -153,6 +156,9 @@ impl Database {
         // (feature-46。NULL のまま — 値は PR-2 の context_mode 導入後、再 index で埋まる)。
         self.ensure_context_text_column()?;
         self.ensure_code_columns()?;
+        // (feature-66) legacy DB 互換: chunks.table_rows が無ければ ALTER で足す (既存行は
+        // NULL = 未計算のまま)。
+        self.ensure_table_rows_column()?;
 
         // legacy DB 互換: documents.size_bytes 列が無ければ ALTER で追加する
         // (feature-51。NULL のまま — 値は次の index 実行時に backfill される)。
@@ -327,6 +333,32 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// (feature-66) `chunks.table_rows` を、無ければ足す (idempotent)。
+    ///
+    /// 列は `.docx` / `.pptx` の chunk の表の行の位置 ([`crate::parser::TableRowSpan`] の
+    /// JSON) で、NULL は「計算していない」: 他の形式の行と、この列より前に書かれた行。
+    /// legacy DB を開いても失敗しないよう init 経路から呼ぶ。race 条件は duplicate column
+    /// エラーを吸収 ([`Self::ensure_code_columns`] と同じ形)。
+    pub(super) fn ensure_table_rows_column(&self) -> Result<()> {
+        let exists = self
+            .conn
+            .prepare("PRAGMA table_info(chunks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(std::result::Result::ok)
+            .any(|c| c == "table_rows");
+        if exists {
+            return Ok(());
+        }
+        match self
+            .conn
+            .execute_batch("ALTER TABLE chunks ADD COLUMN table_rows TEXT;")
+        {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// `documents.size_bytes` 列が存在しなければ追加する (idempotent、feature-51)。

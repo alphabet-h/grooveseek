@@ -38,6 +38,7 @@ impl Parser for TxtParser {
                 context,
                 line_range: None,
                 symbol_kind: None,
+                table_rows: None,
             }]
         };
 

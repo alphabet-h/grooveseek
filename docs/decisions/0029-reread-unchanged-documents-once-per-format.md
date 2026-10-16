@@ -73,6 +73,9 @@ form.
   is recorded, which only `--force` undoes.
 - **Revisit when** one format needs a fourth key of this kind (ADR-0028's
   condition for `.docx`, carried over), or a third format needs a catch-up.
+  *(2026-10-17, v1.20.0)* `.docx` needed a fourth key and met this condition; the
+  keys stay per format, for the reasons in
+  [ADR-0030](0030-mark-table-rows-per-chunk.md).
 - **Tests hold it**: `grooveseek/src/indexer.rs` (the predicates and the
   notice), `grooveseek/src/db.rs` (the key) and
   `grooveseek/tests/index_pptx_table_policy.rs` (the runs, the cross-format

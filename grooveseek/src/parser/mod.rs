@@ -140,6 +140,85 @@ pub struct Chunk {
     /// the thing that keeps a grammar to data. The set grows as languages are
     /// added, so this is a free-form string rather than a closed enum.
     pub symbol_kind: Option<String>,
+    /// (feature-66) Where each table row's line sits in [`Chunk::content`], in bytes
+    /// ([`TableRowSpan`]), or `None` when this was not computed: every format but `.docx` and
+    /// `.pptx`, the `.docx` / `.pptx` fallback [`Parser::parse`], and a chunk whose offsets do
+    /// not fit a `u32`. `Some(vec![])` is a `.docx` or `.pptx` chunk with no table row.
+    pub table_rows: Option<Vec<TableRowSpan>>,
+}
+
+/// (feature-66) Where one table row's line sits in a chunk's `content`.
+///
+/// From [`Self::start`] up to, not including, [`Self::end`] in bytes, on char boundaries, the
+/// row's trailing `\n` left out. [`Self::table`] numbers the tables of the chunk in the order
+/// each first appears, from 0; a table that wrote no row takes no number, and a table split
+/// across chunks is numbered in each. The text inside a span is the row's line as the parser
+/// wrote it: its fields joined with a tab, so a tab inside a cell cannot be told from a field
+/// boundary there, and a newline in a cell's own text stays inside the span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableRowSpan {
+    /// The table's number in the chunk.
+    pub table: u32,
+    /// The byte offset in `content` where the row's line starts.
+    pub start: u32,
+    /// The byte offset in `content` just past the row's line.
+    pub end: u32,
+}
+
+/// (feature-66) Whether `spans` keep the [`TableRowSpan`] contract over `content` (spec R1.3 1, 3,
+/// 4 and 5): each is non-empty, inside it and on char boundaries; each starts at the start of a
+/// line and ends at the end of one; they are in order without touching; and the tables are
+/// numbered by first appearance from 0 without a gap (a span may return to an earlier table, as
+/// the outer table does around a nested one). A `\n` inside a span is allowed: a cell's own
+/// newline stays inside its row (spec §9 U2). The read side of the index answers `None` for a
+/// stored value that fails this, so a reader can rely on every span it is given without a check
+/// of its own.
+pub(crate) fn table_rows_fit(content: &str, spans: &[TableRowSpan]) -> bool {
+    let bytes = content.as_bytes();
+    let mut previous_end: Option<usize> = None;
+    let mut tables = 0_u32;
+    for span in spans {
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end
+            || end > content.len()
+            || !content.is_char_boundary(start)
+            || !content.is_char_boundary(end)
+            || previous_end.is_some_and(|previous| previous >= start)
+            || (start != 0 && bytes[start - 1] != b'\n')
+            || (end != bytes.len() && bytes[end] != b'\n')
+            || span.table > tables
+        {
+            return false;
+        }
+        if span.table == tables {
+            tables += 1;
+        }
+        previous_end = Some(end);
+    }
+    true
+}
+
+/// (feature-66) The span `(table, start, end)`, for tests.
+#[cfg(test)]
+pub(crate) fn row_span(table: u32, start: u32, end: u32) -> TableRowSpan {
+    TableRowSpan { table, start, end }
+}
+
+/// (feature-66) Assert spec R1.3 1, 3, 4 and 5 of `chunk`'s table rows: present and keeping the
+/// contract over the content, by the same check the read side of the index runs
+/// ([`table_rows_fit`]: fitting the content, each covering whole lines, and the tables numbered
+/// by first appearance without gaps).
+#[cfg(test)]
+pub(crate) fn assert_spans_hold(chunk: &Chunk) {
+    let content = &chunk.content;
+    let spans = chunk
+        .table_rows
+        .as_deref()
+        .expect("a .docx / .pptx chunk marks its rows");
+    assert!(
+        table_rows_fit(content, spans),
+        "R1.3 1/3/4/5: {spans:?} in {content:?}"
+    );
 }
 
 /// A fully parsed document: frontmatter + chunks + retained raw content.
@@ -434,6 +513,7 @@ pub(crate) fn sheet_chunk(index: usize, title: &str, name: &str, text: &str) -> 
         context,
         line_range: None,
         symbol_kind: None,
+        table_rows: None,
     }
 }
 
@@ -491,6 +571,7 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
             context,
             line_range: None,
             symbol_kind: None,
+            table_rows: None,
         }]
     };
     ParsedDocument {
@@ -1154,5 +1235,117 @@ mod tests {
             ..d
         };
         assert!(!raised_limits_warning(&finite).contains("bounded only by"));
+    }
+
+    /// feature-66 P11 (AC10): Markdown, plain text and spreadsheet chunks carry no table rows.
+    #[test]
+    fn prose_and_sheet_chunks_carry_no_table_rows() {
+        let md = MarkdownParser.parse("# Harbour\n\nquiet harbour notes\n", "harbour.md", &[]);
+        let txt = TxtParser.parse("plain ledger words\n", "ledger.txt", &[]);
+        assert!(!md.chunks.is_empty() && !txt.chunks.is_empty());
+        for chunk in md.chunks.iter().chain(&txt.chunks) {
+            assert_eq!(chunk.table_rows, None, "{chunk:?}");
+        }
+        assert_eq!(
+            sheet_chunk(0, "book", "Quota", "signer\tlimit").table_rows,
+            None
+        );
+    }
+
+    /// feature-66 (R1.3 1 / 3): spans that leave the content, split a character, are empty or
+    /// touch do not fit.
+    #[test]
+    fn table_rows_fit_refuses_spans_a_reader_could_not_slice() {
+        let content = "über\tbirch\ncedar";
+        assert!(table_rows_fit(content, &[]));
+        assert!(table_rows_fit(
+            content,
+            &[row_span(0, 0, 11), row_span(0, 12, 17)]
+        ));
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 0, 18)]),
+            "past the end"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 1, 11)]),
+            "inside a character"
+        );
+        assert!(!table_rows_fit(content, &[row_span(0, 5, 5)]), "empty");
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 0, 11), row_span(0, 11, 17)]),
+            "touching"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 12, 17), row_span(0, 0, 11)]),
+            "out of order"
+        );
+    }
+
+    /// feature-66 (R1.3 4): a span that starts or ends inside a line does not fit, so a stored
+    /// value cannot hand a reader part of a line as a row.
+    #[test]
+    fn table_rows_fit_refuses_spans_that_do_not_cover_whole_lines() {
+        let content = "lead\nalder\tbirch\ncedar";
+        assert!(table_rows_fit(content, &[row_span(0, 5, 16)]));
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 6, 16)]),
+            "starts inside a line"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 5, 15)]),
+            "ends inside a line"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 17, 20)]),
+            "ends before the content's last byte"
+        );
+        assert!(table_rows_fit(content, &[row_span(0, 17, 22)]), "last line");
+    }
+
+    /// feature-66 (R1.3 3): spans that overlap or come out of order do not fit, also when each
+    /// covers whole lines.
+    #[test]
+    fn table_rows_fit_refuses_overlapping_or_unsorted_whole_line_spans() {
+        let content = "alder\nbirch\ncedar";
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 0, 11), row_span(0, 6, 11)]),
+            "overlap"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 6, 11), row_span(0, 0, 5)]),
+            "unsorted"
+        );
+    }
+
+    /// feature-66 (R1.3 5): table numbers start at 0 and never skip one; returning to an earlier
+    /// table is allowed.
+    #[test]
+    fn table_rows_fit_refuses_table_numbers_that_skip() {
+        let content = "alder\nbirch\ncedar";
+        assert!(
+            !table_rows_fit(content, &[row_span(1, 0, 5)]),
+            "numbering starts at 1"
+        );
+        assert!(
+            !table_rows_fit(content, &[row_span(0, 0, 5), row_span(2, 6, 11)]),
+            "gap 0 -> 2"
+        );
+        assert!(table_rows_fit(
+            content,
+            &[row_span(0, 0, 5), row_span(1, 6, 11), row_span(0, 12, 17)]
+        ));
+    }
+
+    /// feature-66 (R1.3 / spec §9 U2): a value with several tables fits, and so does a span over
+    /// a row whose cell text carries its own newline.
+    #[test]
+    fn table_rows_fit_accepts_several_tables_and_a_cell_newline() {
+        let content = "p\na\tb\nc\td\nq\ne\tf";
+        assert!(table_rows_fit(
+            content,
+            &[row_span(0, 2, 5), row_span(0, 6, 9), row_span(1, 12, 15)]
+        ));
+        let content = "p\nfirst\nline\tb\nq";
+        assert!(table_rows_fit(content, &[row_span(0, 2, 14)]));
     }
 }

@@ -82,6 +82,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 27. Detect docx headings from style names and their basedOn chain | [en](decisions/0027-detect-docx-headings-from-style-names.md) | [ja](decisions/0027-detect-docx-headings-from-style-names.ja.md) |
 | 28. Re-read unchanged docx once and settle each row | [en](decisions/0028-reread-unchanged-docx-once-per-index.md) | [ja](decisions/0028-reread-unchanged-docx-once-per-index.ja.md) |
 | 29. Re-read unchanged documents once per format, by a policy key per format | [en](decisions/0029-reread-unchanged-documents-once-per-format.md) | [ja](decisions/0029-reread-unchanged-documents-once-per-format.ja.md) |
+| 30. Mark table rows per chunk in a nullable column, and catch up through per-format keys | [en](decisions/0030-mark-table-rows-per-chunk.md) | [ja](decisions/0030-mark-table-rows-per-chunk.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

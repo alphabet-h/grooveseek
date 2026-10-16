@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
-use super::ooxml::row_line;
+use super::ooxml::{RawRowSpan, chunk_table_rows, push_row_line, row_line};
 use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
 
 pub struct DocxParser {
@@ -528,11 +528,15 @@ fn push_intra_paragraph_separator(local_name: &[u8], para_text: &mut String) {
 /// becomes a [`Chunk`]: the heading that opens it (`None` for the text before the first
 /// heading), that heading's chunk level, the headings above it when it was read, and its
 /// body paragraphs, each trimmed, joined by `\n`.
+///
+/// (feature-66) [`Self::spans`] says where in [`Self::body`] each table row's line went
+/// ([`push_table_line`]).
 struct DocxSection {
     heading: Option<String>,
     level: Option<u8>,
     ancestry: Vec<String>,
     body: String,
+    spans: Vec<RawRowSpan>,
 }
 
 /// (feature-63) The sections of a document that become its chunks, in order.
@@ -547,6 +551,9 @@ struct DocxSection {
 ///
 /// A document none of whose sections has a body is cut as before: a chunk per heading, each
 /// with an empty body, so a document of headings alone stays in the index.
+///
+/// (feature-66) The held headings go before the receiving section's body, which stays at the end
+/// of the new body as it was, so its row spans move by the bytes put before it.
 fn fold_empty_heading_sections(sections: Vec<DocxSection>) -> Vec<DocxSection> {
     if sections.iter().all(|s| s.body.trim().is_empty()) {
         return sections
@@ -566,17 +573,25 @@ fn fold_empty_heading_sections(sections: Vec<DocxSection>) -> Vec<DocxSection> {
             continue;
         }
         if !held.is_empty() {
+            let old_len = section.body.len();
             held.push(std::mem::take(&mut section.body));
             section.body = held.join("\n");
             held.clear();
+            let shift = section.body.len() - old_len;
+            for span in &mut section.spans {
+                span.start += shift;
+                span.end += shift;
+            }
         }
         kept.push(section);
     }
     kept
 }
 
-/// (feature-64) The row being read at one table level of [`parse_document_xml`]: the field
-/// each closed cell left and the cell that is open, if any.
+/// (feature-64) The row being read at one table level of [`parse_document_xml`]: the field each
+/// closed cell left and the cell that is open, if any.
+///
+/// (feature-66) `table` is the table's number in the document as read, given at its `<w:tbl>`.
 #[derive(Default)]
 struct TableRow {
     /// One field per closed cell, in document order: its paragraphs joined with a space, `""`
@@ -584,6 +599,8 @@ struct TableRow {
     fields: Vec<String>,
     /// The cell between its `<w:tc>` and `</w:tc>`.
     open: Option<OpenCell>,
+    /// (feature-66) The number of this row's table in the document.
+    table: usize,
 }
 
 /// (feature-64) A cell of a [`TableRow`] that has not closed yet.
@@ -633,8 +650,8 @@ impl TableRow {
 }
 
 /// (feature-64) Add `line` to a section's `body` as one more line: after a `\n` when the body
-/// has text already. A body paragraph of [`parse_document_xml`] and a table row
-/// ([`push_table_line`]) are both added to the body through this.
+/// has text already. A body paragraph of [`parse_document_xml`] is added through this; a table
+/// row ([`push_table_line`]) goes through [`push_row_line`], which joins its line the same way.
 fn push_body_line(body: &mut String, line: &str) {
     if !body.is_empty() {
         body.push('\n');
@@ -645,7 +662,10 @@ fn push_body_line(body: &mut String, line: &str) {
 /// (feature-64) Add the [`row_line`] of `fields` to the last section's body the way a body
 /// paragraph is added in [`parse_document_xml`] ([`push_body_line`]), and not at all while
 /// `excluded`.
-fn push_table_line(sections: &mut [DocxSection], excluded: bool, fields: &[String]) {
+///
+/// (feature-66) Through [`push_row_line`], which records where the line went under the raw
+/// number `table` of its table; a row that adds nothing records nothing.
+fn push_table_line(sections: &mut [DocxSection], excluded: bool, table: usize, fields: &[String]) {
     if excluded {
         return;
     }
@@ -653,7 +673,7 @@ fn push_table_line(sections: &mut [DocxSection], excluded: bool, fields: &[Strin
         return;
     };
     let last = sections.last_mut().expect("sections is never empty");
-    push_body_line(&mut last.body, &line);
+    push_row_line(&mut last.body, &mut last.spans, table, &line);
 }
 
 /// (feature-64) [`push_intra_paragraph_separator`], except that inside an open cell (`in_cell`)
@@ -677,6 +697,9 @@ fn push_paragraph_separator(local_name: &[u8], in_cell: bool, para_text: &mut St
 /// adding nothing ([`push_table_line`]). A paragraph outside every `<w:tc>` takes the path a
 /// body paragraph always took, so a document without a table is read as before.
 ///
+/// (feature-66) Each row line written records where it sits ([`push_table_line`]), and each
+/// chunk carries its rows renumbered per chunk ([`chunk_table_rows`]).
+///
 /// (feature-63) Which sections become chunks, and where a heading with no body text goes, is
 /// [`fold_empty_heading_sections`]'s.
 fn parse_document_xml(
@@ -696,6 +719,7 @@ fn parse_document_xml(
         level: None,
         ancestry: Vec::new(),
         body: String::new(),
+        spans: Vec::new(),
     }];
 
     let mut para_style: Option<u8> = None; // 見出し段落 → chunk level (2..=6)
@@ -711,6 +735,8 @@ fn parse_document_xml(
     // (feature-64) One entry per `<w:tbl>` open around the reader, innermost last. Empty outside
     // tables, where every paragraph takes the path it always took.
     let mut tables: Vec<TableRow> = Vec::new();
+    // (feature-66) The number the next `<w:tbl>` gets, in document order.
+    let mut next_table = 0_usize;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -728,15 +754,19 @@ fn parse_document_xml(
                         && row.open.is_some()
                     {
                         let so_far = row.take_so_far();
-                        push_table_line(&mut sections, excluded, &so_far);
+                        push_table_line(&mut sections, excluded, row.table, &so_far);
                     }
-                    tables.push(TableRow::default());
+                    tables.push(TableRow {
+                        table: next_table,
+                        ..TableRow::default()
+                    });
+                    next_table += 1;
                 }
                 b"tr" => {
                     // D3: a row left open before this one is written out, not dropped.
                     if let Some(row) = tables.last_mut() {
                         let left = row.end_row();
-                        push_table_line(&mut sections, excluded, &left);
+                        push_table_line(&mut sections, excluded, row.table, &left);
                     }
                 }
                 b"tc" => {
@@ -798,7 +828,7 @@ fn parse_document_xml(
                         // section it closes, before that section is closed.
                         if in_cell && let Some(row) = tables.last_mut() {
                             let so_far = row.take_so_far();
-                            push_table_line(&mut sections, excluded, &so_far);
+                            push_table_line(&mut sections, excluded, row.table, &so_far);
                         }
                         // stack を pop → 祖先確定 → この見出しを push (exclude でも積む = E-6)。
                         while let Some((l, _)) = stack.last() {
@@ -824,6 +854,7 @@ fn parse_document_xml(
                                 level: Some(level),
                                 ancestry,
                                 body: String::new(),
+                                spans: Vec::new(),
                             });
                         }
                     } else if in_cell && !text.is_empty() {
@@ -843,14 +874,14 @@ fn parse_document_xml(
                 b"tr" => {
                     if let Some(row) = tables.last_mut() {
                         let fields = row.end_row();
-                        push_table_line(&mut sections, excluded, &fields);
+                        push_table_line(&mut sections, excluded, row.table, &fields);
                     }
                 }
                 b"tbl" => {
                     // D3: a row left open at `</w:tbl>` is written out, not dropped.
                     if let Some(mut row) = tables.pop() {
                         let left = row.end_row();
-                        push_table_line(&mut sections, excluded, &left);
+                        push_table_line(&mut sections, excluded, row.table, &left);
                     }
                 }
                 _ => {}
@@ -866,7 +897,7 @@ fn parse_document_xml(
     // R1.7: a document cut off inside a table keeps what was read of it, innermost row first.
     while let Some(mut row) = tables.pop() {
         let so_far = row.take_so_far();
-        push_table_line(&mut sections, excluded, &so_far);
+        push_table_line(&mut sections, excluded, row.table, &so_far);
     }
 
     fold_empty_heading_sections(sections)
@@ -885,6 +916,9 @@ fn parse_document_xml(
                 parts.push(h);
             }
             let context = super::build_context(&parts);
+            // (feature-66) `body` is the chunk's content as it is, so the spans need no other
+            // adjustment than the fold's.
+            let table_rows = chunk_table_rows(&s.spans);
             Chunk {
                 index: i,
                 heading: s.heading,
@@ -893,6 +927,7 @@ fn parse_document_xml(
                 context,
                 line_range: None,
                 symbol_kind: None,
+                table_rows,
             }
         })
         .collect()
@@ -3636,5 +3671,237 @@ mod tests {
         assert_eq!(outline(&read), outline(&index));
         assert_eq!(contents(&read), contents(&index));
         assert_eq!(contents(&read), vec!["alder\tbirch\ncedar\tdamson"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-66: where each table row sits in its chunk
+    // -----------------------------------------------------------------------
+
+    use crate::parser::{assert_spans_hold, row_span};
+
+    /// feature-66: the chunk's table rows, after asserting spec R1.3 on them.
+    fn spans_of(chunk: &Chunk) -> Vec<crate::parser::TableRowSpan> {
+        assert_spans_hold(chunk);
+        chunk.table_rows.clone().expect("checked above")
+    }
+
+    /// feature-66 P1 (AC1): a paragraph then a 2x2 table: each row's line is marked, the
+    /// paragraph is not.
+    #[test]
+    fn docx_table_rows_mark_their_lines() {
+        let body = format!(
+            "{}{}{}",
+            heading_para(1, "Tariff"),
+            body_para("preface"),
+            grid_of(&[&["alder", "birch"], &["cedar", "damson"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["preface\nalder\tbirch\ncedar\tdamson"]);
+        assert_eq!(
+            spans_of(&doc.chunks[0]),
+            vec![row_span(0, 8, 19), row_span(0, 20, 32)]
+        );
+    }
+
+    /// feature-66 P4 (AC3): a `<w:tab/>` outside a table is a tab in the content and no row,
+    /// in a chunk that has a table too.
+    #[test]
+    fn a_docx_tab_outside_a_table_is_not_a_row() {
+        let body = format!(
+            "{}{}{}",
+            heading_para(1, "Tariff"),
+            "<w:p><w:r><w:t>lead</w:t><w:tab/><w:t>mid</w:t></w:r></w:p>",
+            grid_of(&[&["cobalt", "dune"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["lead\tmid\ncobalt\tdune"]);
+        assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 9, 20)]);
+    }
+
+    /// feature-66 P5 (AC4, docx): a row of one field is marked, though its line has no tab.
+    #[test]
+    fn a_one_field_docx_row_is_still_a_row() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["xylem"], &["yarrow"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["xylem\nyarrow"]);
+        assert_eq!(
+            spans_of(&doc.chunks[0]),
+            vec![row_span(0, 0, 5), row_span(0, 6, 12)]
+        );
+    }
+
+    /// feature-66 P6 (AC5, docx): a row whose cells are all empty or blank gets no span.
+    #[test]
+    fn an_empty_docx_row_gets_no_span() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["alder", "birch"], &["", " "], &["cedar", "damson"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\ncedar\tdamson"]);
+        assert_eq!(
+            spans_of(&doc.chunks[0]),
+            vec![row_span(0, 0, 11), row_span(0, 12, 24)]
+        );
+    }
+
+    /// feature-66 P7 (AC6): a heading with no body folds into the next section's content, and
+    /// that section's spans move by what was put before them.
+    #[test]
+    fn a_folded_heading_shifts_the_spans() {
+        let body = format!(
+            "{}{}{}",
+            heading_para(1, "Ledger"),
+            heading_para(2, "Quota"),
+            grid_of(&[&["alder", "birch"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["Ledger\nalder\tbirch"]);
+        assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 7, 18)]);
+    }
+
+    /// feature-66 P8 (AC7a): a heading in a cell splits the row; each piece is a row of its own
+    /// chunk, table 0 in both.
+    #[test]
+    fn a_row_split_by_a_heading_marks_each_piece() {
+        let body = format!(
+            "{}<w:tbl><w:tr><w:tc>{}</w:tc><w:tc>{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            heading_para(2, "Quota"),
+            body_para("birch")
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder", "birch"]);
+        assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 5)]);
+        assert_eq!(spans_of(&doc.chunks[1]), vec![row_span(0, 0, 5)]);
+    }
+
+    /// feature-66 P8 (AC7b): a nested table splits the outer row; the outer pieces keep the
+    /// outer table's number around the inner row's: 0, 1, 0.
+    #[test]
+    fn a_row_split_by_a_nested_table_marks_each_piece() {
+        let body = format!(
+            "{}<w:tbl><w:tr><w:tc>{}{}</w:tc><w:tc>{}</w:tc></w:tr></w:tbl>",
+            heading_para(1, "Tariff"),
+            body_para("alder"),
+            grid_of(&[&["cedar", "damson"]]),
+            body_para("birch")
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\ncedar\tdamson\nbirch"]);
+        assert_eq!(
+            spans_of(&doc.chunks[0]),
+            vec![row_span(0, 0, 5), row_span(1, 6, 18), row_span(0, 19, 24)]
+        );
+    }
+
+    /// feature-66 P11 (AC10, docx): a document without a table marks no row, and the fallback
+    /// [`crate::parser::Parser::parse`] over extracted text leaves the rows not computed.
+    #[test]
+    fn a_docx_without_a_table_marks_no_row_and_the_fallback_marks_none() {
+        let doc = parse_raw_both(&format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            body_para("preface")
+        ));
+        assert_eq!(doc.chunks[0].table_rows, Some(vec![]));
+        let fallback = DocxParser::default().parse("plain words here", "x.docx", &[]);
+        assert_eq!(fallback.chunks[0].table_rows, None);
+    }
+
+    /// feature-66 P12 (AC11, docx): the read entry marks the same rows as the index entry.
+    #[test]
+    fn the_read_entry_marks_the_same_docx_rows() {
+        let bytes = table_docx();
+        let index = DocxParser::default()
+            .parse_bytes(&bytes, "tariff.docx", &[])
+            .unwrap();
+        let read = DocxParser::default()
+            .parse_bytes_for_read(&bytes, "tariff.docx", &[])
+            .unwrap();
+        assert_eq!(read.chunks[0].table_rows, index.chunks[0].table_rows);
+        assert_eq!(
+            spans_of(&index.chunks[0]),
+            vec![row_span(0, 0, 11), row_span(0, 12, 24)]
+        );
+    }
+
+    /// feature-66 P13 (AC12, docx): a tab in a cell stays a tab in the content, inside its row's
+    /// one span.
+    #[test]
+    fn a_tab_in_a_docx_cell_stays_inside_its_row_span() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            concat!(
+                "<w:tbl><w:tr>",
+                "<w:tc><w:p><w:r><w:t>alder</w:t><w:tab/><w:t>birch</w:t></w:r></w:p></w:tc>",
+                "<w:tc><w:p><w:r><w:t>cedar</w:t></w:r></w:p></w:tc>",
+                "</w:tr></w:tbl>",
+            )
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["alder\tbirch\tcedar"]);
+        assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 17)]);
+    }
+
+    /// feature-66 Review Focus 1: a table under an excluded heading writes no row and leaves no
+    /// span; the chunk after it numbers its own table from 0.
+    #[test]
+    fn a_table_under_an_excluded_heading_leaves_no_span() {
+        let body = format!(
+            "{}{}{}{}{}{}",
+            heading_para(1, "Ledger"),
+            grid_of(&[&["alder", "birch"]]),
+            heading_para(1, "Appendix"),
+            grid_of(&[&["cedar", "damson"]]),
+            heading_para(1, "Quota"),
+            grid_of(&[&["elm", "fir"]])
+        );
+        let doc = DocxParser::default()
+            .parse_bytes(&wrap_document_xml(&body), "ledger.docx", &["Appendix"])
+            .unwrap();
+        assert_eq!(contents(&doc), vec!["alder\tbirch", "elm\tfir"]);
+        assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 11)]);
+        assert_eq!(spans_of(&doc.chunks[1]), vec![row_span(0, 0, 7)]);
+    }
+
+    /// feature-66 Review Focus 2: offsets count bytes, not characters.
+    #[test]
+    fn spans_count_bytes_in_a_cjk_table() {
+        let body = format!(
+            "{}{}",
+            heading_para(1, "Tariff"),
+            grid_of(&[&["項目", "値"], &["東京", "晴れ"]])
+        );
+        let doc = parse_raw_both(&body);
+        assert_eq!(contents(&doc), vec!["項目\t値\n東京\t晴れ"]);
+        assert_eq!(
+            spans_of(&doc.chunks[0]),
+            vec![row_span(0, 0, 10), row_span(0, 11, 24)]
+        );
+    }
+
+    /// feature-66 Review Focus 4: a document cut off inside a table still marks the row written
+    /// out at the end.
+    #[test]
+    fn a_table_cut_off_at_the_end_still_marks_its_row() {
+        let xml = concat!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+            "<w:tbl><w:tr>",
+            "<w:tc><w:p><w:r><w:t>alder</w:t></w:r></w:p></w:tc>",
+            "<w:tc><w:p><w:r><w:t>birch</w:t></w:r></w:p></w:tc>",
+        );
+        let doc = DocxParser::default()
+            .parse_bytes(&docx_with_raw_document_xml(xml), "cut.docx", &[])
+            .unwrap();
+        assert_eq!(contents(&doc), vec!["alder\tbirch"]);
+        assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 11)]);
     }
 }

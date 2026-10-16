@@ -36,6 +36,7 @@ pub(crate) use fts_query::query_phrases;
 #[cfg(test)]
 use schema::parse_dim_from_create_sql;
 
+use crate::parser::TableRowSpan;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::{HashMap, HashSet};
@@ -153,6 +154,22 @@ pub struct SearchResult {
     /// (feature-56) The grammar's word for the kind of definition this chunk holds.
     /// `None` for prose and for chunks that are not a definition.
     pub symbol_kind: Option<String>,
+    /// (feature-66) Where each table row of a `.docx` / `.pptx` chunk sits in `content`, in
+    /// bytes. `None` = not computed: other formats, rows written before the column existed,
+    /// and a stored value that does not fit `content`, so every span handed out can be sliced.
+    /// Not carried into [`SearchHit`]: the MCP responses do not change.
+    pub table_rows: Option<Vec<TableRowSpan>>,
+}
+
+/// (feature-66) The [`SearchResult::table_rows`] of a chunk, from its stored `chunks.table_rows`
+/// text (the first argument) and its text `content`: the decoded spans, or `None` (not
+/// computed) for NULL, for a value that is not a JSON array of spans, and for spans that do not
+/// keep the span contract over `content` ([`crate::parser::table_rows_fit`]: in bounds, whole
+/// lines, in order, tables numbered without a gap). Never an error: an unusable value must not stop a
+/// search, and a reader given `None` falls back to its own reading.
+pub(crate) fn table_rows_for(raw: Option<&str>, content: &str) -> Option<Vec<TableRowSpan>> {
+    let spans: Vec<TableRowSpan> = serde_json::from_str(raw?).ok()?;
+    crate::parser::table_rows_fit(content, &spans).then_some(spans)
 }
 
 /// `SearchHit.content` (UTF-8) 内の byte offset 範囲。
@@ -987,6 +1004,7 @@ fn dummy_search_result_for_id(id: i64) -> SearchResult {
         date: None,
         tags: Vec::new(),
         context_text: None,
+        table_rows: None,
     }
 }
 
@@ -6278,6 +6296,7 @@ mod tests {
             date: None,
             tags: vec![],
             context_text: None,
+            table_rows: None,
         };
         let h: SearchHit = r.into();
         assert!(h.match_spans.is_none());
@@ -6300,6 +6319,7 @@ mod tests {
             date: None,
             tags: vec![],
             context_text: Some("T > H".to_string()),
+            table_rows: None,
         };
         let hit: SearchHit = r.into();
         let json = serde_json::to_string(&hit).unwrap();
@@ -6836,6 +6856,7 @@ mod tests {
                     date: None,
                     tags: vec![],
                     context_text: None,
+                    table_rows: None,
                 },
             );
         }
@@ -6870,6 +6891,7 @@ mod tests {
                     date: None,
                     tags: vec![],
                     context_text: None,
+                    table_rows: None,
                 },
             );
         }
@@ -8397,5 +8419,221 @@ mod tests {
             vec![(Some("H".to_string()), "alpha body".to_string())]
         );
         assert_eq!(db.overwrite_content_hash(&[], "marker").unwrap(), 0);
+    }
+
+    // -- feature-66: chunks.table_rows ---------------------------------------
+
+    /// feature-66 D1 (AC13): an index written before the column gets it on open, its rows NULL
+    /// (not computed); a second ensure does nothing.
+    #[test]
+    fn table_rows_column_is_added_to_an_old_index() {
+        let db = db_with_384();
+        db.conn
+            .execute_batch("DROP TABLE fts_chunks; DROP TABLE vec_chunks; DROP TABLE chunks;")
+            .unwrap();
+        db.conn
+            .execute_batch(concat!(
+                "CREATE TABLE chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, ",
+                "document_id INTEGER NOT NULL, chunk_index INTEGER NOT NULL, heading TEXT, ",
+                "level INTEGER, content TEXT NOT NULL, token_count INTEGER, ",
+                "quality_score REAL NOT NULL DEFAULT 1.0, context_text TEXT, ",
+                "start_line INTEGER, end_line INTEGER, symbol_kind TEXT);",
+                "INSERT INTO chunks (document_id, chunk_index, content) VALUES (1, 0, 'an old row');",
+            ))
+            .unwrap();
+        let columns = |db: &Database| -> Vec<String> {
+            db.conn
+                .prepare("PRAGMA table_info(chunks)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(!columns(&db).iter().any(|c| c == "table_rows"), "premise");
+        db.ensure_table_rows_column().unwrap();
+        assert!(columns(&db).iter().any(|c| c == "table_rows"));
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT table_rows FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, None, "an old row is not computed");
+        db.ensure_table_rows_column()
+            .expect("a second ensure does nothing");
+        assert_eq!(
+            columns(&db).iter().filter(|c| *c == "table_rows").count(),
+            1
+        );
+    }
+
+    /// feature-66 D2 (AC14): what was written comes back on both halves of the search: spans as
+    /// written, `[]` as `Some([])`, NULL as `None`.
+    #[test]
+    fn table_rows_round_trip_into_search_results() {
+        use crate::parser::{TableRowSpan, row_span};
+        let db = db_with_384();
+        let spans = [row_span(0, 0, 11)];
+        let none: &[TableRowSpan] = &[];
+        let cases: [(&str, Option<&[TableRowSpan]>); 3] = [
+            ("marked.docx", Some(&spans[..])),
+            ("bare.pptx", Some(none)),
+            ("prose.md", None),
+        ];
+        for (path, rows) in cases {
+            let id = db
+                .upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+            db.insert_chunk_with_table_rows(
+                id,
+                0,
+                None,
+                None,
+                "alder\tbirch",
+                None,
+                &dummy_embedding(0.1),
+                1.0,
+                CodeMeta::default(),
+                rows,
+            )
+            .unwrap();
+        }
+        let expected = |path: &str| -> Option<Vec<TableRowSpan>> {
+            match path {
+                "marked.docx" => Some(spans.to_vec()),
+                "bare.pptx" => Some(vec![]),
+                _ => None,
+            }
+        };
+        let vec_hits = db
+            .search_similar(&dummy_embedding(0.1), 10, &SearchFilters::default())
+            .unwrap();
+        assert_eq!(vec_hits.len(), 3);
+        for hit in &vec_hits {
+            assert_eq!(hit.table_rows, expected(&hit.path), "vec: {}", hit.path);
+        }
+        let fts_hits = db
+            .search_fts_candidates(
+                "alder",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert_eq!(fts_hits.len(), 3);
+        for (_, hit) in &fts_hits {
+            assert_eq!(hit.table_rows, expected(&hit.path), "fts: {}", hit.path);
+        }
+    }
+
+    /// feature-66 D3 (AC15): a stored value that is not JSON, runs past the content, splits a
+    /// character or overlaps reads as not computed, and the search still succeeds.
+    #[test]
+    fn an_unusable_table_rows_value_reads_as_not_computed() {
+        let db = db_with_384();
+        let rows = [
+            ("garbled.docx", "alder\tbirch", "not json"),
+            (
+                "overlong.docx",
+                "alder\tbirch",
+                r#"[{"table":0,"start":0,"end":12}]"#,
+            ),
+            (
+                "split.docx",
+                "über\tbirch",
+                r#"[{"table":0,"start":1,"end":11}]"#,
+            ),
+            (
+                "overlap.docx",
+                "alder\nbirch",
+                r#"[{"table":0,"start":0,"end":5},{"table":0,"start":3,"end":11}]"#,
+            ),
+            (
+                "kept.docx",
+                "alder\tbirch",
+                r#"[{"table":0,"start":0,"end":11}]"#,
+            ),
+        ];
+        for (path, content, raw) in rows {
+            let id = db
+                .upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+            db.insert_chunk(id, 0, None, None, content, None, &dummy_embedding(0.1), 1.0)
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE chunks SET table_rows = ?1 WHERE document_id = ?2",
+                    params![raw, id],
+                )
+                .unwrap();
+        }
+        let hits = db
+            .search_similar(&dummy_embedding(0.1), 10, &SearchFilters::default())
+            .expect("an unusable value does not fail the search");
+        assert_eq!(hits.len(), 5);
+        for hit in &hits {
+            let expected =
+                (hit.path == "kept.docx").then(|| vec![crate::parser::row_span(0, 0, 11)]);
+            assert_eq!(hit.table_rows, expected, "{}", hit.path);
+        }
+    }
+
+    /// feature-66 D4 (AC16): a hit's JSON has no table rows, whatever the result carried.
+    #[test]
+    fn search_hits_do_not_carry_table_rows() {
+        let r = SearchResult {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
+            score: 1.0,
+            content: "alder\tbirch".to_string(),
+            heading: None,
+            document_id: 1,
+            path: "marked.docx".to_string(),
+            title: None,
+            topic: None,
+            date: None,
+            tags: vec![],
+            context_text: None,
+            table_rows: Some(vec![crate::parser::row_span(0, 0, 11)]),
+        };
+        let json = serde_json::to_string(&SearchHit::from(r)).unwrap();
+        assert!(!json.contains("table_rows"), "{json}");
+        assert!(!json.contains("\"table\""), "{json}");
+    }
+
+    /// feature-66 (R7.1): the two table-rows keys round-trip on their own, and writing them
+    /// leaves the earlier keys alone.
+    #[test]
+    fn table_rows_policies_round_trip_beside_the_other_policies() {
+        let db = db_with_384();
+        assert_eq!(db.read_docx_table_rows_policy().unwrap(), None);
+        assert_eq!(db.read_pptx_table_rows_policy().unwrap(), None);
+        db.write_docx_table_policy("tab-joined-rows").unwrap();
+        db.write_pptx_table_break_policy("tab-joined-rows-kept-breaks")
+            .unwrap();
+        db.write_docx_table_rows_policy("row-spans").unwrap();
+        assert_eq!(
+            db.read_docx_table_rows_policy().unwrap().as_deref(),
+            Some("row-spans")
+        );
+        assert_eq!(
+            db.read_pptx_table_rows_policy().unwrap(),
+            None,
+            "a key per format"
+        );
+        db.write_pptx_table_rows_policy("row-spans").unwrap();
+        db.write_pptx_table_rows_policy("next").unwrap();
+        assert_eq!(
+            db.read_pptx_table_rows_policy().unwrap().as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            db.read_docx_table_policy().unwrap().as_deref(),
+            Some("tab-joined-rows")
+        );
+        assert_eq!(
+            db.read_pptx_table_break_policy().unwrap().as_deref(),
+            Some("tab-joined-rows-kept-breaks")
+        );
     }
 }

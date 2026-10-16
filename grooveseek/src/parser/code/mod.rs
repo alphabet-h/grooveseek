@@ -424,6 +424,7 @@ fn chunk_source_capped(
                     line_of(&starts, p.range.end.saturating_sub(1)),
                 )),
                 symbol_kind: p.symbol_kind,
+                table_rows: None,
             }
         })
         .collect();
@@ -2215,6 +2216,14 @@ impl Counter {
                 min_end = witness + chunk.content.len();
             }
         }
+    }
+
+    /// feature-66 P11 (AC10): source-code chunks carry no table rows.
+    #[test]
+    fn code_chunks_carry_no_table_rows() {
+        let doc = parse(SRC, DEFAULT_MAX_CHUNK_CHARS);
+        assert!(!doc.chunks.is_empty());
+        assert!(doc.chunks.iter().all(|c| c.table_rows.is_none()));
     }
 }
 

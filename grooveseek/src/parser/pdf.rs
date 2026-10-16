@@ -439,6 +439,7 @@ fn parse_with_budget(bytes: &[u8], path_hint: &str, budget: u64) -> Result<Parse
             context,
             line_range: None,
             symbol_kind: None,
+            table_rows: None,
         });
     }
 
@@ -1759,5 +1760,15 @@ mod tests {
             .unwrap();
         assert_eq!(read.raw_content, default.raw_content);
         assert_eq!(read.chunks.len(), default.chunks.len());
+    }
+
+    /// feature-66 P11 (AC10): PDF page chunks carry no table rows.
+    #[test]
+    fn pdf_chunks_carry_no_table_rows() {
+        let doc = PdfParser::default()
+            .parse_bytes(MINIMAL_PDF, "docs/minimal.pdf", &[])
+            .expect("minimal pdf must extract");
+        assert!(!doc.chunks.is_empty());
+        assert!(doc.chunks.iter().all(|c| c.table_rows.is_none()));
     }
 }

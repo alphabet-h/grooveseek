@@ -625,6 +625,7 @@ fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> 
                 context,
                 line_range: None,
                 symbol_kind: None,
+                table_rows: None,
             }
         })
         .collect()

@@ -176,6 +176,9 @@ impl Database {
     /// signature is called from over a hundred places, nearly all of them tests that have no
     /// opinion about source lines, and widening it would rewrite all of them to say `None`
     /// three times. The prose path keeps the call it already had.
+    ///
+    /// (feature-66) Writes `chunks.table_rows` NULL (not computed); the indexer writes through
+    /// [`Self::insert_chunk_with_table_rows`].
     #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_code(
         &self,
@@ -189,11 +192,46 @@ impl Database {
         quality_score: f32,
         code: CodeMeta<'_>,
     ) -> Result<i64> {
+        self.insert_chunk_with_table_rows(
+            document_id,
+            chunk_index,
+            heading,
+            level,
+            content,
+            context,
+            embedding,
+            quality_score,
+            code,
+            None,
+        )
+    }
+
+    /// (feature-66) Same, also writing where each table row of the chunk sits
+    /// (`chunks.table_rows`, the JSON of `table_rows`; `None` writes NULL, not computed).
+    ///
+    /// Another constructor rather than a field on [`CodeMeta`] or a parameter on
+    /// [`Self::insert_chunk_with_code`], for the reason that one gives: tests build both with
+    /// every field spelled out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_chunk_with_table_rows(
+        &self,
+        document_id: i64,
+        chunk_index: i32,
+        heading: Option<&str>,
+        level: Option<u8>,
+        content: &str,
+        context: Option<&str>,
+        embedding: &[f32],
+        quality_score: f32,
+        code: CodeMeta<'_>,
+        table_rows: Option<&[TableRowSpan]>,
+    ) -> Result<i64> {
         // Rough token estimate: 1 token ~= 4 chars (English average).
         // F-46: saturate at i32::MAX rather than wrap on the rare 8 GiB+
         // content path (chunker is hard-capped well below this in practice;
         // defense-in-depth for diagnosing oversize indexing failures).
         let token_count = i32::try_from(content.len() / 4).unwrap_or(i32::MAX);
+        let table_rows_json = table_rows.map(serde_json::to_string).transpose()?;
 
         let local_tx = if self.conn.is_autocommit() {
             Some(self.conn.unchecked_transaction()?)
@@ -211,9 +249,9 @@ impl Database {
             None => (None, None),
         };
         self.conn.execute(
-            "INSERT INTO chunks (document_id, chunk_index, heading, level, content, context_text, token_count, quality_score, start_line, end_line, symbol_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![document_id, chunk_index, heading, level_bind, content, context, token_count, quality_score, start_line, end_line, code.symbol_kind],
+            "INSERT INTO chunks (document_id, chunk_index, heading, level, content, context_text, token_count, quality_score, start_line, end_line, symbol_kind, table_rows)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![document_id, chunk_index, heading, level_bind, content, context, token_count, quality_score, start_line, end_line, code.symbol_kind, table_rows_json],
         )?;
         let chunk_id = self.conn.last_insert_rowid();
 
@@ -299,6 +337,27 @@ impl Database {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// (feature-66) `chunks.table_rows` of the given document's chunks in chunk_index order, as
+    /// stored: the JSON text, or `None` for NULL (not computed). Read beside
+    /// [`Self::chunk_texts_for_path`], whose signature tests pin, to decide whether that column
+    /// alone needs writing.
+    pub fn chunk_table_rows_for_path(&self, path: &str) -> Result<Vec<Option<String>>> {
+        let sql = "
+            SELECT c.table_rows
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.path = ?1
+            ORDER BY c.chunk_index
+        ";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![path], |row| row.get::<_, Option<String>>(0))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -452,6 +511,9 @@ impl Database {
                     start_line: None,
                     end_line: None,
                     symbol_kind: None,
+                    // (feature-66) Nor the table rows: a seed starts the walk, it is not an
+                    // excerpt anyone reads.
+                    table_rows: None,
                 },
             ));
         }
@@ -486,6 +548,39 @@ impl Database {
                 None => (None, None),
             };
             stmt.execute(params![start, end, meta.symbol_kind, index as i64, path])?;
+        }
+        drop(stmt);
+        if let Some(tx) = local_tx {
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// (feature-66) Rewrite `chunks.table_rows` of a document's chunks, in chunk order: the JSON
+    /// of each entry of `rows`, `None` writing NULL (not computed).
+    ///
+    /// For the paths that write the column without re-embedding: a re-read whose chunk text
+    /// matches the row's, and a changed file whose chunk text did not change. Positional by
+    /// `chunk_index`, which is sound because the caller has just established that the chunk
+    /// texts match one for one ([`Self::update_chunk_code_meta`] reasons the same way).
+    pub fn update_chunk_table_rows(
+        &self,
+        path: &str,
+        rows: &[Option<&[TableRowSpan]>],
+    ) -> Result<()> {
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let mut stmt = self.conn.prepare(
+            "UPDATE chunks SET table_rows = ?1
+             WHERE chunk_index = ?2
+               AND document_id = (SELECT id FROM documents WHERE path = ?3)",
+        )?;
+        for (index, spans) in rows.iter().enumerate() {
+            let json = spans.map(serde_json::to_string).transpose()?;
+            stmt.execute(params![json, index as i64, path])?;
         }
         drop(stmt);
         if let Some(tx) = local_tx {

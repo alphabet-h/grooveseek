@@ -984,21 +984,33 @@ pub fn rebuild_index(
     // folded into the next section ([`DOCX_SECTION_POLICY`]).
     // (feature-64) And one whose tables were written before each row became one line
     // ([`DOCX_TABLE_POLICY`]). When the other two keys are at their values and only this one is
-    // not, the notice names the table change ([`docx_table_reread_notice`]). The three keys are
-    // read here, once, before the loop; the run does not read them again.
+    // not, the notice names the table change ([`docx_table_reread_notice`]). The four `.docx` keys
+    // and the two `.pptx` keys are read here, once, before the loop; the run does not read them
+    // again.
     let heading_current = db.read_docx_heading_policy()?.as_deref() == Some(DOCX_HEADING_POLICY);
     let section_current = db.read_docx_section_policy()?.as_deref() == Some(DOCX_SECTION_POLICY);
     let table_current = db.read_docx_table_policy()?.as_deref() == Some(DOCX_TABLE_POLICY);
-    let refresh_docx = !force && !(heading_current && section_current && table_current);
+    // (feature-66) And one whose `.docx` chunks were written before they carried their table
+    // rows ([`DOCX_TABLE_ROWS_POLICY`]), the fourth `.docx` key (ADR-0030).
+    let rows_docx_current =
+        db.read_docx_table_rows_policy()?.as_deref() == Some(DOCX_TABLE_ROWS_POLICY);
+    let refresh_docx =
+        !force && !(heading_current && section_current && table_current && rows_docx_current);
     let tables_alone_stale = heading_current && section_current && !table_current;
+    let rows_docx_alone_stale =
+        heading_current && section_current && table_current && !rows_docx_current;
     // (feature-65) `.pptx` has a pass of its own, opened by its own key
     // ([`PPTX_TABLE_BREAK_POLICY`], ADR-0029): an index whose `.pptx` rows were written before
     // table rows became one line and line breaks were kept re-reads each unchanged one once.
     // Each pass re-reads and marks only its own format's rows, so a stale key of one format
     // never touches the other's.
+    // (feature-66) Its second key, [`PPTX_TABLE_ROWS_POLICY`], opens the same pass.
     let pptx_current =
         db.read_pptx_table_break_policy()?.as_deref() == Some(PPTX_TABLE_BREAK_POLICY);
-    let refresh_pptx = !force && !pptx_current;
+    let rows_pptx_current =
+        db.read_pptx_table_rows_policy()?.as_deref() == Some(PPTX_TABLE_ROWS_POLICY);
+    let refresh_pptx = !force && !(pptx_current && rows_pptx_current);
+    let rows_pptx_alone_stale = pptx_current && !rows_pptx_current;
     let passes = [
         OncePass {
             extension: "docx",
@@ -1245,7 +1257,9 @@ pub fn rebuild_index(
     // Announced before the loop, so a run that takes long re-embedding says why even if it is
     // stopped: the `.docx` line first, then the `.pptx` one.
     if docx_rereads > 0 {
-        let notice = if tables_alone_stale {
+        let notice = if rows_docx_alone_stale {
+            docx_rows_reread_notice(docx_rereads)
+        } else if tables_alone_stale {
             docx_table_reread_notice(docx_rereads)
         } else {
             docx_reread_notice(docx_rereads)
@@ -1253,7 +1267,12 @@ pub fn rebuild_index(
         progress.announce(&notice);
     }
     if pptx_rereads > 0 {
-        progress.announce(&pptx_reread_notice(pptx_rereads));
+        let notice = if rows_pptx_alone_stale {
+            pptx_rows_reread_notice(pptx_rereads)
+        } else {
+            pptx_reread_notice(pptx_rereads)
+        };
+        progress.announce(&notice);
     }
 
     // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
@@ -1543,13 +1562,18 @@ pub fn rebuild_index(
             // either write records neither.
             db.write_docx_section_policy(DOCX_SECTION_POLICY)?;
             // (feature-64) After them, in the same transaction: a run that fails on an earlier
-            // write, or on this one, records none of the three.
+            // write, or on this one, records none of the `.docx` keys.
             db.write_docx_table_policy(DOCX_TABLE_POLICY)?;
+            // (feature-66) After the table key, in the same transaction: a run that fails on an
+            // earlier `.docx` key never reaches it, and one that fails on it records none.
+            db.write_docx_table_rows_policy(DOCX_TABLE_ROWS_POLICY)?;
         }
         if force || refresh_pptx {
-            // (feature-65) Last, in the same transaction: a run that fails on a `.docx` key or
-            // on this one records no key and no mark (ADR-0029).
+            // (feature-65) After the `.docx` keys, in the same transaction: a run that fails on
+            // a `.docx` key or on this one records no key and no mark (ADR-0029).
             db.write_pptx_table_break_policy(PPTX_TABLE_BREAK_POLICY)?;
+            // (feature-66) Last, in the same transaction (ADR-0030).
+            db.write_pptx_table_rows_policy(PPTX_TABLE_ROWS_POLICY)?;
         }
         tx.commit()?;
     }
@@ -1710,6 +1734,222 @@ fn stored_chunks_match(
     }
 }
 
+/// (feature-66) Stage one of a write of `chunks.table_rows` that re-embeds nothing, decided from
+/// what the index holds for a document whose chunk text matches the parse
+/// ([`stored_chunks_match`]): the content hash the row held when this was read, whether its
+/// stored table rows already are the parse's ([`stored_table_rows_match`]), and the rows to
+/// write, one per chunk.
+///
+/// Stage two reads the row again inside the transaction that writes, under `BEGIN IMMEDIATE`,
+/// and writes only while the row still holds `stored_hash` and the chunk text
+/// ([`table_rows_still_hold`]): [`write_reparsed_table_rows`] and [`write_matching_chunks_meta`].
+/// So no row is left with table rows computed from a text it does not hold (spec R7.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableRowsDecision {
+    stored_hash: String,
+    matches: bool,
+    rows: Vec<Option<Vec<crate::parser::TableRowSpan>>>,
+}
+
+impl TableRowsDecision {
+    /// [`Self::rows`] as [`Database::update_chunk_table_rows`] takes them.
+    fn row_refs(&self) -> Vec<Option<&[crate::parser::TableRowSpan]>> {
+        self.rows.iter().map(Option::as_deref).collect()
+    }
+}
+
+/// (feature-66) Whether the index holds, for every chunk of `rel`, the table rows `chunks`
+/// carry: NULL for `None`, the JSON of the same spans for `Some` (`[]` for `Some(vec![])`).
+/// A value that is not JSON matches nothing. `false` when the counts differ or the read fails.
+///
+/// Asked after [`stored_chunks_match`] said the text matches, never instead of it: a chunk
+/// whose table rows alone differ keeps its embedding.
+fn stored_table_rows_match(db: &Database, rel: &str, chunks: &[crate::parser::Chunk]) -> bool {
+    db.chunk_table_rows_for_path(rel)
+        .map(|stored| {
+            stored.len() == chunks.len()
+                && stored.iter().zip(chunks).all(|(raw, c)| match raw {
+                    None => c.table_rows.is_none(),
+                    Some(json) => matches!(
+                        serde_json::from_str::<Vec<crate::parser::TableRowSpan>>(json),
+                        Ok(spans) if c.table_rows.as_ref() == Some(&spans)
+                    ),
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// (feature-66) Stage one ([`TableRowsDecision`]) for `rel`, whose chunk text the index holds
+/// as `chunks`. `None` when no chunk carries table rows and `rel` is not a `.docx` or `.pptx`
+/// ([`marks_table_rows`]) -- every other format, whose column is left as it is -- or the index
+/// holds no row for `rel`.
+///
+/// A `.docx` / `.pptx` whose chunks all carry `None` (an offset past `u32`) still gets a
+/// decision, of NULL rows: its column is then written NULL, never left holding rows an older
+/// text produced under the hash this write stores.
+fn decide_table_rows(
+    db: &Database,
+    rel: &str,
+    chunks: &[crate::parser::Chunk],
+) -> Result<Option<TableRowsDecision>> {
+    if chunks.iter().all(|c| c.table_rows.is_none()) && !marks_table_rows(rel) {
+        return Ok(None);
+    }
+    let Some(stored_hash) = db.get_document_hash(rel)? else {
+        return Ok(None);
+    };
+    Ok(Some(TableRowsDecision {
+        stored_hash,
+        matches: stored_table_rows_match(db, rel, chunks),
+        rows: chunks.iter().map(|c| c.table_rows.clone()).collect(),
+    }))
+}
+
+/// (feature-66) Whether `rel` is a document whose parser marks table rows: a `.docx` or a
+/// `.pptx`, by its extension, compared without case as [`Registry::by_extension`] picks the
+/// parser.
+fn marks_table_rows(rel: &str) -> bool {
+    Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("docx") || ext.eq_ignore_ascii_case("pptx"))
+}
+
+/// (feature-66) Whether the row of `rel` still holds what stage one read: the content hash
+/// `stored_hash` and the chunk text `chunks` ([`stored_chunks_match`]). Read first inside a
+/// stage-two transaction, which is `BEGIN IMMEDIATE`, so no other writer can change the answer
+/// before that transaction commits.
+fn table_rows_still_hold(
+    db: &Database,
+    rel: &str,
+    stored_hash: &str,
+    chunks: &[crate::parser::Chunk],
+    context_mode: ContextMode,
+) -> Result<bool> {
+    Ok(db.get_document_hash(rel)?.as_deref() == Some(stored_hash)
+        && stored_chunks_match(db, rel, chunks, context_mode))
+}
+
+/// (feature-66) Stage two for a re-read ([`Reindex::Reparse`]) whose chunk text matches the row
+/// and whose table rows do not: the parse's table rows are written, and nothing else, and the
+/// document is [`SingleResult::Unchanged`] -- it was not re-embedded, so it is not counted as
+/// updated. When the row no longer holds what stage one read, nothing is written and the
+/// document is a [`SKIPPED_CHANGED_DURING_READ`] skip, which the run leaves unsettled.
+fn write_reparsed_table_rows(
+    db: &Database,
+    rel: &str,
+    decision: &TableRowsDecision,
+    chunks: &[crate::parser::Chunk],
+    context_mode: ContextMode,
+    frontmatter_unparsed: bool,
+) -> Result<SingleResult> {
+    let tx = db.begin_immediate_transaction()?;
+    if !table_rows_still_hold(db, rel, &decision.stored_hash, chunks, context_mode)? {
+        drop(tx);
+        return Ok(SingleResult::Skipped {
+            reason: SKIPPED_CHANGED_DURING_READ,
+            frontmatter_unparsed,
+        });
+    }
+    db.update_chunk_table_rows(rel, &decision.row_refs())?;
+    tx.commit()?;
+    Ok(SingleResult::Unchanged)
+}
+
+/// The write for a changed file whose new chunks match the row's ([`stored_chunks_match`]):
+/// the document's metadata and hash, its `document_fields` rows, its code positions, without
+/// re-embedding. `None` when the metadata update touched no row (it went away in between): the
+/// caller then writes the document the ordinary way.
+///
+/// (feature-66) And its table rows, when stage one ([`decide_table_rows`]) was read for it
+/// (`table_rows`, a `.docx` or `.pptx`): the transaction is then `BEGIN IMMEDIATE` and first asks
+/// whether the row still holds the hash and the text stage one saw ([`table_rows_still_hold`]).
+/// If so the parse's table rows are written; if another writer moved the row in between they are
+/// written NULL (not computed), since this write replaces the hash and a value it could not check
+/// would otherwise stay behind the fast path. The metadata, the hash and the code positions are
+/// written either way, as before. Every other format keeps the deferred transaction and its
+/// column as it is.
+#[allow(clippy::too_many_arguments)]
+fn write_matching_chunks_meta(
+    db: &Database,
+    entry: &DiskEntry,
+    parsed: &crate::parser::ParsedDocument,
+    table_rows: Option<&TableRowsDecision>,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+    size_bytes: u64,
+    topic: Option<&str>,
+    category: Option<&str>,
+) -> Result<Option<SingleResult>> {
+    let tx = if table_rows.is_some() {
+        db.begin_immediate_transaction()?
+    } else {
+        db.begin_transaction()?
+    };
+    let rows_hold = match table_rows {
+        Some(decision) => table_rows_still_hold(
+            db,
+            &entry.rel,
+            &decision.stored_hash,
+            &parsed.chunks,
+            context_mode,
+        )?,
+        None => false,
+    };
+    let updated = db.update_document_meta(
+        &entry.rel,
+        parsed.frontmatter.title.as_deref(),
+        parsed.frontmatter.topic.as_deref().or(topic),
+        category,
+        parsed.frontmatter.depth.as_deref(),
+        &parsed.frontmatter.tags,
+        parsed.frontmatter.date.as_deref(),
+        &entry.hash,
+        size_bytes,
+    )?;
+    if !updated {
+        // update が 0 行なら通常経路にフォールスルー (レース耐性)
+        tx.commit()?;
+        return Ok(None);
+    }
+    // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the
+    // frontmatter-only path: a `None` here must not overwrite a document's rows
+    // with an empty set just because the caller does not yet know the real one.
+    write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
+    // (feature-56) The chunk texts match, so the embeddings still stand — but the
+    // *positions* may not. Inserting a blank line above a function, or trimming a
+    // comment short enough to be dropped as a thin gap, moves every definition below
+    // it while leaving every chunk body identical. Without this the stored line
+    // numbers would keep pointing at the previous version of the file until someone
+    // re-indexed with --force, and a line number that is confidently wrong is worse
+    // than one that is absent.
+    if parsed.chunks.iter().any(|c| c.line_range.is_some()) {
+        let metas: Vec<crate::db::CodeMeta<'_>> = parsed
+            .chunks
+            .iter()
+            .map(|c| crate::db::CodeMeta {
+                line_range: c.line_range,
+                symbol_kind: c.symbol_kind.as_deref(),
+            })
+            .collect();
+        db.update_chunk_code_meta(&entry.rel, &metas)?;
+    }
+    // (feature-66) Outside the code gate above: a `.docx` / `.pptx` chunk has no line range,
+    // and its table rows can move while its text stays (a paragraph `a\tb` becoming a row).
+    if let Some(decision) = table_rows {
+        if rows_hold {
+            db.update_chunk_table_rows(&entry.rel, &decision.row_refs())?;
+        } else {
+            db.update_chunk_table_rows(&entry.rel, &vec![None; decision.rows.len()])?;
+        }
+    }
+    tx.commit()?;
+    Ok(Some(SingleResult::Updated {
+        chunks: parsed.chunks.len() as u32,
+        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+    }))
+}
+
 /// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed and
 /// counts as having read it. The one-time frontmatter check (#251) treats every other skip
 /// as "not read" -- the ones that return before the parser runs, and
@@ -1852,6 +2092,24 @@ fn docx_table_reread_notice(n: usize) -> String {
 fn pptx_reread_notice(n: usize) -> String {
     format!(
         "Re-reading {n} unchanged .pptx document(s) once: table rows are now one line each, cells separated by tabs, and line breaks are kept; only documents whose slides change are re-embedded"
+    )
+}
+
+/// (feature-66) The line the one-time `.docx` pass writes instead of [`docx_reread_notice`] when
+/// every `.docx` key but [`DOCX_TABLE_ROWS_POLICY`] is at its value. ASCII only, and it opens the
+/// same way.
+fn docx_rows_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .docx document(s) once: table rows are now marked in each chunk; only documents whose sections change are re-embedded"
+    )
+}
+
+/// (feature-66) The line the one-time `.pptx` pass writes instead of [`pptx_reread_notice`] when
+/// [`PPTX_TABLE_BREAK_POLICY`] is at its value and [`PPTX_TABLE_ROWS_POLICY`] is not. ASCII only,
+/// and it opens the same way.
+fn pptx_rows_reread_notice(n: usize) -> String {
+    format!(
+        "Re-reading {n} unchanged .pptx document(s) once: table rows are now marked in each chunk; only documents whose slides change are re-embedded"
     )
 }
 
@@ -2132,57 +2390,57 @@ fn index_single_disk_entry(
     // 不要になったため撤去した。Off モードは context を embed/保存しないため、
     // 従来通り (heading, content) のみで比較する (挙動不変)。
     let chunks_unchanged = stored_chunks_match(db, &entry.rel, &parsed.chunks, context_mode);
+    // (feature-66) Stage one of a table-rows write that re-embeds nothing, read beside the
+    // comparison above; stage two reads the row again where it writes. Gated as the meta-only
+    // write below is (`!force`; a re-read is not forced), so `--force` reads nothing extra.
+    let table_rows = if !force && chunks_unchanged {
+        decide_table_rows(db, &entry.rel, &parsed.chunks)?
+    } else {
+        None
+    };
 
     // (feature-62) The pass found the row already split the way this parser splits it: nothing
     // to write, and the hash already matches.
+    // (feature-66) Unless its table rows are not the ones this parser marks: that column alone
+    // is written, and the document still counts as unchanged. Only under the hash of the bytes
+    // just parsed: the pass re-reads a row because its hash matched the scan's, and a row another
+    // writer rehashed since (newer bytes, same text) would otherwise keep rows computed from the
+    // older bytes under its new hash, which the fast path then never revisits (spec R7.7).
     if reparse && chunks_unchanged {
-        return Ok(SingleResult::Unchanged);
+        return match &table_rows {
+            Some(decision) if !decision.matches && decision.stored_hash != entry.hash => {
+                Ok(SingleResult::Skipped {
+                    reason: SKIPPED_CHANGED_DURING_READ,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                })
+            }
+            Some(decision) if !decision.matches => write_reparsed_table_rows(
+                db,
+                &entry.rel,
+                decision,
+                &parsed.chunks,
+                context_mode,
+                parsed.frontmatter_error.is_some(),
+            ),
+            _ => Ok(SingleResult::Unchanged),
+        };
     }
 
-    if !force && chunks_unchanged {
-        let tx = db.begin_transaction()?;
-        let updated = db.update_document_meta(
-            &entry.rel,
-            parsed.frontmatter.title.as_deref(),
-            parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
-            category.as_deref(),
-            parsed.frontmatter.depth.as_deref(),
-            &parsed.frontmatter.tags,
-            parsed.frontmatter.date.as_deref(),
-            &entry.hash,
+    if !force
+        && chunks_unchanged
+        && let Some(done) = write_matching_chunks_meta(
+            db,
+            entry,
+            &parsed,
+            table_rows.as_ref(),
+            context_mode,
+            declared,
             size_bytes,
-        )?;
-        if updated {
-            // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the
-            // frontmatter-only path above: a `None` here must not overwrite a document's rows
-            // with an empty set just because the caller does not yet know the real one.
-            write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
-            // (feature-56) The chunk texts match, so the embeddings still stand — but the
-            // *positions* may not. Inserting a blank line above a function, or trimming a
-            // comment short enough to be dropped as a thin gap, moves every definition below
-            // it while leaving every chunk body identical. Without this the stored line
-            // numbers would keep pointing at the previous version of the file until someone
-            // re-indexed with --force, and a line number that is confidently wrong is worse
-            // than one that is absent.
-            if parsed.chunks.iter().any(|c| c.line_range.is_some()) {
-                let metas: Vec<crate::db::CodeMeta<'_>> = parsed
-                    .chunks
-                    .iter()
-                    .map(|c| crate::db::CodeMeta {
-                        line_range: c.line_range,
-                        symbol_kind: c.symbol_kind.as_deref(),
-                    })
-                    .collect();
-                db.update_chunk_code_meta(&entry.rel, &metas)?;
-            }
-            tx.commit()?;
-            return Ok(SingleResult::Updated {
-                chunks: parsed.chunks.len() as u32,
-                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
-            });
-        }
-        // update が 0 行なら通常経路にフォールスルー (レース耐性)
-        tx.commit()?;
+            topic.as_deref(),
+            category.as_deref(),
+        )?
+    {
+        return Ok(done);
     }
 
     // Embed first, *outside* the DB tx — fastembed inference can take
@@ -2262,6 +2520,9 @@ fn index_single_disk_entry(
 /// [`crate::parser::Chunk::line_range`] and [`crate::parser::Chunk::symbol_kind`] as
 /// [`crate::db::CodeMeta`].
 ///
+/// (feature-66) And [`crate::parser::Chunk::table_rows`], in the same insert as the text it
+/// describes.
+///
 /// This is the one place a parsed chunk becomes a row. Indexing calls it with the embeddings
 /// the model produced; `tests/code_formats_light.rs` calls it with constants, so that what a
 /// pull request checks is the same write path the binary runs and not a copy of it (codex P1
@@ -2321,7 +2582,7 @@ pub fn write_parsed_document(
             ContextMode::Static => chunk.context.as_deref(),
             ContextMode::Off => None,
         };
-        db.insert_chunk_with_code(
+        db.insert_chunk_with_table_rows(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
@@ -2334,6 +2595,7 @@ pub fn write_parsed_document(
                 line_range: chunk.line_range,
                 symbol_kind: chunk.symbol_kind.as_deref(),
             },
+            chunk.table_rows.as_deref(),
         )?;
     }
     Ok(doc_id)
@@ -3186,6 +3448,20 @@ pub(crate) const DOCX_TABLE_POLICY: &str = "tab-joined-rows";
 /// [`pptx_reread_notice`]; the final transaction writes the key after the `.docx` ones. A key per
 /// format, so a stale key of one format never re-reads the other's rows (ADR-0029).
 pub(crate) const PPTX_TABLE_BREAK_POLICY: &str = "tab-joined-rows-kept-breaks";
+
+/// (feature-66) Recorded in `index_meta.docx_table_rows_policy` after the three earlier `.docx`
+/// keys, in the same transaction, once every `.docx` row of the index carries its table rows
+/// (`chunks.table_rows`). Absence or another value opens the one-time `.docx` pass; when it is
+/// the only stale `.docx` key the pass announces itself with [`docx_rows_reread_notice`], and
+/// the chunk text matches, so the pass writes that column alone and re-embeds nothing. A fourth
+/// key of its own rather than a new value of an earlier one, whose values tests pin (ADR-0030).
+pub(crate) const DOCX_TABLE_ROWS_POLICY: &str = "row-spans";
+
+/// (feature-66) Recorded in `index_meta.pptx_table_rows_policy` after
+/// [`PPTX_TABLE_BREAK_POLICY`], in the same transaction, once every `.pptx` row of the index
+/// carries its table rows. Absence or another value opens the one-time `.pptx` pass, announced
+/// with [`pptx_rows_reread_notice`] when this is the only stale `.pptx` key (ADR-0030).
+pub(crate) const PPTX_TABLE_ROWS_POLICY: &str = "row-spans";
 
 /// (feature-62 introduced it for the `.docx` pass) The `content_hash` a row of a one-time pass
 /// (ADR-0029) carries when that pass could not settle it: skipped by the scan, failed to parse,
@@ -7133,5 +7409,416 @@ mod tests {
             db.get_document_hash("quarry.docx").unwrap(),
             Some(entry.hash.clone())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-66: chunks.table_rows
+    // -----------------------------------------------------------------------
+
+    /// feature-66: the JSON `chunks.table_rows` holds for the one chunk of
+    /// [`crate::parser::docx::fixture::table_docx`] (`"alder\tbirch\ncedar\tdamson"`).
+    const TARIFF_ROWS_JSON: &str =
+        r#"[{"table":0,"start":0,"end":11},{"table":0,"start":12,"end":24}]"#;
+
+    /// feature-66: what the registry's parser for `ext` makes of `bytes`, under the default
+    /// exclusions [`index_single_disk_entry`] uses when none are configured.
+    fn parse_doc(
+        registry: &Registry,
+        ext: &str,
+        rel: &str,
+        bytes: &[u8],
+    ) -> crate::parser::ParsedDocument {
+        use crate::parser::ParserExt;
+        registry
+            .by_extension(ext)
+            .unwrap()
+            .parse_bytes(bytes, rel, crate::parser::DEFAULT_EXCLUDED_HEADINGS)
+            .unwrap()
+    }
+
+    /// feature-66 (R5.2): the one write path stores each chunk's table rows: the parse's for a
+    /// docx, NULL for Markdown.
+    #[test]
+    fn a_written_document_keeps_its_table_rows() {
+        use crate::parser::docx::fixture::table_docx;
+        let db = reparse_db();
+        let registry = docx_registry();
+        let cases: [(&str, &str, Vec<u8>, Option<String>); 2] = [
+            (
+                "tariff.docx",
+                "docx",
+                table_docx(),
+                Some(TARIFF_ROWS_JSON.to_string()),
+            ),
+            (
+                "harbour.md",
+                "md",
+                b"# Harbour\n\nquiet harbour notes\n".to_vec(),
+                None,
+            ),
+        ];
+        for (rel, ext, bytes, expected) in cases {
+            let parsed = parse_doc(&registry, ext, rel, &bytes);
+            let parser = registry.by_extension(ext).unwrap();
+            let embeddings = vec![vec![0.6_f32, 0.8]; parsed.chunks.len()];
+            write_parsed_document(
+                &db,
+                rel,
+                &parsed,
+                parser,
+                &embeddings,
+                ContextMode::Off,
+                "h",
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+            let stored = db.chunk_table_rows_for_path(rel).unwrap();
+            assert!(!stored.is_empty(), "{rel}");
+            assert!(stored.iter().all(|s| *s == expected), "{rel}: {stored:?}");
+        }
+    }
+
+    /// feature-66: a file-backed index in `dir` with two-dimensional vectors, matching
+    /// [`unreachable_embedder`], and the path a second connection opens it by.
+    fn file_db(dir: &std::path::Path) -> (Database, std::path::PathBuf) {
+        let path = dir.join("index.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.verify_embedding_meta("test-model", 2).unwrap();
+        (db, path)
+    }
+
+    /// feature-66 X1 (AC22, Reparse): the column-only write decides from what the row holds,
+    /// then reads the row again under an immediate lock. Undisturbed, it writes the parse's
+    /// rows and the document is unchanged; when another connection rewrote the chunk text or
+    /// the hash in between, it writes nothing and the document is a changed-during-read skip.
+    #[test]
+    fn a_reparse_table_rows_write_rechecks_the_row_it_read() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("f66-x1-reparse");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let chunks = parse_doc(&registry, "docx", "tariff.docx", &table_docx()).chunks;
+        let cases: [(&str, Option<&str>); 3] = [
+            ("steady.docx", None),
+            (
+                "rewritten.docx",
+                Some(
+                    "UPDATE chunks SET content = 'another writer was here' WHERE document_id = (SELECT id FROM documents WHERE path = ?1)",
+                ),
+            ),
+            (
+                "rehashed.docx",
+                Some(
+                    "UPDATE documents SET content_hash = 'hash-another-writer-left' WHERE path = ?1",
+                ),
+            ),
+        ];
+        for (rel, interruption) in cases {
+            write_row(&db, rel, "hash-of-these-bytes", &chunks);
+            let decision = decide_table_rows(&db, rel, &chunks)
+                .unwrap()
+                .expect("a docx row");
+            assert_eq!(decision.stored_hash, "hash-of-these-bytes", "{rel}");
+            assert!(!decision.matches, "{rel}: NULL is not the parse's rows");
+            if let Some(sql) = interruption {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(sql, [rel])
+                    .unwrap();
+            }
+            let result =
+                write_reparsed_table_rows(&db, rel, &decision, &chunks, ContextMode::Off, false)
+                    .unwrap();
+            let stored = db.chunk_table_rows_for_path(rel).unwrap();
+            if interruption.is_none() {
+                assert_eq!(result, SingleResult::Unchanged, "{rel}");
+                assert_eq!(stored, vec![Some(TARIFF_ROWS_JSON.to_string())], "{rel}");
+            } else {
+                assert_eq!(
+                    result,
+                    SingleResult::Skipped {
+                        reason: SKIPPED_CHANGED_DURING_READ,
+                        frontmatter_unparsed: false
+                    },
+                    "{rel}"
+                );
+                assert_eq!(stored, vec![None], "{rel}: nothing written");
+            }
+        }
+    }
+
+    /// feature-66 X1 (AC22, the ordinary path): a changed file whose chunk text matches gets its
+    /// metadata either way. Undisturbed, its table rows are the parse's; when another connection
+    /// rewrote the hash between the decision and the write, they are NULL -- neither the parse's
+    /// nor what was there before -- and the result is still `Updated`.
+    #[test]
+    fn a_meta_update_marks_table_rows_only_while_the_row_holds() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("f66-x1-meta");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let parsed = parse_doc(&registry, "docx", "tariff.docx", &table_docx());
+        let declared = DeclaredSet::Known {
+            list: &[],
+            pass: None,
+            generation: "[]",
+        };
+        let before = [crate::parser::row_span(0, 0, 5)];
+        for (rel, interrupted) in [("steady.docx", false), ("moved.docx", true)] {
+            write_row(&db, rel, "hash-before-the-edit", &parsed.chunks);
+            db.update_chunk_table_rows(rel, &[Some(&before[..])])
+                .unwrap();
+            let decision = decide_table_rows(&db, rel, &parsed.chunks)
+                .unwrap()
+                .expect("a docx row");
+            assert_eq!(decision.stored_hash, "hash-before-the-edit", "{rel}");
+            if interrupted {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE documents SET content_hash = 'hash-another-writer-left' WHERE path = ?1",
+                        [rel],
+                    )
+                    .unwrap();
+            }
+            let entry = mk_entry(rel, "hash-after-the-edit");
+            let result = write_matching_chunks_meta(
+                &db,
+                &entry,
+                &parsed,
+                Some(&decision),
+                ContextMode::Off,
+                declared,
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                Some(SingleResult::Updated {
+                    chunks: 1,
+                    frontmatter_unparsed: false
+                }),
+                "{rel}"
+            );
+            assert_eq!(
+                db.get_document_hash(rel).unwrap().as_deref(),
+                Some("hash-after-the-edit"),
+                "{rel}: the metadata is written either way"
+            );
+            let expected = (!interrupted).then(|| TARIFF_ROWS_JSON.to_string());
+            assert_eq!(
+                db.chunk_table_rows_for_path(rel).unwrap(),
+                vec![expected],
+                "{rel}"
+            );
+        }
+    }
+
+    /// feature-66 Review Focus 5: a stored value that is not JSON does not match the parse, so
+    /// the re-read rewrites the column alone -- through the embedder that is never reached --
+    /// and reports the document unchanged.
+    #[test]
+    fn a_broken_stored_table_rows_value_is_rewritten() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("f66-rf5");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let bytes = table_docx();
+        let entry = docx_entry(&dir.0, "tariff.docx", &bytes);
+        let chunks = parse_doc(&registry, "docx", "tariff.docx", &bytes).chunks;
+        write_row(&db, "tariff.docx", &entry.hash, &chunks);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE chunks SET table_rows = 'not json'", [])
+            .unwrap();
+        assert_eq!(
+            reindex(&db, &registry, &entry, Reindex::Reparse),
+            SingleResult::Unchanged
+        );
+        assert_eq!(
+            db.chunk_table_rows_for_path("tariff.docx").unwrap(),
+            vec![Some(TARIFF_ROWS_JSON.to_string())]
+        );
+    }
+
+    /// feature-66 X1 (R7.7, review fix round 1): a re-read whose row another writer rehashed
+    /// *before* stage one read it -- the watcher indexed newer bytes with the same text -- holds
+    /// a hash that is not the entry's. The column is not written from the older bytes; the
+    /// document is a changed-during-read skip, left unsettled.
+    #[test]
+    fn a_reparse_does_not_write_table_rows_under_a_hash_that_is_not_the_entrys() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("f66-x1-prehash");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let bytes = table_docx();
+        let entry = docx_entry(&dir.0, "tariff.docx", &bytes);
+        let chunks = parse_doc(&registry, "docx", "tariff.docx", &bytes).chunks;
+        write_row(&db, "tariff.docx", &entry.hash, &chunks);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE documents SET content_hash = 'hash-another-writer-left' WHERE path = ?1",
+                ["tariff.docx"],
+            )
+            .unwrap();
+        assert_eq!(
+            reindex(&db, &registry, &entry, Reindex::Reparse),
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.chunk_table_rows_for_path("tariff.docx").unwrap(),
+            vec![None],
+            "nothing written"
+        );
+        assert_eq!(
+            db.get_document_hash("tariff.docx").unwrap().as_deref(),
+            Some("hash-another-writer-left")
+        );
+    }
+
+    /// feature-66 (carried from Task 3's review): [`Database::update_chunk_table_rows`] writes each entry's
+    /// JSON by chunk position, `None` as NULL, and a path with no document row is a silent
+    /// no-op, as [`Database::update_chunk_code_meta`] is.
+    #[test]
+    fn update_chunk_table_rows_writes_by_position_and_ignores_an_unknown_path() {
+        let db = reparse_db();
+        let registry = docx_registry();
+        let one = parse_doc(
+            &registry,
+            "md",
+            "ledger.md",
+            b"# Ledger\n\nfirst ledger notes\n",
+        )
+        .chunks;
+        let chunks = vec![one[0].clone(), one[0].clone()];
+        write_row(&db, "ledger.md", "h", &chunks);
+        let spans = [crate::parser::row_span(1, 2, 7)];
+        db.update_chunk_table_rows("ledger.md", &[None, Some(&spans[..])])
+            .unwrap();
+        assert_eq!(
+            db.chunk_table_rows_for_path("ledger.md").unwrap(),
+            vec![None, Some(r#"[{"table":1,"start":2,"end":7}]"#.to_string())]
+        );
+        db.update_chunk_table_rows("ledger.md", &[Some(&[][..]), None])
+            .unwrap();
+        assert_eq!(
+            db.chunk_table_rows_for_path("ledger.md").unwrap(),
+            vec![Some("[]".to_string()), None]
+        );
+        db.update_chunk_table_rows("absent.md", &[Some(&spans[..])])
+            .unwrap();
+        assert!(
+            db.chunk_table_rows_for_path("absent.md")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.chunk_table_rows_for_path("ledger.md").unwrap(),
+            vec![Some("[]".to_string()), None],
+            "another document's rows are untouched"
+        );
+    }
+
+    /// feature-66 (final review): a `.docx` whose chunks all carry `None` (an offset past `u32`)
+    /// still gets a decision, so a stored non-NULL column is written NULL -- through the meta
+    /// update that stores a new hash and through the re-read alike -- rather than left behind.
+    /// A Markdown document's all-`None` chunks still decide nothing.
+    #[test]
+    fn a_docx_with_no_computed_table_rows_has_its_column_written_null() {
+        use crate::parser::docx::fixture::table_docx;
+        let db = reparse_db();
+        let registry = docx_registry();
+        let mut parsed = parse_doc(&registry, "docx", "tariff.docx", &table_docx());
+        for chunk in &mut parsed.chunks {
+            chunk.table_rows = None;
+        }
+        let before = [crate::parser::row_span(0, 0, 5)];
+        let declared = DeclaredSet::Known {
+            list: &[],
+            pass: None,
+            generation: "[]",
+        };
+
+        write_row(&db, "edited.docx", "hash-before-the-edit", &parsed.chunks);
+        db.update_chunk_table_rows("edited.docx", &[Some(&before[..])])
+            .unwrap();
+        let decision = decide_table_rows(&db, "edited.docx", &parsed.chunks)
+            .unwrap()
+            .expect("a docx row decides even with no computed rows");
+        assert!(!decision.matches);
+        let entry = mk_entry("edited.docx", "hash-after-the-edit");
+        let result = write_matching_chunks_meta(
+            &db,
+            &entry,
+            &parsed,
+            Some(&decision),
+            ContextMode::Off,
+            declared,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(result, Some(SingleResult::Updated { .. })));
+        assert_eq!(
+            db.get_document_hash("edited.docx").unwrap().as_deref(),
+            Some("hash-after-the-edit")
+        );
+        assert_eq!(
+            db.chunk_table_rows_for_path("edited.docx").unwrap(),
+            vec![None]
+        );
+
+        write_row(&db, "reread.DOCX", "hash-of-these-bytes", &parsed.chunks);
+        db.update_chunk_table_rows("reread.DOCX", &[Some(&before[..])])
+            .unwrap();
+        let decision = decide_table_rows(&db, "reread.DOCX", &parsed.chunks)
+            .unwrap()
+            .expect("the extension is compared without case");
+        let result = write_reparsed_table_rows(
+            &db,
+            "reread.DOCX",
+            &decision,
+            &parsed.chunks,
+            ContextMode::Off,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, SingleResult::Unchanged);
+        assert_eq!(
+            db.chunk_table_rows_for_path("reread.DOCX").unwrap(),
+            vec![None]
+        );
+
+        let md = parse_doc(&registry, "md", "notes.md", b"# Notes\n\nplain notes\n").chunks;
+        write_row(&db, "notes.md", "h", &md);
+        assert!(decide_table_rows(&db, "notes.md", &md).unwrap().is_none());
+    }
+
+    /// feature-66 X2 (AC25): the two notices for a stale table-rows key alone name the count and
+    /// the change, open as the earlier notices do, and are ASCII, since they go to stderr.
+    #[test]
+    fn the_rows_notices_count_the_documents_in_ascii() {
+        let docx = docx_rows_reread_notice(3);
+        assert_eq!(
+            docx,
+            "Re-reading 3 unchanged .docx document(s) once: table rows are now marked in each chunk; only documents whose sections change are re-embedded"
+        );
+        let pptx = pptx_rows_reread_notice(3);
+        assert_eq!(
+            pptx,
+            "Re-reading 3 unchanged .pptx document(s) once: table rows are now marked in each chunk; only documents whose slides change are re-embedded"
+        );
+        assert!(docx.is_ascii() && pptx.is_ascii());
+        assert_eq!(DOCX_TABLE_ROWS_POLICY, "row-spans");
+        assert_eq!(PPTX_TABLE_ROWS_POLICY, "row-spans");
     }
 }

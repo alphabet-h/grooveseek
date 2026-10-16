@@ -395,6 +395,58 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.docx_table_rows_policy` (feature-66): whether the `.docx` chunks of this index
+    /// carry their table rows (`chunks.table_rows`), recorded by
+    /// [`crate::indexer::rebuild_index`] after the other `.docx` keys. `None` = never recorded,
+    /// which is every index written before the column.
+    pub fn read_docx_table_rows_policy(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'docx_table_rows_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records `index_meta.docx_table_rows_policy` (feature-66), replacing any value already
+    /// there (INSERT OR REPLACE).
+    pub fn write_docx_table_rows_policy(&self, policy: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('docx_table_rows_policy', ?1)",
+            params![policy],
+        )?;
+        Ok(())
+    }
+
+    /// `index_meta.pptx_table_rows_policy` (feature-66): whether the `.pptx` chunks of this index
+    /// carry their table rows (`chunks.table_rows`), recorded by
+    /// [`crate::indexer::rebuild_index`] after `pptx_table_break_policy`. `None` = never
+    /// recorded, which is every index written before the column.
+    pub fn read_pptx_table_rows_policy(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'pptx_table_rows_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records `index_meta.pptx_table_rows_policy` (feature-66), replacing any value already
+    /// there (INSERT OR REPLACE).
+    pub fn write_pptx_table_rows_policy(&self, policy: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('pptx_table_rows_policy', ?1)",
+            params![policy],
+        )?;
+        Ok(())
+    }
+
     /// `index_meta.declared_fields` (feature-58): the sorted JSON array of key
     /// names `groove-schema.toml` declared when the index was last completed.
     /// `None` = never recorded, which is every index written before 1.9.0.
