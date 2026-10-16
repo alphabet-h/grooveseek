@@ -72,7 +72,8 @@ ADR-0028 と ADR-0029 は schema を変えずに、policy key で既存の索引
 - **見直す時**: `.docx` に同じ種類の 5 本目の key が要る時、3 つ目の形式に追いつきが要る時、または
   chunk ごとの列が 2 つ目に要る時。
 - **test が守る場所**: `grooveseek/src/parser/docx.rs`、`grooveseek/src/parser/pptx.rs`、
-  `grooveseek/src/parser/ooxml.rs` (範囲)、`grooveseek/src/db.rs` (列、読む時の検査、key)、
+  `grooveseek/src/parser/ooxml.rs` (範囲)、`grooveseek/src/parser/mod.rs`
+  (`table_rows_fit`、範囲が通る検査)、`grooveseek/src/db.rs` (列、読む時の検査、key)、
   `grooveseek/src/indexer.rs` (列だけの書き込みと読み直し、告知)、
   `grooveseek/tests/index_table_rows_policy.rs` (run)。
 

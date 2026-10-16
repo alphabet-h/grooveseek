@@ -91,7 +91,8 @@ For the catch-up:
 - **Revisit when** `.docx` needs a fifth key of this kind, a third format needs a
   catch-up, or a second per-chunk column is needed.
 - **Tests hold it**: `grooveseek/src/parser/docx.rs`, `grooveseek/src/parser/pptx.rs`
-  and `grooveseek/src/parser/ooxml.rs` (the spans), `grooveseek/src/db.rs` (the
+  and `grooveseek/src/parser/ooxml.rs` (the spans), `grooveseek/src/parser/mod.rs`
+  (`table_rows_fit`, the check a span must pass), `grooveseek/src/db.rs` (the
   column, the read check, the keys), `grooveseek/src/indexer.rs` (the
   column-only write and its recheck, the notices) and
   `grooveseek/tests/index_table_rows_policy.rs` (the runs).
