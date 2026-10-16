@@ -149,12 +149,12 @@ pub struct Chunk {
 
 /// (feature-66) Where one table row's line sits in a chunk's `content`.
 ///
-/// `[start, end)` in bytes, on char boundaries, the row's trailing `\n` left out. `table` numbers
-/// the tables of the chunk in the order each first appears, from 0; a table that wrote no row
-/// takes no number, and a table split across chunks is numbered in each. The text inside a span
-/// is the row's line as the parser wrote it: its fields joined with a tab, so a tab inside a cell
-/// cannot be told from a field boundary there, and a newline in a cell's own text stays inside
-/// the span.
+/// From [`Self::start`] up to, not including, [`Self::end`] in bytes, on char boundaries, the
+/// row's trailing `\n` left out. [`Self::table`] numbers the tables of the chunk in the order
+/// each first appears, from 0; a table that wrote no row takes no number, and a table split
+/// across chunks is numbered in each. The text inside a span is the row's line as the parser
+/// wrote it: its fields joined with a tab, so a tab inside a cell cannot be told from a field
+/// boundary there, and a newline in a cell's own text stays inside the span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TableRowSpan {
     /// The table's number in the chunk.

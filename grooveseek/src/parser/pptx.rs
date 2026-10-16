@@ -2034,7 +2034,7 @@ mod tests {
     }
 
     /// feature-66 P11 (AC10, pptx): a slide without a table marks no row, and the fallback
-    /// `parse` over extracted text leaves the rows not computed.
+    /// [`crate::parser::Parser::parse`] over extracted text leaves the rows not computed.
     #[test]
     fn a_pptx_without_a_table_marks_no_row_and_the_fallback_marks_none() {
         assert_eq!(

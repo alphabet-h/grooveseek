@@ -344,8 +344,8 @@ impl Database {
         Ok(out)
     }
 
-    /// (feature-66) `chunks.table_rows` of `path`'s chunks in chunk_index order, as stored: the
-    /// JSON text, or `None` for NULL (not computed). Read beside
+    /// (feature-66) `chunks.table_rows` of the given document's chunks in chunk_index order, as
+    /// stored: the JSON text, or `None` for NULL (not computed). Read beside
     /// [`Self::chunk_texts_for_path`], whose signature tests pin, to decide whether that column
     /// alone needs writing.
     pub fn chunk_table_rows_for_path(&self, path: &str) -> Result<Vec<Option<String>>> {

@@ -529,7 +529,7 @@ fn push_intra_paragraph_separator(local_name: &[u8], para_text: &mut String) {
 /// heading), that heading's chunk level, the headings above it when it was read, and its
 /// body paragraphs, each trimmed, joined by `\n`.
 ///
-/// (feature-66) `spans` says where in `body` each table row's line went
+/// (feature-66) [`Self::spans`] says where in [`Self::body`] each table row's line went
 /// ([`push_table_line`]).
 struct DocxSection {
     heading: Option<String>,
@@ -3802,7 +3802,7 @@ mod tests {
     }
 
     /// feature-66 P11 (AC10, docx): a document without a table marks no row, and the fallback
-    /// `parse` over extracted text leaves the rows not computed.
+    /// [`crate::parser::Parser::parse`] over extracted text leaves the rows not computed.
     #[test]
     fn a_docx_without_a_table_marks_no_row_and_the_fallback_marks_none() {
         let doc = parse_raw_both(&format!(

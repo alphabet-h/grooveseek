@@ -466,9 +466,10 @@ pub(crate) fn row_line(fields: &[String]) -> Option<String> {
     }
 }
 
-/// (feature-66) A table row's line in a body as a parser wrote it: `[start, end)` in bytes and
-/// the number of its table in the document (`.docx`) or slide (`.pptx`) as read, before
-/// [`chunk_table_rows`] numbers the tables per chunk.
+/// (feature-66) A table row's line in a body as a parser wrote it: from [`Self::start`] up to,
+/// not including, [`Self::end`] in bytes, and the number of its table ([`Self::table`]) in the
+/// document (`.docx`) or slide (`.pptx`) as read, before [`chunk_table_rows`] numbers the tables
+/// per chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawRowSpan {
     pub(crate) table: usize,
@@ -499,9 +500,9 @@ pub(crate) fn push_row_line(
 }
 
 /// (feature-66) The [`crate::parser::Chunk::table_rows`] of a chunk whose rows sit at `spans`:
-/// in order of `start`, each table renumbered by the order it first appears in the chunk, from
-/// 0, so a table that wrote no row, or wrote its rows into another chunk, leaves no gap. `None`
-/// when an offset or a number does not fit a `u32`: not computed, rather than wrong.
+/// in order of [`RawRowSpan::start`], each table renumbered by the order it first appears in the
+/// chunk, from 0, so a table that wrote no row, or wrote its rows into another chunk, leaves no
+/// gap. `None` when an offset or a number does not fit a `u32`: not computed, rather than wrong.
 pub(crate) fn chunk_table_rows(spans: &[RawRowSpan]) -> Option<Vec<super::TableRowSpan>> {
     let mut ordered = spans.to_vec();
     ordered.sort_by_key(|span| span.start);
@@ -793,7 +794,8 @@ mod tests {
     }
 
     /// feature-66 (R1.2): tables are renumbered per chunk by first appearance, in the order of
-    /// `start`, whatever their raw numbers; a nested table's number need not grow monotonically.
+    /// [`RawRowSpan::start`], whatever their raw numbers; a nested table's number need not grow
+    /// monotonically.
     #[test]
     fn chunk_table_rows_numbers_tables_by_first_appearance() {
         use crate::parser::row_span;

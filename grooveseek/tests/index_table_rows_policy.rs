@@ -4,8 +4,8 @@
 //! beside the earlier ones (ADR-0030). The chunk text never changes, so nothing is re-embedded.
 //!
 //! Each test drives a knowledge base of generated files against the mock endpoint of
-//! [`crate::common::embed_cli`], so nothing downloads a model. The helpers of
-//! `tests/index_pptx_table_policy.rs` are private to that file, so the ones needed here are
+//! [`crate::common::embed_cli`], so nothing downloads a model. The helpers of the `.pptx`
+//! table-policy integration test are private to that test crate, so the ones needed here are
 //! repeated rather than opened up, which would edit it. The file names, the slide text and the
 //! cells share no word.
 
@@ -544,8 +544,8 @@ const HERMETIC_CHILD: &str = "GROOVE_F66_HERMETIC_CHILD";
 /// [`common::embed_mock::hermetic`] pins. `true` in the parent, after the child passed exactly
 /// one test; `false` in the child.
 ///
-/// Copy of the helper of the same name in `tests/index_pptx_table_policy.rs`, whose copy is
-/// private to that file.
+/// Copy of the helper of the same name in the `.pptx` table-policy integration test, whose
+/// copy is private to that test crate.
 fn run_in_hermetic_child(name: &str) -> bool {
     if std::env::var_os(HERMETIC_CHILD).is_some() {
         return false;
@@ -571,7 +571,7 @@ fn run_in_hermetic_child(name: &str) -> bool {
 }
 
 /// [`grooveseek::indexer::rebuild_index`] over `fx` under its `groove.toml`, wired the way
-/// `groove index` wires it, reporting to `progress`.
+/// `groove index` wires it, reporting to the given reporter.
 fn rebuild_in_process(fx: &Fixture, progress: ProgressReporter) -> anyhow::Result<IndexResult> {
     let kb = fx.kb();
     let cfg = Config::load_from(&fx.config).expect("load groove.toml");

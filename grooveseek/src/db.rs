@@ -161,10 +161,10 @@ pub struct SearchResult {
     pub table_rows: Option<Vec<TableRowSpan>>,
 }
 
-/// (feature-66) The [`SearchResult::table_rows`] of a chunk whose `chunks.table_rows` is `raw`
-/// and whose text is `content`: the decoded spans, or `None` (not computed) for NULL, for a
-/// value that is not a JSON array of spans, and for spans that do not fit `content`
-/// ([`crate::parser::table_rows_fit`]). Never an error: an unusable value must not stop a
+/// (feature-66) The [`SearchResult::table_rows`] of a chunk, from its stored `chunks.table_rows`
+/// text (the first argument) and its text `content`: the decoded spans, or `None` (not
+/// computed) for NULL, for a value that is not a JSON array of spans, and for spans that do not
+/// fit `content` ([`crate::parser::table_rows_fit`]). Never an error: an unusable value must not stop a
 /// search, and a reader given `None` falls back to its own reading.
 pub(crate) fn table_rows_for(raw: Option<&str>, content: &str) -> Option<Vec<TableRowSpan>> {
     let spans: Vec<TableRowSpan> = serde_json::from_str(raw?).ok()?;
