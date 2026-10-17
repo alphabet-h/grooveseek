@@ -52,8 +52,10 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    両方を user に見せる (止まる条件 4)。`mcp__kuriya__status` が呼べない / エラーを返す時は止まらず、
    Phase 1 の報告に「kuriya 未接続、突き合わせ未実施」と 1 行書いて handoff だけで続ける
 6. **repo 状態を見る** — root は `git -C <repo root の絶対パス> status --short --branch`、続けて nested repo の
-   `git -C <repo root の絶対パス>/.dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
-   commit し忘れていればここでしか分からない)。**root にも `-C` を付ける** — project root での素の `git` は hook が `-C` を足して通すが、それ以外の cwd では deny する
+   `git -C <repo root の絶対パス>/.dev status --short --branch -- . ':(exclude)desktop'` (root の status は `.dev/` を見ない。前 session が handoff を
+   commit し忘れていればここでしか分からない)。**`.dev/desktop/` 配下は grooveseek-desktop の session の持ち物なので条件 3 に入れない** —
+   `git -C <repo root の絶対パス>/.dev status --short -- desktop` を打って Phase 1 の repo 状態に表示するだけで、止まらない
+   (desktop の書きかけ handoff で止まらないため。2026-10-17 の一時措置: grooveseek-desktop の `.dev` を独立 repo に移したら消す)。**root にも `-C` を付ける** — project root での素の `git` は hook が `-C` を足して通すが、それ以外の cwd では deny する
    (cwd は呼び出しを跨いで残り、`.dev` が nested repo なので、cwd 依存の git は黙って別 repo の答えを返す)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
    step 4 で読んだ handoff (遡った分も含む)、または FOCUS 行の `repo=<絶対パス>` が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
@@ -133,7 +135,7 @@ prompt に**書かないもの**: system prompt の引用や、内部の思考�
 
 1. **前提が欠けている** (`.dev/` が無い、または private repo ではない = この checkout では動かない)
 2. **鎖が切れている、または末端 script が失敗した** (Phase 0 step 3 が exit 0 以外、または step 4 の遡り先が無い / 循環する)
-3. **想定外の git state** (root または `.dev` の uncommitted changes / 別 branch / handoff か FOCUS の `repo=` が挙げた repo の path が無い、git が失敗する)
+3. **想定外の git state** (root または `.dev` (`desktop/` 配下を除く) の uncommitted changes / 別 branch / handoff か FOCUS の `repo=` が挙げた repo の path が無い、git が失敗する)
 4. **handoff と kuriya の食い違い** (kuriya 未接続は含まない — その時は報告して続ける)
 5. **focus が「★ 次にやること」と矛盾する** (別件は矛盾ではない — focus に着手する)
 
