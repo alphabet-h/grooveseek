@@ -73,10 +73,13 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
    無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
    ```bash
    case "$(git -C .dev rev-parse --show-toplevel)" in
-     */.dev) git -C .dev add -A && git -C .dev commit -F <msgfile> && git -C .dev push ;;
+     */.dev) git -C .dev add -A -- . ':(exclude)desktop' && git -C .dev commit -F <msgfile> && git -C .dev push ;;
      *) echo "ABORT: .dev is not its own repository; see the preconditions" >&2; exit 1 ;;
    esac
    ```
+   `add` は `.dev/desktop/` を除く (grooveseek-desktop の session の書きかけ handoff を巻き込まないため。2026-10-17 の一時措置:
+   grooveseek-desktop の `.dev` を独立 repo に移したら `add -A` に戻す)。`desktop/` 配下に既に stage 済みの変更があれば
+   commit に乗るので、`git -C .dev diff --cached --name-only` に `desktop/` が出ないことを commit の前に見る。
    `.dev` の pre-push hook (`.dev/tools/hooks/pre-push`) が step 2 と同じ script を打ち、末端が 1 本でなければ push を
    止める。**止まったら handoff に marker を足して push し直す。`--no-verify` で迂回しない** — 迂回した push は次 session の
    入口をそのまま塞ぐ。**commit か push がそれ以外の理由 (network / 認証 / 別の hook) で失敗したら step 4 へ進まない** —
