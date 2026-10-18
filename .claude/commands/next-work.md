@@ -65,7 +65,10 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    `git -C <path> status --short --branch` を打って Phase 1 の repo 状態に書くが、条件 3 に入れない (相手の session の
    書きかけで止まらないため)。README は `<repo root の絶対パス>/../grooveseek-shared/README.md` で開く。README が無い・読めない・
    `## 兄弟 repo` 節が無い時は止まらず、Phase 1 に「兄弟 repo の一覧が読めない (path と理由)」と警告を書き、handoff が挙げた
-   別の repo は上の既定どおり条件 3 に入れる (`grooveseek-shared` 自身は README に依らず表示のみのまま)
+   別の repo は上の既定どおり条件 3 に入れる (`grooveseek-shared` 自身は README に依らず表示のみのまま)。
+   **例外: FOCUS 行の `repo=` が名指しした repo は、兄弟 repo でも `grooveseek-shared` でも表示のみにしない** — user が
+   着手先として選んだ repo なので、上の既定どおり条件 3 に入れる (dirty な checkout で Phase 2 を始めない)。handoff が
+   名前で挙げただけの兄弟 repo は表示のみのまま
    **FOCUS 行から repo を取るのは `repo=` の語だけ** — `repo=` は 1 つまで。値を囲む引用符は外し、残りをそのまま
    `git -C` の 1 引数に渡す (path の形は判定しない。`repo=` が 2 つ以上なら「focus の repo は未確認」扱いで Phase 1 に書く。
    存在しなければ上の条件 3)。`repo=` が無い focus (例: `gate GUI`) は path を推測せず、Phase 1 で
@@ -140,7 +143,7 @@ prompt に**書かないもの**: system prompt の引用や、内部の思考�
 
 1. **前提が欠けている** (`.dev/` が無い、または private repo ではない = この checkout では動かない)
 2. **鎖が切れている、または末端 script が失敗した** (Phase 0 step 3 が exit 0 以外、または step 4 の遡り先が無い / 循環する)
-3. **想定外の git state** (root または `.dev` の uncommitted changes / 別 branch / handoff か FOCUS の `repo=` が挙げた repo の path が無い、git が失敗する。README の兄弟 repo と grooveseek-shared は表示のみなので除く)
+3. **想定外の git state** (root または `.dev` の uncommitted changes / 別 branch / handoff か FOCUS の `repo=` が挙げた repo の path が無い、git が失敗する。README の兄弟 repo と grooveseek-shared は表示のみなので除く。ただし FOCUS の `repo=` が名指ししたものは除かない)
 4. **handoff と kuriya の食い違い** (kuriya 未接続は含まない — その時は報告して続ける)
 5. **focus が「★ 次にやること」と矛盾する** (別件は矛盾ではない — focus に着手する)
 
