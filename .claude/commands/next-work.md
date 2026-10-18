@@ -52,15 +52,23 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    両方を user に見せる (止まる条件 4)。`mcp__kuriya__status` が呼べない / エラーを返す時は止まらず、
    Phase 1 の報告に「kuriya 未接続、突き合わせ未実施」と 1 行書いて handoff だけで続ける
 6. **repo 状態を見る** — root は `git -C <repo root の絶対パス> status --short --branch`、続けて nested repo の
-   `git -C <repo root の絶対パス>/.dev status --short --branch -- . ':(exclude)desktop'` (root の status は `.dev/` を見ない。前 session が handoff を
-   commit し忘れていればここでしか分からない)。**`.dev/desktop/` 配下は grooveseek-desktop の session の持ち物なので条件 3 に入れない** —
-   `git -C <repo root の絶対パス>/.dev status --short -- desktop` を打って Phase 1 の repo 状態に表示するだけで、止まらない
-   (desktop の書きかけ handoff で止まらないため。2026-10-17 の一時措置: grooveseek-desktop の `.dev` を独立 repo に移したら消す)。**root にも `-C` を付ける** — project root での素の `git` は hook が `-C` を足して通すが、それ以外の cwd では deny する
+   `git -C <repo root の絶対パス>/.dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
+   commit し忘れていればここでしか分からない)。root と `.dev` のどちらも、branch が main のままの
+   `## main...origin/main [ahead N]` (未 push の commit があるだけ) は uncommitted でも想定外の branch でもないので
+   条件 3 に入れず、Phase 1 の repo 状態に「`[ahead N]` は main のままで uncommitted でもないので条件 3 に入らない」と 1 行書く。**root にも `-C` を付ける** — project root での素の `git` は hook が `-C` を足して通すが、それ以外の cwd では deny する
    (cwd は呼び出しを跨いで残り、`.dev` が nested repo なので、cwd 依存の git は黙って別 repo の答えを返す)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
    step 4 で読んだ handoff (遡った分も含む)、または FOCUS 行の `repo=<絶対パス>` が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
    uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
    その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない。
+   **ただし shared/README.md の `## 兄弟 repo` に挙げた repo (handoff 鎖を分けた相手) と `grooveseek-shared` 自身は表示のみ** —
+   `git -C <path> status --short --branch` を打って Phase 1 の repo 状態に書くが、条件 3 に入れない (相手の session の
+   書きかけで止まらないため)。README は `<repo root の絶対パス>/../grooveseek-shared/README.md` で開く。README が無い・読めない・
+   `## 兄弟 repo` 節が無い時は止まらず、Phase 1 に「兄弟 repo の一覧が読めない (path と理由)」と警告を書き、handoff が挙げた
+   別の repo は上の既定どおり条件 3 に入れる (`grooveseek-shared` 自身は README に依らず表示のみのまま)。
+   **例外: FOCUS 行の `repo=` が名指しした repo は、兄弟 repo でも `grooveseek-shared` でも表示のみにしない** — user が
+   着手先として選んだ repo なので、上の既定どおり条件 3 に入れる (dirty な checkout で Phase 2 を始めない)。handoff が
+   名前で挙げただけの兄弟 repo は表示のみのまま
    **FOCUS 行から repo を取るのは `repo=` の語だけ** — `repo=` は 1 つまで。値を囲む引用符は外し、残りをそのまま
    `git -C` の 1 引数に渡す (path の形は判定しない。`repo=` が 2 つ以上なら「focus の repo は未確認」扱いで Phase 1 に書く。
    存在しなければ上の条件 3)。`repo=` が無い focus (例: `gate GUI`) は path を推測せず、Phase 1 で
@@ -99,7 +107,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 | `sonnet` | `general-purpose` | テスト実行と報告 (cargo を打つので下の定型を読ませる) |
 | `haiku` | `reader` | 読み取りだけ: grep / ファイル一覧 / 状態確認 / リンク切れ確認 |
 
-`implementer` / `reviewer` / `doc-writer` / `reader` は `.claude/agents/*.md` の project subagent で、下の定型 5 項を
+`implementer` / `reviewer` / `doc-writer` / `reader` は project subagent (agent 定義) で、下の定型 5 項を
 skill として preload する。**`model` は agent 定義の `model:` と同じ値を明示する** (明示した `model` は agent 定義に勝つ。値を揃えておけば
 どちらが効いても同じ)。**fallback**: `subagent_type` が解決しない時 (anthropics/claude-code#59881 / #88023 — project agent が
 見つからない / `/compact` 後に消える) は `general-purpose` + `model` 明示 + 下の定型を読ませる指示を prompt に書く。
@@ -108,13 +116,13 @@ skill として preload する。**`model` は agent 定義の `model:` と同�
 **段の上端は `opus`** — 能力のために `fable` へは上げない (Claude Code 2.1.280 以降の `opus` が解決する
 Opus 5.5 は公表ベンチマークで Fable 5.1 を上回る。それより前の版では `opus` は Opus 5 に解決され、表はそのまま動く)。`fable` を使うのは user が指示した時だけ (Opus 枠 / Sonnet 枠の使用量が尽きた時の逃げ道)。
 表は alias で書いてあり、解決先は Claude Code の版で動く。段ごとの根拠と見直しの trigger (Sonnet 5.5 /
-Haiku 5.5 の登場など) は `.dev/knowledge/subagent-model-tiers-opus-5-5.md`。
+Haiku 5.5 の登場など) は `.dev/knowledge/subagent-model-tiers-opus-5-5.md` (KB の記録。DT には無い)。
 
 subagent の effort は Agent tool では指定できない (docs では、agent 定義の `effort:` が無ければ session の値を継承する)。
 **session と subagent のモデルが違う時** (Fable の controller から `opus` を起こす等) に、session の値と subagent の
 モデルの `modelSettings` のどちらが効くかは未確認 — controller の effort を変えれば subagent の effort も変わる、とは決めてかからない。
 
-subagent が**毎回守る定型** (抜けた分だけ subagent が踏む): 定型 5 項の家は `.claude/skills/house-rules/SKILL.md`。
+subagent が**毎回守る定型** (抜けた分だけ subagent が踏む): 定型 5 項の家は skill `house-rules`。
 project agent (`implementer` / `reviewer` / `doc-writer` / `reader`) は `skills:` で preload する。fallback の
 `general-purpose` には prompt の最初に『Skill tool で `house-rules` を読んでから始める』と書く。
 
@@ -135,7 +143,7 @@ prompt に**書かないもの**: system prompt の引用や、内部の思考�
 
 1. **前提が欠けている** (`.dev/` が無い、または private repo ではない = この checkout では動かない)
 2. **鎖が切れている、または末端 script が失敗した** (Phase 0 step 3 が exit 0 以外、または step 4 の遡り先が無い / 循環する)
-3. **想定外の git state** (root または `.dev` (`desktop/` 配下を除く) の uncommitted changes / 別 branch / handoff か FOCUS の `repo=` が挙げた repo の path が無い、git が失敗する)
+3. **想定外の git state** (root または `.dev` の uncommitted changes / 別 branch / handoff か FOCUS の `repo=` が挙げた repo の path が無い、git が失敗する。README の兄弟 repo と grooveseek-shared は表示のみなので除く。ただし FOCUS の `repo=` が名指ししたものは除かない)
 4. **handoff と kuriya の食い違い** (kuriya 未接続は含まない — その時は報告して続ける)
 5. **focus が「★ 次にやること」と矛盾する** (別件は矛盾ではない — focus に着手する)
 
@@ -146,6 +154,6 @@ prompt に**書かないもの**: system prompt の引用や、内部の思考�
 
 - `.dev/README.md` (= handoff 鎖の規約と `.dev/tools/handoff_tail.ps1`、`knowledge/` の運用)
 - `CLAUDE.local.md` の「feature-flow の常時 guardrail」節 (= 本 command の常時 guardrail)
-- `.claude/commands/feature-flow.md` (= 着手先が新 feature cycle だった場合の渡し先)
+- `/feature-flow` command (= 着手先が新 feature cycle だった場合の渡し先)
 - memory `feedback_fable_controller_opus_subagents` (= Phase 2 のモデル振り分けの出所)
-- `.dev/knowledge/subagent-model-tiers-opus-5-5.md` (= 各段がそのモデルである根拠、alias の解決先、見直しの trigger)
+- `.dev/knowledge/subagent-model-tiers-opus-5-5.md` (KB の記録。DT には無い) (= 各段がそのモデルである根拠、alias の解決先、見直しの trigger)

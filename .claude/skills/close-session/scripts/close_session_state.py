@@ -6,6 +6,10 @@ has no `.dev` directory, so this wrapper prints a skip line and exits 0 there.
 A `.dev` that exists without the delegate is a broken owner setup (for
 example an older `.dev` revision), not a public clone: that is an error.
 
+`--root <path>` names the repo root. The wrapper takes it out of argv and
+does not pass it on. Without it the root is four levels above this file,
+which holds when the skill sits in the repo's own skills dir.
+
 Exit codes:
   0   no `.dev` directory (skip line printed), or the delegate ran and
       exited 0.
@@ -20,7 +24,8 @@ Exit codes:
   n   the delegate exited n != 0 (crash, interpreter error, killed): the
       last line is `wrapper: delegate exit n` and this wrapper exits n
       (1 if n is outside 0-255). State is incomplete; the caller must stop.
-  2   unexpected wrapper error: `wrapper: error <ExcType>: <message>`.
+  2   unexpected wrapper error, `--root` without a path (or followed by an
+      option), or `--root` given twice: `wrapper: error <ExcType>: <message>`.
 
 The delegate itself exits 0 by its own contract and reports per-item
 failures as `exit:` lines, so a non-zero exit here means it could not even
@@ -79,10 +84,46 @@ def _nested_repo_problem(dev):
     return None
 
 
+def _take_root(argv):
+    """Split `--root <path>` (or `--root=<path>`) out of argv.
+
+    Returns (root or None, the rest of argv). The rest goes to the
+    delegate, which does not know `--root`.
+    """
+    root = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--root" or arg.startswith("--root="):
+            if root is not None:
+                raise ValueError("--root given more than once")
+            if arg == "--root":
+                # an option in the value slot means the path was left out
+                if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                    raise ValueError("--root needs a path")
+                root = argv[i + 1]
+                i += 2
+            else:
+                root = arg[len("--root="):]
+                i += 1
+            continue
+        rest.append(arg)
+        i += 1
+    if root is not None and not root:
+        raise ValueError("--root needs a path")
+    return root, rest
+
+
 def main():
-    # .claude/skills/close-session/scripts/ -> repo root is four levels up.
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
+    given, rest = _take_root(sys.argv[1:])
+    if given is not None:
+        root = os.path.abspath(given)
+    else:
+        # this skill's scripts/ dir -> four levels up is the repo root when
+        # the skill sits in a repo's own skills dir.
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
     dev = os.path.join(root, ".dev")
     delegate = os.path.join(dev, "tools", "close_session_state.py")
     if not os.path.isdir(dev):
@@ -96,7 +137,7 @@ def main():
         _out("wrapper: error .dev is not a nested git repository: %s\n" % problem)
         return 2
     sys.stdout.flush()
-    rc = subprocess.call([sys.executable, delegate] + sys.argv[1:], cwd=root)
+    rc = subprocess.call([sys.executable, delegate] + rest, cwd=root)
     if rc != 0:
         _out("wrapper: delegate exit %d\n" % rc)
         return rc if 0 < rc <= 255 else 1
