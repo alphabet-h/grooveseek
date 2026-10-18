@@ -45,7 +45,7 @@ powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Root <repo root の絶対
 ```
 
    `-Root` には `/next-work` の git command と同じ置き方で、この checkout の root の絶対 path を書く (無ければ script が
-   自分の置き場から求める)。exit 0 だけが成功。それ以外は script 自体の失敗なので、stdout を信用せず exit code と stderr を添えて止まる (止まる条件 2)。
+   自分の置き場から求める)。exit 0 だけが成功。exit 4 (末尾 `ROOT-REFUSED`) は `-Root` の誤りで、読み方は手順 4。それ以外は script 自体の失敗なので、stdout を信用せず exit code と stderr を添えて止まる (止まる条件 2)。
 2. **報告を user に見せる** — 空き、`target` 直下の各行と判定 (`delete` / `keep` / `report only`)、Temp の prefix ごとの件数、
    `proc-macro-srv` の表、`report only` の節。数字は script の出力をそのまま使い、丸めたり足し直したりしない。
    MODE が `apply` でなければここで終わる
@@ -70,6 +70,10 @@ powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Root <repo root の絶対
    - `2` — 削除は済んだが `cargo check` が失敗した。削除が原因とは限らない (元から壊れていた可能性がある) ので、
      check の出力を添えて報告する
    - `3` — 消し切れなかったものがある。出力の `delete failures` を添えて報告する。再実行で消しに行かない
+   - `4` で末尾が `ROOT-REFUSED` — `-Root` が存在しない、git の作業ツリーの top-level でない (サブ dir や別の dir)、
+     または git で確かめられなかった。**何も測っておらず、何も消えていない** (報告モードでも同じ code で止まる)。
+     `-Root` に渡した path を `git -C <path> rev-parse --show-toplevel` の結果と見比べて直し、打ち直す。直らなければ
+     拒否の行を添えて止まる (止まる条件 2)
 5. `proc-macro-srv` の段が「no deletion in this step」と出したら、その理由 (rust-analyzer が動いている、など) をそのまま伝える。
    飛ばされたのは設計どおりで、失敗ではない
 

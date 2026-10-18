@@ -33,6 +33,8 @@
 #        empty (an empty stdin for `-` included) / whose first line does not start
 #        with `@codex review`: `ABORT: trigger_body_file ...` + `Action: ...`;
 #        checked before any GitHub read, --dry-run included
+#      - a --root that does not exist / is not a directory / is not a git work
+#        tree: `ABORT: --root ...` + `Action: ...`; also before any GitHub read
 #      Failing to create the temporary directory (where the body snapshot lives) is
 #      exit 8, as before, also before any GitHub read
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
@@ -179,8 +181,19 @@ CODEX_SUMMARY_MARKER="codex-pull-request-review-summary"
 # The repo is --root when given, else the one the caller's cwd is in. It is
 # not resolved from this script's location: the skill may be read from a
 # checkout other than the repo under review.
+# --root の誤りは引数の誤りなので exit 2 + ASCII の ABORT / Action 行 (trigger_body_file と同じ形)。
+# GitHub を読む前なので --dry-run でも効く。git の stderr は locale 依存で非 ASCII になり得るので
+# 捨て、理由は bad_root の ASCII 行で出す (罠 52)。
+bad_root() {   # $1 = 理由
+  diag "ABORT: --root ${ROOT_ARG}: $1. Nothing was posted."
+  diag "Action: pass the checkout to review (its top level, git rev-parse --show-toplevel), or omit --root to use the cwd's repo."
+  exit 2
+}
 if [ -n "$ROOT_ARG" ]; then
-  REPO_DIR=$(git -C "$ROOT_ARG" rev-parse --show-toplevel) || exit 1
+  [ -e "$ROOT_ARG" ] || bad_root "does not exist"
+  [ -d "$ROOT_ARG" ] || bad_root "is not a directory"
+  REPO_DIR=$(git -C "$ROOT_ARG" rev-parse --show-toplevel 2>/dev/null) || bad_root "is not a git work tree"
+  [ -n "$REPO_DIR" ] || bad_root "git printed no top level"
 else
   REPO_DIR=$(git rev-parse --show-toplevel) || exit 1
 fi
