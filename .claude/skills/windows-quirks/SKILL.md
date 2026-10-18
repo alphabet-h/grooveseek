@@ -338,7 +338,7 @@ CR を落とすとは書かれていない。上の表のとおり、綺麗に�
 
 skill `codex-review` の scripts の `codex_review_round.sh` も
 **複数行の jq 出力を変数に入れている** (via:
-`grep -n '=\$(.*jq' <この skill の base directory>/../codex-review/scripts/codex_review_round.sh`
+`grep -n '=\$(.*jq' "<この skill の base directory>/../codex-review/scripts/codex_review_round.sh"`
 → `LATEST_REVIEW` / `LATEST_ISSUE_BODY` / `REVIEW_BODY` ほか。行番号は script を直すたびに動くので、この grep の出力で引く)。
 CR は変数の中に入っている。それでも壊れていないのは **`$( )` のおかげではなく**、
 (1) JSON を再び jq に食わせる経路は CR を whitespace として読み飛ばし、
