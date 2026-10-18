@@ -31,7 +31,7 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
 0. **状態を読んで、数える**
    - **最初に状態 helper を打つ** — controller が Bash tool で、**絶対 path** のまま実行する (script は cwd に依存しない):
      ```bash
-     python "<この skill の base directory>/scripts/close_session_state.py" --root <repo root の絶対パス>
+     python "<この skill の base directory>/scripts/close_session_state.py" --root "<repo root の絶対パス>"
      ```
      `<この skill の base directory>` は skill を読み込んだ時に示される dir (この file の置き場。shared から読む session では
      repo の外にある)。wrapper は `--root` を受け取って root に使い、delegate には渡さない (無ければ wrapper の 4 段上を

@@ -24,8 +24,8 @@ Exit codes:
   n   the delegate exited n != 0 (crash, interpreter error, killed): the
       last line is `wrapper: delegate exit n` and this wrapper exits n
       (1 if n is outside 0-255). State is incomplete; the caller must stop.
-  2   unexpected wrapper error, or `--root` without a path:
-      `wrapper: error <ExcType>: <message>`.
+  2   unexpected wrapper error, `--root` without a path (or followed by an
+      option), or `--root` given twice: `wrapper: error <ExcType>: <message>`.
 
 The delegate itself exits 0 by its own contract and reports per-item
 failures as `exit:` lines, so a non-zero exit here means it could not even
@@ -95,15 +95,18 @@ def _take_root(argv):
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--root":
-            if i + 1 >= len(argv):
-                raise ValueError("--root needs a path")
-            root = argv[i + 1]
-            i += 2
-            continue
-        if arg.startswith("--root="):
-            root = arg[len("--root="):]
-            i += 1
+        if arg == "--root" or arg.startswith("--root="):
+            if root is not None:
+                raise ValueError("--root given more than once")
+            if arg == "--root":
+                # an option in the value slot means the path was left out
+                if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                    raise ValueError("--root needs a path")
+                root = argv[i + 1]
+                i += 2
+            else:
+                root = arg[len("--root="):]
+                i += 1
             continue
         rest.append(arg)
         i += 1
