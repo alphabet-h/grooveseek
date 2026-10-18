@@ -16,7 +16,7 @@ TOPIC: $ARGUMENTS
 
 handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`。TOPIC が空なら、この session の主題を短い kebab-case で controller が決め、step 6 の通知に書く。
 
-本文の「前提の節」は `.claude/commands/feature-flow.md` の `## 前提` 節、「Phase 7 step 7」は同じ file の Phase 7 を指す。
+本文の「前提の節」は `/feature-flow` command の `## 前提` 節、「Phase 7 step 7」は同じ command の Phase 7 を指す。
 
 ## しないこと
 
@@ -31,9 +31,11 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
 0. **状態を読んで、数える**
    - **最初に状態 helper を打つ** — controller が Bash tool で、**絶対 path** のまま実行する (script は cwd に依存しない):
      ```bash
-     python "<repo root の絶対パス>/.claude/skills/close-session/scripts/close_session_state.py"
+     python "<この skill の base directory>/scripts/close_session_state.py" --root <repo root の絶対パス>
      ```
-     `<repo root の絶対パス>` は `/next-work` の git command と同じ置き方 (`.claude/commands/next-work.md` の Phase 0) で、
+     `<この skill の base directory>` は skill を読み込んだ時に示される dir (この file の置き場。shared から読む session では
+     repo の外にある)。wrapper は `--root` を受け取って root に使い、delegate には渡さない (無ければ wrapper の 4 段上を
+     root とする後方互換)。`<repo root の絶対パス>` は `/next-work` の git command と同じ置き方 (`/next-work` command の Phase 0) で、
      この checkout の root の絶対 path を書く。出力の「状態」block (鎖の末端、`session id:` と `source:`、3 つの git status、
      deny / rewrite の集計) を**読んでから**先へ進む。
      - `wrapper: error delegate missing` は private `.dev` checkout が古いという意味。`.dev` を pull して打ち直し、続けない
@@ -41,10 +43,16 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
      - この command が 0 以外で終わった (`wrapper: delegate exit N` / `wrapper: error …` / tool error。`python` が無い、path が違う、collector が落ちた) なら、state は不完全。**止めて原因を直し、打ち直す**。0 以外のまま step 1 以降へ進まない
      - `state: skipped (no .dev checkout — …)` が出たら、この checkout では手順を回せない (owner 用)。user に 1 行で伝えて止まる (`/next-work` と同じ)
      - exit 0 で終わった run の中の各項目の `exit:` 行が 0 以外なら、その項目は読めていない (collector 自体は常に exit 0 で終わる)。鎖の末端の項目の `exit:` が 0 以外なら step 1 の「鎖が切れている」停止条件。`session id:` 行の `source:` が `env` 以外なら取得元を疑う — `guess` は最も新しい scratchpad で、別 session を数えていることがある (kuriya trap #295)
+   - helper の次に写しの差を表示する:
+     ```bash
+     python "<repo root の絶対パス>/.dev/tools/show_copy_drift.py"
+     ```
+     **表示だけ。exit も出力も止まる条件に入れない** (script は常に exit 0 で 1 行を出す)。差ありは移行中 (dev-split の
+     S1〜S5) は想定内で、handoff に「差あり (移行中、想定内)」と書く
    - 次に background task の leak を見る (`run_in_background` の polling が残っていないか。あれば `TaskStop`)
    - 次に上で読んだ「状態」の `guard_deny_by_rule.py --list` の行から controller 分の deny を選び、step 1 で書く handoff の guard 節に
    1 件ずつ `- [Rn] <target の先頭> — 判断: なし (反射) | あり (<理由>) | 不明` と書く。subagent 分は deny の場の記録が無いので
-   `判断: 不明` とまとめて 1 行で書き、後から埋めない (台帳 `.dev/knowledge/repeat-offences-ledger.md` の `判断` 列と同じ規律)。
+   `判断: 不明` とまとめて 1 行で書き、後から埋めない (台帳 `.dev/knowledge/repeat-offences-ledger.md` (KB の記録。DT には無い) の `判断` 列と同じ規律)。
    `rewrite by rule:` 行の件数 (hook が R5 / R6 を書き換えて通した数) も同じ節に書く
 
 1. **handoff doc を即時 write**: `.dev/knowledge/session-<YYYY-MM-DD>-<topic>-handoff.md`
@@ -73,13 +81,10 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
    無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
    ```bash
    case "$(git -C .dev rev-parse --show-toplevel)" in
-     */.dev) git -C .dev add -A -- . ':(exclude)desktop' && git -C .dev commit -F <msgfile> && git -C .dev push ;;
+     */.dev) git -C .dev add -A && git -C .dev commit -F <msgfile> && git -C .dev push ;;
      *) echo "ABORT: .dev is not its own repository; see the preconditions" >&2; exit 1 ;;
    esac
    ```
-   `add` は `.dev/desktop/` を除く (grooveseek-desktop の session の書きかけ handoff を巻き込まないため。2026-10-17 の一時措置:
-   grooveseek-desktop の `.dev` を独立 repo に移したら `add -A` に戻す)。`desktop/` 配下に既に stage 済みの変更があれば
-   commit に乗るので、`git -C .dev diff --cached --name-only` に `desktop/` が出ないことを commit の前に見る。
    `.dev` の pre-push hook (`.dev/tools/hooks/pre-push`) が step 2 と同じ script を打ち、末端が 1 本でなければ push を
    止める。**止まったら handoff に marker を足して push し直す。`--no-verify` で迂回しない** — 迂回した push は次 session の
    入口をそのまま塞ぐ。**commit か push がそれ以外の理由 (network / 認証 / 別の hook) で失敗したら step 4 へ進まない** —
@@ -94,7 +99,7 @@ handoff の file 名は `.dev/knowledge/session-<YYYY-MM-DD>-<TOPIC>-handoff.md`
      `/next-work` は突き合わせ無しで本 handoff から続く」
    - **繋がるが読み戻しが合わない**: もう 1 回 update して読み戻す。それでも合わなければ「kuriya goal 不一致 (update が
      反映されない)。次 session の `/next-work` は食い違いで止まる — 本 handoff を正として goal を直してから続ける」
-5. **`/next-work` の Phase 0 を自分で通してから「再開できる」と言う**。`.claude/commands/next-work.md` を開き、Phase 0 の
+5. **`/next-work` の Phase 0 を自分で通してから「再開できる」と言う**。`/next-work` command の Phase 0 を開き、その
    step 3〜6 (末端を取る / 末端を読む — 遡りを含む / kuriya と突き合わせる / repo 状態を見る) を**そこに書いてあるとおりに**
    実行する。**判定の中身 (何を一致とみなすか、どの repo を見るか、何が止まる条件か) はここに写さない** — 家は next-work で、
    写しは食い違う。step 4 で「goal 未更新 / 不一致」の 1 行を handoff に書いた場合、突き合わせが食い違うのは想定どおりで、
