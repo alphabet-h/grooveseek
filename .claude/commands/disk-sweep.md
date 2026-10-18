@@ -41,17 +41,18 @@ MODE: $ARGUMENTS
 1. **報告を取る** (何も消さない):
 
 ```powershell
-powershell -NoProfile -File .dev/tools/disk-sweep.ps1
+powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Root <repo root の絶対パス>
 ```
 
-   exit 0 だけが成功。それ以外は script 自体の失敗なので、stdout を信用せず exit code と stderr を添えて止まる (止まる条件 2)。
+   `-Root` には `/next-work` の git command と同じ置き方で、この checkout の root の絶対 path を書く (無ければ script が
+   自分の置き場から求める)。exit 0 だけが成功。それ以外は script 自体の失敗なので、stdout を信用せず exit code と stderr を添えて止まる (止まる条件 2)。
 2. **報告を user に見せる** — 空き、`target` 直下の各行と判定 (`delete` / `keep` / `report only`)、Temp の prefix ごとの件数、
    `proc-macro-srv` の表、`report only` の節。数字は script の出力をそのまま使い、丸めたり足し直したりしない。
    MODE が `apply` でなければここで終わる
 3. **MODE が `apply` の時だけ削除する**。`cargo check` を含むので数分かかる — **background で走らせ**、完了通知を待つ:
 
 ```powershell
-powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Apply
+powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Root <repo root の絶対パス> -Apply
 ```
 
 4. **exit code で読む**:
@@ -59,8 +60,8 @@ powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Apply
      `.dev` にも。`.dev` は tracked な private repo で、ここでノートに追記して止めると未 commit の変更が残り、次の
      `/next-work` がそれを想定外の git state として止まる (掃除が session の入口を塞ぐ)。かといってここで commit / push まで
      持つと、既にあった未 commit の編集を巻き込む、push が失敗する、といった分岐をこの page が抱えることになる。
-     記録は session を閉じる時の handoff が持つ (`.claude/skills/close-session/SKILL.md` の step 1 が
-     disk の数字を書かせ、`.dev` の commit / push も同じ command の step 3 にある)。履歴のノート `.dev/knowledge/target-dir-disk-hygiene.md` に
+     記録は session を閉じる時の handoff が持つ (skill `close-session` の step 1 が
+     disk の数字を書かせ、`.dev` の commit / push も同じ command の step 3 にある)。履歴のノート `.dev/knowledge/target-dir-disk-hygiene.md` (KB の記録。DT には無い) に
      その行を足すかどうかは、その時に user が決める
    - `1` で末尾が `PRECHECK-REFUSED` — 事前確認が拒否した。**何も消えていない**。理由 (走っている cargo / rustc / link、
      `target` から動いている process や scheduled task) を user に伝える。止めてよいかを決めるのは user で、
@@ -89,7 +90,7 @@ flag を足した引数は報告のみになる (上の節)。組み合わせご
 ## 関連
 
 - `.dev/tools/disk-sweep.ps1` (= 判定と順序の実体。exit code の契約は冒頭の comment)
-- `.dev/knowledge/target-dir-disk-hygiene.md` (= なぜその判定なのか、と回ごとの実測)
+- `.dev/knowledge/target-dir-disk-hygiene.md` (KB の記録。DT には無い) (= なぜその判定なのか、と回ごとの実測)
 - `.dev/tools/session-hooks/session-start.sh` (= `disk` 行と `LOW` の閾値 `GROOVE_DISK_WARN_GB`)
-- `.claude/commands/feature-flow.md` (= Phase 7 からここへ来る)
-- `.claude/skills/close-session/SKILL.md` (= step 1 の disk の数字からここへ来る)
+- `/feature-flow` command (= Phase 7 からここへ来る)
+- skill `close-session` (= step 1 の disk の数字からここへ来る)

@@ -1,7 +1,7 @@
 ---
 name: codex-review
 description: push 前に doc comment の名前を洗い、ローカルの Codex (adversarial-review) で前掃除してから、PR で `@codex review` を trigger し、3 endpoint (inline / reviews / issue) を `(id, updated_at)` set diff で同時 polling、state-base convergence + P0/P1 absence + sentinel text の 3 layer で判定、wall-clock timeout / error string detect / cost-aware retry cap で hardening したオーケストレータ
-argument-hint: [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec]
+argument-hint: [--root <repo root>] [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec]
 ---
 
 # /codex-review
@@ -11,10 +11,10 @@ detection + 結果 fetch + 整形** する。`/feature-flow` Phase 6 の sub-ste
 
 **1 round = `scripts/codex_review_round.sh` を 1 回実行する。** 実体はその script 1 本で、
 踏んだ罠の回避はすべて script の中 — **守っているコードの横のコメント**にある。
-一覧は数えずに引く: `grep -oE '罠 [0-9]+' .claude/skills/codex-review/scripts/codex_review_round.sh | sort -u`
-(番号の由来: `.dev/knowledge/codex-review-loop-pitfalls.md`)。
+一覧は数えずに引く: `grep -oE '罠 [0-9]+' "<この skill の base directory>/scripts/codex_review_round.sh" | sort -u`
+(番号の由来: `.dev/knowledge/codex-review-loop-pitfalls.md` (KB の記録。DT には無い))。
 
-引数: option `-R owner/repo` / `--dry-run` (どちらも任意、**`<PR#>` より前に置く**) と、位置引数
+引数: option `--root <repo root>` / `-R owner/repo` / `--dry-run` (どれも任意、**`<PR#>` より前に置く**) と、位置引数
 `<PR#>` 必須 / `<max_rounds>` default **3** (罠 16: 25 credits × 3) / `<per_round_timeout_sec>` default 600 (罠 9)。
 受けたものは option も位置引数も **そのまま、同じ順で script に渡す** (位置引数の 4 番目の body file は
 controller が re-review round で足す、下記)。round 番号は script が PR の `@codex review` 投稿履歴から導くので、
@@ -25,14 +25,16 @@ controller が re-review round で足す、下記)。round 番号は script が 
 
 1. `-R owner/repo` を渡せばその repo
 2. 無ければ環境変数 `GH_REPO`
-3. どちらも無ければ **script が置かれている checkout の repo** (= kb-mcp。従来どおり。cwd ではない)
+3. どちらも無ければ **script が動く checkout の repo** — `--root <repo root>` を渡せばその checkout、無ければ cwd の
+   checkout (`git rev-parse --show-toplevel`)。script の置き場からは決めない (skill を共有の checkout から読む session では、
+   置き場は対象の repo の外にある)
 
 決めた 1 つの repo を、投稿 (`gh pr comment -R`)・3 endpoint の読み取り・round の数え方 (trigger 履歴)・
 head sha の全部が使う。`-R` と `GH_REPO` が両方あって別の repo を指すと **exit 2 で何も投稿しない**。
 github.com 以外の host も exit 2。script は repo を決める前に `GH_HOST=github.com` を export するので、
 呼び出し側の `GH_HOST` が別 host を指していても読み書きは github.com に行く。PR がその repo に無ければ exit 8 (投稿前)。stderr 1 行目の
 `repo <owner/repo> / PR <url>` で、どこを見ているかを確かめる。
-#409 では `GH_REPO` を付けて打ったら投稿は別 repo の PR、読み取りは kb-mcp の同番号 PR になり、
+#409 (KB で起きた例) では `GH_REPO` を付けて打ったら投稿は別 repo の PR、読み取りは checkout の repo の同番号 PR になり、
 「baseline none」と「600 秒無応答」が出た。引数なしの `gh repo view` は `GH_REPO` を見ないので、
 script は repo を自分で解決してから `GH_REPO` に export し直している。
 
@@ -40,16 +42,16 @@ script は repo を自分で解決してから `GH_REPO` に export し直して
 `DRY_RUN repo=… pr=… url=…` / `head=… prior_triggers=… round=N/M would_stop_at_limit=…` /
 `baseline_inline=… baseline_reviews=… baseline_issues=…` を出して **投稿せずに exit 0**。round を消費しない。
 別 repo の PR に初めて向ける時は、本番の round の前に
-`bash .claude/skills/codex-review/scripts/codex_review_round.sh -R alphabet-h/grooveseek-desktop --dry-run 25`
+`bash "<この skill の base directory>/scripts/codex_review_round.sh" -R alphabet-h/grooveseek-desktop --dry-run 25`
 を 1 回打って、repo と round 番号を確かめる。
 
 **別 repo の PR では、下の 2 つの push 前の手順の扱いが変わる**:
 
-- 次節の doc comment の sweep script は **kb-mcp 専用** — kb-mcp の Rust tree の item index と
-  `AGENTS.md` の rule 5 が前提で、diff も kb-mcp の checkout で `main...HEAD` を取る。
+- 次節の doc comment の sweep script は **KB 専用** — KB の Rust tree の item index と
+  `AGENTS.md` の rule 5 が前提で、diff も KB の checkout で `main...HEAD` を取る。
   別 repo では打たない (その repo に同等の規則と道具があればそちら)
 - ローカルの Codex の前掃除は、**`--cwd` をその repo の checkout の絶対パスに、`--base` をその repo の
-  base branch に**変える。kb-mcp の checkout のまま打つと kb-mcp の diff を review する
+  base branch に**変える。今の session の checkout のまま打つと、その checkout の diff を review する
 
 ## push する前に doc comment の名前を洗う
 
@@ -57,7 +59,7 @@ codex は `AGENTS.md` の rule 5 (「tree の中にあるものを名指しす�
 **字義どおり**適用する。人間の review が認める例外 — private item は module link + 散文、
 `tests/` は rustdoc の対象外 — を codex は認めず、**round を 1 つ使って P1 で返す**。
 PR #222 / #234 / #236 / #237 で起きていて、#234 では 3 round 連続した
-(台帳 `.dev/knowledge/repeat-offences-ledger.md` の category 4)。round は `<max_rounds>` で
+(台帳 `.dev/knowledge/repeat-offences-ledger.md` (KB の記録。DT には無い) の category 4)。round は `<max_rounds>` で
 頭打ちなので、これは review に見つけさせるものではない。
 
 **打つのは、この branch を push するたび。** PR を開く直前も、review の指摘を直した後も同じで、
@@ -106,7 +108,7 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
 `sort -u | wc -l` にして `fe7ac23...70dc178` で実行) が、落ちるのは `COMPOSITE`
 = 実際に P1 を受けた形なので、絞ると意味が無くなる。script はこの理由で全 span を読む。
 
-`` [`..`] `` の path の作り方 (実測は `.dev/knowledge/comments-the-compiler-cannot-see.md`):
+`` [`..`] `` の path の作り方 (実測は `.dev/knowledge/comments-the-compiler-cannot-see.md` (KB の記録。DT には無い)):
 
 - **`//!` の中は bare 名も `self::` も解決しない。** 同じ file の item でも
   `` [`crate::db::search`] `` と絶対で書く
@@ -140,7 +142,7 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
   `tests/` crate から見た lib の `pub(crate)` item)。持ち主の module が private な nested mod で
   そこへも届かないなら、**到達できる一番近い祖先** を link する (privacy は module にも効く。
   `fallback_whole_query` が `no item named 'fts_query' in module 'db'` で落ちたのはこの形、
-  `.dev/knowledge/comments-the-compiler-cannot-see.md`)。
+  `.dev/knowledge/comments-the-compiler-cannot-see.md` (KB の記録。DT には無い))。
   散文だけで済ませてよいのは、link できる持ち主が無い場合だけ: 非 test の doc から名指した
   `#[cfg(test)] mod tests` の中の item (module 自体が rustdoc に無い) / 別の `tests/` crate の
   test fn。**item だけが `#[cfg(test)]` で gate されている** (`db.rs` の `rrf_topk`、`config.rs` の
@@ -152,12 +154,12 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
 **見えるのは追加行だけ** (`^+` で絞っている)。既存行に残った古い名前はここには出ない —
 そちらは `cargo doc` と review 側の仕事。分類の実例は
 `.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表、script の設計と tree 全体の
-計測値は `.dev/knowledge/doc-link-sweep-script.md`。
+計測値は `.dev/knowledge/doc-link-sweep-script.md` (どちらも KB の記録。DT には無い)。
 
 ## push する前にローカルの Codex で前掃除する
 
 GitHub の round は 1 回 25 credits と 10 分強を使い、fix を push するたびに P2 が返る連鎖に
-なりやすい (feature-58 / PR #291 は 15 round、内訳は `.dev/knowledge/feature-58-summary.md` の
+なりやすい (feature-58 / PR #291 は 15 round、内訳は `.dev/knowledge/feature-58-summary.md` (KB の記録。DT には無い) の
 「codex round」節)。**同じ目 (Codex CLI) に push 前の diff を見せて収束させ、GitHub は確認の
 round に使う** — 2026-09-09 の user 判断。役割は **ローカル = 明白な違反の前掃除、GitHub = 最終確認**:
 ローカルが approve でも GitHub は P2 を出す (同 summary の r7〜r9) し、focus を当てればローカルが
@@ -194,7 +196,7 @@ node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --ba
 - path は `ls | sort -V | tail -1` で解決する。`${CLAUDE_PLUGIN_ROOT}` は plugin 自身の command /
   agent の中でしか定義されず、version の directory を literal で書くと plugin の更新で外れる
 - `--model` は明示する。既定の `gpt-6-astra` は混雑で落ちることがあり、`gpt-5.3-codex*` は ChatGPT
-  アカウントで 400。通る model の表と runtime の罠は `.dev/knowledge/codex-plugin-review-model-pitfalls.md`
+  アカウントで 400。通る model の表と runtime の罠は `.dev/knowledge/codex-plugin-review-model-pitfalls.md` (KB の記録。DT には無い)
   (ここに写さない)
 - **focus は Write で file にして `"$(cat file)"` で渡す**。二重引用符の中に直接書くと backtick が
   command substitution される (`tune: command not found`、kuriya trap #159)
@@ -209,7 +211,7 @@ node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --ba
 ### focus の書き方
 
 plugin の `prompts/adversarial-review.md` の `User focus:` に差し込まれ、「weight it heavily」で読まれる。
-効いた形は 3 要素 (feature-58 の r4 / r5 と round 10 後、`.dev/knowledge/feature-58-summary.md` の
+効いた形は 3 要素 (feature-58 の r4 / r5 と round 10 後、`.dev/knowledge/feature-58-summary.md` (KB の記録。DT には無い) の
 「ローカル terra」の段落):
 
 1. **判定基準の名指し**: `AGENTS.md` の Code Review Rules と同じ基準で、P1 (壊れる) / P2 (edge case) を
@@ -238,7 +240,7 @@ severity は **`critical` / `high` / `medium` / `low`** の 4 段 (同 file の 
 
 **上限は push 1 回につき 3 round** — 打った回数で数える (approve で終わる round も、`[low]` を取り込んで
 打ち直した round も 1 つ)。上限の出所は 2026-09-09 の user 判断「ローカルで収束させてから GitHub round」
-(`.dev/knowledge/feature-58-summary.md` の「後続」節に記録。GitHub round の上限が 3 / 5 なのと同じ理由 =
+(`.dev/knowledge/feature-58-summary.md` (KB の記録。DT には無い) の「後続」節に記録。GitHub round の上限が 3 / 5 なのと同じ理由 =
 cost と、収束しない loop は spec の問題という判定)。**3 round 目が `needs-attention` で終わったら**:
 `[critical]` / `[high]` が残っているなら fix が次の指摘を生んでいる (台帳 category 6) = user に相談
 (介入ポイント 3)。`[medium]` / `[low]` だけなら取り込んで **4 round 目は打たず push** し、取り込んだ内容を
@@ -259,7 +261,7 @@ stdout / stderr を scratchpad の file に分けて受ける (stdout = review �
 
 ```bash
 S=<scratchpad>
-bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds> 600 > "$S/r1.out" 2> "$S/r1.err"; echo exit=$?
+bash "<この skill の base directory>/scripts/codex_review_round.sh" <PR#> <max_rounds> 600 > "$S/r1.out" 2> "$S/r1.err"; echo exit=$?
 ```
 
 re-review round (P0/P1 を fix して push した後) は **body file を 4 番目の位置引数に渡す** (`<PR#>` `<max_rounds>` `<per_round_timeout_sec>` の次。option は数えない)。本文は
@@ -271,14 +273,14 @@ verb は `review` のみ** (罠 15 / 18)。heredoc ではなく Write で file �
 `@codex review` で始まらない時は、GitHub を読む前に exit 2 で止める (相対 path は呼び出し側の cwd 基準):
 
 ```bash
-bash .claude/skills/codex-review/scripts/codex_review_round.sh <PR#> <max_rounds> 600 "$S/r2-body.md" > "$S/r2.out" 2> "$S/r2.err"; echo exit=$?
+bash "<この skill の base directory>/scripts/codex_review_round.sh" <PR#> <max_rounds> 600 "$S/r2-body.md" > "$S/r2.out" 2> "$S/r2.err"; echo exit=$?
 ```
 
 round ごとに別プロセスで、状態は持たない。初回かどうか (罠 51) も今が何 round 目か (罠 16 / 28) も
 PR の `@codex review` 投稿履歴から導く。stderr の `round N/M` 行で確認できる。
 
 別 repo の PR は、上の 2 つの形の `<PR#>` の前に `-R owner/repo` を足す (round ごとに毎回。状態を
-持たないので、round 2 で付け忘れると kb-mcp の同番号 PR を読む)。
+持たないので、round 2 で付け忘れると checkout の repo の同番号 PR を読む。KB で起きた例)。
 
 ## 結果の読み方
 
@@ -318,7 +320,7 @@ GitHub round の P0/P1 / P2 / P3 でも、ローカル前掃除の `[critical]` 
 grooveseek-gate PR #3 は 1 つの不変条件 (「Argon2 を待つ前に読んだ判断 — hash / disabled /
 lock / session の有無 / 実行者自身の admin 権限と session — は、それが正当化する書き込みと
 同じ SQL 文で読み直す。状態変更と session 削除は 1 transaction にする」) に round を使い切った。
-台帳 `.dev/knowledge/repeat-offences-ledger.md` の category「自分の修正が次の指摘を生む連鎖」
+台帳 `.dev/knowledge/repeat-offences-ledger.md` (KB の記録。DT には無い) の category「自分の修正が次の指摘を生む連鎖」
 (**対策が効いていない**と印の付いた category) の最新 instance がこれで、経緯は
 `grep -n 'CODEX round' .dev/archive/2026-09-16-plan3-web-gui-sdd/progress.md` で引ける。
 
@@ -386,12 +388,12 @@ CLAUDE.local.md guardrail「5 round 経過で user 報告」と揃えて **明�
 
 ## 関連
 
-- 罠の発見経緯: `.dev/knowledge/codex-review-loop-pitfalls.md` (script が構造で防いでいないものも含む)
-- caller: `.claude/commands/feature-flow.md` Phase 6 / CLAUDE.local.md の常時 guardrail 節
+- 罠の発見経緯: `.dev/knowledge/codex-review-loop-pitfalls.md` (KB の記録。DT には無い) (script が構造で防いでいないものも含む)
+- caller: `/feature-flow` command の Phase 6 / CLAUDE.local.md の常時 guardrail 節
 - ローカル前掃除の実体: plugin `codex@openai-codex` (`~/.claude/plugins/cache/openai-codex/codex/<version>/`) の
   `commands/adversarial-review.md` (公式の実行形) / `agents/codex-rescue.md` (`task` 専用、review には使わない) /
   `prompts/adversarial-review.md` (focus の差し込み先)。model / runtime の罠は
-  `.dev/knowledge/codex-plugin-review-model-pitfalls.md`、効いた focus の実例は `.dev/knowledge/feature-58-summary.md`
+  `.dev/knowledge/codex-plugin-review-model-pitfalls.md`、効いた focus の実例は `.dev/knowledge/feature-58-summary.md` (どちらも KB の記録。DT には無い)
 - 公式: [Codex GitHub integration](https://developers.openai.com/codex/integrations/github) /
   [Codex pricing](https://developers.openai.com/codex/pricing) /
   [GitHub REST: pull request reviews](https://docs.github.com/en/rest/pulls/reviews)

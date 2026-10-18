@@ -19,7 +19,7 @@ Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっ
 
 - リポジトリは git clean (uncommitted changes なし)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` skill が利用可能
-- subagent type: project agent `reviewer` (`.claude/agents/reviewer.md`) と `general-purpose` が available。起動時の `model` は `/next-work` Phase 2 の表に従う
+- subagent type: project agent `reviewer` (agent 定義) と `general-purpose` が available。起動時の `model` は `/next-work` Phase 2 の表に従う
 - GitHub CLI (`gh`) が認証済 (`gh auth status` で確認可)
 - `@codex review` 経由で chatgpt-codex-connector が動く (PR repo 側で設定済)
 - plugin `codex@openai-codex` が install 済で、Codex CLI が 0.153.4 以上、`codex login` 済 (`/codex:setup` が
@@ -72,7 +72,7 @@ spec を `.dev/specs/<feature-NN-name>.md` に起草する (groove の `CLAUDE.l
 その後 **subagent review loop** を回す:
 
 1. **dispatch**: `reviewer` (`model: opus`、`/next-work` Phase 2 の表) に spec を渡し、低/中/高/重大の 4 段階で指摘を返させる
-2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。**読んでから書くまでに何かが挟まり得る形の指摘なら、不変条件を 1 行で spec に書く** (書き込み点がまだ無いので表は作らない — 表は実装後、`.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
+2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。**読んでから書くまでに何かが挟まり得る形の指摘なら、不変条件を 1 行で spec に書く** (書き込み点がまだ無いので表は作らない — 表は実装後、skill `codex-review` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
 3. **re-dispatch**: 同じ subagent に「low-only に到達したか」を再評価させる
 4. **convergence**: low-only or "no major issues" が 2 round 連続で得られたら脱出。最大 5 round。5 round で収束しないなら spec 起草の前提が崩れている = ユーザに再相談
 
@@ -104,7 +104,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 `superpowers:subagent-driven-development` skill に plan を渡して実装を回す。**この skill 内部で**:
 
 - task ごとに implementer subagent + spec compliance reviewer + code quality reviewer の 3 段
-- review round の中間 fix もユーザ非介在。**reviewer の指摘が `.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形なら、その節どおり表にしてから fix に写す** (codex round を待たず、ここで兄弟の書き込み点を拾う)
+- review round の中間 fix もユーザ非介在。**reviewer の指摘が skill `codex-review` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形なら、その節どおり表にしてから fix に写す** (codex round を待たず、ここで兄弟の書き込み点を拾う)
 - task 単位で `feat(<scope>): ...` 形式のコミット 1 個
 - PR は phase 区切り (PR-1 / PR-2 / ...) で作成
 
@@ -115,12 +115,12 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 各 phase の最後で:
 
 0. **push の前に 2 つ — この branch を push するたび、毎回。** PR を開く前も、review の指摘を直した後も同じで、P0/P1 の fix だけでなく**収束した round の P2/P3 を取り込んだ push も含む**
-   - (a) **doc comment の名前を洗う**。指摘された行だけ直して push すると同じ形が次の round で返り、収束後の取り込みはそのまま merge へ行く (#234 / #236 はそれで round を溶かした)。手順は `.claude/skills/codex-review/SKILL.md` の「push する前に doc comment の名前を洗う」節
+   - (a) **doc comment の名前を洗う**。指摘された行だけ直して push すると同じ形が次の round で返り、収束後の取り込みはそのまま merge へ行く (#234 / #236 はそれで round を溶かした)。手順は skill `codex-review` の「push する前に doc comment の名前を洗う」節
    - (b) **ローカルの Codex (adversarial review) を収束させてから push する**。役割は「ローカル = 明白な違反の前掃除、GitHub = 最終確認」(2026-09-09 の user 判断。feature-58 で GitHub round が P2 の連鎖になった後に決めた)。実行形 / focus の定型 / 上限 (push 1 回につき 3 round) と上限に達した時の手は同 SKILL.md の「push する前にローカルの Codex で前掃除する」節。上限で critical / high が残ったら介入ポイント 3
    - どちらも、コマンドと判定はそこにあり、ここには写さない (step 4 の注意と同じ理由)
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
-3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える — 揃えないと本 command と skill で default がずれる、PR #54 codex round 2 の P2)。1 round = `.claude/skills/codex-review/scripts/codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
+3. **`/codex-review <PR#> 5` skill を invoke** (= skill `codex-review`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える — 揃えないと本 command と skill で default がずれる、PR #54 codex round 2 の P2)。1 round = その skill の scripts の `codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
 4. controller (= main agent) は **script の verdict だけを読む** — stdout の `CONVERGED=` 行とその直前の判定行、および exit code。**判定の predicate (sentinel 文言 / P-badge の数え方 / 何を再 round にするか) をここに書き写さない**: 2 か所にあると script と食い違い、sentinel と P1 が同時に来た round で blocking な指摘を飛ばすか、P2 だけの round で無駄な 1 round を回す (codex P1 on PR #222、AGENTS.md "One question gets one implementation")。読み方の家は SKILL.md の **GitHub round 側**の「結果の読み方」の表 (「1 round の回し方」の次の節。step 0 (b) の「ローカルの結果の読み方」は別の表で、`CONVERGED` も exit code も持たない)。そこから本 phase の分岐だけ言い直すと:
    - `CONVERGED=true` → step 5 へ。P2 / P3 の note が付いていたら内容を見て取り込み or skip を即決する。取り込む指摘は P2 でも P3 でも、SKILL.md の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形なら、その節どおり表にしてから取り込む。いずれの場合も再 round はしない
    - `WARN P0/P1 issues present` → 指摘が SKILL.md の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形 (読んでから書くまでに何かが挟まり得る) なら、その節どおり表にしてから取り込み、そうでなければそのまま取り込み (**verdict が決めるのは再 round の要否だけで、形の判定と不変条件を書くために読むのは inline の指摘本文** — 読み方は同 SKILL.md の「結果の読み方」の表)、regression test を 1 件追加、**step 0 (sweep + ローカル Codex) を通してから** 再 push → goto step 3 (re-trigger body 付きで `/codex-review` 再 invoke)
@@ -135,7 +135,7 @@ review 取り込み時の判断はすべて controller (= main agent) が行い�
 - 取り込みが「Phase 3 で承認した spec の前提を覆す」内容なら user に確認
 - 5 round 経過した時点で必ず user に状況を投げ、続行 / 妥協 / scope 縮小を判断してもらう
 
-参照: `.claude/skills/codex-review/SKILL.md` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠の蓄積)。**罠の番号や本数をここに写さない** — あのノートは追記順に並んでいて番号が飛び、重複もあるので、番号で引くと外れる。見出しから引く: `grep -n '^#\+ 罠' .dev/knowledge/codex-review-loop-pitfalls.md`
+参照: skill `codex-review` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠の蓄積。KB の記録。DT には無い)。**罠の番号や本数をここに写さない** — あのノートは追記順に並んでいて番号が飛び、重複もあるので、番号で引くと外れる。見出しから引く: `grep -n '^#\+ 罠' .dev/knowledge/codex-review-loop-pitfalls.md`
 
 ### Phase 7 — CHANGELOG / version bump / tag (該当 PR が release worthy な場合のみ)
 
@@ -167,14 +167,14 @@ cycle 完了時に必ず:
 
 **Phase 6 step 5 で PR が merge されたら (= step 6)、Phase 7 / 8 の後処理を済ませて session を閉じる**
 (例外として、Phase 5 / Phase 6 の途中で context が逼迫したときも同じ手順)。`/compact` で続けない — 1 session 1 回まで
-(根拠: `.dev/knowledge/mistakes-repeat-session-length-ungated-rules-duplicated-facts.md`)。
+(根拠: `.dev/knowledge/mistakes-repeat-session-length-ungated-rules-duplicated-facts.md`。KB の記録。DT には無い)。
 
 **閉じ方は `/clear` で足りる** — 止めたいのは「溜まった context に compaction を重ねること」であって
 プロセスの寿命ではない。`/clear` は context を捨て、transcript も切り替わる (実測: 同日の 3 本が
 226 MB / 1 MB / 3 MB)。立ち上げ直す価値があるのは **`settings.json` / hook を触った直後だけ**
 (skill は同 session 内で反映される)。`/clear` は background task を止めないので、下の leak 確認が効く:
 
-**閉じる手順は `/close-session <topic>` (`.claude/skills/close-session/SKILL.md`) にだけ書く** — leak の確認 (同 skill の step 0)、鎖の末端 (`handoff_tail.ps1`) を型にした handoff、push の前の鎖の確認、`.dev` の push、push が通ってからの kuriya goal の向け直しと読み戻し、`/next-work` Phase 0 の自己確認、user への通知とその gate、止まる条件まで。controller が起動してよく (`disable-model-invocation` は付けていない)、`/clear` だけは user が打つ。手順をここへ写し戻さない — 写しは食い違う。
+**閉じる手順は `/close-session <topic>` (skill `close-session`) にだけ書く** — leak の確認 (同 skill の step 0)、鎖の末端 (`handoff_tail.ps1`) を型にした handoff、push の前の鎖の確認、`.dev` の push、push が通ってからの kuriya goal の向け直しと読み戻し、`/next-work` Phase 0 の自己確認、user への通知とその gate、止まる条件まで。controller が起動してよく (`disable-model-invocation` は付けていない)、`/clear` だけは user が打つ。手順をここへ写し戻さない — 写しは食い違う。
 
 ## 介入ポイント以外でユーザを巻き込まない原則
 
@@ -213,10 +213,10 @@ cycle 完了時に必ず:
 
 - `.dev/release-checklist.md` (= Phase 7 step 1 / step 3 の元。`CLAUDE.local.md` の「リリース運用」から辿れる)
 - `CLAUDE.local.md` の「feature-flow の常時 guardrail」節 (= 本 command の常時 guardrail)
-- `.claude/commands/full-audit.md` (Phase 7 で起動判断)
-- `.claude/skills/codex-review/SKILL.md` + `.claude/skills/codex-review/scripts/codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke。push 前の sweep とローカル Codex 前掃除の節も同じ SKILL.md)
-- `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference。罠の番号はここに写さない — 引き方は Phase 6 の参照行)
-- `.dev/knowledge/index-progress-buffering-pitfall.md` (background bash の罠 reference)
+- `/full-audit` command (Phase 7 で起動判断。KB の repo にだけある)
+- skill `codex-review` とその scripts の `codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke。push 前の sweep とローカル Codex 前掃除の節も同じ SKILL.md)
+- `.dev/knowledge/codex-review-loop-pitfalls.md` (KB の記録。DT には無い) (Phase 6 の運用 reference。罠の番号はここに写さない — 引き方は Phase 6 の参照行)
+- `.dev/knowledge/index-progress-buffering-pitfall.md` (KB の記録。DT には無い) (background bash の罠 reference)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` (orchestrate される 3 skill)
 
 ## 成立したかの判定

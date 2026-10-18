@@ -21,7 +21,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 したがって統合テストは **`#[ignore]` のまま** (Task Scheduler を変更するので通常の `cargo test` では走らせない) だが、nightly の `--include-ignored` では CI カバレッジが得られる。「CI では動かないから」を理由に skip リストへ入れる前に、**その CI がどの logon 環境かを確認して実測する**こと。
 
-出典: `.dev/knowledge/windows-task-scheduler-pitfalls.md` (罠 W-1〜W-6) / `.dev/knowledge/feature-43-summary.md` / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 5)
+出典: `.dev/knowledge/windows-task-scheduler-pitfalls.md` (罠 W-1〜W-6) / `.dev/knowledge/feature-43-summary.md` / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 5) (どれも KB の記録。DT には無い)
 
 ## 2. コンソール subsystem binary から subprocess を spawn すると黒窓が出る
 
@@ -31,7 +31,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: `#![windows_subsystem = "windows"]` を付けた別 crate (groove では `crates/groove-svc/`) を用意し、そこから `Command::new(...).creation_flags(0x0800_0000 /* CREATE_NO_WINDOW */).spawn(...)` で本体 binary を child として起動する。GUI subsystem 化 flag を本体 crate に直接付けると CLI / MCP stdio / test との両立が崩れるため、別 crate 分離が最も clean。
 
-出典: `.dev/knowledge/feature-44-summary.md` 罠 11
+出典: `.dev/knowledge/feature-44-summary.md` 罠 11 (KB の記録。DT には無い)
 
 ## 3. subagent が spawn したバックグラウンドプロセスは session idle で死ぬ
 
@@ -41,7 +41,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: subagent は「foreground tool call 1 回 (最大 10 分) で完結する」作業だけを自分で回す。構造的に 10 分を超えると分かっている作業 (大規模 embedding index、CPU-bound reranker eval 等) は、実行コマンドをコピペ可能な形で controller / team-lead に委譲し、subagent 側で監視ループを自作しない (監視ループごと消えるため)。10 分ちょうどで 2-3 回連続 timeout したら、リトライせず早めに委譲判断する。
 
-出典: `.dev/knowledge/subagent-background-process-lifecycle-pitfalls.md` / `.dev/knowledge/feature-46-summary.md` ハマりどころ (d)
+出典: `.dev/knowledge/subagent-background-process-lifecycle-pitfalls.md` / `.dev/knowledge/feature-46-summary.md` ハマりどころ (d) (どちらも KB の記録。DT には無い)
 
 ## 4. 編集ツールの CP932 書き戻しで日本語コメントが mojibake 化する
 
@@ -51,7 +51,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: 恒久的な自動防止策は未確立。**日本語コメントを含む差分は、コミット前・PR final review 時に必ず目視確認する**運用で対処する。文字化けを見つけたら該当行のみ手動で UTF-8 に書き直す。
 
-出典: `.dev/knowledge/feature-46-summary.md` ハマりどころ (f)
+出典: `.dev/knowledge/feature-46-summary.md` ハマりどころ (f) (KB の記録。DT には無い)
 
 ## 5. tracing-subscriber が ANSI color を stderr に出す
 
@@ -61,7 +61,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: subprocess test で stderr を assert する際は `strip_ansi` 相当のヘルパーで ANSI コードを剥がしてから比較する。
 
-出典: `.dev/knowledge/feature-27-summary.md` / CLAUDE.md。**CLAUDE.md / CLAUDE.local.md と重複記載。乖離時はそちらを正とする**。
+出典: `.dev/knowledge/feature-27-summary.md` (KB の記録。DT には無い) / CLAUDE.md。**CLAUDE.md / CLAUDE.local.md と重複記載。乖離時はそちらを正とする**。
 
 ## 6. rust-analyzer の stale diagnostics (Windows で特に頻発)
 
@@ -71,7 +71,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: `cargo check` の実結果を正 (source of truth) とし、rust-analyzer 上の diagnostics は一時的ノイズとして無視して押し切る。
 
-出典: CLAUDE.local.md 運用上の気付き / `.dev/knowledge/feature-25-eval-notes.md` / `feature-27-summary.md`。**CLAUDE.md / CLAUDE.local.md と重複記載。乖離時はそちらを正とする**。
+出典: CLAUDE.local.md 運用上の気付き / `.dev/knowledge/feature-25-eval-notes.md` / `feature-27-summary.md` (どちらも KB の記録。DT には無い)。**CLAUDE.md / CLAUDE.local.md と重複記載。乖離時はそちらを正とする**。
 
 ## 7. PowerShell 5.1 は native コマンド引数内の `"` を escape せず渡して引数分解を壊す
 
@@ -91,7 +91,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: 検証コマンドでは **stderr を捨てない**。Bash tool 側で `cargo clippy --all-targets -- -D warnings 2>&1 | tail -5` として exit code を見るか、PowerShell なら `2>$null` を外して `$LASTEXITCODE` を確認する。**この `2>&1` は Bash tool 限定** — `powershell.exe` に持ち込むと罠 20 の `NativeCommandError` になる。「grep がヒット 0 件」を成功条件にしない — **exit code を成功条件にする**。
 
-**補足**: これは「検証コマンドが壊れていても成功に見える」class の罠。同 session では codex polling script を `run_in_background` ではなく shell の `&` で起動して harness の追跡外に置く失敗も 2 回起こしており (詳細は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 38)、**1 度 note に書いただけでは再発を防げなかった**。検証系のコマンドは「exit code を見る」形に統一するのが唯一効く対策。
+**補足**: これは「検証コマンドが壊れていても成功に見える」class の罠。同 session では codex polling script を `run_in_background` ではなく shell の `&` で起動して harness の追跡外に置く失敗も 2 回起こしており (詳細は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 38、KB の記録。DT には無い)、**1 度 note に書いただけでは再発を防げなかった**。検証系のコマンドは「exit code を見る」形に統一するのが唯一効く対策。
 
 出典: 2026-07-26 full-audit hot-fix session (review agent の Must-fix で発覚)
 
@@ -124,7 +124,7 @@ git grep -lE '(/var/)[^ ]*foo' -- .          # → 一致する ('(' で始ま�
 対策は同じ 2 つ — パターンを `/` で始めない (`var/lib/foo`)、または
 `MSYS_NO_PATHCONV=1` を前置する。
 
-出典: 2026-07-26 AU-09 session / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 7)。
+出典: 2026-07-26 AU-09 session / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 7) (KB の記録。DT には無い)。
 `git grep` 側は 2026-08-17 の GrooveSeek 改名で実測 (13 箇所を取りこぼしかけた)
 
 ## 10. Python の text mode で書き戻すとファイル全体が LF → CRLF に反転する
@@ -241,7 +241,7 @@ CP932 は valid UTF-8 ではない (`0x93` は継続バイト域、`0xfa` は不
 
 **ただしこのテストは「あらゆる環境で前置の適用を証明する」ものではない**。ACP が既に UTF-8 (CP65001 — Windows 11 の「ベータ: ワールドワイド言語サポートで Unicode UTF-8 を使用」で有効になる) のホストでは、**前置が無くても PowerShell は UTF-8 を出す**ので、前置を外してもテストは通ってしまう。守れているのは「非 UTF-8 ACP のホスト」= まさにこの fix が存在する理由の環境であって、それで十分ではあるが、**CI が UTF-8 ACP の runner だけになると回帰ガードとして無音になる**。「locale 非依存」と書くのは言い過ぎ。
 
-出典: 2026-07-27 AU-04 (PR #108)。測定の詳細は `.dev/knowledge/powershell-output-encoding-measurement.md`
+出典: 2026-07-27 AU-04 (PR #108)。測定の詳細は `.dev/knowledge/powershell-output-encoding-measurement.md` (KB の記録。DT には無い)
 
 ## 13. Python の stdout は redirect 先がファイルでも CP932。**途中で落ちて「完走したように見える」**
 
@@ -272,7 +272,7 @@ PYTHONIOENCODING=utf-8 python verify.py > out.txt     # 書く側
 見えた。表示が長いのは正しさの代償。
 
 出典: 2026-08-17 PR #175 (README を docs/ へ分割)。詳細は
-`.dev/knowledge/readme-split-link-surface.md`
+`.dev/knowledge/readme-split-link-surface.md` (KB の記録。DT には無い)
 
 ## 14. PowerShell 5.1 の `ConvertFrom-Json` は JSON 配列を **1 オブジェクト**として流す (filter が黙って素通り)
 
@@ -300,7 +300,7 @@ Count **1**、括弧つき → **3**。
 1 度は実機で出力を見る**。
 
 出典: 2026-08-23 B6 smoke (hook deny 化の検証中、通過した代替形の出力が filter されていなかった)。
-詳細は `.dev/knowledge/shell-trap-guard-deny-rollout.md`
+詳細は `.dev/knowledge/shell-trap-guard-deny-rollout.md` (KB の記録。DT には無い)
 
 ## 15. `jq.exe` は書く改行ごとに CR を足す。`gh --jq` は足さない (混ぜた比較が全件不一致になる)
 
@@ -333,10 +333,10 @@ M=$(echo '{"a":"x","b":"y"}' | jq -r '.a, .b'); printf '%s' "$M" | od -c
 ([GNU Bash manual, Command Substitution](https://www.gnu.org/software/bash/manual/html_node/Command-Substitution.html))、
 CR を落とすとは書かれていない。上の表のとおり、綺麗になるのは 1 行のときだけ。
 
-この repo の `.claude/skills/codex-review/scripts/codex_review_round.sh` も
+skill `codex-review` の scripts の `codex_review_round.sh` も
 **複数行の jq 出力を変数に入れている** (via:
-`grep -n '=\$(.*jq' .claude/skills/codex-review/scripts/codex_review_round.sh`
-→ `LATEST_REVIEW` `:315` / `LATEST_ISSUE_BODY` `:325` / `REVIEW_BODY` `:389` ほか)。
+`grep -n '=\$(.*jq' <この skill の base directory>/../codex-review/scripts/codex_review_round.sh`
+→ `LATEST_REVIEW` `:629` / `LATEST_ISSUE_BODY` `:637` / `REVIEW_BODY` `:718` ほか)。
 CR は変数の中に入っている。それでも壊れていないのは **`$( )` のおかげではなく**、
 (1) JSON を再び jq に食わせる経路は CR を whitespace として読み飛ばし、
 (2) sentinel 照合が行内の部分一致だから。**条件が変われば壊れる**。
@@ -419,7 +419,7 @@ diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **�
 「`-j 2` で `LNK1102` が出なくなる」までで、下の 4 点は原因の特定ではなく**用心**として、
 subagent に cargo を打たせる指示に貼る:
 
-- `cargo test` は `-j 2` を必ず付ける
+- `cargo test` は `-j 2` (KB で測った値) を必ず付ける
 - 重い cargo を 2 本同時に走らせない (subagent を並列にするのは cargo を打たない組だけ)
 - `run_in_background` を使わず foreground + timeout
 - status file は手順ごとに追記させる (途中で落ちても、続きを file から拾える)
@@ -578,7 +578,7 @@ Linux では字面がそのまま prefix になるので再現しない — Wind
 「alias を作っていないのに食い違う」入力**の方。
 
 **原因**: 片側 (KB) だけ `std::fs::canonicalize` に通し、もう片側 (まだ存在しない plugin dir) は
-そのまま比べていた。実測では prefix と短縮名の食い違いが同時に出た (via: `bash scratchpad/av11_observe.sh`、`.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md:51-53`):
+そのまま比べていた。実測では prefix と短縮名の食い違いが同時に出た (via: `bash scratchpad/av11_observe.sh`、`.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md:51-53` (KB の記録。DT には無い)):
 
 ```
 kb  = \\?\C:\Users\yabushita\AppData\Local\Temp\...\kb          <- canonicalize 済
@@ -644,8 +644,8 @@ junction 解決前の書かれたパスの親に戻す。**POSIX** はリンク�
 (`config.rs:4139` / `:4169` `a_dotdot_does_not_end_the_walk_before_an_inside_link` の unix / windows twin)。
 **手元 (Windows) では Unix の経路を検証できない** — CI の ubuntu leg が検証点。
 
-出典: 2026-09-05 AV-11 (PR #268)。詳細は `.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md` /
-`.dev/knowledge/session-2026-09-05-av-11-grammar-dir-handoff.md:47-58`
+出典: 2026-09-05 AV-11 (PR #268)。詳細は `.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md` (KB の記録。DT には無い) /
+`.dev/knowledge/session-2026-09-05-av-11-grammar-dir-handoff.md:47-58` (KB の記録。DT には無い)
 
 ## 19. 起動途中のログ行を assert すると、OS ごとのタイミングで通ったり落ちたりする
 
@@ -676,7 +676,7 @@ junction 解決前の書かれたパスの親に戻す。**POSIX** はリンク�
 証明したいテストなら、その性質に合う状態 (ファイルを触って再索引が起きる、など) を観測する。
 DB 存在の assert をそこへ流用すると、watcher が一度も動かない回帰を見逃す。
 
-出典: 2026-09-06 AV-12 (PR #269)。`.dev/knowledge/av-12-chunk-cap-degrade-pitfalls.md:156-163`
+出典: 2026-09-06 AV-12 (PR #269)。`.dev/knowledge/av-12-chunk-cap-degrade-pitfalls.md:156-163` (KB の記録。DT には無い)
 
 ## 20. PowerShell 5.1 で native exe に `2>&1` を付けると `NativeCommandError` に包まれて結果が読めない
 
@@ -727,7 +727,7 @@ DB 存在の assert をそこへ流用すると、watcher が一度も動かな�
 stderr が要る検証には使わない**。
 
 出典: 2026-08-21 (初出、`.dev/knowledge/archive/superseded/bash-tool-wrapper-parse-error.md:48-50`) /
-2026-09-06 AV-13 (`cargo test` の stack overflow 判定が当たらなかった、`.dev/knowledge/av-13-identical-ranges-pitfalls.md:139-144`)
+2026-09-06 AV-13 (`cargo test` の stack overflow 判定が当たらなかった、`.dev/knowledge/av-13-identical-ranges-pitfalls.md:139-144`、KB の記録。DT には無い)
 
 ## 21. 長いパス (MAX_PATH 260): Rust std が自分で `\\?\` を付けるので、**Rust std の fs 呼び出し**はレジストリにもマニフェストにも依存しない (std を通らない経路は未調査)
 
