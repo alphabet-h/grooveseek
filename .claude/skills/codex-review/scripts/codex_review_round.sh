@@ -4,9 +4,11 @@
 # convergence with three layers, and print the round's findings.
 #
 # Usage:
-#   codex_review_round.sh [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]
+#   codex_review_round.sh [--root <repo root>] [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]
+#     --root <repo root>     the checkout to run in. Omitted: the repo the caller's cwd is in
+#                            (`git rev-parse --show-toplevel`), never this script's own location
 #     -R / --repo owner/repo the GitHub repo the PR lives in. Omitted: $GH_REPO if set,
-#                            else the repo this script is checked out in (unchanged default).
+#                            else the repo of the checkout above.
 #                            Every read, the round count and the post all use this one repo
 #                            (kuriya trap #409 / #238)
 #     --dry-run              do every read (repo, PR, baselines, trigger history, round number),
@@ -31,6 +33,9 @@
 #        empty (an empty stdin for `-` included) / whose first line does not start
 #        with `@codex review`: `ABORT: trigger_body_file ...` + `Action: ...`;
 #        checked before any GitHub read, --dry-run included
+#      - a --root that does not exist / is not a directory / is not a git work
+#        tree / is not the top level of one (a sub directory):
+#        `ABORT: --root ...` + `Action: ...`; also before any GitHub read
 #      Failing to create the temporary directory (where the body snapshot lives) is
 #      exit 8, as before, also before any GitHub read
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
@@ -57,7 +62,7 @@
 #   stderr = progress / warnings, ASCII only (trap 52) - never bot-written text (trap 55)
 #
 # Every trap this script guards against is a comment next to the code that
-# guards it. The numbers refer to .dev/knowledge/codex-review-loop-pitfalls.md.
+# guards it. The numbers refer to .dev/knowledge/codex-review-loop-pitfalls.md (KB の記録。DT には無い).
 # To list them:  grep -oE '罠 [0-9]+' "$0" | sort -u
 # The count is deliberately not written anywhere: a copied number rots.
 #
@@ -68,13 +73,18 @@
 set -u -o pipefail
 
 usage() {
-  printf 'usage: %s [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]\n' "$0" >&2
+  printf 'usage: %s [--root <repo root>] [-R owner/repo] [--dry-run] <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]\n' "$0" >&2
   exit 2
 }
 REPO_ARG=""
+ROOT_ARG=""
 DRY_RUN=false
 while [ $# -gt 0 ]; do
   case "$1" in
+    --root)    [ $# -ge 2 ] || usage; ROOT_ARG="$2"; shift 2
+               case "$ROOT_ARG" in ''|-*) usage;; esac;;
+    --root=*)  ROOT_ARG="${1#--root=}"; shift
+               case "$ROOT_ARG" in ''|-*) usage;; esac;;
     # 値が `-` で始まる (`-R --dry-run 356`) なら option の取り違え。gh に flag として渡さず usage で止める。
     -R|--repo) [ $# -ge 2 ] || usage; REPO_ARG="$2"; shift 2
                case "$REPO_ARG" in ''|-*) usage;; esac;;
@@ -169,10 +179,29 @@ BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
 # sentinel も無い。1 行目全体が `<!-- ${CODEX_SUMMARY_MARKER} -->` の comment を snapshot_issues で除外する (下)。
 CODEX_SUMMARY_MARKER="codex-pull-request-review-summary"
 
-# The script lives at <repo>/.claude/skills/codex-review/scripts/; resolve the
-# repo from there so it works from any cwd and any checkout location.
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_DIR=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel) || exit 1
+# The repo is --root when given, else the one the caller's cwd is in. It is
+# not resolved from this script's location: the skill may be read from a
+# checkout other than the repo under review.
+# --root の誤りは引数の誤りなので exit 2 + ASCII の ABORT / Action 行 (trigger_body_file と同じ形)。
+# GitHub を読む前なので --dry-run でも効く。git の stderr は locale 依存で非 ASCII になり得るので
+# 捨て、理由は bad_root の ASCII 行で出す (罠 52)。
+bad_root() {   # $1 = 理由
+  diag "ABORT: --root ${ROOT_ARG}: $1. Nothing was posted."
+  diag "Action: pass the checkout to review (its top level, git rev-parse --show-toplevel), or omit --root to use the cwd's repo."
+  exit 2
+}
+if [ -n "$ROOT_ARG" ]; then
+  [ -e "$ROOT_ARG" ] || bad_root "does not exist"
+  [ -d "$ROOT_ARG" ] || bad_root "is not a directory"
+  REPO_DIR=$(git -C "$ROOT_ARG" rev-parse --show-toplevel 2>/dev/null) || bad_root "is not a git work tree"
+  [ -n "$REPO_DIR" ] || bad_root "git printed no top level"
+  # サブ dir を親の checkout へ黙って付け替えない (入れ子の repo なら別の repo になる)。top level か
+  # どうかは path の文字列ではなく --show-prefix が空かで見る (8.3 名や /c/ と C:/ の表記差に依らない)。
+  ROOT_PREFIX=$(git -C "$ROOT_ARG" rev-parse --show-prefix 2>/dev/null) || bad_root "is not a git work tree"
+  [ -z "$ROOT_PREFIX" ] || bad_root "is not the top level of its git work tree (top level: ${REPO_DIR})"
+else
+  REPO_DIR=$(git rev-parse --show-toplevel) || exit 1
+fi
 cd "$REPO_DIR" || exit 1
 
 # diag と ROUND_TMP (一時 dir + EXIT trap) は上、引数の検査の直前で作っている
