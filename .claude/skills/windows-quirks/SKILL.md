@@ -8,6 +8,9 @@ description: Field-verified Windows pitfalls from groove release cycles, each wi
 groove を Windows (特に日本語 locale) 向けに開発する中で、公式 docs や codex review では検出できず**実機 dogfood で初めて発覚した**罠集。Windows 固有のコードパス (`grooveseek/src/service/windows.rs`、`crates/groove-svc/`、subprocess 起動、CI/subagent の実行環境等) に触れる前に必ず目を通すこと。
 
 詳細な出典 note は `.dev/knowledge/` 配下 (**ローカル専用、git untracked のためリポジトリ外部からは参照不可**)。
+`via:` に出てくる `scratchpad/…` / `scratchpad\…` の script は、その時の session の一時 dir に置いた probe で、
+どの repo にも残していない (session が終わると消える)。再現するときは `via:` の本文 (置いた file と比べた引数) と、
+一緒に名指した note の行から組み直す。
 
 ## 1. Task Scheduler 経由の subprocess 登録 (schtasks / Register-ScheduledTask)
 
