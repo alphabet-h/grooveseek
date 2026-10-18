@@ -34,7 +34,8 @@
 #        with `@codex review`: `ABORT: trigger_body_file ...` + `Action: ...`;
 #        checked before any GitHub read, --dry-run included
 #      - a --root that does not exist / is not a directory / is not a git work
-#        tree: `ABORT: --root ...` + `Action: ...`; also before any GitHub read
+#        tree / is not the top level of one (a sub directory):
+#        `ABORT: --root ...` + `Action: ...`; also before any GitHub read
 #      Failing to create the temporary directory (where the body snapshot lives) is
 #      exit 8, as before, also before any GitHub read
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
@@ -194,6 +195,10 @@ if [ -n "$ROOT_ARG" ]; then
   [ -d "$ROOT_ARG" ] || bad_root "is not a directory"
   REPO_DIR=$(git -C "$ROOT_ARG" rev-parse --show-toplevel 2>/dev/null) || bad_root "is not a git work tree"
   [ -n "$REPO_DIR" ] || bad_root "git printed no top level"
+  # サブ dir を親の checkout へ黙って付け替えない (入れ子の repo なら別の repo になる)。top level か
+  # どうかは path の文字列ではなく --show-prefix が空かで見る (8.3 名や /c/ と C:/ の表記差に依らない)。
+  ROOT_PREFIX=$(git -C "$ROOT_ARG" rev-parse --show-prefix 2>/dev/null) || bad_root "is not a git work tree"
+  [ -z "$ROOT_PREFIX" ] || bad_root "is not the top level of its git work tree (top level: ${REPO_DIR})"
 else
   REPO_DIR=$(git rev-parse --show-toplevel) || exit 1
 fi
