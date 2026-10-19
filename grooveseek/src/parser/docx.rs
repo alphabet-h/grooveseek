@@ -125,10 +125,11 @@ const STYLES_SKIPPED_MEANS: &str = "headings fall back to style IDs";
 /// `word/styles.xml` as a [`StyleTable`], or `None` when the document has no usable one: the
 /// part is missing, over the decompression budget on its own, would take the document past
 /// it ([`super::ooxml::read_optional_zip_part`]), or is not readable as a styles part
-/// ([`StyleTable::parse`]). Each case but a missing part is named on stderr in one line; a part
-/// the zip layer cannot open or inflate falls back the same way without a line, as
-/// [`super::ooxml::read_zip_part`] always has. With `None` every paragraph's heading is decided
-/// by its style ID's spelling, as before.
+/// ([`StyleTable::parse`]). Each case but a missing part is named on stderr in one line, and so
+/// is a part the zip layer opens but cannot read through
+/// ([`super::ooxml::part_unreadable_as_declared_message`]); a part the zip layer cannot open
+/// falls back the same way without a line, as [`super::ooxml::read_zip_part`] always has.
+/// With `None` every paragraph's heading is decided by its style ID's spelling, as before.
 fn read_style_table(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     path_hint: &str,

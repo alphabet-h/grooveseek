@@ -53,6 +53,12 @@ pub(crate) fn read_zip_entry_capped(
 /// document.xml が budget を超えた docx は "word/document.xml missing" としか言われず、
 /// pptx の slide は何も言われずに消え、どちらも上げるべきキーが読めないため。
 ///
+/// (2026-10-19) 読み出しが `Err` で終わったパートも `Ok(None)` で、
+/// [`part_unreadable_as_declared_message`] の 1 行を stderr に出す。zip 9.0.1
+/// (zip-rs/zip2#1022) 以降の zip は申告 size を超える read を `Err` にするので、申告を偽装した
+/// パートはここに来る。末尾で CRC が合わない read が `Err` になるのは zip 8.6 でも同じ。
+/// キーを上げても読めないので、この警告はキーを名指さない。
+///
 /// zip-bomb hardening を 2 レイヤで行う:
 ///
 /// - **codex P2 (PR #70 round 1)**: per-entry の展開を 2 段で bound する。
@@ -83,7 +89,8 @@ pub(crate) fn read_zip_part(
 }
 
 /// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
-/// `None` when it is missing, cannot be read, is over `cap` on its own (named with
+/// `None` when it is missing, cannot be read (named with [`part_unreadable_as_declared_message`]
+/// when its read fails), is over `cap` on its own (named with
 /// [`entry_over_budget_message`]) or is larger than what is left of the document's budget
 /// (named with [`part_past_document_budget_message`], which ends with `skipped_means`). It is
 /// never an `Err`, so a document whose other parts fit is still read.
@@ -168,6 +175,15 @@ fn read_zip_part_within(
     // 判定できる。ちょうど bound バイトのエントリは正常に許可する。
     let limit = bound.saturating_add(1);
     if (&mut file).take(limit).read_to_end(&mut buf).is_err() {
+        // zip 9.0.1 (zip-rs/zip2#1022) and later fail a read that goes past the declared size,
+        // and every zip version fails the read that finds a CRC mismatch at the end, so a part
+        // that declares less than it holds ends here rather than at the bound below. Say so
+        // instead of dropping it silently; it is the same line whether or not the document can
+        // do without the part.
+        eprintln!(
+            "{}",
+            part_unreadable_as_declared_message(path_hint, name, file.size())
+        );
         return Ok(None);
     }
     if buf.len() as u64 > bound {
@@ -196,6 +212,20 @@ fn read_zip_part_within(
 pub(crate) fn entry_over_budget_message(path_hint: &str, entry: &str, cap: u64) -> String {
     format!(
         "warning: {path_hint}: {entry} exceeds [index].max_decompressed_size ({cap} bytes); skipping this part"
+    )
+}
+
+/// The warning for a part whose read fails before it completes: zip refuses a part that holds
+/// more than it declares (9.0.1 and later, zip-rs/zip2#1022) and one whose CRC does not match
+/// (every version). ASCII only. It names no key, since raising one does not make such a part
+/// readable.
+pub(crate) fn part_unreadable_as_declared_message(
+    path_hint: &str,
+    entry: &str,
+    declared: u64,
+) -> String {
+    format!(
+        "warning: {path_hint}: {entry} cannot be read as declared (it declares {declared} bytes); it holds more than it declares, or is corrupt; skipping this part"
     )
 }
 
@@ -580,6 +610,115 @@ mod tests {
         );
     }
 
+    /// ちょうど budget の大きさの part は読める (Deflate)。zip 9.0.1 (zip-rs/zip2#1022) 以降の zip
+    /// は申告 size を超える read を `Err` にするが、正常な entry は末尾で `Ok(0)` を返すので、
+    /// [`read_zip_part_within`] の `take(bound + 1)` が 1 byte 余分に求めても error にならない
+    /// (zip 9.0.5 の `Crc32Reader` が申告 size を理由に `Err` にするのは、申告より多い byte が
+    /// 実際に出た時だけ)。
+    /// [`test_read_zip_entry_accepts_entry_within_cap`] の entry は cap よりずっと小さく、この
+    /// 境目を見ていない。
+    ///
+    /// **この test が落ちたら、zip が末尾の read を `Err` にするようになった印**で、申告どおりの
+    /// part まで "cannot be read as declared" の警告とともに読み飛ばされる (docx なら本文が
+    /// "word/document.xml missing" になる)。
+    #[test]
+    fn a_part_of_exactly_the_budget_is_read_under_zip_9() {
+        a_part_of_exactly_the_budget_is_read(
+            SimpleFileOptions::default(),
+            zip::CompressionMethod::Deflated,
+        );
+    }
+
+    /// [`a_part_of_exactly_the_budget_is_read_under_zip_9`] の Stored 版。Stored の entry は
+    /// decoder を通らないので、zip 9 の reader の経路が Deflate とは別になる。
+    #[test]
+    fn a_stored_part_of_exactly_the_budget_is_read_under_zip_9() {
+        a_part_of_exactly_the_budget_is_read(
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            zip::CompressionMethod::Stored,
+        );
+    }
+
+    /// [`a_part_of_exactly_the_budget_is_read_under_zip_9`] と
+    /// [`a_stored_part_of_exactly_the_budget_is_read_under_zip_9`] の本体。`options` で 10 byte の
+    /// entry と 1024 byte の entry を書いた archive で、[`read_zip_part`] は cap ちょうどの part を
+    /// 読んで budget に積み、cap が 1 byte 足りなければ申告 size を見て展開せずに `None` を返す。
+    /// [`read_optional_zip_part`] は残り budget ちょうどの part を読み、残りが 1 byte 足りなければ
+    /// 展開せずに `None` を返して budget を変えない。
+    fn a_part_of_exactly_the_budget_is_read(
+        options: SimpleFileOptions,
+        method: zip::CompressionMethod,
+    ) {
+        const FIRST: &[u8] = b"0123456789";
+        const PART: u64 = 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("first.bin", options).unwrap();
+            zip.write_all(FIRST).unwrap();
+            zip.start_file("exact.bin", options).unwrap();
+            zip.write_all(&[0u8; PART as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        {
+            let part = archive.by_name("exact.bin").unwrap();
+            assert_eq!(part.compression(), method, "premise: the part is {method}");
+            assert_eq!(
+                part.size(),
+                PART,
+                "premise: the part declares what it holds"
+            );
+        }
+        let len = |read: Option<Vec<u8>>| read.map(|part| part.len() as u64);
+
+        // read_zip_part: cap ちょうど (1024) の part は読まれて budget に積まれる ...
+        let mut budget: u64 = 0;
+        let read = read_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, PART).unwrap();
+        assert_eq!(
+            len(read),
+            Some(PART),
+            "{method}: a part of exactly the cap is read"
+        );
+        assert_eq!(budget, PART);
+        // ... cap が 1 byte 足りなければ (1023) 申告 size で拒まれ、何も積まれない。
+        let mut budget: u64 = 0;
+        let read =
+            read_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, PART - 1).unwrap();
+        assert_eq!(
+            len(read),
+            None,
+            "{method}: a part declaring 1 byte over the cap"
+        );
+        assert_eq!(budget, 0);
+
+        // read_optional_zip_part: 10 byte を読んだ後、残り budget ちょうどの part (cap 1034) は
+        // 読まれる ...
+        let first = FIRST.len() as u64;
+        let mut budget: u64 = 0;
+        let cap = first + PART;
+        let read = read_zip_part(&mut archive, "<test>", "first.bin", &mut budget, cap).unwrap();
+        assert_eq!(read.as_deref(), Some(FIRST));
+        assert_eq!(budget, first);
+        let read =
+            read_optional_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, cap, "-");
+        assert_eq!(
+            len(read),
+            Some(PART),
+            "{method}: a part of exactly what is left is read"
+        );
+        assert_eq!(budget, cap);
+        // ... 残りが 1 byte 足りなければ (cap 1033) 読まれず、budget は 10 のまま。
+        let mut budget: u64 = 0;
+        let cap = first + PART - 1;
+        let read = read_zip_part(&mut archive, "<test>", "first.bin", &mut budget, cap).unwrap();
+        assert_eq!(read.as_deref(), Some(FIRST));
+        let read =
+            read_optional_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, cap, "-");
+        assert_eq!(len(read), None, "{method}: a part 1 byte over what is left");
+        assert_eq!(budget, first, "{method}: a part left out charges nothing");
+    }
+
     #[test]
     fn test_read_zip_entry_capped_rejects_cumulative_budget_over_cap() {
         // codex P2 (PR #70 round 2): 1 エントリずつは cap 未満でも、複数
@@ -712,6 +851,19 @@ mod tests {
         assert!(msg.is_ascii());
     }
 
+    /// zip 9 (zip-rs/zip2#1022): a part whose read fails partway is named, with the size it
+    /// declares and what is wrong with it, in one ASCII line that names no key to raise.
+    #[test]
+    fn part_unreadable_as_declared_message_names_the_part_and_its_declared_size() {
+        let msg = part_unreadable_as_declared_message("docs/q.pptx", "ppt/slides/slide1.xml", 1);
+        assert_eq!(
+            msg,
+            "warning: docs/q.pptx: ppt/slides/slide1.xml cannot be read as declared (it declares 1 bytes); it holds more than it declares, or is corrupt; skipping this part"
+        );
+        assert!(msg.is_ascii());
+        assert!(!msg.contains("max_decompressed_size"), "{msg}");
+    }
+
     /// The `forge_declared_uncompressed_size` of the xlsx tests ([`crate::parser::xlsx`]),
     /// copied rather than moved so that module's tests stay as they are: rewrites the uncompressed size the zip declares
     /// for the entry whose real size is `real`, in the local file header (+22) and the central
@@ -742,11 +894,13 @@ mod tests {
     /// feature-62 T15b (AC15 (c)): an optional part that declares less than what is left of
     /// the document's budget but holds more is left out and charges nothing; a part that fits
     /// is read and charged. The forged part is larger than what is left (1014 bytes) and no
-    /// larger than the cap (1024), so only a read bounded by what is left refuses it before
-    /// it is charged: one bounded by the cap would read all of it, charge it, and fail the
-    /// total. zip 8 does not stop at the declared size when it inflates (the xlsx parser's
-    /// tests, in [`crate::parser::xlsx`], measure it with their
-    /// `forge_declared_uncompressed_size` helper).
+    /// larger than the cap (1024). Under zip 8, which did not stop at the declared size when it
+    /// inflated, only a read bounded by what is left refused it before it was charged: one
+    /// bounded by the cap would have read the whole part, charged it, and failed the total.
+    /// Since zip 9.0.1 (zip-rs/zip2#1022) zip itself fails a read that goes past the declared
+    /// size, so the forged part is refused at its declared byte, before either bound is
+    /// reached, and this test no longer tells the two bounds apart; what it still pins is that
+    /// the part left out charges nothing.
     #[test]
     fn a_forged_optional_part_is_skipped_without_charging_the_budget() {
         const REAL: u32 = 1020;

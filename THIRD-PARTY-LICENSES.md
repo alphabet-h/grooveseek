@@ -48,11 +48,11 @@ SOFTWARE.
 
 ## Summary
 
-- Apache License 2.0 (Apache-2.0): 355
-- MIT License (MIT): 140
+- Apache License 2.0 (Apache-2.0): 353
+- MIT License (MIT): 141
 - ISC License (ISC): 24
 - Unicode License v3 (Unicode-3.0): 19
-- BSD 3-Clause "New" or "Revised" License (BSD-3-Clause): 9
+- BSD 3-Clause "New" or "Revised" License (BSD-3-Clause): 14
 - BSD 2-Clause "Simplified" License (BSD-2-Clause): 4
 - Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0): 2
 - zlib License (Zlib): 2
@@ -2736,7 +2736,7 @@ Used by:
 
 Used by:
 
-- lzma-rust2 0.16.5 (https://github.com/hasenbanck/lzma-rust2/)
+- lzma-rust2 0.22.0 (https://github.com/hasenbanck/lzma-rust2/)
 
 ```text
                                  Apache License
@@ -9322,7 +9322,7 @@ Used by:
 - arraydeque 0.5.1 (https://github.com/andylokandy/arraydeque)
 - async-trait 0.1.89 (https://github.com/dtolnay/async-trait)
 - aws-lc-sys 0.45.0 (https://github.com/aws/aws-lc-rs)
-- constant_time_eq 0.4.2 (https://github.com/cesarb/constant_time_eq)
+- constant_time_eq 0.6.1 (https://codeberg.org/cesarb/constant_time_eq)
 - dary_heap 0.3.8 (https://github.com/hanmertens/dary_heap)
 - dirs-sys 0.5.0 (https://github.com/dirs-dev/dirs-sys-rs)
 - dirs 6.0.0 (https://github.com/soc/dirs-rs)
@@ -9336,7 +9336,7 @@ Used by:
 - image 0.25.10 (https://github.com/image-rs/image)
 - itoa 1.0.18 (https://github.com/dtolnay/itoa)
 - libappindicator-sys 0.9.0
-- libc 0.2.185 (https://github.com/rust-lang/libc)
+- libc 0.2.191 (https://github.com/rust-lang/libc)
 - md5 0.8.1 (https://github.com/stainless-steel/md5)
 - miniz_oxide 0.8.9 (https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 - monostate-impl 0.1.18 (https://github.com/dtolnay/monostate)
@@ -9387,8 +9387,6 @@ Used by:
 - unicode-ident 1.0.24 (https://github.com/dtolnay/unicode-ident)
 - utf8parse 0.2.2 (https://github.com/alacritty/vte)
 - wide 0.7.33 (https://github.com/Lokathor/wide)
-- zstd-safe 7.2.4 (https://github.com/gyscos/zstd-rs)
-- zstd-sys 2.0.16+zstd.1.5.7 (https://github.com/gyscos/zstd-rs)
 - zune-inflate 0.2.54
 
 ```text
@@ -10064,6 +10062,86 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- zstd-safe 8.2.0 (https://github.com/gyscos/zstd-rs)
+- zstd-sys 2.1.2+zstd.1.5.7 (https://github.com/gyscos/zstd-rs)
+- zstd 0.14.3 (https://github.com/gyscos/zstd-rs)
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2026, Alexandre Bury
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- zstd-sys 2.1.2+zstd.1.5.7 (https://github.com/gyscos/zstd-rs)
+
+```text
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
 - subtle 2.6.1 (https://github.com/dalek-cryptography/subtle)
 
 ```text
@@ -10190,6 +10268,48 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+## BSD 3-Clause "New" or "Revised" License
+
+Used by:
+
+- zstd-sys 2.1.2+zstd.1.5.7 (https://github.com/gyscos/zstd-rs)
+
+```text
+The auto-generated bindings are under the 3-clause BSD license:
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
@@ -12668,7 +12788,7 @@ SOFTWARE.
 Used by:
 
 - tracing-core 0.1.36 (https://github.com/tokio-rs/tracing)
-- zip 8.6.0 (https://github.com/zip-rs/zip2)
+- zip 9.0.5 (https://github.com/zip-rs/zip2)
 
 ```text
 The MIT License (MIT)
@@ -12711,6 +12831,37 @@ Used by:
 The MIT License (MIT)
 
 Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
+- nix 0.31.3 (https://github.com/nix-rust/nix)
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -12897,7 +13048,8 @@ SOFTWARE.
 
 Used by:
 
-- calamine 0.36.0 (https://github.com/tafia/calamine)
+- calamine 0.37.0 (https://github.com/tafia/calamine)
+- quick-xml 0.42.0 (https://github.com/tafia/quick-xml)
 
 ```text
 The MIT License (MIT)
@@ -13155,24 +13307,6 @@ SOFTWARE.
 
 Used by:
 
-- zstd 0.13.3 (https://github.com/gyscos/zstd-rs)
-
-```text
-The MIT License (MIT)
-Copyright (c) 2016 Alexandre Bury
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
 - nu-ansi-term 0.50.3 (https://github.com/nushell/nu-ansi-term)
 
 ```text
@@ -13285,7 +13419,7 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 
 Used by:
 
-- ppmd-rust 1.4.0 (https://github.com/hasenbanck/ppmd-rust)
+- ppmd-rust 1.5.1 (https://github.com/hasenbanck/ppmd-rust)
 
 ```text
 MIT No Attribution
