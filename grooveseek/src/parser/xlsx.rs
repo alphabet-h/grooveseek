@@ -414,12 +414,17 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 ///    declared uncompressed size") で失敗させる。calamine も同じ `zip` の `by_name` で
 ///    part を読むので、そこで同じく止まる。そこで層 2 の [`count_decompressed_bytes`]
 ///    は申告 size ちょうどまで読んでから 1 バイトだけ probe して、zip の拒否を見分ける:
-///    probe が EOF なら申告どおり、`Err` なら zip が申告超えを拒んだ (か、末尾の CRC
-///    が合わない = 壊れている) ので、**申告どおりに読めない entry として zip-bomb guard
-///    の `Err` にする**。この `Err` は cap に依らないので、
+///    probe が EOF なら申告どおり、`Err` なら zip が申告超えを拒んだ (か、申告 size の
+///    境目で decoder が失敗した = 壊れている) ので、**申告どおりに読めない entry として
+///    zip-bomb guard の `Err` にする**。この `Err` は cap に依らないので、
 ///    `[index].max_decompressed_size` を上げる案内は付けない (上げても zip が拒む)。
 ///    probe が 1 バイト読めた時 (= zip が申告で止めなかった。zip 8.6 と同じ挙動への
 ///    退行) は、上のとおり残り budget + 1 バイトまで実際に展開して数え続ける。
+///    entry は CRC の照合を外して開く (`ZipReadOptions::ignore_crc32`)。probe は EOF を
+///    読むので、照合つきだと CRC だけが合わない entry (大きさは申告どおり) まで拒んで
+///    しまうが、preflight の役目は展開量の bound だけで、CRC 違いは calamine に任せる
+///    (calamine は閉じ tag で抜けて EOF の CRC を見ない part があり、media はそもそも
+///    読まない)。申告 size の上限は CRC の照合と独立に zip が掛ける。
 ///
 /// 代償として正規の xlsx でも XML パートを 1 回余分に展開する (calamine が
 /// 後でもう一度展開する)。実測 (release、この機の場合): calamine が読まない
@@ -511,7 +516,16 @@ fn preflight_xlsx_decompression_budget_capped(
         // 読んでから 1 バイト probe し、zip が申告どおりに読ませない entry はその場で
         // 拒否する ([`count_decompressed_bytes`])。zip が申告で止めなかった時も、残り
         // budget を 1 バイトでも超えたら打ち切れるよう `remaining + 1` で bound する。
-        let Ok(mut entry) = zip.by_index(i) else {
+        //
+        // CRC は見ない (`ignore_crc32`)。probe は EOF を読むので、照合つきの reader だと
+        // zip がそこで CRC を照合するが、preflight の役目は展開量の bound だけで、CRC だけ
+        // が合わない entry は大きさが申告どおり。calamine は閉じ tag で抜けるので EOF の
+        // CRC を見ない part があり (media はそもそも読まない)、そうした entry で workbook
+        // ごと拒むのは過剰。旧版も CRC の `Err` を数え終わりとして通していた。申告 size の
+        // 上限は CRC の照合と独立に zip が掛けるので、層 2 の拒否はそのまま残る。
+        let Ok(mut entry) =
+            zip.by_index_with_options(i, zip::ZipReadOptions::new().ignore_crc32(true))
+        else {
             // 展開できない entry (暗号化 / 未対応の圧縮方式) は calamine でも
             // 読めないため、budget には数えず次へ進む。
             continue;
@@ -542,8 +556,10 @@ enum Inflation {
     /// 展開後のバイト数 (`limit` 以下)。
     Counted(u64),
     /// 申告 size ちょうどまで読めた後、次の read が `Err` になった = 申告どおりに読めない。
-    /// zip 9.0.1 (zip-rs/zip2#1022) 以降の zip は、申告 uncompressed size を超える read と、
-    /// 末尾で CRC が合わない read を `Err` にする。
+    /// zip 9.0.1 (zip-rs/zip2#1022) 以降の zip は申告 uncompressed size を超える read を
+    /// `Err` にするので、これは申告超えか、申告 size の境目で decoder が失敗した (壊れた
+    /// stream) かのどちらか。CRC が合わない read の `Err` はここに来ない (層 2 は CRC の照合を
+    /// 外して読む)。
     UnreadableAsDeclared,
 }
 
@@ -560,8 +576,9 @@ enum Inflation {
 /// 2. 申告 size まで読めたら **1 バイトだけ probe** する。EOF なら申告どおりなので、
 ///    読めたバイト数 (= 申告 size) を返す。`Err` なら
 ///    [`Inflation::UnreadableAsDeclared`] を返す: zip が申告を超える read を拒んだか、
-///    末尾で CRC が合わなかったかで、どちらでも calamine は同じ所で止まる
-///    (`io::Error` の文言では区別しない)。
+///    申告 size の境目で decoder が失敗したかで、どちらでも calamine は同じ所で止まる
+///    (`io::Error` の文言では区別しない)。呼び出し側は CRC の照合を外した reader を渡すので、
+///    EOF での CRC の照合はここでは起きない (CRC 違いは calamine に任せる)。
 /// 3. probe が 1 バイト読めた = zip が申告 size で止めなかった (zip 8.6 までの挙動。
 ///    今の zip なら退行) 時は、従来どおり `limit` バイトまで数え続ける。この段は防御の層
 ///    として残す (`zip_refuses_to_read_an_entry_past_its_declared_size` が落ちたら現役になる)。
@@ -879,7 +896,7 @@ mod tests {
     #[test]
     fn test_xlsx_preflight_rejects_a_lying_declaration_even_within_the_cap() {
         // 層 2 は申告どおりに読めない entry を cap に依らず拒む: 実体 64 KiB を
-        // 1 バイトと偽装したエントリは、cap が実体を上回っていても Err になる。
+        // 1 バイトと偽装したエントリは、実体がちょうど cap に収まっていても Err になる。
         // 2026-10-19 に期待を反転した。旧版は同じ fixture で「cap が実体を上回って
         // いれば通る (= 偽装の検出ではなく、あくまで展開量で判断している)」を確かめて
         // いたが、zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が申告 size を超える read
@@ -1072,6 +1089,60 @@ mod tests {
         );
     }
 
+    /// [`zip_refuses_to_read_an_entry_past_its_declared_size`] の Stored 版。Stored の entry は
+    /// decoder を通らず、圧縮 size (偽装していない) まで読める reader に申告 size の上限が直に
+    /// 掛かる。申告を超える read はやはり zip が `Err` にするので、層 2 の前提は圧縮方式に依らない。
+    #[test]
+    fn zip_refuses_to_read_a_stored_entry_past_its_declared_size() {
+        use std::io::Read as _;
+
+        const REAL: u32 = 64 * 1024;
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", stored).unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+
+        let mut entry = archive.by_index(0).unwrap();
+        assert_eq!(
+            entry.compression(),
+            zip::CompressionMethod::Stored,
+            "premise: the entry is stored"
+        );
+        assert_eq!(entry.size(), 1, "premise: the forged entry declares 1 byte");
+        assert_eq!(
+            entry.compressed_size(),
+            u64::from(REAL),
+            "premise: only the declared uncompressed size is forged"
+        );
+        let mut out = Vec::new();
+        let read = entry.read_to_end(&mut out);
+        assert!(
+            read.is_err(),
+            "zip must refuse to read the stored entry to its end: {read:?}, {} bytes read",
+            out.len()
+        );
+        drop(entry);
+
+        let mut entry = archive.by_index(0).unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            entry.read(&mut byte).ok(),
+            Some(1),
+            "the declared byte reads"
+        );
+        assert!(
+            entry.read(&mut byte).is_err(),
+            "the read past the declared size must fail"
+        );
+    }
+
     /// 申告どおりに読めない entry の拒否は zip-bomb guard として entry 名と申告バイト数を言い、
     /// `[index].max_decompressed_size` を上げる案内を付けない (上げても zip が拒む)。cap を
     /// 実体の倍にしても、無制限にしても同じ `Err` になる。
@@ -1102,6 +1173,168 @@ mod tests {
             assert!(msg.is_ascii(), "{msg}");
             assert!(!msg.contains("raise [index]"), "{msg}");
         }
+    }
+
+    /// zip の CRC-32 を書き換えて、`name` の entry を「大きさは申告どおりで、CRC だけが合わない」
+    /// entry にする。書き換える 2 箇所は zip の仕様どおり: local file header (`PK\x03\x04`) の
+    /// +14、central directory header (`PK\x01\x02`) の +16 が、いずれも CRC-32 (u32 LE)。
+    /// `forge_declared_uncompressed_size` と同じ patch の形。
+    fn forge_crc32(zip_bytes: &[u8], name: &str) -> Vec<u8> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let index = archive
+            .index_for_name(name)
+            .expect("the entry to forge is in the archive");
+        let real = archive.by_index_raw(index).unwrap().crc32();
+        let fake = !real;
+        let mut data = zip_bytes.to_vec();
+        let mut patched = 0;
+        for (magic, offset) in [(b"PK\x03\x04", 14usize), (b"PK\x01\x02", 16usize)] {
+            let mut i = 0;
+            while i + offset + 4 <= data.len() {
+                if &data[i..i + 4] == magic
+                    && u32::from_le_bytes(data[i + offset..i + offset + 4].try_into().unwrap())
+                        == real
+                {
+                    data[i + offset..i + offset + 4].copy_from_slice(&fake.to_le_bytes());
+                    patched += 1;
+                }
+                i += 1;
+            }
+        }
+        assert_eq!(
+            patched, 2,
+            "expected to patch the local + central header CRC fields of {name}"
+        );
+        data
+    }
+
+    /// (2026-10-19) 層 2 は CRC を見ない。probe は申告 size の 1 バイト先 (= EOF) を読むので、
+    /// CRC の照合つきで開いた entry では zip がそこで CRC を照合する。照合つきのままだと、CRC
+    /// だけが壊れた entry (大きさは申告どおり) で workbook ごと zip-bomb guard に拒まれていた:
+    /// calamine が読まない media でも、calamine が閉じ tag で抜けて EOF の CRC を見ない
+    /// worksheet でも。zip 8.6 の頃の層 2 は CRC の `Err` を数え終わりとして通していた。
+    #[test]
+    fn test_xlsx_preflight_leaves_an_entry_whose_crc_does_not_match_to_calamine() {
+        use std::io::Read as _;
+
+        const SHEET: &[u8] = br#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>hello</t></is></c></row></sheetData></worksheet>"#;
+        const MEDIA: &str = "xl/media/image1.png";
+        const MEDIA_BODY: &[u8] = b"\x89PNG\r\n\x1a\nnot an image: bytes calamine never reads";
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let workbook = {
+            // `ZipWriter::new_append` は古い central directory を file に残す (CRC の欄が 3 か所
+            // 一致する) ので、entry を raw copy して central directory が 1 つの archive に組む。
+            let base_bytes = make_xlsx_with_worksheet_part("worksheets/sheet1.xml", SHEET);
+            let mut base = zip::ZipArchive::new(Cursor::new(base_bytes.as_slice())).unwrap();
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for i in 0..base.len() {
+                zip.raw_copy_file(base.by_index_raw(i).unwrap()).unwrap();
+            }
+            zip.start_file(MEDIA, stored).unwrap();
+            zip.write_all(MEDIA_BODY).unwrap();
+            zip.finish().unwrap().into_inner()
+        };
+        let cap = crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES;
+
+        // (a) calamine が読まない media の CRC が合わない。
+        let forged = forge_crc32(&workbook, MEDIA);
+        {
+            // 前提の確認: 大きさは申告どおりで、CRC だけが合わない。
+            let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+            let index = archive.index_for_name(MEDIA).unwrap();
+            let mut out = Vec::new();
+            let checked = archive.by_index(index).unwrap().read_to_end(&mut out);
+            assert!(
+                checked.is_err(),
+                "premise: with the CRC check on, the forged media fails its read: {checked:?}"
+            );
+            out.clear();
+            archive
+                .by_index_with_options(index, zip::ZipReadOptions::new().ignore_crc32(true))
+                .unwrap()
+                .read_to_end(&mut out)
+                .expect("premise: with the CRC check off, the forged media reads as declared");
+            assert_eq!(out, MEDIA_BODY, "premise: only the CRC is forged");
+        }
+        preflight_xlsx_decompression_budget_capped(&forged, "crc.xlsx", cap)
+            .expect("a CRC mismatch alone is not the zip-bomb guard's business");
+        let doc = XlsxParser::default()
+            .parse_bytes(&forged, "crc.xlsx", &[])
+            .expect("calamine never reads the media, so the workbook reads");
+        assert_eq!(
+            doc.chunks.len(),
+            1,
+            "the worksheet is read whatever the media's CRC"
+        );
+
+        // (b) worksheet 自身の CRC が合わない。preflight は CRC を見ないので、これも通す。
+        // その先で calamine が EOF まで読んで CRC で止まるかは calamine の読み方次第なので、
+        // ここでは pin しない (止まっても、その sheet だけの skip に乗る。calamine 0.37.0 は
+        // 閉じ tag で抜けて、この sheet を読み切った)。
+        let forged = forge_crc32(&workbook, "xl/worksheets/sheet1.xml");
+        preflight_xlsx_decompression_budget_capped(&forged, "crc.xlsx", cap)
+            .expect("the preflight does not check a worksheet's CRC either");
+    }
+
+    /// 中身の無い entry (directory と空 file) は cap 0 でも通る: 申告 0 バイトは層 1 の
+    /// `declared > remaining` に掛からず、層 2 は probe で EOF を読むだけで、数えるバイトは 0。
+    #[test]
+    fn test_xlsx_preflight_admits_directories_and_empty_files_at_a_zero_cap() {
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.add_directory("xl/", SimpleFileOptions::default())
+                .unwrap();
+            zip.add_directory("xl/media/", SimpleFileOptions::default())
+                .unwrap();
+            zip.start_file("xl/empty.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.start_file("xl/media/empty.bin", stored).unwrap();
+            zip.finish().unwrap();
+        }
+
+        // 前提の確認: directory 2 つと空 file 2 つ。どれも 0 バイトを申告する。
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        assert_eq!(archive.len(), 4, "premise: four entries");
+        for i in 0..archive.len() {
+            let entry = archive.by_index_raw(i).unwrap();
+            assert_eq!(entry.size(), 0, "premise: entry {i} declares 0 bytes");
+            assert_eq!(
+                entry.is_dir(),
+                i < 2,
+                "premise: entries 0 and 1 are directories"
+            );
+        }
+
+        preflight_xlsx_decompression_budget_capped(&buf, "empty.xlsx", 0)
+            .expect("entries that hold nothing fit a zero cap");
+    }
+
+    /// budget の境目: N バイトの entry 1 つは cap N で通り、cap N - 1 では zip-bomb guard の
+    /// `Err` になる (申告 N バイトが残り N - 1 バイトを超えるので層 1 で拒む)。
+    #[test]
+    fn test_xlsx_preflight_admits_an_entry_of_exactly_the_cap_and_refuses_it_one_byte_below() {
+        const N: u64 = 1000;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![b'x'; N as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+
+        preflight_xlsx_decompression_budget_capped(&buf, "edge.xlsx", N)
+            .expect("an entry of exactly the cap fits it");
+        let err = preflight_xlsx_decompression_budget_capped(&buf, "edge.xlsx", N - 1)
+            .expect_err("an entry one byte over the cap is refused");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
     }
 
     /// `len` バイトのゼロを返した後は、read のたびに `Err` を返す reader。zip 9 が申告

@@ -53,11 +53,11 @@ pub(crate) fn read_zip_entry_capped(
 /// document.xml が budget を超えた docx は "word/document.xml missing" としか言われず、
 /// pptx の slide は何も言われずに消え、どちらも上げるべきキーが読めないため。
 ///
-/// (2026-10-19) 読み出しが途中で `Err` になったパートも `Ok(None)` で、
+/// (2026-10-19) 読み出しが `Err` で終わったパートも `Ok(None)` で、
 /// [`part_unreadable_as_declared_message`] の 1 行を stderr に出す。zip 9.0.1
-/// (zip-rs/zip2#1022) 以降の zip は、申告 size を超える read と末尾で CRC が合わない read を
-/// `Err` にするので、申告を偽装したパートはここに来る。キーを上げても読めないので、
-/// この警告はキーを名指さない。
+/// (zip-rs/zip2#1022) 以降の zip は申告 size を超える read を `Err` にするので、申告を偽装した
+/// パートはここに来る。末尾で CRC が合わない read が `Err` になるのは zip 8.6 でも同じ。
+/// キーを上げても読めないので、この警告はキーを名指さない。
 ///
 /// zip-bomb hardening を 2 レイヤで行う:
 ///
@@ -90,7 +90,7 @@ pub(crate) fn read_zip_part(
 
 /// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
 /// `None` when it is missing, cannot be read (named with [`part_unreadable_as_declared_message`]
-/// when its read fails partway), is over `cap` on its own (named with
+/// when its read fails), is over `cap` on its own (named with
 /// [`entry_over_budget_message`]) or is larger than what is left of the document's budget
 /// (named with [`part_past_document_budget_message`], which ends with `skipped_means`). It is
 /// never an `Err`, so a document whose other parts fit is still read.
@@ -175,10 +175,11 @@ fn read_zip_part_within(
     // 判定できる。ちょうど bound バイトのエントリは正常に許可する。
     let limit = bound.saturating_add(1);
     if (&mut file).take(limit).read_to_end(&mut buf).is_err() {
-        // zip 9.0.1 (zip-rs/zip2#1022) and later fail a read that goes past the declared size
-        // and one whose CRC does not match at the end, so a part that declares less than it
-        // holds ends here rather than at the bound below. Say so instead of dropping it
-        // silently; it is the same line whether or not the document can do without the part.
+        // zip 9.0.1 (zip-rs/zip2#1022) and later fail a read that goes past the declared size,
+        // and every zip version fails the read that finds a CRC mismatch at the end, so a part
+        // that declares less than it holds ends here rather than at the bound below. Say so
+        // instead of dropping it silently; it is the same line whether or not the document can
+        // do without the part.
         eprintln!(
             "{}",
             part_unreadable_as_declared_message(path_hint, name, file.size())
@@ -214,9 +215,10 @@ pub(crate) fn entry_over_budget_message(path_hint: &str, entry: &str, cap: u64) 
     )
 }
 
-/// The warning for a part whose read fails before its end, which is how zip (9.0.1 and later,
-/// zip-rs/zip2#1022) refuses a part that holds more than it declares, or whose CRC does not
-/// match. ASCII only. It names no key, since raising one does not make such a part readable.
+/// The warning for a part whose read fails before it completes: zip refuses a part that holds
+/// more than it declares (9.0.1 and later, zip-rs/zip2#1022) and one whose CRC does not match
+/// (every version). ASCII only. It names no key, since raising one does not make such a part
+/// readable.
 pub(crate) fn part_unreadable_as_declared_message(
     path_hint: &str,
     entry: &str,

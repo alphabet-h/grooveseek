@@ -21,8 +21,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   with `ZipArchive::extract()` or `ZipStreamReader::extract()`: SUID / SGID bits kept from the
   archive, symbolic links whose targets lie outside the destination, and Unix permissions applied
   through such a link. GrooveSeek never extracts. It opens a `.docx`, `.xlsx` or `.pptx` with
-  `ZipArchive::new` over the file's bytes in memory and reads its parts by name, and `calamine`
-  reads an `.xlsx` the same way, so no GrooveSeek code path calls the affected functions. `zip`
+  `ZipArchive::new` over the file's bytes in memory and reads its parts from that archive (by
+  name, and every entry by index in the `.xlsx` preflight), and `calamine` reads an `.xlsx` the
+  same way, so no GrooveSeek code path calls the affected functions. `zip`
   is a direct dependency and is also reached through `calamine`, which asks for `zip` 8.6 in 0.36
   and 9.0 in 0.37; the two therefore move together and still share one `zip`, so the `.xlsx`
   zip-bomb check inflates each part with the same code `calamine` reads it with. Also moved:
@@ -35,18 +36,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   warning that names it.** Since `zip` 9.0.1 (zip-rs/zip2#1022), `zip` itself fails a read that
   goes past an entry's declared uncompressed size, where 8.6 read a deflated entry on to its real
   end. The second layer of the `.xlsx` zip-bomb preflight, which inflates every entry and counts
-  what comes out, now reports that refusal as the zip-bomb guard's error, `entry "..." cannot be
-  read as declared (zip-bomb guard; it declares N bytes but holds more, or is corrupt; the
-  archive is rejected whatever [index].max_decompressed_size is)`, and the run continues with the
-  other files. With 8.6 such a workbook was indexed when it fitted the cap and refused with an
-  offer to raise the key when it did not; now `calamine` cannot read it at any cap either, so the
-  message offers none. `.docx` and `.pptx` read their parts through the same `zip`. Such a part,
-  which 8.6 read as far as the cap allowed, is now skipped with `warning: <file>: <part> cannot be
-  read as declared (it declares N bytes); it holds more than it declares, or is corrupt; skipping
-  this part` on stderr, and a corrupt part, which used to be dropped without a word, gets the
-  same line. The document is read without that part (a slide, its notes, `word/styles.xml`),
-  except that a `.docx` cannot do without `word/document.xml` and fails as it does when that part
-  is missing.
+  what comes out, now reports that refusal as the zip-bomb guard's error, `<file>: entry "<part>"
+  cannot be read as declared (zip-bomb guard; it declares N bytes but holds more, or is corrupt;
+  the archive is rejected whatever [index].max_decompressed_size is)`, and the run continues with
+  the other files. With 8.6 such a workbook was indexed when it fitted the cap and refused with an
+  offer to raise the key when it did not. Now the preflight refuses it at any cap before `calamine`
+  opens it, so the message offers none. That includes an entry `calamine` never reads, such as an
+  image, and a worksheet, which `calamine` would have failed on its own while still reading the
+  other sheets. An entry whose CRC does not match is not what this is about: the preflight reads
+  with the CRC check off, so such an entry passes it as it did before and is left to `calamine`.
+  `.docx` and `.pptx` read their parts through the same `zip`. Such a part, which 8.6 read as far
+  as the cap allowed, is now skipped with `warning: <file>: <part> cannot be read as declared (it
+  declares N bytes); it holds more than it declares, or is corrupt; skipping this part` on stderr,
+  and a part that `zip` opens but cannot read through (a broken stream, or a CRC that does not
+  match), which used to be dropped without a word, gets the same line; one `zip` cannot open at
+  all, such as an encrypted part, is still dropped without one. The document is read without that
+  part (a slide, its notes, `word/styles.xml`), except that a `.docx` cannot do without
+  `word/document.xml` and fails as it does when that part is missing.
 
 ### Internal
 
@@ -68,8 +74,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **`quick-xml` stays at 0.41, and `grooveseek/Cargo.toml` now asks for its `encoding` feature
   itself.** The feature was on only because `calamine` 0.36 asked for it on the same 0.41
   (feature unification). `calamine` 0.37 moved to `quick-xml` 0.42, and without the feature 0.41
-  decodes every `.docx` / `.pptx` part as UTF-8 whatever its XML declaration says, where it used
-  to decode the part in the encoding the declaration names; asking for the feature keeps that.
+  decodes every `.docx` / `.pptx` part, and the `docProps/core.xml` of an `.xlsx`, as UTF-8
+  whatever its XML declaration says, where it used to decode the part in the encoding the
+  declaration names; asking for the feature keeps that.
   `oxidize-pdf` (pinned at `=4.3.0`) asks for 0.41 as well, so 0.41.0 and 0.42.0 build side by
   side while it does.
 
