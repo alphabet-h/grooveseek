@@ -581,7 +581,8 @@ enum Inflation {
 ///    EOF での CRC の照合はここでは起きない (CRC 違いは calamine に任せる)。
 /// 3. probe が 1 バイト読めた = zip が申告 size で止めなかった (zip 8.6 までの挙動。
 ///    今の zip なら退行) 時は、従来どおり `limit` バイトまで数え続ける。この段は防御の層
-///    として残す (`zip_refuses_to_read_an_entry_past_its_declared_size` が落ちたら現役になる)。
+///    として残す (この file の tests の
+///    `zip_refuses_to_read_an_entry_past_its_declared_size` が落ちたら現役になる)。
 ///
 /// 呼び出し側は層 1 の後に `limit = remaining + 1` で呼ぶので `declared < limit`
 /// (`remaining` が `u64::MAX` で `limit` が飽和した時だけ等しくなり得る)。それが
@@ -1178,7 +1179,7 @@ mod tests {
     /// zip の CRC-32 を書き換えて、`name` の entry を「大きさは申告どおりで、CRC だけが合わない」
     /// entry にする。書き換える 2 箇所は zip の仕様どおり: local file header (`PK\x03\x04`) の
     /// +14、central directory header (`PK\x01\x02`) の +16 が、いずれも CRC-32 (u32 LE)。
-    /// `forge_declared_uncompressed_size` と同じ patch の形。
+    /// [`forge_declared_uncompressed_size`] と同じ patch の形。
     fn forge_crc32(zip_bytes: &[u8], name: &str) -> Vec<u8> {
         let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
         let index = archive

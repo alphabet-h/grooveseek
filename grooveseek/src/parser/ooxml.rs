@@ -610,6 +610,115 @@ mod tests {
         );
     }
 
+    /// ちょうど budget の大きさの part は読める (Deflate)。zip 9.0.1 (zip-rs/zip2#1022) 以降の zip
+    /// は申告 size を超える read を `Err` にするが、正常な entry は末尾で `Ok(0)` を返すので、
+    /// [`read_zip_part_within`] の `take(bound + 1)` が 1 byte 余分に求めても error にならない
+    /// (zip 9.0.5 の `Crc32Reader` が申告 size を理由に `Err` にするのは、申告より多い byte が
+    /// 実際に出た時だけ)。
+    /// [`test_read_zip_entry_accepts_entry_within_cap`] の entry は cap よりずっと小さく、この
+    /// 境目を見ていない。
+    ///
+    /// **この test が落ちたら、zip が末尾の read を `Err` にするようになった印**で、申告どおりの
+    /// part まで "cannot be read as declared" の警告とともに読み飛ばされる (docx なら本文が
+    /// "word/document.xml missing" になる)。
+    #[test]
+    fn a_part_of_exactly_the_budget_is_read_under_zip_9() {
+        a_part_of_exactly_the_budget_is_read(
+            SimpleFileOptions::default(),
+            zip::CompressionMethod::Deflated,
+        );
+    }
+
+    /// [`a_part_of_exactly_the_budget_is_read_under_zip_9`] の Stored 版。Stored の entry は
+    /// decoder を通らないので、zip 9 の reader の経路が Deflate とは別になる。
+    #[test]
+    fn a_stored_part_of_exactly_the_budget_is_read_under_zip_9() {
+        a_part_of_exactly_the_budget_is_read(
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            zip::CompressionMethod::Stored,
+        );
+    }
+
+    /// [`a_part_of_exactly_the_budget_is_read_under_zip_9`] と
+    /// [`a_stored_part_of_exactly_the_budget_is_read_under_zip_9`] の本体。`options` で 10 byte の
+    /// entry と 1024 byte の entry を書いた archive で、[`read_zip_part`] は cap ちょうどの part を
+    /// 読んで budget に積み、cap が 1 byte 足りなければ申告 size を見て展開せずに `None` を返す。
+    /// [`read_optional_zip_part`] は残り budget ちょうどの part を読み、残りが 1 byte 足りなければ
+    /// 展開せずに `None` を返して budget を変えない。
+    fn a_part_of_exactly_the_budget_is_read(
+        options: SimpleFileOptions,
+        method: zip::CompressionMethod,
+    ) {
+        const FIRST: &[u8] = b"0123456789";
+        const PART: u64 = 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("first.bin", options).unwrap();
+            zip.write_all(FIRST).unwrap();
+            zip.start_file("exact.bin", options).unwrap();
+            zip.write_all(&[0u8; PART as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        {
+            let part = archive.by_name("exact.bin").unwrap();
+            assert_eq!(part.compression(), method, "premise: the part is {method}");
+            assert_eq!(
+                part.size(),
+                PART,
+                "premise: the part declares what it holds"
+            );
+        }
+        let len = |read: Option<Vec<u8>>| read.map(|part| part.len() as u64);
+
+        // read_zip_part: cap ちょうど (1024) の part は読まれて budget に積まれる ...
+        let mut budget: u64 = 0;
+        let read = read_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, PART).unwrap();
+        assert_eq!(
+            len(read),
+            Some(PART),
+            "{method}: a part of exactly the cap is read"
+        );
+        assert_eq!(budget, PART);
+        // ... cap が 1 byte 足りなければ (1023) 申告 size で拒まれ、何も積まれない。
+        let mut budget: u64 = 0;
+        let read =
+            read_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, PART - 1).unwrap();
+        assert_eq!(
+            len(read),
+            None,
+            "{method}: a part declaring 1 byte over the cap"
+        );
+        assert_eq!(budget, 0);
+
+        // read_optional_zip_part: 10 byte を読んだ後、残り budget ちょうどの part (cap 1034) は
+        // 読まれる ...
+        let first = FIRST.len() as u64;
+        let mut budget: u64 = 0;
+        let cap = first + PART;
+        let read = read_zip_part(&mut archive, "<test>", "first.bin", &mut budget, cap).unwrap();
+        assert_eq!(read.as_deref(), Some(FIRST));
+        assert_eq!(budget, first);
+        let read =
+            read_optional_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, cap, "-");
+        assert_eq!(
+            len(read),
+            Some(PART),
+            "{method}: a part of exactly what is left is read"
+        );
+        assert_eq!(budget, cap);
+        // ... 残りが 1 byte 足りなければ (cap 1033) 読まれず、budget は 10 のまま。
+        let mut budget: u64 = 0;
+        let cap = first + PART - 1;
+        let read = read_zip_part(&mut archive, "<test>", "first.bin", &mut budget, cap).unwrap();
+        assert_eq!(read.as_deref(), Some(FIRST));
+        let read =
+            read_optional_zip_part(&mut archive, "<test>", "exact.bin", &mut budget, cap, "-");
+        assert_eq!(len(read), None, "{method}: a part 1 byte over what is left");
+        assert_eq!(budget, first, "{method}: a part left out charges nothing");
+    }
+
     #[test]
     fn test_read_zip_entry_capped_rejects_cumulative_budget_over_cap() {
         // codex P2 (PR #70 round 2): 1 エントリずつは cap 未満でも、複数
