@@ -53,6 +53,12 @@ pub(crate) fn read_zip_entry_capped(
 /// document.xml が budget を超えた docx は "word/document.xml missing" としか言われず、
 /// pptx の slide は何も言われずに消え、どちらも上げるべきキーが読めないため。
 ///
+/// (2026-10-19) 読み出しが途中で `Err` になったパートも `Ok(None)` で、
+/// [`part_unreadable_as_declared_message`] の 1 行を stderr に出す。zip 9.0.1
+/// (zip-rs/zip2#1022) 以降の zip は、申告 size を超える read と末尾で CRC が合わない read を
+/// `Err` にするので、申告を偽装したパートはここに来る。キーを上げても読めないので、
+/// この警告はキーを名指さない。
+///
 /// zip-bomb hardening を 2 レイヤで行う:
 ///
 /// - **codex P2 (PR #70 round 1)**: per-entry の展開を 2 段で bound する。
@@ -83,7 +89,8 @@ pub(crate) fn read_zip_part(
 }
 
 /// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
-/// `None` when it is missing, cannot be read, is over `cap` on its own (named with
+/// `None` when it is missing, cannot be read (named with [`part_unreadable_as_declared_message`]
+/// when its read fails partway), is over `cap` on its own (named with
 /// [`entry_over_budget_message`]) or is larger than what is left of the document's budget
 /// (named with [`part_past_document_budget_message`], which ends with `skipped_means`). It is
 /// never an `Err`, so a document whose other parts fit is still read.
@@ -168,6 +175,14 @@ fn read_zip_part_within(
     // 判定できる。ちょうど bound バイトのエントリは正常に許可する。
     let limit = bound.saturating_add(1);
     if (&mut file).take(limit).read_to_end(&mut buf).is_err() {
+        // zip 9.0.1 (zip-rs/zip2#1022) and later fail a read that goes past the declared size
+        // and one whose CRC does not match at the end, so a part that declares less than it
+        // holds ends here rather than at the bound below. Say so instead of dropping it
+        // silently; it is the same line whether or not the document can do without the part.
+        eprintln!(
+            "{}",
+            part_unreadable_as_declared_message(path_hint, name, file.size())
+        );
         return Ok(None);
     }
     if buf.len() as u64 > bound {
@@ -196,6 +211,19 @@ fn read_zip_part_within(
 pub(crate) fn entry_over_budget_message(path_hint: &str, entry: &str, cap: u64) -> String {
     format!(
         "warning: {path_hint}: {entry} exceeds [index].max_decompressed_size ({cap} bytes); skipping this part"
+    )
+}
+
+/// The warning for a part whose read fails before its end, which is how zip (9.0.1 and later,
+/// zip-rs/zip2#1022) refuses a part that holds more than it declares, or whose CRC does not
+/// match. ASCII only. It names no key, since raising one does not make such a part readable.
+pub(crate) fn part_unreadable_as_declared_message(
+    path_hint: &str,
+    entry: &str,
+    declared: u64,
+) -> String {
+    format!(
+        "warning: {path_hint}: {entry} cannot be read as declared (it declares {declared} bytes); it holds more than it declares, or is corrupt; skipping this part"
     )
 }
 
@@ -710,6 +738,19 @@ mod tests {
             "warning: docs/q.docx: word/styles.xml would take the document past [index].max_decompressed_size (4096 bytes); skipping this part, headings fall back to style IDs"
         );
         assert!(msg.is_ascii());
+    }
+
+    /// zip 9 (zip-rs/zip2#1022): a part whose read fails partway is named, with the size it
+    /// declares and what is wrong with it, in one ASCII line that names no key to raise.
+    #[test]
+    fn part_unreadable_as_declared_message_names_the_part_and_its_declared_size() {
+        let msg = part_unreadable_as_declared_message("docs/q.pptx", "ppt/slides/slide1.xml", 1);
+        assert_eq!(
+            msg,
+            "warning: docs/q.pptx: ppt/slides/slide1.xml cannot be read as declared (it declares 1 bytes); it holds more than it declares, or is corrupt; skipping this part"
+        );
+        assert!(msg.is_ascii());
+        assert!(!msg.contains("max_decompressed_size"), "{msg}");
     }
 
     /// The `forge_declared_uncompressed_size` of the xlsx tests ([`crate::parser::xlsx`]),

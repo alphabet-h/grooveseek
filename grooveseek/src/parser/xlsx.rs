@@ -408,14 +408,18 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 ///    **残り budget + 1 バイトで打ち切る**ので、preflight 自体のメモリは
 ///    固定バッファ分、CPU は最大でも cap + 1 バイトの展開に収まる。
 ///
-///    (zip 9 で前提が変わった) 上の「申告値で bound していない」は zip 8.6 までの
-///    話。zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が、申告 uncompressed size を
-///    超えた read を `InvalidData` ("File is larger than its declared uncompressed
-///    size") で失敗させる。calamine も同じ `zip` の `by_name` で part を読むので、
-///    そこで同じく止まる。一方、層 2 の [`count_decompressed_bytes`] は read の Err で
-///    数えるのをやめ、Err になった read の分は数えないので、申告を偽装した entry は
-///    申告 size 以下しか数えられない。この関数は偽装した entry を実体の大きさで
-///    `Err` にすることはもう無く、それを止めているのは zip の read error の方である。
+///    (2026-10-19、zip 9 で前提が変わった) 上の「申告値で bound していない」は
+///    zip 8.6 までの話。zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が、申告
+///    uncompressed size を超えた read を `InvalidData` ("File is larger than its
+///    declared uncompressed size") で失敗させる。calamine も同じ `zip` の `by_name` で
+///    part を読むので、そこで同じく止まる。そこで層 2 の [`count_decompressed_bytes`]
+///    は申告 size ちょうどまで読んでから 1 バイトだけ probe して、zip の拒否を見分ける:
+///    probe が EOF なら申告どおり、`Err` なら zip が申告超えを拒んだ (か、末尾の CRC
+///    が合わない = 壊れている) ので、**申告どおりに読めない entry として zip-bomb guard
+///    の `Err` にする**。この `Err` は cap に依らないので、
+///    `[index].max_decompressed_size` を上げる案内は付けない (上げても zip が拒む)。
+///    probe が 1 バイト読めた時 (= zip が申告で止めなかった。zip 8.6 と同じ挙動への
+///    退行) は、上のとおり残り budget + 1 バイトまで実際に展開して数え続ける。
 ///
 /// 代償として正規の xlsx でも XML パートを 1 回余分に展開する (calamine が
 /// 後でもう一度展開する)。実測 (release、この機の場合): calamine が読まない
@@ -503,14 +507,25 @@ fn preflight_xlsx_decompression_budget_capped(
             );
         }
 
-        // 層 2: 申告値は信用できないので実際に展開して数える。残り budget を
-        // 1 バイトでも超えたら打ち切れるよう `remaining + 1` で bound する。
+        // 層 2: 申告値は信用できないので実際に展開して数える。申告 size ちょうどまで
+        // 読んでから 1 バイト probe し、zip が申告どおりに読ませない entry はその場で
+        // 拒否する ([`count_decompressed_bytes`])。zip が申告で止めなかった時も、残り
+        // budget を 1 バイトでも超えたら打ち切れるよう `remaining + 1` で bound する。
         let Ok(mut entry) = zip.by_index(i) else {
             // 展開できない entry (暗号化 / 未対応の圧縮方式) は calamine でも
             // 読めないため、budget には数えず次へ進む。
             continue;
         };
-        let actual = count_decompressed_bytes(&mut entry, remaining.saturating_add(1));
+        let actual = match count_decompressed_bytes(
+            &mut entry,
+            declared,
+            remaining.saturating_add(1),
+        ) {
+            Inflation::Counted(actual) => actual,
+            Inflation::UnreadableAsDeclared => anyhow::bail!(
+                "{path_hint}: entry {name:?} cannot be read as declared (zip-bomb guard; it declares {declared} bytes but holds more, or is corrupt; the archive is rejected whatever [index].max_decompressed_size is)"
+            ),
+        };
         total = total.saturating_add(actual);
         if total > cap {
             anyhow::bail!(
@@ -521,26 +536,73 @@ fn preflight_xlsx_decompression_budget_capped(
     Ok(())
 }
 
-/// `reader` を最大 `limit` バイトまで読み進め、読めたバイト数を返す。中身は
-/// 保持しない (固定バッファに読んでは捨てる) ので、メモリは `limit` に依らず
-/// 一定。
+/// [`count_decompressed_bytes`] が entry を読んで分かったこと。
+#[derive(Debug, PartialEq, Eq)]
+enum Inflation {
+    /// 展開後のバイト数 (`limit` 以下)。
+    Counted(u64),
+    /// 申告 size ちょうどまで読めた後、次の read が `Err` になった = 申告どおりに読めない。
+    /// zip 9.0.1 (zip-rs/zip2#1022) 以降の zip は、申告 uncompressed size を超える read と、
+    /// 末尾で CRC が合わない read を `Err` にする。
+    UnreadableAsDeclared,
+}
+
+/// 申告 size が `declared` の entry を `reader` から読み進め、展開後のバイト数を数える。
+/// 中身は保持しない (固定バッファに読んでは捨てる) ので、メモリは `limit` に依らず一定。
 ///
-/// 読み出しエラー (壊れた deflate stream、CRC 不一致等) は `Err` にせず、
-/// **そこまでに読めたバイト数**を返して打ち切る: pre-flight の役目は
-/// 「展開量が cap を超えないこと」の確認だけで、壊れたファイル自体は後段の
-/// calamine が `Err` にする (= 既存の per-file skip 経路に乗る)。
-fn count_decompressed_bytes(reader: &mut impl std::io::Read, limit: u64) -> u64 {
+/// 読み方は 3 段 (zip 9 で変わった前提は
+/// [`preflight_xlsx_decompression_budget_capped`] の層 2):
+///
+/// 1. **申告 size ちょうどまで**読む。途中の読み出しエラー (壊れた deflate stream 等) と
+///    申告より手前の EOF は `Err` にせず、**そこまでに読めたバイト数**を返す:
+///    pre-flight の役目は「展開量が cap を超えないこと」の確認だけで、壊れたファイル
+///    自体は後段の calamine が `Err` にする (= 既存の per-file skip 経路に乗る)。
+/// 2. 申告 size まで読めたら **1 バイトだけ probe** する。EOF なら申告どおりなので、
+///    読めたバイト数 (= 申告 size) を返す。`Err` なら
+///    [`Inflation::UnreadableAsDeclared`] を返す: zip が申告を超える read を拒んだか、
+///    末尾で CRC が合わなかったかで、どちらでも calamine は同じ所で止まる
+///    (`io::Error` の文言では区別しない)。
+/// 3. probe が 1 バイト読めた = zip が申告 size で止めなかった (zip 8.6 までの挙動。
+///    今の zip なら退行) 時は、従来どおり `limit` バイトまで数え続ける。この段は防御の層
+///    として残す (`zip_refuses_to_read_an_entry_past_its_declared_size` が落ちたら現役になる)。
+///
+/// 呼び出し側は層 1 の後に `limit = remaining + 1` で呼ぶので `declared < limit`
+/// (`remaining` が `u64::MAX` で `limit` が飽和した時だけ等しくなり得る)。それが
+/// 崩れても `limit` を超えては読まない (1 段目も `limit` で止める)。
+fn count_decompressed_bytes(
+    reader: &mut impl std::io::Read,
+    declared: u64,
+    limit: u64,
+) -> Inflation {
     let mut buf = [0u8; 8 * 1024];
     let mut total: u64 = 0;
+    // 1. 申告 size ちょうどまで。
+    let up_to_declared = declared.min(limit);
+    while total < up_to_declared {
+        let want = std::cmp::min(buf.len() as u64, up_to_declared - total) as usize;
+        match reader.read(&mut buf[..want]) {
+            Ok(0) | Err(_) => return Inflation::Counted(total),
+            Ok(n) => total += n as u64,
+        }
+    }
+    if total >= limit {
+        return Inflation::Counted(total);
+    }
+    // 2. 申告 size の 1 バイト先を probe する。
+    match reader.read(&mut buf[..1]) {
+        Ok(0) => return Inflation::Counted(total),
+        Ok(n) => total += n as u64,
+        Err(_) => return Inflation::UnreadableAsDeclared,
+    }
+    // 3. zip が申告 size で止めなかった: zip 8.6 の時と同じく `limit` まで数える。
     while total < limit {
         let want = std::cmp::min(buf.len() as u64, limit - total) as usize;
         match reader.read(&mut buf[..want]) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => total += n as u64,
-            Err(_) => break,
         }
     }
-    total
+    Inflation::Counted(total)
 }
 
 /// `docProps/core.xml` から frontmatter を取る。読めなければ (zip でない xls、core.xml が
@@ -781,6 +843,8 @@ mod tests {
         // で bound していない (実測: 申告 10 バイトのエントリから 100 MB が
         // 読み出せた)。したがって「申告を極小に偽装した高圧縮エントリ」は
         // pre-flight を素通りし、calamine が実際に展開してしまう。
+        // (2026-10-19) zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が申告超えの
+        // read を Err にするので、層 2 はその拒否を zip-bomb guard として伝える。
         //
         // ここでは 64 KiB のゼロ (= 高圧縮) を書いてから申告値を 1 バイトに
         // 偽装し、cap を 1 KiB に注入する。層 1 (申告値) では 1 <= 1024 なので
@@ -813,10 +877,14 @@ mod tests {
     }
 
     #[test]
-    fn test_xlsx_preflight_counts_actual_bytes_not_declared_ones() {
-        // 層 2 の会計が「実展開バイト数」であることの確認: 実体 64 KiB を
-        // 1 バイトと偽装したエントリでも、cap が実体を上回っていれば通る
-        // (= 偽装の検出ではなく、あくまで展開量で判断している)。
+    fn test_xlsx_preflight_rejects_a_lying_declaration_even_within_the_cap() {
+        // 層 2 は申告どおりに読めない entry を cap に依らず拒む: 実体 64 KiB を
+        // 1 バイトと偽装したエントリは、cap が実体を上回っていても Err になる。
+        // 2026-10-19 に期待を反転した。旧版は同じ fixture で「cap が実体を上回って
+        // いれば通る (= 偽装の検出ではなく、あくまで展開量で判断している)」を確かめて
+        // いたが、zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が申告 size を超える read
+        // を Err にするので、申告が嘘の entry は cap 内でも申告の先を読めず (calamine
+        // も同じ所で止まる)、層 2 はそれを zip-bomb guard として拒む。
         const REAL: u32 = 64 * 1024;
         let mut buf = Vec::new();
         {
@@ -827,8 +895,14 @@ mod tests {
             zip.finish().unwrap();
         }
         let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
-        preflight_xlsx_decompression_budget_capped(&forged, "ok.xlsx", REAL as u64)
-            .expect("actual size within the cap must be Ok even when the declaration is a lie");
+        let err = preflight_xlsx_decompression_budget_capped(&forged, "ok.xlsx", REAL as u64)
+            .expect_err(
+                "an entry whose declaration is a lie must be Err even when its actual size is within the cap",
+            );
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
     }
 
     #[test]
@@ -836,6 +910,9 @@ mod tests {
         // 1 エントリずつは cap 未満でも、複数の偽装エントリを積算すると
         // 超える (ooxml.rs::read_zip_entry_capped の累積 budget と同じ論点を
         // 実展開ベースの会計でも押さえる)。
+        // (2026-10-19) zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が申告超えの
+        // read を Err にするので、層 2 はその拒否を zip-bomb guard として伝える
+        // (積算に届く前、1 個目の偽装エントリで Err になる)。
         const REAL: u32 = 32 * 1024;
         let mut buf = Vec::new();
         {
@@ -933,6 +1010,8 @@ mod tests {
         // 程度) を確実に上回り、かつ bomb の実体 64 KiB は下回る値にする —
         // さもないと boilerplate の合計超過で Err になり、**穴を突けていない
         // のにテストが通ってしまう** (最初の版がこれで false pass した)。
+        // (2026-10-19) zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が申告超えの
+        // read を Err にするので、層 2 はその拒否を zip-bomb guard として伝える。
         const REAL: u32 = 64 * 1024;
         const CAP: u64 = 8 * 1024;
         let bomb = make_xlsx_with_worksheet_part("worksheets/payload", &vec![0u8; REAL as usize]);
@@ -944,6 +1023,163 @@ mod tests {
         assert!(
             err.to_string().contains("zip-bomb guard"),
             "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    /// zip 9.0.1 (zip-rs/zip2#1022) 以降の前提を pin する: 申告 uncompressed size を偽装した
+    /// entry は、zip 自身が申告を超える read を `Err` にするので最後まで読めない。層 2
+    /// ([`count_decompressed_bytes`]) はこの拒否を zip-bomb guard として伝えている。
+    /// **この test が落ちたら zip が申告超えを止めなくなった印**で、層 2 の 3 段目 (probe が
+    /// 1 バイト読めた時に `limit` まで数え続ける経路) が現役になる。
+    #[test]
+    fn zip_refuses_to_read_an_entry_past_its_declared_size() {
+        use std::io::Read as _;
+
+        const REAL: u32 = 64 * 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+
+        let mut entry = archive.by_index(0).unwrap();
+        assert_eq!(entry.size(), 1, "premise: the forged entry declares 1 byte");
+        let mut out = Vec::new();
+        let read = entry.read_to_end(&mut out);
+        assert!(
+            read.is_err(),
+            "zip must refuse to read the entry to its end: {read:?}, {} bytes read",
+            out.len()
+        );
+        drop(entry);
+
+        // What layer 2 relies on, read by read: the declared byte reads, the one after it fails.
+        let mut entry = archive.by_index(0).unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            entry.read(&mut byte).ok(),
+            Some(1),
+            "the declared byte reads"
+        );
+        assert!(
+            entry.read(&mut byte).is_err(),
+            "the read past the declared size must fail"
+        );
+    }
+
+    /// 申告どおりに読めない entry の拒否は zip-bomb guard として entry 名と申告バイト数を言い、
+    /// `[index].max_decompressed_size` を上げる案内を付けない (上げても zip が拒む)。cap を
+    /// 実体の倍にしても、無制限にしても同じ `Err` になる。
+    #[test]
+    fn test_xlsx_preflight_names_an_entry_unreadable_as_declared_without_offering_a_raise() {
+        const REAL: u32 = 64 * 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
+        for cap in [
+            2 * u64::from(REAL),
+            crate::parser::FileSizeLimit::Unlimited.cap_bytes(),
+        ] {
+            let err = preflight_xlsx_decompression_budget_capped(&forged, "bomb.xlsx", cap)
+                .expect_err("an entry that cannot be read as declared is Err whatever the cap");
+            let msg = err.to_string();
+            assert_eq!(
+                msg,
+                "bomb.xlsx: entry \"xl/worksheets/sheet1.xml\" cannot be read as declared (zip-bomb guard; it declares 1 bytes but holds more, or is corrupt; the archive is rejected whatever [index].max_decompressed_size is)",
+                "cap {cap}"
+            );
+            assert!(msg.is_ascii(), "{msg}");
+            assert!(!msg.contains("raise [index]"), "{msg}");
+        }
+    }
+
+    /// `len` バイトのゼロを返した後は、read のたびに `Err` を返す reader。zip 9 が申告
+    /// size の先で read を `Err` にするのを、zip を介さずに真似る。
+    struct FailsAfter {
+        len: u64,
+        served: u64,
+    }
+
+    impl FailsAfter {
+        fn new(len: u64) -> Self {
+            Self { len, served: 0 }
+        }
+    }
+
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.served >= self.len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "past the declared size",
+                ));
+            }
+            let n = std::cmp::min(buf.len() as u64, self.len - self.served) as usize;
+            buf[..n].fill(0);
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// 層 2 の 3 段目 (zip が申告 size で止めなかった時): probe が 1 バイト読めたら、
+    /// 従来どおり `limit` まで数え続ける。今の zip は申告で止めるので、zip を介さず、
+    /// 申告を知らない `Cursor` で突く。申告ちょうどで終わる reader は申告どおりに数える。
+    #[test]
+    fn count_decompressed_bytes_counts_on_to_the_limit_when_the_reader_does_not_stop() {
+        let bytes = [0u8; 100];
+        assert_eq!(
+            count_decompressed_bytes(&mut Cursor::new(&bytes[..]), 10, 50),
+            Inflation::Counted(50),
+            "a reader that goes on past the declared 10 bytes is counted up to the limit"
+        );
+        assert_eq!(
+            count_decompressed_bytes(&mut Cursor::new(&bytes[..]), 100, 200),
+            Inflation::Counted(100),
+            "a reader that ends at the declared size is counted as declared"
+        );
+        assert_eq!(
+            count_decompressed_bytes(&mut Cursor::new(&bytes[..0]), 0, 50),
+            Inflation::Counted(0),
+            "an empty entry that declares 0 bytes is counted as declared"
+        );
+    }
+
+    /// 層 2 の 2 段目: 申告 size ちょうどまで読めた後の read が `Err` なら、数えずに
+    /// 「申告どおりに読めない」を返す。申告より手前の `Err` / EOF は従来どおり、そこまでの
+    /// バイト数を返す (壊れた stream は calamine が後で `Err` にする)。
+    #[test]
+    fn count_decompressed_bytes_tells_a_refusal_at_the_declared_size_from_an_earlier_failure() {
+        assert_eq!(
+            count_decompressed_bytes(&mut FailsAfter::new(10), 10, 50),
+            Inflation::UnreadableAsDeclared,
+            "a read that fails right after the declared size is the refusal"
+        );
+        assert_eq!(
+            count_decompressed_bytes(&mut FailsAfter::new(0), 0, 50),
+            Inflation::UnreadableAsDeclared,
+            "an entry that declares 0 bytes and fails its first read is refused too"
+        );
+        assert_eq!(
+            count_decompressed_bytes(&mut FailsAfter::new(4), 10, 50),
+            Inflation::Counted(4),
+            "a read that fails before the declared size counts what was read"
+        );
+        let bytes = [0u8; 4];
+        assert_eq!(
+            count_decompressed_bytes(&mut Cursor::new(&bytes[..]), 10, 50),
+            Inflation::Counted(4),
+            "an entry that ends before its declared size counts what it holds"
         );
     }
 
