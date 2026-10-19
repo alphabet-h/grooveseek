@@ -69,7 +69,7 @@ Source-level structure and data flow of groove, for contributors extending or mo
 (filtered by Registry::extensions(); only .md is on by default)
      │
      ▼ walkdir
-indexer.rs: SHA-256 content-hash diff vs the chunks.hash column
+indexer.rs: SHA-256 content-hash diff vs documents.content_hash (per document)
      │
      ▼ changed files only
 parser/: dispatch by extension → extract frontmatter + title + chunk

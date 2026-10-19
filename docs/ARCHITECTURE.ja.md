@@ -69,7 +69,7 @@ groove のソース構造とデータフロー。コードを拡張・修正す�
 (Registry::extensions() でフィルタ。既定で有効なのは .md のみ)
      │
      ▼ walkdir
-indexer.rs: SHA-256 content-hash を chunks.hash と比較
+indexer.rs: SHA-256 content-hash を documents.content_hash と比較 (文書単位)
      │
      ▼ 変更ありのファイルのみ
 parser/: 拡張子で Parser を選択 → frontmatter + title 抽出 + チャンク化
