@@ -15,7 +15,7 @@ use common::embed_cli::{
     BODY_SENTINEL, DIM, REJECT_MARKER, files, fixture, note, rejects_marker, reply, stderr_of,
 };
 use common::embed_mock::{
-    DOC_MODEL, EmbedMock, Framing, MockReply, MockResponse, QUERY_MODEL, Recorded,
+    DOC_MODEL, EmbedMock, Framing, MockReply, MockResponse, QUERY_MODEL, Recorded, StallEnd,
     assert_dir_empty, default_response, hermetic, wait_until,
 };
 use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
@@ -1191,18 +1191,26 @@ fn mcp_rebuild_index_names_a_document_side_401_without_the_response_body() {
     assert_dir_empty(&fx.cache);
 }
 
-/// A 429 asking for more than 60 s is given up on at once, without reading
-/// its body: a body that stalls must not hold the run (and a daemon's
-/// embedder) for the request timeout.
+/// A 429 asking for more than 60 s is given up on without reading its body:
+/// a body that stalls must not hold the run (and a daemon's embedder) for the
+/// request timeout. The mock sees that as the client letting go of the
+/// connection while the body is still owed. That the run then stops without
+/// waiting is
+/// [`index_stops_without_waiting_when_retry_after_exceeds_sixty_seconds`]'s
+/// check.
 ///
-/// Red if the body is read before the `Retry-After` is looked at: the run
-/// would wait for the stalled body (the mock holds it for up to 10 s) before
-/// it gives up.
+/// Red if the body is read before the `Retry-After` is looked at: the client
+/// is still waiting on the stalled body when the mock stops holding it
+/// ([`StallEnd::BudgetRanOut`]), since the request timeout set here is longer
+/// than that 10 s hold. stderr reads the same either way (`HTTP 429: <empty>`)
+/// and elapsed time depends on the runner, so this is the assertion that tells
+/// them apart.
 #[test]
 fn index_gives_up_on_a_long_retry_after_without_reading_a_stalled_body() {
     let notes = one_note();
     let fx = fixture("groove-aw04-429-stall", &files(&notes), "");
-    // A request timeout well above the time the test allows for the run.
+    // A request timeout longer than the mock's 10 s hold, so a client that
+    // reads the stalled body is still attached when the hold runs out.
     let config = std::fs::read_to_string(&fx.config).expect("read groove.toml");
     assert!(config.contains("timeout_seconds = 15\n"), "{config}");
     std::fs::write(
@@ -1215,15 +1223,17 @@ fn index_gives_up_on_a_long_retry_after_without_reading_a_stalled_body() {
         stalled.stall_body = true;
         stalled
     });
-    let started = Instant::now();
     let out = fx.run_index();
-    let took = started.elapsed();
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
     assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
     assert!(stderr.contains("asked to retry after 120 s"), "{stderr}");
-    assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
     assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_eq!(
+        fx.mock.wait_for_stall_ends(1),
+        [StallEnd::ClientClosed],
+        "the client did not let go of the stalled body: {stderr}"
+    );
     assert_dir_empty(&fx.cache);
 }
 
@@ -1284,6 +1294,47 @@ fn embed_mock_writes_a_chunked_body_and_a_declared_content_length() {
     assert_eq!(body, payload, "{answer}");
 }
 
+/// The mock records that a client let go of a stalled body: the client reads
+/// the head of a reply whose body stalls, then closes the connection.
+///
+/// Red if `serve_one` records nothing when the client closes first (the wait
+/// runs to the budget and comes back empty), or if the read that sees the
+/// close does not end the hold (it then runs out as
+/// [`StallEnd::BudgetRanOut`]).
+#[test]
+fn embed_mock_records_that_a_client_let_go_of_a_stalled_body() {
+    let mock = EmbedMock::with_reply_responder(|_| {
+        let mut stalled = reply(429, &[]);
+        stalled.stall_body = true;
+        stalled
+    });
+    let mut stream = TcpStream::connect(mock.addr()).expect("connect");
+    let body = r#"{"model":"m","input":["x"]}"#;
+    write!(
+        stream,
+        "POST /v1/embeddings HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n{body}",
+        mock.addr(),
+        body.len()
+    )
+    .expect("write request");
+    // Only as far as the end of the head: the body is owed and the mock holds
+    // the connection, so reading to EOF would wait out its budget.
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream.read(&mut chunk).expect("read answer head");
+        assert!(
+            n > 0,
+            "closed before the head ended: {}",
+            String::from_utf8_lossy(&head)
+        );
+        head.extend_from_slice(&chunk[..n]);
+    }
+    drop(stream);
+    assert_eq!(mock.wait_for_stall_ends(1), [StallEnd::ClientClosed]);
+    assert_eq!(mock.requests().len(), 1);
+}
+
 /// [`default_response`] for `req`, framed as `framing`.
 fn framed_default(req: &Recorded, framing: Framing) -> MockReply {
     let mut framed = MockReply::plain(default_response(req, DIM));
@@ -1296,12 +1347,12 @@ const CAP_EXCEEDED: &str = "embedding endpoint answered with more than";
 /// AW-11: a 2xx whose `Content-Length` is over the cap is refused before a
 /// byte of it is read, and the run stops: the same inputs would bring the
 /// same answer again, so it is not retried. The mock holds the connection
-/// after its short body (for up to 10 s), so a client that started reading
-/// would still be waiting.
+/// after its short body and sees the refusal as the client letting go of it.
 ///
-/// Red if the `Content-Length` check is dropped (the run waits on the stalled
-/// body and fails on it instead), or if the refusal is made retryable (four
-/// requests).
+/// Red if the `Content-Length` check is dropped (the client reads on and is
+/// still attached when the mock's 10 s hold runs out,
+/// [`StallEnd::BudgetRanOut`], then fails on the broken body instead), or if
+/// the refusal is made retryable (four requests).
 #[test]
 fn index_stops_without_reading_a_2xx_whose_content_length_exceeds_the_cap() {
     let notes = one_note();
@@ -1311,15 +1362,17 @@ fn index_stops_without_reading_a_2xx_whose_content_length_exceeds_the_cap() {
         huge.stall_body = true;
         huge
     });
-    let started = Instant::now();
     let out = fx.run_index();
-    let took = started.elapsed();
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains(CAP_EXCEEDED), "{stderr}");
     assert!(stderr.contains("check [embedding].dimension"), "{stderr}");
     assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
-    assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
+    assert_eq!(
+        fx.mock.wait_for_stall_ends(1),
+        [StallEnd::ClientClosed],
+        "the client did not let go of the stalled body: {stderr}"
+    );
     assert_dir_empty(&fx.cache);
 }
 
@@ -1364,10 +1417,11 @@ fn index_accepts_a_chunked_2xx_within_the_cap() {
 
 /// AW-11: a non-2xx is read only as far as its snippet shows. A 503 whose
 /// long body then stalls is reported (the snippet's 512 bytes and `...`) at
-/// once, not after the mock gives up holding it (10 s).
+/// once, the client letting go of the connection the mock still holds.
 ///
-/// Red if a non-2xx body is read whole: the run waits on the stalled body, and
-/// the body read then fails, leaving the snippet empty.
+/// Red if a non-2xx body is read whole: the client waits on the stalled body
+/// until the mock's 10 s hold runs out ([`StallEnd::BudgetRanOut`]), and the
+/// body read then fails, leaving the snippet empty.
 #[test]
 fn index_retries_a_503_without_waiting_for_the_rest_of_a_long_stalled_body() {
     let notes = one_note();
@@ -1380,9 +1434,7 @@ fn index_retries_a_503_without_waiting_for_the_rest_of_a_long_stalled_body() {
         long.stall_body = true;
         long
     });
-    let started = Instant::now();
     let out = fx.run_index();
-    let took = started.elapsed();
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
     assert!(
@@ -1390,7 +1442,11 @@ fn index_retries_a_503_without_waiting_for_the_rest_of_a_long_stalled_body() {
         "{stderr}"
     );
     assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
-    assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
+    assert_eq!(
+        fx.mock.wait_for_stall_ends(1),
+        [StallEnd::ClientClosed],
+        "the client did not let go of the stalled body: {stderr}"
+    );
     assert_dir_empty(&fx.cache);
 }
 

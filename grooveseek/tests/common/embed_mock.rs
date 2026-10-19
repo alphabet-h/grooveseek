@@ -13,6 +13,12 @@
 //!   connection still has its whole budget);
 //! - a connection closed before it wrote anything (`read == 0`) is dropped,
 //!   not asserted on;
+//! - a reply whose body stalls records how its hold ended
+//!   ([`crate::common::embed_mock::StallEnd`]: the client let go of the
+//!   connection, its budget ran out, or the mock was stopped), so a test asks
+//!   the mock what it saw
+//!   ([`crate::common::embed_mock::EmbedMock::wait_for_stall_ends`]) rather
+//!   than timing a run that a loaded runner stretches;
 //! - every response carries `Connection: close`, so one request is one
 //!   connection and
 //!   [`crate::common::embed_mock::EmbedMock::connection_count`] means
@@ -158,6 +164,28 @@ impl MockReply {
     }
 }
 
+/// Why the mock stopped serving a connection, recorded once for every reply
+/// served with [`MockReply::stall_body`] and read with
+/// [`EmbedMock::wait_for_stall_ends`].
+///
+/// A client waiting on the body under a request timeout longer than
+/// [`CONNECTION_BUDGET`] cannot end a hold as [`StallEnd::ClientClosed`]: it is
+/// still attached when the budget runs out. That is what the stalled-body tests
+/// rely on to tell a client that let go of the body from one that waited on
+/// it, whatever the runner's load before the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallEnd {
+    /// The client closed or reset the connection while it still had budget: a
+    /// read or write saw `Ok(0)`, or an error [`worth_retrying`] rejects, such
+    /// as `ConnectionReset` when the client exits with bytes unread.
+    ClientClosed,
+    /// [`CONNECTION_BUDGET`] passed with the client still attached: it was
+    /// waiting on the body.
+    BudgetRanOut,
+    /// The mock was dropped during the hold.
+    Stopped,
+}
+
 /// The answer an OpenAI-compatible endpoint gives: one vector per input, in
 /// order, as long as the dimension parameter says. A body without an
 /// `input` array gets a 400.
@@ -237,6 +265,7 @@ type Responder = dyn Fn(&Recorded) -> MockReply + Send + Sync;
 pub struct EmbedMock {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    stall_ends: Arc<Mutex<Vec<StallEnd>>>,
     connections: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -272,19 +301,32 @@ impl EmbedMock {
             .expect("non-blocking mock listener");
         let addr = listener.local_addr().expect("mock local addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let stall_ends = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let responder: Arc<Responder> = Arc::new(responder);
         let handle = {
-            let (requests, connections, stop) =
-                (requests.clone(), connections.clone(), stop.clone());
+            let (requests, stall_ends, connections, stop) = (
+                requests.clone(),
+                stall_ends.clone(),
+                connections.clone(),
+                stop.clone(),
+            );
             thread::spawn(move || {
-                accept_loop(listener, &requests, &connections, &stop, responder.as_ref())
+                accept_loop(
+                    listener,
+                    &requests,
+                    &stall_ends,
+                    &connections,
+                    &stop,
+                    responder.as_ref(),
+                )
             })
         };
         Self {
             addr,
             requests,
+            stall_ends,
             connections,
             stop,
             handle: Some(handle),
@@ -315,6 +357,30 @@ impl EmbedMock {
     pub fn wait_for(&self, deadline: Duration, pred: impl Fn(&[Recorded]) -> bool) -> bool {
         wait_until(deadline, || pred(&self.requests()))
     }
+
+    /// How the holds of the replies served with [`MockReply::stall_body`]
+    /// ended: one entry per stalled reply (not per request), in the order their
+    /// holds ended. Returns once `count` are on record, or when no hold could
+    /// still be running.
+    ///
+    /// Unlike [`EmbedMock::requests`] this has to wait: a request is recorded
+    /// before its answer is written, but a hold is recorded only once the
+    /// mock's thread sees the client close, which can come after the client
+    /// process has exited. A hold cannot outlast its budget
+    /// ([`CONNECTION_BUDGET`]), so after the wait a missing entry means fewer
+    /// replies stalled than expected. Never wait by dropping the mock instead:
+    /// `Drop` sets the stop flag first, which ends a running hold as
+    /// [`StallEnd::Stopped`].
+    pub fn wait_for_stall_ends(&self, count: usize) -> Vec<StallEnd> {
+        let ends = || {
+            self.stall_ends
+                .lock()
+                .expect("mock stall ends lock")
+                .clone()
+        };
+        wait_until(CONNECTION_BUDGET + IO_POLL, || ends().len() >= count);
+        ends()
+    }
 }
 
 impl Drop for EmbedMock {
@@ -329,6 +395,7 @@ impl Drop for EmbedMock {
 fn accept_loop(
     listener: TcpListener,
     requests: &Mutex<Vec<Recorded>>,
+    stall_ends: &Mutex<Vec<StallEnd>>,
     connections: &AtomicUsize,
     stop: &AtomicBool,
     responder: &Responder,
@@ -338,7 +405,7 @@ fn accept_loop(
         match listener.accept() {
             Ok((stream, _)) => {
                 connections.fetch_add(1, Ordering::SeqCst);
-                serve_one(stream, requests, responder, stop);
+                serve_one(stream, requests, stall_ends, responder, stop);
             }
             // `WouldBlock` is the usual case (nobody is connecting). Any other
             // error is transient for a loopback listener; the loop tries again
@@ -348,9 +415,11 @@ fn accept_loop(
     }
 }
 
-/// Read one request, record it, answer it, close. Anything malformed or cut
-/// short is dropped without a panic: a panic here would kill the accept loop
-/// and turn every later request into a hang.
+/// Read one request, record it, answer it, close. A reply served with
+/// [`MockReply::stall_body`] also records how its hold ended ([`StallEnd`]),
+/// before the connection is closed. Anything malformed or cut short is dropped
+/// without a panic: a panic here would kill the accept loop and turn every
+/// later request into a hang.
 ///
 /// The socket option calls are the exception: a failure there panics, because a
 /// read or write without its short timeout would block past the stop flag, and
@@ -358,6 +427,7 @@ fn accept_loop(
 fn serve_one(
     mut stream: TcpStream,
     requests: &Mutex<Vec<Recorded>>,
+    stall_ends: &Mutex<Vec<StallEnd>>,
     responder: &Responder,
     stop: &AtomicBool,
 ) {
@@ -413,26 +483,47 @@ fn serve_one(
         resp.status,
         reason(resp.status),
     );
-    if write_bounded(&mut stream, head.as_bytes(), stop, deadline)
-        && write_bounded(&mut stream, &body, stop, deadline)
-        && stall_body
-    {
-        // Hold the connection, bounded like every other wait here, until the
-        // client closes it (its timeout) or the budget runs out.
-        let mut chunk = [0u8; 1024];
-        while read_some(&mut stream, &mut chunk, stop, deadline).is_some() {}
+    let written = write_bounded(&mut stream, head.as_bytes(), stop, deadline)
+        .and_then(|()| write_bounded(&mut stream, &body, stop, deadline));
+    if !stall_body {
+        return;
     }
+    let end = match written {
+        Err(end) => end,
+        // Hold the connection, bounded like every other wait here, until the
+        // client closes it (letting go of the body, or its timeout) or the
+        // budget runs out. What the client sends meanwhile is discarded.
+        Ok(()) => {
+            let mut chunk = [0u8; 1024];
+            loop {
+                if let Err(end) = read_some(&mut stream, &mut chunk, stop, deadline) {
+                    break end;
+                }
+            }
+        }
+    };
+    // Recorded while `stream` is still open, so before the client is released:
+    // a hold that ran out its budget is on record by the time the client
+    // process has exited.
+    stall_ends.lock().expect("mock stall ends lock").push(end);
 }
 
-/// Whether the connection may make another read or write: the mock is not
-/// stopping and the connection's deadline is still ahead.
+/// Whether the connection may make another read or write, and if not, why:
+/// [`StallEnd::Stopped`] when the mock is stopping, else
+/// [`StallEnd::BudgetRanOut`] when the connection's deadline has passed.
 ///
 /// Asked before every attempt, not only after a timed-out one. A client that
 /// trickles its request, or drains the answer steadily, makes every call
 /// succeed inside the poll, and a check that waited for a timeout would never
 /// run.
-fn still_serving(stop: &AtomicBool, deadline: Instant) -> bool {
-    !stop.load(Ordering::SeqCst) && Instant::now() < deadline
+fn still_serving(stop: &AtomicBool, deadline: Instant) -> Result<(), StallEnd> {
+    if stop.load(Ordering::SeqCst) {
+        Err(StallEnd::Stopped)
+    } else if Instant::now() >= deadline {
+        Err(StallEnd::BudgetRanOut)
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether an I/O error on a mock connection is worth another try.
@@ -449,46 +540,45 @@ fn worth_retrying(e: &std::io::Error) -> bool {
 }
 
 /// One read that gives up when the mock is stopping or the connection is out
-/// of time. `None` means abandon the connection: closed, failed, stopped, or
-/// past the deadline.
+/// of time. `Err` means abandon the connection, and says why: the client
+/// closed it or the read failed ([`StallEnd::ClientClosed`]), or
+/// [`still_serving`] said no.
 fn read_some(
     stream: &mut TcpStream,
     chunk: &mut [u8],
     stop: &AtomicBool,
     deadline: Instant,
-) -> Option<usize> {
-    while still_serving(stop, deadline) {
+) -> Result<usize, StallEnd> {
+    loop {
+        still_serving(stop, deadline)?;
         match stream.read(chunk) {
-            Ok(0) => return None,
-            Ok(n) => return Some(n),
+            Ok(0) => return Err(StallEnd::ClientClosed),
+            Ok(n) => return Ok(n),
             Err(e) if worth_retrying(&e) => {}
-            Err(_) => return None,
+            Err(_) => return Err(StallEnd::ClientClosed),
         }
     }
-    None
 }
 
 /// Write all of `buf` unless the mock is stopping or the connection is out of
-/// time. `false` means abandon the connection: closed, failed, stopped, or past
-/// the deadline.
+/// time. `Err` means abandon the connection, and says why, as for
+/// [`read_some`].
 fn write_bounded(
     stream: &mut TcpStream,
     mut buf: &[u8],
     stop: &AtomicBool,
     deadline: Instant,
-) -> bool {
+) -> Result<(), StallEnd> {
     while !buf.is_empty() {
-        if !still_serving(stop, deadline) {
-            return false;
-        }
+        still_serving(stop, deadline)?;
         match stream.write(buf) {
-            Ok(0) => return false,
+            Ok(0) => return Err(StallEnd::ClientClosed),
             Ok(n) => buf = &buf[n..],
             Err(e) if worth_retrying(&e) => {}
-            Err(_) => return false,
+            Err(_) => return Err(StallEnd::ClientClosed),
         }
     }
-    true
+    Ok(())
 }
 
 fn read_request(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) -> Option<Recorded> {
@@ -498,7 +588,7 @@ fn read_request(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) ->
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break pos;
         }
-        let n = read_some(stream, &mut chunk, stop, deadline)?;
+        let n = read_some(stream, &mut chunk, stop, deadline).ok()?;
         buf.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
@@ -516,7 +606,7 @@ fn read_request(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) ->
         .unwrap_or(0);
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < len {
-        let n = read_some(stream, &mut chunk, stop, deadline)?;
+        let n = read_some(stream, &mut chunk, stop, deadline).ok()?;
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(len);
@@ -543,6 +633,12 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// The `timeout_seconds` ([`grooveseek::config::EmbeddingConfig::timeout_seconds`])
+/// [`openai_config_toml`] writes. Why it sits above [`CONNECTION_BUDGET`] is on
+/// that function; the assertion below holds it there at compile time.
+const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
+const _: () = assert!(DEFAULT_TIMEOUT_SECONDS > CONNECTION_BUDGET.as_secs());
+
 /// A `groove.toml` that selects the OpenAI-compatible provider at `endpoint`.
 ///
 /// Pass it with `--config` **before** the subcommand: a config found by
@@ -554,6 +650,13 @@ fn reason(status: u16) -> &'static str {
 /// ([`grooveseek::config::EmbeddingConfig::timeout_seconds`]) is short so a
 /// mock that stops answering fails the test inside its deadline rather than
 /// after the 60 s default.
+///
+/// It is still longer than [`CONNECTION_BUDGET`] (checked at compile time, by
+/// [`DEFAULT_TIMEOUT_SECONDS`]), so a client that waits on a stalled body is
+/// still attached when the mock's hold runs out: [`EmbedMock::wait_for_stall_ends`]
+/// then reports [`StallEnd::BudgetRanOut`] for it, and only a client that let
+/// go of the body reports [`StallEnd::ClientClosed`]. A test that cuts the
+/// timeout below the budget loses that distinction.
 pub fn openai_config_toml(endpoint: &str, api_key: Option<&str>, dimension: usize) -> String {
     let mut s = format!(
         "[embedding]\n\
@@ -562,7 +665,7 @@ pub fn openai_config_toml(endpoint: &str, api_key: Option<&str>, dimension: usiz
          document_model = {}\n\
          query_model = {}\n\
          dimension = {dimension}\n\
-         timeout_seconds = 15\n",
+         timeout_seconds = {DEFAULT_TIMEOUT_SECONDS}\n",
         toml_str(endpoint),
         toml_str(DOC_MODEL),
         toml_str(QUERY_MODEL),
