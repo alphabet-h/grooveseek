@@ -742,11 +742,13 @@ mod tests {
     /// feature-62 T15b (AC15 (c)): an optional part that declares less than what is left of
     /// the document's budget but holds more is left out and charges nothing; a part that fits
     /// is read and charged. The forged part is larger than what is left (1014 bytes) and no
-    /// larger than the cap (1024), so only a read bounded by what is left refuses it before
-    /// it is charged: one bounded by the cap would read all of it, charge it, and fail the
-    /// total. zip 8 does not stop at the declared size when it inflates (the xlsx parser's
-    /// tests, in [`crate::parser::xlsx`], measure it with their
-    /// `forge_declared_uncompressed_size` helper).
+    /// larger than the cap (1024). Under zip 8, which did not stop at the declared size when it
+    /// inflated, only a read bounded by what is left refused it before it was charged: one
+    /// bounded by the cap would have read the whole part, charged it, and failed the total.
+    /// Since zip 9.0.1 (zip-rs/zip2#1022) zip itself fails a read that goes past the declared
+    /// size, so the forged part is refused at its declared byte, before either bound is
+    /// reached, and this test no longer tells the two bounds apart; what it still pins is that
+    /// the part left out charges nothing.
     #[test]
     fn a_forged_optional_part_is_skipped_without_charging_the_budget() {
         const REAL: u32 = 1020;

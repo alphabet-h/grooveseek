@@ -113,9 +113,10 @@ oxidize-pdf = "=4.3.0"
 # [feature-45 PR-3] Office 抽出。calamine=xlsx/xls (streaming, 純 Rust)。
 # zip/quick-xml は calamine が transitive で導入済のため direct dep に昇格
 # (docx/pptx を自前実装するのに使う。XML スタックを 1 本化して追加 heavy dep ゼロ)。
-calamine = "0.36"
-zip = "8"
-quick-xml = "0.41"
+# quick-xml の `encoding` は calamine 0.36 までは feature unification で有効だった。calamine 0.37 は quick-xml 0.42 を使うので 0.41 側で明示して挙動を保つ (oxidize-pdf =4.3.0 が 0.41 を要求する間は 2 版が並ぶ)。
+calamine = "0.37"
+zip = "9"
+quick-xml = { version = "0.41", features = ["encoding"] }
 
 # (feature-56) Source code parsed into one chunk per definition. `tree-sitter` is
 # the runtime, `tree-sitter-tags` turns a parse tree into definitions and

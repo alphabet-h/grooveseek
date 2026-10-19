@@ -408,6 +408,15 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 ///    **残り budget + 1 バイトで打ち切る**ので、preflight 自体のメモリは
 ///    固定バッファ分、CPU は最大でも cap + 1 バイトの展開に収まる。
 ///
+///    (zip 9 で前提が変わった) 上の「申告値で bound していない」は zip 8.6 までの
+///    話。zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が、申告 uncompressed size を
+///    超えた read を `InvalidData` ("File is larger than its declared uncompressed
+///    size") で失敗させる。calamine も同じ `zip` の `by_name` で part を読むので、
+///    そこで同じく止まる。一方、層 2 の [`count_decompressed_bytes`] は read の Err で
+///    数えるのをやめ、Err になった read の分は数えないので、申告を偽装した entry は
+///    申告 size 以下しか数えられない。この関数は偽装した entry を実体の大きさで
+///    `Err` にすることはもう無く、それを止めているのは zip の read error の方である。
+///
 /// 代償として正規の xlsx でも XML パートを 1 回余分に展開する (calamine が
 /// 後でもう一度展開する)。実測 (release、この機の場合): calamine が読まない
 /// 11.8 MB の XML パートを持つ xlsx で `parse_bytes` が 12 µs → **5.08 ms**
@@ -417,7 +426,7 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// embedding (数百 ms 〜) に比べれば無視できる。
 ///
 /// `zip` crate は calamine と **同一インスタンス** (`cargo tree` で
-/// `zip v8.6.0` を共有、feature unification 済) なので、「我々が展開でき
+/// `zip v9.0.5` を共有、feature unification 済) なので、「我々が展開でき
 /// ない圧縮方式を calamine だけが展開できる」という抜け道は無い。
 ///
 /// **なぜ「全 entry」なのか — 対象を name で絞る方式は 3 回破られた**:
@@ -476,7 +485,14 @@ fn preflight_xlsx_decompression_budget_capped(
             let Ok(entry) = zip.by_index_raw(i) else {
                 continue;
             };
-            (entry.name().to_string(), entry.size())
+            // zip 9 の `name()` は `ZipResult`。名前は下の error 文にしか使わないので、
+            // 読めない名前でも entry を飛ばさず (飛ばすと budget に数えない穴になる)、
+            // raw bytes を lossy に表示する。
+            let name = match entry.name() {
+                Ok(name) => name.into_owned(),
+                Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+            };
+            (name, entry.size())
         };
 
         // 層 1: 申告値だけで既に budget 超過 = 展開を試みるまでもなく拒否。

@@ -89,9 +89,11 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDoc
 
     // slide エントリをファイル番号順に集める (zip 内順序非依存。
     // presentation.xml が読めない場合のフォールバック用)。
+    // zip 9 の `file_names()` は名前ごとに `ZipResult` を返す。名前として読めない
+    // entry は slide でない名前と同じく飛ばす。
     let mut slide_nums: Vec<usize> = zip
         .file_names()
-        .filter_map(|n| slide_number(n, "ppt/slides/slide", ".xml"))
+        .filter_map(|n| slide_number(&n.ok()?, "ppt/slides/slide", ".xml"))
         .collect();
     slide_nums.sort_unstable();
 
