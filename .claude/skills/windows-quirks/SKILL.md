@@ -936,10 +936,10 @@ Read tool で読み、`user32` の P/Invoke で押す形の実機確認をした
 **正しいやり方**: 撮る・押す・貼るを 1 つの script に action として持ち、同じ process で動かす:
 
 - 先頭で `[W]::SetProcessDPIAware()` (P/Invoke で宣言) を呼ぶ。以後の screenshot と click は同じ座標系
-- 前面に出す前に Alt を `keybd_event(0x12, 0, 0, 0)` / `keybd_event(0x12, 0, 2, 0)` で 1 回叩く (lock が外れる)。`GetForegroundWindow()` で確かめ、だめなら `(New-Object -ComObject WScript.Shell).AppActivate($pid)`
+- 前面に出す前に Alt を `keybd_event(0x12, 0, 0, 0)` / `keybd_event(0x12, 0, 2, 0)` で 1 回叩く (lock が外れる)。`GetForegroundWindow()` で確かめ、だめなら `(New-Object -ComObject WScript.Shell).AppActivate($gui.Id)` (`$gui` は下の `Start-Process … -PassThru` が返した GUI の process)。**`AppActivate($pid)` と書かない** — PowerShell の変数名は大文字小文字を区別しないので `$pid` は自動変数 `$PID` (= この shell 自身の process id、上書きもできない) に解決され、shell を前面に出すか window が見つからずに失敗し、続く `SendWait` が別の app に貼る (codex P2 on grooveseek PR #372)
 - 和文は `[Windows.Forms.Clipboard]::SetText($text)` → `SendWait("^a")` → `SendWait("^v")` → `SendWait("{ENTER}")`
 - 下方向の wheel は `[uint32]4294967176` (= 2^32 − 120) を渡す。上方向は `[uint32]120`
-- GUI を `Start-Process` で起こす時は罠 24 (`-WorkingDirectory` を repo の外に)
+- GUI を `Start-Process` で起こす時は罠 24 (`-WorkingDirectory` を repo の外に)。`-PassThru` を付けて返り値の process を `$gui` に取っておき、上の `AppActivate($gui.Id)` に渡す
 
 script の実物は DT の .dev の tools の下の gui-smoke (private。KB からは読まない)。撮った PNG は Read tool で開いて見る (真っ黒なら前面に出ていない)。
 
