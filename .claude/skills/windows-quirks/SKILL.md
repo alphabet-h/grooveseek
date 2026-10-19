@@ -922,6 +922,29 @@ cwd を見ない app なら repo の外のどこでもよい。起こした後�
 
 出典: 2026-10-19、kuriya trap #490 (KB の記録。DT には無い)
 
+## 25. PowerShell から GUI を駆動する (撮る・押す・貼る) 時の 4 点: DPI、foreground lock、日本語入力、wheel の `uint`
+
+**観測**: computer use の tool が無い CLI session で、desktop の release exe を shell から起動し、`System.Drawing` で画面を撮って
+Read tool で読み、`user32` の P/Invoke で押す形の実機確認をした (DT の ADR-0005 の採用、2026-10-20)。素直に書くと 4 か所で止まる:
+<!-- via: DT の記録 desktop-gui-smoke-via-powershell-notes.md (KB からは読まない) の「手順」5 と「踏んだ罠」。implementer が 1 本で通した時の findings -->
+
+- **座標系**: `CopyFromScreen` / `GetWindowRect` / `SetCursorPos` は process が DPI aware かどうかで値が変わる。撮る process と押す process が違うと、screenshot で測った座標が外れる
+- **前面**: `SetForegroundWindow` は foreground lock で黙って拒まれることがある (戻り値 false、別の window のまま)
+- **日本語**: `[Windows.Forms.SendKeys]::SendWait` は和文を打てない (IME を通らない)
+- **wheel**: `mouse_event(0x0800, 0, 0, dwData, 0)` の `dwData` は `uint`。下方向の `-120` を渡すと `Cannot convert value "-120" to type "System.UInt32"`
+
+**正しいやり方**: 撮る・押す・貼るを 1 つの script に action として持ち、同じ process で動かす:
+
+- 先頭で `[W]::SetProcessDPIAware()` (P/Invoke で宣言) を呼ぶ。以後の screenshot と click は同じ座標系
+- 前面に出す前に Alt を `keybd_event(0x12, 0, 0, 0)` / `keybd_event(0x12, 0, 2, 0)` で 1 回叩く (lock が外れる)。`GetForegroundWindow()` で確かめ、だめなら `(New-Object -ComObject WScript.Shell).AppActivate($pid)`
+- 和文は `[Windows.Forms.Clipboard]::SetText($text)` → `SendWait("^a")` → `SendWait("^v")` → `SendWait("{ENTER}")`
+- 下方向の wheel は `[uint32]4294967176` (= 2^32 − 120) を渡す。上方向は `[uint32]120`
+- GUI を `Start-Process` で起こす時は罠 24 (`-WorkingDirectory` を repo の外に)
+
+script の実物は DT の .dev の tools の下の gui-smoke (private。KB からは読まない)。撮った PNG は Read tool で開いて見る (真っ黒なら前面に出ていない)。
+
+出典: 2026-10-20、DT の記録 desktop-gui-smoke-via-powershell-notes.md (KB からは読まない)
+
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
 上記のどれにも当てはまらない未知の Windows 固有挙動に遭遇したら、**公式 docs だけで判断せず実機 dogfood で確認する**。本 skill に集約された罠のほぼ全てが「docs 上は問題ないはずなのに実機だけ失敗する」パターンであり、静的 review (codex / subagent self-review) や CI runner (多くは非 interactive logon session) では再現・検出できない。新しい罠を発見したら `.dev/knowledge/<topic>-pitfalls.md` に追記し、本 skill にも反映すること。
