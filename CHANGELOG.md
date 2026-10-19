@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.20.1] - 2026-10-20
+
 ### Security
 
 - **`zip` was updated 8.6.0 → 9.0.5 and `calamine` 0.36.0 → 0.37.0 to clear RUSTSEC-2026-0367,
@@ -6156,7 +6158,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...HEAD
+[1.20.1]: https://github.com/alphabet-h/grooveseek/compare/v1.20.0...v1.20.1
 [1.20.0]: https://github.com/alphabet-h/grooveseek/compare/v1.19.0...v1.20.0
 [1.19.0]: https://github.com/alphabet-h/grooveseek/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/alphabet-h/grooveseek/compare/v1.17.1...v1.18.0
