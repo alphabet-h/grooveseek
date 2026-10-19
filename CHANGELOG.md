@@ -14,6 +14,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Internal
+
+- **The stalled-body tests of the OpenAI-compatible embedder now ask the mock how its hold ended
+  instead of timing the whole `groove index` run.**
+  `index_gives_up_on_a_long_retry_after_without_reading_a_stalled_body` failed in CI runs
+  36934827898 and 38962986917 (windows-latest) while the product behaved correctly: its bound
+  covered process start-up, database creation and scanning, which a loaded runner stretches, and
+  it could not be raised past the mock's connection budget without also passing a client that
+  reads the stalled body. The mock (`grooveseek/tests/common/embed_mock.rs`) now records, for
+  every reply whose body stalls, whether the client let go of the connection, the connection
+  budget ran out, or the mock was stopped, and the tests that timed the run (that one,
+  `index_stops_without_reading_a_2xx_whose_content_length_exceeds_the_cap` and
+  `index_retries_a_503_without_waiting_for_the_rest_of_a_long_stalled_body`) assert the first.
+  The deciding window starts at the mock's accept, so runner load before the request no longer
+  counts, while a client that reads the stalled body is still attached when the budget runs out.
+  The default request timeout in the mock's `groove.toml` stays above that budget, checked at
+  compile time, and the 429 test sets a longer one of its own.
+
 ## [1.20.0] - 2026-10-17
 
 ### Added
