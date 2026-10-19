@@ -922,6 +922,30 @@ cwd を見ない app なら repo の外のどこでもよい。起こした後�
 
 出典: 2026-10-19、kuriya trap #490 (KB の記録。DT には無い)
 
+## 25. PowerShell から GUI を駆動する (撮る・押す・貼る) 時の 4 点: DPI、foreground lock、日本語入力、wheel の `uint`
+
+**観測**: computer use の tool が無い CLI session で、desktop の release exe を shell から起動し、`System.Drawing` で画面を撮って
+Read tool で読み、`user32` の P/Invoke で押す形の実機確認をした (DT の ADR-0005 の採用、2026-10-20)。素直に書くと 4 か所で止まる:
+<!-- via: DT の記録 desktop-gui-smoke-via-powershell-notes.md (KB からは読まない) の「手順」5 と「踏んだ罠」。implementer が 1 本で通した時の findings -->
+
+- **座標系**: `CopyFromScreen` / `GetWindowRect` / `SetCursorPos` は process が DPI aware かどうかで値が変わる。撮る process と押す process が違うと、screenshot で測った座標が外れる
+- **前面**: `SetForegroundWindow` は foreground lock で黙って拒まれることがある (戻り値 false、別の window のまま)
+- **日本語**: `[Windows.Forms.SendKeys]::SendWait` は和文を打てない (IME を通らない)
+- **wheel**: `mouse_event(0x0800, 0, 0, dwData, 0)` の `dwData` は `uint`。下方向の `-120` を渡すと `Cannot convert value "-120" to type "System.UInt32"`
+
+**正しいやり方**: 撮る・押す・貼るを 1 つの script に action として持ち、同じ process で動かす:
+
+- 先頭で `[W]::SetProcessDPIAware()` (P/Invoke で宣言) を呼ぶ。以後の screenshot と click は同じ座標系
+- GUI は `Start-Process <exe> -WorkingDirectory <repo の外> -PassThru` で起こし (罠 24)、返り値の process を `$gui` に取っておく。launcher が子 process に GUI を出す app では、返り値は window を持たない launcher なので、`Get-CimInstance Win32_Process -Filter "ParentProcessId = $($gui.Id)"` で子を辿り (子が複数なら `Name` = GUI の exe 名で絞る)、`$gui = Get-Process -Id <その ProcessId>` に差し替える — 以後の `$gui` はすべてこの子で、window の title で探さない (同じ title の別 window や古い window を通してしまう。codex P2 on PR #372 round 2 / 3)。それから `$gui.MainWindowHandle` が 0 でなくなるまで `$gui.Refresh()` を挟んで polling する (`Process` の property は最初に読んだ値を cache するので `Refresh()` が要る。window を持たない process では 0 のまま。window ができる前の activate / click は届かない)。timeout なら中断
+- 前面に出す前に Alt を `keybd_event(0x12, 0, 0, 0)` / `keybd_event(0x12, 0, 2, 0)` で 1 回叩く (lock が外れる)。`SetForegroundWindow($gui.MainWindowHandle)` を呼び、`GetForegroundWindow()` で確かめ、だめなら `(New-Object -ComObject WScript.Shell).AppActivate($gui.Id)`。**`AppActivate($pid)` と書かない** — PowerShell の変数名は大文字小文字を区別しないので `$pid` は自動変数 `$PID` (= この shell 自身の process id、上書きもできない) に解決され、shell を前面に出すか window が見つからずに失敗する (codex P2 on grooveseek PR #372)
+- 貼る text は先に `[Windows.Forms.Clipboard]::SetText($text)` で clipboard に置いておく (和文は clipboard 経由でしか入らない、上の観測)。**押す・貼る直前に、前面が `$gui` であることを確かめ、違えば中断する**: `GetForegroundWindow()` の HWND を `GetWindowThreadProcessId(hwnd, [ref]$fgPid)` に通し、`$fgPid -eq $gui.Id` でなければ `SendWait` を打たない (HWND を `MainWindowHandle` と比べると、GUI が dialog を前面に出している時に外れる。launcher 経由の app では `$gui` を上で子に差し替えてあるので、比べるのはその子の PID)。`SetForegroundWindow` も `AppActivate` も OS に拒まれてよい API で、拒まれたまま進むと続く key は前面にいる別の app に届く (ローカル Codex [high] on PR #372)。**この検査は保証ではない** — `SendWait` は打つ瞬間の前面に届くので、検査から送信までの間に focus が動けば (user の操作、dialog、通知) やはり別の app に届く。だからこの型は「smoke の間は手を触れない」dev 機で、Enter が検索を走らせるだけの非破壊の操作にしか使わない。何かを確定・保存・送信する操作は `SendKeys` ではなく対象を指す口 (app 自身の CLI / IPC、UI Automation の `SetValue` / `Invoke`) で打つ (同 [high]、2 回目)
+- 検査の直後は `SendWait("^a^v{ENTER}")` の 1 回だけ (3 回に分けると検査と送信の間が広がる)。検査と送信の間に clipboard の書き込み・`Start-Sleep`・screenshot を挟まない (ローカル Codex [high] on PR #372、3 回目)
+- 下方向の wheel は `[uint32]4294967176` (= 2^32 − 120) を渡す。上方向は `[uint32]120`
+
+script の実物は DT の .dev の tools の下の gui-smoke (private。KB からは読まない)。撮った PNG は Read tool で開いて見る (真っ黒なら前面に出ていない)。
+
+出典: 2026-10-20、DT の記録 desktop-gui-smoke-via-powershell-notes.md (KB からは読まない)
+
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
 上記のどれにも当てはまらない未知の Windows 固有挙動に遭遇したら、**公式 docs だけで判断せず実機 dogfood で確認する**。本 skill に集約された罠のほぼ全てが「docs 上は問題ないはずなのに実機だけ失敗する」パターンであり、静的 review (codex / subagent self-review) や CI runner (多くは非 interactive logon session) では再現・検出できない。新しい罠を発見したら `.dev/knowledge/<topic>-pitfalls.md` に追記し、本 skill にも反映すること。
