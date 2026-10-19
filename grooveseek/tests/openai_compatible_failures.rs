@@ -1297,10 +1297,10 @@ fn embed_mock_writes_a_chunked_body_and_a_declared_content_length() {
 /// The mock records that a client let go of a stalled body: the client reads
 /// the head of a reply whose body stalls, then closes the connection.
 ///
-/// Red if `serve_one` records nothing when the client closes first (the wait
-/// runs to the budget and comes back empty), or if the read that sees the
-/// close does not end the hold (it then runs out as
-/// [`StallEnd::BudgetRanOut`]).
+/// Red if `serve_one` ([`crate::common::embed_mock`]) records nothing when
+/// the client closes first (the wait runs to the budget and comes back
+/// empty), or if the read that sees the close does not end the hold (it then
+/// runs out as [`StallEnd::BudgetRanOut`]).
 #[test]
 fn embed_mock_records_that_a_client_let_go_of_a_stalled_body() {
     let mock = EmbedMock::with_reply_responder(|_| {

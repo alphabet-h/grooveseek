@@ -14,7 +14,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
-### Changed
+### Internal
 
 - **The stalled-body tests of the OpenAI-compatible embedder now ask the mock how its hold ended
   instead of timing the whole `groove index` run.**
