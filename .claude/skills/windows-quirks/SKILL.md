@@ -872,6 +872,56 @@ ErrorVariable + SilentlyContinue : AllFiles=2 TargetFiles=1 EnumErrors=1  (Permi
 (気付かなければ、全ファイルのバイト数を索引対象のバイト数として稟議の見積に使っていた)。
 関連: 罠 21 (同じ調査コマンドの別の行)
 
+## 23. process の cwd は `Win32_Process` の `CommandLine` / `ExecutablePath` に出ない (command line の grep では dir の holder が見つからない)
+
+**症状**: repo の dir を `Rename-Item` すると `The process cannot access the file because it is being used by another process.` で落ちる。
+`Get-CimInstance Win32_Process` の `CommandLine` と `ExecutablePath` を dir の path で grep しても、当たる process が無い
+(daemon・editor・Codex の broker など、command line に path を持つものは先に止めた後)。
+
+**原因**: process の current directory は `CommandLine` にも `ExecutablePath` にも入らない。PEB の
+`RTL_USER_PROCESS_PARAMETERS.CurrentDirectory` にだけある。引数なしで起動した常駐 app (tray など) は command line に
+path を一切持たないので、grep の網を素通りする。実例は `groove-tray.exe` (引数なし) で、cwd を repo の中に持っていた。
+
+**正しいやり方**: 各 process の PEB から cwd を読んで一覧にする。`OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)` →
+`NtQueryInformationProcess` (`ProcessBasicInformation` で `PebBaseAddress`) → `ReadProcessMemory` で
+`PEB.ProcessParameters` → `CurrentDirectory.DosPath` (UNICODE_STRING) の順に読む。offset は x64 の layout
+(`ProcessParameters` が PEB の 0x20、`CurrentDirectory.DosPath` が 0x38) なので、64-bit の PowerShell から打つ。
+<!-- via: 下の find-cwd-holders.ps1 の 8-9 行目のコメント (その offset で 2026-10-19 に groove-tray の cwd を読めた) -->
+
+owner の private tooling に、この手順を PowerShell + `Add-Type` の C# で書いた読み取り専用の script `find-cwd-holders.ps1` がある
+(`-Path <dir>` の配下を cwd に持つ process を並べ、読めなかった process を名前と理由で並べる)。
+
+**死角**: 他 user・保護された process・(非昇格の shell からは) 昇格した process は `OpenProcess` が error 5 で開けない。
+32-bit (WOW64) の process は x64 の offset で読めないので飛ばす。file handle だけを持つ holder (watcher、開いた DB) は
+cwd に出ないので見えない。この machine には `handle.exe` (Sysinternals) が無く、handle の側は一覧にできていない。
+読めなかった process の名前を目で見て、dir を cwd にし得るものが無いかを判断する。昇格の分の切り分けは推定。
+
+出典: 2026-10-19、repo の dir の改名で踏んだ。kuriya trap #490 (KB の記録。DT には無い)。関連: 罠 24 (tray が repo を cwd に持った理由)
+
+## 24. `Start-Process` で `-WorkingDirectory` を省くと、常駐する GUI が caller の cwd を継いで dir を掴み続ける
+
+**観測**: repo を cwd にした session から `Start-Process <tray>.exe` (`-WorkingDirectory` 無し) で起こした tray の cwd が repo になり、
+その 2 日後の repo の dir の `Rename-Item` を止めた (罠 23)。
+<!-- via: KB の記録 dogfood-daemon-upgrade-runbook.md の tray を起こす段 (Start-Process に -WorkingDirectory が無かった) と、同じ記録の 2026-10-17 の入れ替えの行 (tray の起動時刻)、kuriya trap #490 の 2026-10-19 の改名の失敗 -->
+常駐するものは何日も生きるので、起こした時の cwd がずっと dir を掴む。
+
+**食い違い**: MS Learn の `Start-Process` の頁は `-WorkingDirectory` の既定を「起動する exe の場所」と書くが、観測は exe の置き場ではなく
+caller の cwd だった。**仕組みは未確認** (起こした script は使い捨てで残っておらず、再現は試していない)。docs の既定を当てにしない。
+<!-- via: MS Learn の Start-Process (powershell-5.1) の -WorkingDirectory の節「The default is the location of the executable file or document being started.」を 2026-10-19 に microsoft_docs_fetch で読んだ -->
+<!-- via: 未確認 (調べていない): 同じ頁の Notes が「Process.Start で実装」と書くので、PowerShell が ProcessStartInfo.WorkingDirectory を空のまま渡して caller の cwd になる可能性がある (推定) -->
+
+
+**正しいやり方**: 常駐するもの (tray、daemon、watcher) を `Start-Process` で起こす時は、`-WorkingDirectory` を repo の外に明示する:
+
+```powershell
+Start-Process -FilePath ~\.cargo\bin\groove-tray.exe -WorkingDirectory "$env:APPDATA\groove\groove"
+```
+
+`$env:APPDATA\groove\<service>` は、その app が自分の config を読む場所で、startup の shortcut の workdir と揃う。
+cwd を見ない app なら repo の外のどこでもよい。起こした後は罠 23 の方法で cwd を読んで確かめる。
+
+出典: 2026-10-19、kuriya trap #490 (KB の記録。DT には無い)
+
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
 上記のどれにも当てはまらない未知の Windows 固有挙動に遭遇したら、**公式 docs だけで判断せず実機 dogfood で確認する**。本 skill に集約された罠のほぼ全てが「docs 上は問題ないはずなのに実機だけ失敗する」パターンであり、静的 review (codex / subagent self-review) や CI runner (多くは非 interactive logon session) では再現・検出できない。新しい罠を発見したら `.dev/knowledge/<topic>-pitfalls.md` に追記し、本 skill にも反映すること。
