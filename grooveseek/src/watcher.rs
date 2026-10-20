@@ -1254,7 +1254,11 @@ fn dispatch_directory_rename(
     // (re-review) Both ends the same path: the debouncer folds a rename away
     // and back inside one window into one paired event on the same path.
     // Taken here it would rename each row onto itself, drop them all and
-    // re-embed the directory; the children's own events carry what changed.
+    // re-embed the directory. Left to the file rename it is a skip, so changes
+    // made under the temporary name inside the window are not picked up until
+    // the file changes again or a full index runs: the debouncer does not move
+    // the children's queues, so such an edit arrives under the temporary path
+    // and is skipped as a file that no longer exists.
     if old_rel == new_rel {
         return false;
     }

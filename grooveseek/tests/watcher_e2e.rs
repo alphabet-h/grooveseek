@@ -790,9 +790,12 @@ fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
 /// whole directory on the scan. Its two ends being the same, the watcher
 /// leaves it to the file-rename path, which skips two directory names.
 ///
-/// The wait is a bounded sleep rather than a poll on a state change, because
-/// what is checked is that nothing happens: 1.5 s covers the 500 ms window
-/// and the handler run after it.
+/// What is checked is that nothing happens, so the test waits on a sentinel
+/// rather than on the change itself: a file written right after the second
+/// rename. The debouncer emits events in time order and the handler takes
+/// the batches in turn, so once the sentinel is searchable the renames have
+/// been handled. A fixed sleep could end before the handler ran on a slow
+/// host, and the test would be green without the guard.
 ///
 /// Not run on macOS, for the measured failure described on the moves test
 /// above (nightly run 39471586474, tracked in the private issue tracker as
@@ -802,6 +805,7 @@ fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_leaves_a_directory_alone_when_a_rename_returns_within_the_window() {
     const A_MARKER: &str = "zqxwdirreturnamarker68";
+    const SENTINEL_MARKER: &str = "zqxwdirreturnsentinelmarker68";
 
     // Long enough to clear the default per-chunk quality filter, as above.
     let body = |marker: &str| {
@@ -852,8 +856,20 @@ fn watcher_leaves_a_directory_alone_when_a_rename_returns_within_the_window() {
     let notes = layout.kb().join("notes");
     rename_retrying(&docs, &notes);
     rename_retrying(&notes, &docs);
+    layout.write("sentinel.md", &body(SENTINEL_MARKER));
 
-    sleep(Duration::from_millis(1500));
+    // Same budget as the tests above.
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    while !has(SENTINEL_MARKER, "sentinel.md") {
+        assert!(
+            start.elapsed() < deadline,
+            "sentinel.md never became searchable within {deadline:?}; stderr so far: {:?}",
+            guard.stderr().lines()
+        );
+        sleep(poll_interval);
+    }
 
     assert!(
         has(A_MARKER, "docs/a.md"),
