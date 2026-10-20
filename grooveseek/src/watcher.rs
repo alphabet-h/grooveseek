@@ -1131,10 +1131,11 @@ enum DirRenameEntry {
 /// `None` leaves it to the file rename as before.
 ///
 /// - [`ToState::Dir`]: [`DirRenameEntry::ScanDestination`], without listing
-///   or looking at `db`.
+///   or looking at the store argument.
 /// - [`ToState::NotDir`]: `None`, without listing.
-/// - [`ToState::Missing`]: list the rows under `old_rel` in `db`; any row
-///   means [`DirRenameEntry::SweepOnly`], none (or no `db`) means `None`.
+/// - [`ToState::Missing`]: list the rows under `old_rel` in the store
+///   argument; any row means [`DirRenameEntry::SweepOnly`], none (or no
+///   store given) means `None`.
 ///
 /// The stat and the lock belong to the caller
 /// ([`dispatch_directory_rename`]), the decision lives here, and the caller keeps the db
@@ -1190,8 +1191,8 @@ fn to_state(p: &Path) -> ToState {
 ///   gone. Renaming the rows onto a destination that no longer exists would
 ///   drop them while logging a rename; the later event for the new name scans it.
 ///
-/// The db is locked only while listing, never across the loop, so `search`
-/// is not held up for the size of the directory. The listing guard is
+/// The db is locked only while listing, never across the loop, so the MCP search
+/// tool is not held up for the size of the directory. The listing guard is
 /// dropped before any `dispatch_*` call, because each of those locks the db
 /// again and a std `Mutex` is not reentrant. The embedder is not locked here.
 /// When `to` exists and is not a directory, the db is not locked at all.
@@ -2300,7 +2301,7 @@ mod tests {
 
     /// feature-68: every row under the old directory maps to its file rename,
     /// in the listing's order; a sibling sharing the name as a prefix is not
-    /// under it. `txt` is off in the default registry, so that row skips.
+    /// under it. `.txt` is off in the default registry, so that row skips.
     #[test]
     fn test_dir_rename_steps_maps_each_row_under_the_old_dir() {
         let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
@@ -2350,7 +2351,7 @@ mod tests {
     }
 
     /// feature-68: a new directory name the index cannot hold (a `.` segment,
-    /// refused by `doc_is_addressable` on every platform) is a write the name
+    /// refused by [`crate::resources::doc_is_addressable`] on every platform) is a write the name
     /// check turns away, so each row is deindexed.
     #[test]
     fn test_dir_rename_steps_onto_an_unaddressable_name_deindexes() {
