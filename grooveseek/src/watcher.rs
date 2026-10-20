@@ -1184,9 +1184,12 @@ fn to_state(p: &Path) -> ToState {
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
 ///   [`rename_decision`] and run by the existing [`dispatch_rename`] /
-///   [`dispatch_deindex`] / [`dispatch_reindex`]); whatever is left under the
-///   old prefix is swept by [`dispatch_deindex_subtree`] once `from` is gone;
-///   then [`dispatch_new_directory`] scans `to` for files not indexed yet.
+///   [`dispatch_deindex`] / [`dispatch_reindex`]); then every listed row is
+///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
+///   already moved), so no listed row stays there even when the old directory
+///   was recreated; rows added under the old prefix after the listing are
+///   swept by [`dispatch_deindex_subtree`] once `from` is gone; last,
+///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
 /// - [`DirRenameEntry::SweepOnly`]: only the sweep, and only when `from` is
 ///   gone. Renaming the rows onto a destination that no longer exists would
 ///   drop them while logging a rename; the later event for the new name scans it.
@@ -1260,6 +1263,14 @@ fn dispatch_directory_rename(
                     RenameAction::Reindex => dispatch_reindex(state, &step.new_rel),
                     RenameAction::Skip => {}
                 }
+            }
+            // (local Codex r1) Every listed row leaves its old path, whether or
+            // not `from` is gone: a row the pass above did not move (a skip, a
+            // reindex of the new path, a rename that failed) would otherwise stay
+            // as a hit for a path the old directory may hold again under other
+            // contents. A row already moved is a no-op here.
+            for p in &paths {
+                dispatch_deindex(state, p);
             }
         }
     }
