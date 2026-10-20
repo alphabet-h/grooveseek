@@ -422,10 +422,10 @@ fn rename_retrying(from: &std::path::Path, to: &std::path::Path) {
 /// paired rename of a directory is skipped today, and the debouncer emits no
 /// events for the children, so the `docs/` rows stay and nothing appears under
 /// `notes/`. Linux stitches through the inotify cookie and is expected to be
-/// red the same way (unverified). A platform that does not stitch (macOS may
-/// not) delivers the two halves separately, the existing paths handle them,
-/// and the test is green there without the fix: only the end state is
-/// asserted, so it errs on the green side.
+/// red the same way (unverified). After the end state, the test also asserts
+/// the watcher's line for a paired directory rename, so a platform that does
+/// not stitch (macOS may not) and handles the two halves through the existing
+/// paths is red rather than green: the test proves the paired path ran.
 ///
 /// `docs-other/` shares the name prefix without the `/` and must survive.
 #[test]
@@ -519,6 +519,15 @@ fn watcher_moves_an_indexed_directory_on_rename() {
         "`docs-other/c.md` shares the name prefix without the `/` and must survive the rename of `docs/`; stderr: {:?}",
         guard.stderr().lines()
     );
+    // The end state alone could be reached by an unpaired rename too; this line
+    // is printed only by the paired directory-rename path.
+    assert!(
+        guard
+            .stderr()
+            .contains("watcher: a renamed directory held 2 indexed documents"),
+        "the end state was reached without the paired directory-rename path; stderr: {:?}",
+        guard.stderr().lines()
+    );
 }
 
 /// (feature-68) Files written into a directory that is then renamed are
@@ -528,8 +537,8 @@ fn watcher_moves_an_indexed_directory_on_rename() {
 /// The directory has to be created in an earlier debounce window than the
 /// rename. Inside one window the debouncer rewrites the directory's Create to
 /// the new path and emits no rename at all, which the watcher already handles.
-/// So the test waits for the seed file to be reported as indexed before it
-/// writes the second file and renames.
+/// So the test waits for the seed file to be searchable under `tmp/` before
+/// it writes the second file and renames.
 ///
 /// Why this is red without the fix (Windows): `tmp/` entered the debouncer's
 /// file-id cache on its Create, so the rename is stitched into one event with
@@ -539,7 +548,8 @@ fn watcher_moves_an_indexed_directory_on_rename() {
 /// searchable under `final/`. Linux stitches through the inotify cookie and is
 /// expected to be red the same way (unverified). A platform that does not
 /// stitch (macOS may not) handles the two halves through the existing paths
-/// and stays green without the fix: only the end state is asserted.
+/// and stays green without the fix: only the end state is asserted here (the
+/// moves test above asserts that the paired path ran).
 ///
 /// The seed row also exercises the rewrite of an already indexed row, so this
 /// one test covers the rewrite, the sweep of the old prefix and the scan of
@@ -579,36 +589,6 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
     let (guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
     let session = mcp_initialize(&base);
 
-    let tmp = layout.kb().join("tmp");
-    std::fs::create_dir(&tmp).expect("create tmp/");
-    layout.write("tmp/seed.md", &body(SEED_MARKER));
-
-    // Waited for, not slept through (the AV-32 shape above). The debouncer
-    // decides per event whether `now - event.time >= timeout` before emitting
-    // it (notify-debouncer-full 0.6.0 `lib.rs:229`), so on the tick the later
-    // Create of `tmp/seed.md` has expired, the older Create of `tmp/` has
-    // expired too: once this line is visible, the Create of `tmp/` is out of
-    // the debouncer, even when mkdir and the write fell into separate windows.
-    // A fixed sleep could leave that Create still queued on a slow host; the
-    // rename would then come out as a rewritten Create instead of a paired
-    // rename, and the test would be green without the fix.
-    let seed_line = "watcher: reindexed tmp/seed.md";
-    let deadline = Duration::from_millis(8000);
-    let poll_interval = Duration::from_millis(250);
-    let start = Instant::now();
-    while !guard.stderr().contains(seed_line) {
-        assert!(
-            start.elapsed() < deadline,
-            "the watcher never reported indexing tmp/seed.md within {deadline:?}; stderr so far: {:?}",
-            guard.stderr().lines()
-        );
-        sleep(poll_interval);
-    }
-
-    // Back to back: the second file and the rename land in one window.
-    layout.write("tmp/a.md", &body(A_MARKER));
-    rename_retrying(&tmp, &layout.kb().join("final"));
-
     let hits = |marker: &str| {
         let resp = mcp_search_call(
             &base,
@@ -618,6 +598,37 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
         extract_path_heading_order(&resp)
     };
     let has = |marker: &str, path: &str| hits(marker).iter().any(|(p, _)| p.ends_with(path));
+
+    let tmp = layout.kb().join("tmp");
+    std::fs::create_dir(&tmp).expect("create tmp/");
+    layout.write("tmp/seed.md", &body(SEED_MARKER));
+
+    // Waited for on the index state, not slept through (the AV-32 shape
+    // above). The debouncer decides per event whether
+    // `now - event.time >= timeout` before emitting it (notify-debouncer-full
+    // 0.6.0 `lib.rs:229`), so on the tick the later Create of `tmp/seed.md`
+    // has expired, the older Create of `tmp/` has expired too: once the seed is
+    // searchable under `tmp/`, the event that indexed it is out of the
+    // debouncer and so is the Create of `tmp/`, even when mkdir and the write
+    // fell into separate windows. A fixed sleep could leave that Create still
+    // queued on a slow host; the rename would then come out as a rewritten
+    // Create instead of a paired rename. This is also the sanity check that the
+    // seed was indexed before the rename.
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    while !has(SEED_MARKER, "tmp/seed.md") {
+        assert!(
+            start.elapsed() < deadline,
+            "tmp/seed.md never became searchable within {deadline:?}; stderr so far: {:?}",
+            guard.stderr().lines()
+        );
+        sleep(poll_interval);
+    }
+
+    // Back to back: the second file and the rename land in one window.
+    layout.write("tmp/a.md", &body(A_MARKER));
+    rename_retrying(&tmp, &layout.kb().join("final"));
 
     // Same budget as the tests above.
     let deadline = Duration::from_millis(8000);
@@ -637,4 +648,111 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
         );
         sleep(poll_interval);
     }
+}
+
+/// (feature-68, local Codex r1) A row the per-file pass does not move is
+/// still dropped from the old path when the source directory is recreated
+/// before the rename is handled.
+///
+/// Right after `docs/` is renamed to `notes/`, `docs/` is created again and
+/// `docs/a.md` is made a hard link of `notes/a.md` (no privilege needed on
+/// Windows). By the time the paired rename is handled, both ends of `a.md` are
+/// multiply linked, so the watcher's gate refuses both and the file rename of
+/// that row is a skip; `b.md` is moved as usual. The old directory exists
+/// again, so the sweep of the old prefix does not run. Without dropping every
+/// listed old row after the per-file pass, the `docs/a.md` row survives as a
+/// hit for a file the index would refuse. The recreated `docs/a.md` produces
+/// its own Create, which the same gate refuses, so nothing puts the row back.
+///
+/// Red without that step on Windows (the rename is paired as in the moves test
+/// above). The paired path is asserted through its stderr line, as there.
+#[test]
+#[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
+fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
+    const A_MARKER: &str = "zqxwdirrecreateamarker68";
+    const B_MARKER: &str = "zqxwdirrecreatebmarker68";
+
+    // Long enough to clear the default per-chunk quality filter, as above.
+    let body = |marker: &str| {
+        format!(
+            concat!(
+                "---\ntitle: Watcher dir recreate fixture\ntags: [test]\n---\n",
+                "\n",
+                "## marker section\n",
+                "\n",
+                "Distinct content carrying the marker `{}` so the search assertions\n",
+                "can tell under which path this file is in the index. Written long\n",
+                "enough to clear the default per-chunk quality filter, which drops\n",
+                "short single-line sections from search results regardless of\n",
+                "whether they reached the index.\n",
+            ),
+            marker,
+        )
+    };
+
+    let layout = TempKbLayout::new("groove-watcher-dirrecreate-e2e");
+    layout.write("docs/a.md", &body(A_MARKER));
+    layout.write("docs/b.md", &body(B_MARKER));
+    build_index(layout.kb());
+
+    let cfg_path = layout.root().join("groove.toml");
+    std::fs::write(&cfg_path, "[watch]\nenabled = true\ndebounce_ms = 500\n")
+        .expect("write groove.toml");
+
+    let (guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
+    let session = mcp_initialize(&base);
+
+    let hits = |marker: &str| {
+        let resp = mcp_search_call(
+            &base,
+            &session,
+            serde_json::json!({ "query": marker, "limit": 5, "mmr": false }),
+        );
+        extract_path_heading_order(&resp)
+    };
+    let has = |marker: &str, path: &str| hits(marker).iter().any(|(p, _)| p.ends_with(path));
+
+    // Sanity: the fixture is searchable under the old paths before the rename.
+    assert!(
+        has(A_MARKER, "docs/a.md"),
+        "docs/a.md not indexed to begin with"
+    );
+    assert!(
+        has(B_MARKER, "docs/b.md"),
+        "docs/b.md not indexed to begin with"
+    );
+
+    // Back to back, inside one debounce window: the rename, then the source
+    // directory again with a hard link in it.
+    let docs = layout.kb().join("docs");
+    let notes = layout.kb().join("notes");
+    rename_retrying(&docs, &notes);
+    std::fs::create_dir(&docs).expect("recreate docs/");
+    std::fs::hard_link(notes.join("a.md"), docs.join("a.md")).expect("hard link docs/a.md");
+
+    // Same budget as the tests above.
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    loop {
+        let new_b = has(B_MARKER, "notes/b.md");
+        let old_a = has(A_MARKER, "docs/a.md");
+        let old_b = has(B_MARKER, "docs/b.md");
+        if new_b && !old_a && !old_b {
+            break;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "after renaming `docs/` and recreating it, the old rows were not all gone within {deadline:?} (notes/b.md: {new_b}, docs/a.md: {old_a}, docs/b.md: {old_b}); stderr: {:?}",
+            guard.stderr().lines()
+        );
+        sleep(poll_interval);
+    }
+    assert!(
+        guard
+            .stderr()
+            .contains("watcher: a renamed directory held 2 indexed documents"),
+        "the end state was reached without the paired directory-rename path; stderr: {:?}",
+        guard.stderr().lines()
+    );
 }
