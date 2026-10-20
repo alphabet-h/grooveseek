@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.20.2] - 2026-10-20
+
 ### Fixed
 
 - **The live watcher now deindexes the documents under a deleted directory.** When a directory's files were removed within one debounce window (`git rm -r`, a branch switch), only the directory's own removal reached groove, and its documents stayed searchable until the next full index.
@@ -6162,7 +6164,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...HEAD
+[1.20.2]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...v1.20.2
 [1.20.1]: https://github.com/alphabet-h/grooveseek/compare/v1.20.0...v1.20.1
 [1.20.0]: https://github.com/alphabet-h/grooveseek/compare/v1.19.0...v1.20.0
 [1.19.0]: https://github.com/alphabet-h/grooveseek/compare/v1.18.0...v1.19.0
