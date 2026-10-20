@@ -1102,6 +1102,64 @@ fn dir_rename_steps(
         .collect()
 }
 
+/// (feature-68) What the caller saw at a rename's destination, from one
+/// `symlink_metadata` taken outside the db lock. A symlink is not followed,
+/// so a symlink to a directory is [`ToState::NotDir`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToState {
+    /// A directory is there.
+    Dir,
+    /// Something is there that is not a directory (a file, a symlink).
+    NotDir,
+    /// Nothing is there.
+    Missing,
+}
+
+/// (feature-68) How a paired rename is handled once it is known to be a
+/// directory rename.
+#[derive(Debug, PartialEq, Eq)]
+enum DirRenameEntry {
+    /// The destination is a directory: move the rows under the old prefix,
+    /// sweep what is left there, and scan the destination.
+    ScanDestination,
+    /// The destination is already gone but rows sit under the old prefix:
+    /// only sweep the old prefix (no move, no scan).
+    SweepOnly,
+}
+
+/// (feature-68) Decide whether a paired rename is a directory rename.
+/// `None` leaves it to the file rename as before.
+///
+/// - [`ToState::Dir`]: [`DirRenameEntry::ScanDestination`], without listing
+///   or looking at `db`.
+/// - [`ToState::NotDir`]: `None`, without listing.
+/// - [`ToState::Missing`]: list the rows under `old_rel` in `db`; any row
+///   means [`DirRenameEntry::SweepOnly`], none (or no `db`) means `None`.
+///
+/// The stat and the lock belong to the caller (the directory-rename dispatch
+/// in the watcher), the decision lives here, and the caller keeps the db
+/// guard inside the scope of this call. This function stats, locks and logs
+/// nothing. A listing error is returned as `Err` rather than folded into
+/// `None`, so the caller can log it before falling back to the file rename.
+fn dir_rename_entry(
+    to: ToState,
+    db: Option<&Database>,
+    old_rel: &str,
+) -> Result<Option<DirRenameEntry>> {
+    match (to, db) {
+        (ToState::Dir, _) => Ok(Some(DirRenameEntry::ScanDestination)),
+        (ToState::NotDir, _) => Ok(None),
+        (ToState::Missing, None) => Ok(None),
+        (ToState::Missing, Some(db)) => {
+            if db.document_paths_under(old_rel)?.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(DirRenameEntry::SweepOnly))
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -2273,6 +2331,72 @@ mod tests {
             )]
         );
         assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: a directory at the destination is a directory rename whose
+    /// destination is to be scanned, decided before any listing.
+    #[test]
+    fn test_dir_rename_entry_dir_scans_the_destination() {
+        let entry = dir_rename_entry(ToState::Dir, None, "docs").unwrap();
+        assert_eq!(entry, Some(DirRenameEntry::ScanDestination));
+    }
+
+    /// feature-68: something other than a directory at the destination is left
+    /// to the file rename, even while rows sit under the old name as a prefix.
+    #[test]
+    fn test_dir_rename_entry_not_a_dir_is_left_to_the_file_rename() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+        assert_eq!(db.document_paths_under("docs").unwrap().len(), 2);
+
+        let entry = dir_rename_entry(ToState::NotDir, None, "docs").unwrap();
+        assert_eq!(entry, None);
+    }
+
+    /// feature-68: nothing at the destination but rows under the old prefix is
+    /// a directory rename whose destination is already gone: sweep only.
+    #[test]
+    fn test_dir_rename_entry_missing_with_rows_sweeps_only() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+
+        let entry = dir_rename_entry(ToState::Missing, Some(&db), "docs").unwrap();
+        assert_eq!(entry, Some(DirRenameEntry::SweepOnly));
+    }
+
+    /// feature-68: nothing at the destination and no rows under the old name as
+    /// a prefix (a chained file rename) is left to the file rename.
+    #[test]
+    fn test_dir_rename_entry_missing_without_rows_is_left_to_the_file_rename() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+
+        let entry = dir_rename_entry(ToState::Missing, Some(&db), "a.md").unwrap();
+        assert_eq!(entry, None);
+    }
+
+    /// feature-68: a listing error comes back as an error, not as "no rows".
+    #[test]
+    fn test_dir_rename_entry_surfaces_a_listing_error() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+
+        let entry = dir_rename_entry(ToState::Missing, Some(&db), "docs/");
+        assert!(entry.is_err(), "{entry:?}");
+    }
+
+    /// feature-68: a sibling sharing the old name as a string prefix is not
+    /// under the old directory.
+    #[test]
+    fn test_dir_rename_entry_missing_ignores_a_sibling_prefix() {
+        let db = dir_rename_db(&["docs-other/c.md"]);
+
+        let entry = dir_rename_entry(ToState::Missing, Some(&db), "docs").unwrap();
+        assert_eq!(entry, None);
+    }
+
+    /// feature-68: with nothing at the destination and no store to list, the
+    /// rename is left to the file rename.
+    #[test]
+    fn test_dir_rename_entry_missing_without_a_db_is_none() {
+        let entry = dir_rename_entry(ToState::Missing, None, "docs").unwrap();
+        assert_eq!(entry, None);
     }
 
     #[test]
