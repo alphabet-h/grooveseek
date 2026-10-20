@@ -1206,7 +1206,10 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 /// It is a directory rename when `to` is a real directory (a symlink is not
 /// followed), or when `to` is already gone and the store holds rows under
 /// `old_rel/` (the handler fell behind a chain of renames). The decision is
-/// [`dir_rename_entry`]; the KB root (an empty rel at either end) never enters.
+/// [`dir_rename_entry`]; the KB root (an empty rel at either end) never enters,
+/// and neither does a paired event whose two ends are the same path, which
+/// notify-debouncer-full emits for a rename away and back inside one debounce
+/// window: it falls through and the file rename skips it.
 /// A destination that cannot be stat'ed for a reason other than "not found"
 /// is logged and left to the file rename. If the event was a directory
 /// rename, that is a skip for two directory names: its rows stay under the
@@ -1246,6 +1249,13 @@ fn dispatch_directory_rename(
     new_rel: &str,
 ) -> bool {
     if old_rel.is_empty() || new_rel.is_empty() {
+        return false;
+    }
+    // (re-review) Both ends the same path: the debouncer folds a rename away
+    // and back inside one window into one paired event on the same path.
+    // Taken here it would rename each row onto itself, drop them all and
+    // re-embed the directory; the children's own events carry what changed.
+    if old_rel == new_rel {
         return false;
     }
     let (to_kind, stat_err) = to_state(to);
@@ -2625,6 +2635,14 @@ mod tests {
     /// listing, even when a store with rows under the old prefix is handed in.
     /// Read as "gone", those rows would be swept while the directory may well
     /// be there.
+    #[test]
+    fn test_dir_rename_entry_unknown_does_not_list() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+
+        let entry = dir_rename_entry(ToState::Unknown, Some(&db), "docs").unwrap();
+        assert_eq!(entry, None);
+    }
+
     /// feature-68 (local Codex r5): the sweep-only entry carries exactly the
     /// rows it listed under the old directory, sorted, so the caller can drop
     /// them even when the old directory has been recreated. A sibling sharing
@@ -2641,14 +2659,6 @@ mod tests {
                 "docs/deep/b.md".to_string(),
             ]))
         );
-    }
-
-    #[test]
-    fn test_dir_rename_entry_unknown_does_not_list() {
-        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
-
-        let entry = dir_rename_entry(ToState::Unknown, Some(&db), "docs").unwrap();
-        assert_eq!(entry, None);
     }
 
     #[test]

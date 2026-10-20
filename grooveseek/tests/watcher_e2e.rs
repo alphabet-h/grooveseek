@@ -779,3 +779,96 @@ fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
         guard.stderr().lines()
     );
 }
+
+/// (feature-68, re-review) A directory renamed away and back inside one
+/// debounce window stays indexed where it is, and the paired directory-rename
+/// path is not taken.
+///
+/// The debouncer can fold the two renames into one paired event whose two
+/// ends are the same path. Taken as a directory rename, that event would
+/// "rename" each row onto itself, drop every listed row and re-embed the
+/// whole directory on the scan. Its two ends being the same, the watcher
+/// leaves it to the file-rename path, which skips two directory names.
+///
+/// The wait is a bounded sleep rather than a poll on a state change, because
+/// what is checked is that nothing happens: 1.5 s covers the 500 ms window
+/// and the handler run after it.
+///
+/// Not run on macOS, for the measured failure described on the moves test
+/// above (nightly run 39471586474, tracked in the private issue tracker as
+/// #520). Remove the gate once that issue is closed.
+#[cfg(not(target_os = "macos"))]
+#[test]
+#[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
+fn watcher_leaves_a_directory_alone_when_a_rename_returns_within_the_window() {
+    const A_MARKER: &str = "zqxwdirreturnamarker68";
+
+    // Long enough to clear the default per-chunk quality filter, as above.
+    let body = |marker: &str| {
+        format!(
+            concat!(
+                "---\ntitle: Watcher dir return fixture\ntags: [test]\n---\n",
+                "\n",
+                "## marker section\n",
+                "\n",
+                "Distinct content carrying the marker `{}` so the search assertions\n",
+                "can tell under which path this file is in the index. Written long\n",
+                "enough to clear the default per-chunk quality filter, which drops\n",
+                "short single-line sections from search results regardless of\n",
+                "whether they reached the index.\n",
+            ),
+            marker,
+        )
+    };
+
+    let layout = TempKbLayout::new("groove-watcher-dirreturn-e2e");
+    layout.write("docs/a.md", &body(A_MARKER));
+    build_index(layout.kb());
+
+    let cfg_path = layout.root().join("groove.toml");
+    std::fs::write(&cfg_path, "[watch]\nenabled = true\ndebounce_ms = 500\n")
+        .expect("write groove.toml");
+
+    let (guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
+    let session = mcp_initialize(&base);
+
+    let hits = |marker: &str| {
+        let resp = mcp_search_call(
+            &base,
+            &session,
+            serde_json::json!({ "query": marker, "limit": 5, "mmr": false }),
+        );
+        extract_path_heading_order(&resp)
+    };
+    let has = |marker: &str, path: &str| hits(marker).iter().any(|(p, _)| p.ends_with(path));
+
+    assert!(
+        has(A_MARKER, "docs/a.md"),
+        "docs/a.md not indexed to begin with"
+    );
+
+    // Back to back, inside one debounce window: away and back.
+    let docs = layout.kb().join("docs");
+    let notes = layout.kb().join("notes");
+    rename_retrying(&docs, &notes);
+    rename_retrying(&notes, &docs);
+
+    sleep(Duration::from_millis(1500));
+
+    assert!(
+        has(A_MARKER, "docs/a.md"),
+        "docs/a.md is no longer searchable after renaming `docs/` away and back; stderr: {:?}",
+        guard.stderr().lines()
+    );
+    let stderr = guard.stderr();
+    assert!(
+        !stderr.contains("renamed docs/a.md -> docs/a.md"),
+        "a row was renamed onto itself; stderr: {:?}",
+        stderr.lines()
+    );
+    assert!(
+        !stderr.contains("a renamed directory held"),
+        "the paired directory-rename path was taken for a rename that returned; stderr: {:?}",
+        stderr.lines()
+    );
+}
