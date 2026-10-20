@@ -1048,6 +1048,60 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
     sweep_legacy_row(&db, &state.kb_path, new_rel, true);
 }
 
+/// (feature-68) One stored document under a renamed directory, mapped to the
+/// file rename it stands for.
+#[derive(Debug, PartialEq, Eq)]
+struct DirRenameStep {
+    /// The stored path under the old directory.
+    old_rel: String,
+    /// The same path under the new directory.
+    new_rel: String,
+    /// What a rename of this one file would do, from [`rename_decision`].
+    action: RenameAction,
+}
+
+/// (feature-68) Map each stored path under `old_dir` to its file rename under
+/// `new_dir`, judged by the existing [`rename_decision`]: the old end as a
+/// removal, the new end as a write. A move into an excluded or unaddressable
+/// place therefore deindexes and a move out of one reindexes, exactly as a
+/// single file rename would. Both full paths are `kb_path.join(rel)`.
+///
+/// Split out so a test can run the same decision as production with no
+/// [`crate::embedder::Embedder`] ([`deindex_subtree_parts`] is the precedent).
+///
+/// The steps keep the order of `paths`. A path not under `old_dir/` is
+/// skipped (the listing helper never returns one).
+fn dir_rename_steps(
+    paths: &[String],
+    kb_path: &Path,
+    old_dir: &str,
+    new_dir: &str,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> Vec<DirRenameStep> {
+    let old_prefix = format!("{old_dir}/");
+    paths
+        .iter()
+        .filter_map(|p| {
+            let rest = p.strip_prefix(&old_prefix)?;
+            let new_rel = format!("{new_dir}/{rest}");
+            let action = rename_decision(
+                p,
+                &kb_path.join(p),
+                &new_rel,
+                &kb_path.join(&new_rel),
+                registry,
+                rules,
+            );
+            Some(DirRenameStep {
+                old_rel: p.clone(),
+                new_rel,
+                action,
+            })
+        })
+        .collect()
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -2051,6 +2105,172 @@ mod tests {
         assert_eq!(
             db.all_document_paths().unwrap(),
             vec!["sub-other/c.md".to_string()]
+        );
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: an in-memory store holding `rows`, for the directory-rename
+    /// decision. Nothing is created on disk.
+    fn dir_rename_db(rows: &[&str]) -> Database {
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        for path in rows {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        }
+        db
+    }
+
+    fn dir_rename_step(old_rel: &str, new_rel: &str, action: RenameAction) -> DirRenameStep {
+        DirRenameStep {
+            old_rel: old_rel.to_string(),
+            new_rel: new_rel.to_string(),
+            action,
+        }
+    }
+
+    /// feature-68: every row under the old directory maps to its file rename,
+    /// in the listing's order; a sibling sharing the name as a prefix is not
+    /// under it. `txt` is off in the default registry, so that row skips.
+    #[test]
+    fn test_dir_rename_steps_maps_each_row_under_the_old_dir() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = dir_rename_db(&[
+            "docs/a.md",
+            "docs/deep/b.md",
+            "docs/c.txt",
+            "docs-other/d.md",
+        ]);
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = db.document_paths_under("docs").unwrap();
+
+        let steps = dir_rename_steps(&paths, &kb, "docs", "notes", &registry, &rules);
+
+        assert_eq!(
+            steps,
+            vec![
+                dir_rename_step("docs/a.md", "notes/a.md", RenameAction::Rename),
+                dir_rename_step("docs/c.txt", "notes/c.txt", RenameAction::Skip),
+                dir_rename_step("docs/deep/b.md", "notes/deep/b.md", RenameAction::Rename),
+            ]
+        );
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: a directory moved under a denylisted one leaves the index,
+    /// as a single file moved there does.
+    #[test]
+    fn test_dir_rename_steps_into_an_excluded_dir_deindexes() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = db.document_paths_under("docs").unwrap();
+
+        let steps = dir_rename_steps(&paths, &kb, "docs", "node_modules/docs", &registry, &rules);
+
+        let olds: Vec<&str> = steps.iter().map(|s| s.old_rel.as_str()).collect();
+        assert_eq!(olds, vec!["docs/a.md", "docs/deep/b.md"]);
+        for step in &steps {
+            assert_eq!(step.action, RenameAction::Deindex, "{step:?}");
+        }
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: a new directory name the index cannot hold (a `.` segment,
+    /// refused by `doc_is_addressable` on every platform) is a write the name
+    /// check turns away, so each row is deindexed.
+    #[test]
+    fn test_dir_rename_steps_onto_an_unaddressable_name_deindexes() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = db.document_paths_under("docs").unwrap();
+
+        let steps = dir_rename_steps(&paths, &kb, "docs", "notes/.", &registry, &rules);
+
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        for step in &steps {
+            assert!(
+                !crate::resources::doc_is_addressable(&step.new_rel),
+                "{step:?}"
+            );
+            assert_eq!(step.action, RenameAction::Deindex, "{step:?}");
+        }
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: a nested directory moves only its own rows; a file beside
+    /// it in the parent is not touched.
+    #[test]
+    fn test_dir_rename_steps_nested_keeps_the_rest() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = dir_rename_db(&["a/b/x.md", "a/b/d/y.md", "a/z.md"]);
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = db.document_paths_under("a/b").unwrap();
+
+        let steps = dir_rename_steps(&paths, &kb, "a/b", "c/b", &registry, &rules);
+
+        assert_eq!(
+            steps,
+            vec![
+                dir_rename_step("a/b/d/y.md", "c/b/d/y.md", RenameAction::Rename),
+                dir_rename_step("a/b/x.md", "c/b/x.md", RenameAction::Rename),
+            ]
+        );
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: rows left under a directory excluded after they were
+    /// indexed follow it out as a reindex of the new path.
+    #[test]
+    fn test_dir_rename_steps_out_of_an_excluded_dir_reindexes() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = dir_rename_db(&["node_modules/docs/a.md"]);
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = db.document_paths_under("node_modules/docs").unwrap();
+
+        let steps = dir_rename_steps(&paths, &kb, "node_modules/docs", "docs", &registry, &rules);
+
+        assert_eq!(
+            steps,
+            vec![dir_rename_step(
+                "node_modules/docs/a.md",
+                "docs/a.md",
+                RenameAction::Reindex
+            )]
+        );
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
+    /// feature-68: a path handed in that is not under `old_dir/` is skipped
+    /// rather than spliced onto the new directory.
+    #[test]
+    fn test_dir_rename_steps_skips_a_path_outside_the_old_dir() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = vec!["docs/a.md".to_string(), "docs-other/d.md".to_string()];
+
+        let steps = dir_rename_steps(&paths, &kb, "docs", "notes", &registry, &rules);
+
+        assert_eq!(
+            steps,
+            vec![dir_rename_step(
+                "docs/a.md",
+                "notes/a.md",
+                RenameAction::Rename
+            )]
         );
         assert!(!kb.exists(), "still nothing on disk");
     }
