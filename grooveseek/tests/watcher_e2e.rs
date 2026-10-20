@@ -269,3 +269,113 @@ fn watcher_reloads_grooveseekignore_while_running() {
          nothing. Investigate the watcher before trusting this test."
     );
 }
+
+/// (feature-67, kuriya issue #479) A directory whose files are removed one by
+/// one and then the directory itself, all inside one debounce window (what
+/// `git rm -r` or a branch switch does), leaves nothing of it in the index.
+///
+/// notify-debouncer-full drops a child's Remove when its parent's Remove lands
+/// in the same window, so only the directory's event may reach groove. The
+/// watcher has to expand that one event from its own store.
+///
+/// `sub-other/` shares the name prefix without the `/` and must survive: it is
+/// both the anchoring check and the proof that the watcher was alive when the
+/// `sub/` documents disappeared (an absence alone proves nothing). Only the end
+/// state is asserted, so a platform whose backend does not fold the events
+/// (single-file deletes then do the work) stays green.
+#[test]
+#[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
+fn watcher_deindexes_a_subdirectory_removed_file_by_file() {
+    const A_MARKER: &str = "zqxwsubdiramarker67";
+    const B_MARKER: &str = "zqxwsubdirbmarker67";
+    const C_MARKER: &str = "zqxwsubdircmarker67";
+
+    // Long enough to clear the default per-chunk quality filter (see the test
+    // above): a terse body would be hidden from `search` whether or not it was
+    // indexed.
+    let body = |marker: &str| {
+        format!(
+            concat!(
+                "---\ntitle: Watcher subtree fixture\ntags: [test]\n---\n",
+                "\n",
+                "## marker section\n",
+                "\n",
+                "Distinct content carrying the marker `{}` so the search assertions\n",
+                "can tell whether this file is still in the index. Written long\n",
+                "enough to clear the default per-chunk quality filter, which drops\n",
+                "short single-line sections from search results regardless of\n",
+                "whether they reached the index.\n",
+            ),
+            marker,
+        )
+    };
+
+    let layout = TempKbLayout::new("groove-watcher-subtree-e2e");
+    layout.write("sub/a.md", &body(A_MARKER));
+    layout.write("sub/b.md", &body(B_MARKER));
+    layout.write("sub-other/c.md", &body(C_MARKER));
+    build_index(layout.kb());
+
+    let cfg_path = layout.root().join("groove.toml");
+    std::fs::write(&cfg_path, "[watch]\nenabled = true\ndebounce_ms = 500\n")
+        .expect("write groove.toml");
+
+    let (guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
+    let session = mcp_initialize(&base);
+
+    let hits = |marker: &str| {
+        let resp = mcp_search_call(
+            &base,
+            &session,
+            serde_json::json!({ "query": marker, "limit": 5, "mmr": false }),
+        );
+        extract_path_heading_order(&resp)
+    };
+    let has = |marker: &str, path: &str| hits(marker).iter().any(|(p, _)| p.ends_with(path));
+
+    // Sanity: the fixture is searchable before anything is removed, so a
+    // missing hit below means "deindexed", not "never indexed".
+    assert!(
+        has(A_MARKER, "sub/a.md"),
+        "sub/a.md not indexed to begin with"
+    );
+    assert!(
+        has(B_MARKER, "sub/b.md"),
+        "sub/b.md not indexed to begin with"
+    );
+    assert!(
+        has(C_MARKER, "sub-other/c.md"),
+        "sub-other/c.md not indexed to begin with"
+    );
+
+    // As git does it: the files first, then the directory, back to back.
+    let sub = layout.kb().join("sub");
+    std::fs::remove_file(sub.join("a.md")).expect("remove sub/a.md");
+    std::fs::remove_file(sub.join("b.md")).expect("remove sub/b.md");
+    std::fs::remove_dir(&sub).expect("remove sub/");
+
+    // Same budget as the tests above.
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    loop {
+        let a_left = has(A_MARKER, "sub/a.md");
+        let b_left = has(B_MARKER, "sub/b.md");
+        if !a_left && !b_left {
+            break;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "documents under the removed `sub/` were still searchable after \
+             {deadline:?} (sub/a.md: {a_left}, sub/b.md: {b_left}); stderr: {:?}",
+            guard.stderr().lines()
+        );
+        sleep(poll_interval);
+    }
+    assert!(
+        has(C_MARKER, "sub-other/c.md"),
+        "`sub-other/c.md` shares the name prefix without the `/` and must survive \
+         the removal of `sub/`; stderr: {:?}",
+        guard.stderr().lines()
+    );
+}

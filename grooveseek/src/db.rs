@@ -1408,6 +1408,142 @@ mod tests {
         println!("test_delete_document: OK");
     }
 
+    /// feature-67: insert a bare document row (no chunks) at `path`.
+    fn upsert_bare(db: &Database, path: &str) -> i64 {
+        db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+            .unwrap()
+    }
+
+    /// feature-67: count the rows of `table` (a fixed test-only table name).
+    fn table_count(db: &Database, table: &str) -> i64 {
+        db.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_delete_documents_under_is_anchored_at_slash() {
+        let db = db_with_384();
+        let all = [
+            "a",
+            "a.md",
+            "a/x.md",
+            "a/b/y.md",
+            "a-b/x.md",
+            "a0/x.md",
+            "ab/x.md",
+            "日本語/x.md",
+            "日本語x/y.md",
+        ];
+        for p in all {
+            upsert_bare(&db, p);
+        }
+
+        let deleted = db.delete_documents_under("a").unwrap();
+        assert_eq!(deleted, vec!["a/b/y.md".to_string(), "a/x.md".to_string()]);
+        let expected_left: Vec<String> = [
+            "a",
+            "a-b/x.md",
+            "a.md",
+            "a0/x.md",
+            "ab/x.md",
+            "日本語/x.md",
+            "日本語x/y.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut left = db.all_document_paths().unwrap();
+        left.sort();
+        let mut expected_sorted = expected_left.clone();
+        expected_sorted.sort();
+        assert_eq!(left, expected_sorted);
+
+        let deleted = db.delete_documents_under("日本語").unwrap();
+        assert_eq!(deleted, vec!["日本語/x.md".to_string()]);
+        let left = db.all_document_paths().unwrap();
+        assert!(left.contains(&"日本語x/y.md".to_string()));
+        assert!(!left.contains(&"日本語/x.md".to_string()));
+        assert_eq!(left.len(), expected_left.len() - 1);
+    }
+
+    #[test]
+    fn test_delete_documents_under_removes_dependent_rows() {
+        let db = db_with_384();
+        let in_id = upsert_bare(&db, "sub/a.md");
+        let out_id = upsert_bare(&db, "keep.md");
+        db.replace_document_fields("sub/a.md", &[("status".into(), "active".into())])
+            .unwrap();
+        db.replace_document_fields("keep.md", &[("status".into(), "active".into())])
+            .unwrap();
+        for (id, text) in [(in_id, "inside"), (out_id, "outside")] {
+            db.insert_chunk(id, 0, None, None, text, None, &dummy_embedding(0.3), 1.0)
+                .unwrap();
+        }
+        assert_eq!(table_count(&db, "chunks"), 2);
+
+        let deleted = db.delete_documents_under("sub").unwrap();
+        assert_eq!(deleted, vec!["sub/a.md".to_string()]);
+        assert_eq!(db.document_count().unwrap(), 1);
+        assert_eq!(table_count(&db, "chunks"), 1, "chunks of sub/ deleted");
+        assert_eq!(table_count(&db, "vec_chunks"), 1, "vectors of sub/ deleted");
+        assert_eq!(fts_count(&db), 1, "fts rows of sub/ deleted");
+        assert_eq!(
+            table_count(&db, "document_fields"),
+            1,
+            "fields of sub/ deleted"
+        );
+        assert!(db.document_fields_for_path("sub/a.md").unwrap().is_empty());
+        assert_eq!(db.document_fields_for_path("keep.md").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_delete_documents_under_treats_like_metacharacters_literally() {
+        let db = db_with_384();
+        for p in ["a_b/x.md", "aXb/x.md", "100%/x.md", "1000/x.md"] {
+            upsert_bare(&db, p);
+        }
+        assert_eq!(
+            db.delete_documents_under("a_b").unwrap(),
+            vec!["a_b/x.md".to_string()]
+        );
+        assert_eq!(
+            db.delete_documents_under("100%").unwrap(),
+            vec!["100%/x.md".to_string()]
+        );
+        let mut left = db.all_document_paths().unwrap();
+        left.sort();
+        assert_eq!(left, vec!["1000/x.md".to_string(), "aXb/x.md".to_string()]);
+    }
+
+    #[test]
+    fn test_delete_documents_under_refuses_empty_and_trailing_slash() {
+        let db = db_with_384();
+        for p in ["a.md", "a/x.md"] {
+            upsert_bare(&db, p);
+        }
+        assert!(db.delete_documents_under("").is_err());
+        assert!(db.delete_documents_under("a/").is_err());
+        assert_eq!(db.document_count().unwrap(), 2, "no row touched");
+    }
+
+    #[test]
+    fn test_delete_documents_under_joins_the_callers_transaction() {
+        let db = db_with_384();
+        upsert_bare(&db, "sub/a.md");
+        upsert_bare(&db, "sub/b.md");
+        {
+            let _tx = db.begin_transaction().unwrap();
+            let deleted = db.delete_documents_under("sub").unwrap();
+            assert_eq!(deleted.len(), 2);
+            assert!(!db.conn.is_autocommit(), "the caller's tx stays open");
+            assert_eq!(db.document_count().unwrap(), 0);
+            // `_tx` is dropped here without commit: rollback.
+        }
+        assert!(db.conn.is_autocommit());
+        assert_eq!(db.document_count().unwrap(), 2, "rows came back");
+    }
+
     #[test]
     fn test_search_similar_executes_knn_query() {
         // Regression: sqlite-vec requires `k = ?` (or literal LIMIT) on knn

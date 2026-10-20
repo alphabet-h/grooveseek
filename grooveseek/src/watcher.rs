@@ -455,9 +455,10 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // arrival scan (codex P2 on PR #168 asked for it). Populating a
                 // directory under a temporary name and renaming it inside one
                 // debounce window does leave its files unindexed — but indexing
-                // the destination alone would be worse, not better: there is no
-                // prefix-scoped delete (`storage.rs` has `delete_document(path)`
-                // only), so the source subtree's rows survive and `search` starts
+                // the destination alone would be worse, not better: this branch
+                // does not delete by prefix (`Database::delete_documents_under`
+                // exists since feature-67, but is not used here yet), so the
+                // source subtree's rows would survive and `search` would start
                 // returning **stale hits that cannot be opened** alongside the new
                 // ones. Today that rename is skipped entirely, so no such
                 // duplicate exists. Closing this properly means deindexing the
@@ -517,6 +518,10 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     {
                         dispatch_deindex(state, &rel);
                     }
+                    // (feature-67) Always, whatever the gate above said: a
+                    // removed directory carries no extension, and its files'
+                    // own events may have been folded into this one.
+                    dispatch_deindex_subtree(state, p);
                 }
             }
             Classified::Ignore => {}
@@ -919,6 +924,41 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
         Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
     sweep_legacy_row(&db, &state.kb_path, rel, false);
+}
+
+/// (feature-67) The decision behind [`dispatch_deindex_subtree`], split out so
+/// a test can run it with no `Embedder` (as [`should_process_parts`] is).
+///
+/// `None` when `p` is not under the KB or is the KB root itself: an empty
+/// prefix would name the whole KB (the helper refuses it too). Otherwise the
+/// rows under `rel/` are deleted. Nothing is stat'ed and no exclusion /
+/// extension / link gate is asked: a removed directory cannot be stat'ed, and
+/// whatever the store still holds under it is gone from disk.
+fn deindex_subtree_parts(db: &Database, kb_path: &Path, p: &Path) -> Option<Result<Vec<String>>> {
+    let rel = to_rel(kb_path, p)?;
+    if rel.is_empty() {
+        return None;
+    }
+    Some(indexer::deindex_subtree(db, &rel))
+}
+
+/// (feature-67, kuriya issue #479) Delete what the store holds under a removed
+/// path. The debouncer drops a child's Remove when its directory's Remove lands
+/// in the same window, so the directory event is the only one that arrives.
+fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
+    let db = recover_db(state.db.lock());
+    let Some(outcome) = deindex_subtree_parts(&db, &state.kb_path, p) else {
+        return;
+    };
+    let rel = to_rel(&state.kb_path, p).unwrap_or_default();
+    match outcome {
+        Ok(deleted) if deleted.is_empty() => {}
+        Ok(deleted) => wdiag!(
+            "watcher: deindexed {} documents under {rel}/",
+            deleted.len()
+        ),
+        Err(e) => wdiag!("watcher: deindexing under {rel}/ failed: {e}"),
+    }
 }
 
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
@@ -1954,6 +1994,52 @@ mod tests {
             vec![PathBuf::from("/tmp/a.md")],
         );
         assert!(matches!(classify(&evt), Classified::Deindex(_)));
+    }
+
+    /// feature-67: Windows reports a removed directory as `RemoveKind::Any`
+    /// with no extension; it must still reach the Deindex arm, where the
+    /// subtree delete runs.
+    #[test]
+    fn test_classify_remove_any_extensionless_is_deindex() {
+        let evt = mk_evt(
+            EventKind::Remove(notify_debouncer_full::notify::event::RemoveKind::Any),
+            vec![PathBuf::from("/tmp/sub")],
+        );
+        match classify(&evt) {
+            Classified::Deindex(paths) => assert_eq!(paths, [PathBuf::from("/tmp/sub")]),
+            other => panic!("expected Deindex, got {other:?}"),
+        }
+    }
+
+    /// feature-67: the subtree delete decides from the store alone. The KB is
+    /// never created on disk, so nothing here can have been stat'ed.
+    #[test]
+    fn test_deindex_subtree_parts_drops_only_rows_under_the_removed_dir() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-subtree");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        for path in ["sub/a.md", "sub/b.md", "sub-other/c.md"] {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        }
+
+        // The KB root itself: no subtree delete at all.
+        assert!(deindex_subtree_parts(&db, &kb, &kb).is_none());
+        assert_eq!(db.all_document_paths().unwrap().len(), 3);
+
+        let deleted = deindex_subtree_parts(&db, &kb, &kb.join("sub"))
+            .expect("a path under the KB is handled")
+            .unwrap();
+        assert_eq!(
+            deleted,
+            vec!["sub/a.md".to_string(), "sub/b.md".to_string()]
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["sub-other/c.md".to_string()]
+        );
+        assert!(!kb.exists(), "still nothing on disk");
     }
 
     #[test]
