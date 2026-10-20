@@ -1113,6 +1113,9 @@ enum ToState {
     NotDir,
     /// Nothing is there.
     Missing,
+    /// The stat failed for a reason other than "not found" (permission, a
+    /// sharing violation, an I/O error): something may be there.
+    Unknown,
 }
 
 /// (feature-68) How a paired rename is handled once it is known to be a
@@ -1132,7 +1135,7 @@ enum DirRenameEntry {
 ///
 /// - [`ToState::Dir`]: [`DirRenameEntry::ScanDestination`], without listing
 ///   or looking at the store argument.
-/// - [`ToState::NotDir`]: `None`, without listing.
+/// - [`ToState::NotDir`] and [`ToState::Unknown`]: `None`, without listing.
 /// - [`ToState::Missing`]: list the rows under `old_rel` in the store
 ///   argument; any row means [`DirRenameEntry::SweepOnly`], none (or no
 ///   store given) means `None`.
@@ -1149,7 +1152,9 @@ fn dir_rename_entry(
 ) -> Result<Option<DirRenameEntry>> {
     match (to, db) {
         (ToState::Dir, _) => Ok(Some(DirRenameEntry::ScanDestination)),
-        (ToState::NotDir, _) => Ok(None),
+        // (local Codex r4) An unknown destination is never read as gone: the
+        // rows it would sweep may belong to a directory that is still there.
+        (ToState::NotDir | ToState::Unknown, _) => Ok(None),
         (ToState::Missing, None) => Ok(None),
         (ToState::Missing, Some(db)) => {
             if db.document_paths_under(old_rel)?.is_empty() {
@@ -1162,13 +1167,18 @@ fn dir_rename_entry(
 }
 
 /// (feature-68) What is at a rename's destination, from one `symlink_metadata`.
-/// A symlink is not followed. A failed stat of any kind reads as
-/// [`ToState::Missing`], the way [`gate_parts`] treats a stat it cannot take.
-fn to_state(p: &Path) -> ToState {
+/// A symlink is not followed. Only "not found" reads as [`ToState::Missing`];
+/// any other failure is [`ToState::Unknown`] and comes back with its error so
+/// the caller can log it (local Codex r4). Unlike [`gate_parts`], which only
+/// declines to read a path it cannot stat, "missing" here can lead to a
+/// sweep that deletes rows, so a failure that does not prove absence must not
+/// count as one.
+fn to_state(p: &Path) -> (ToState, Option<std::io::Error>) {
     match std::fs::symlink_metadata(p) {
-        Ok(m) if m.file_type().is_dir() => ToState::Dir,
-        Ok(_) => ToState::NotDir,
-        Err(_) => ToState::Missing,
+        Ok(m) if m.file_type().is_dir() => (ToState::Dir, None),
+        Ok(_) => (ToState::NotDir, None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ToState::Missing, None),
+        Err(e) => (ToState::Unknown, Some(e)),
     }
 }
 
@@ -1180,6 +1190,10 @@ fn to_state(p: &Path) -> ToState {
 /// followed), or when `to` is already gone and the store holds rows under
 /// `old_rel/` (the handler fell behind a chain of renames). The decision is
 /// [`dir_rename_entry`]; the KB root (an empty rel at either end) never enters.
+/// A destination that cannot be stat'ed for a reason other than "not found"
+/// is logged and left to the file rename (a skip for two directory names), so
+/// the rows stay under the old path rather than being swept while the
+/// directory may still be there; a full index recovers them.
 ///
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
@@ -1209,14 +1223,21 @@ fn dispatch_directory_rename(
     if old_rel.is_empty() || new_rel.is_empty() {
         return false;
     }
-    let to_kind = to_state(to);
+    let (to_kind, stat_err) = to_state(to);
+    if let Some(e) = &stat_err {
+        wdiag!(
+            "watcher: could not stat the destination of a renamed directory: {e}. Its rows stay under the old path until the next full `groove index`."
+        );
+    }
     let entry = match to_kind {
         ToState::Missing => {
             let db = recover_db(state.db.lock());
             dir_rename_entry(to_kind, Some(&db), old_rel)
             // `db` is dropped here, before the outcome is acted on.
         }
-        ToState::Dir | ToState::NotDir => dir_rename_entry(to_kind, None, old_rel),
+        ToState::Dir | ToState::NotDir | ToState::Unknown => {
+            dir_rename_entry(to_kind, None, old_rel)
+        }
     };
     let entry = match entry {
         Ok(Some(entry)) => entry,
@@ -2543,6 +2564,19 @@ mod tests {
 
         let entry = dir_rename_entry(ToState::Dir, Some(&db), "docs").unwrap();
         assert_eq!(entry, Some(DirRenameEntry::ScanDestination));
+    }
+
+    /// feature-68 (local Codex r4): a destination whose stat failed for a
+    /// reason other than "not found" is left to the file rename without
+    /// listing, even when a store with rows under the old prefix is handed in.
+    /// Read as "gone", those rows would be swept while the directory may well
+    /// be there.
+    #[test]
+    fn test_dir_rename_entry_unknown_does_not_list() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+
+        let entry = dir_rename_entry(ToState::Unknown, Some(&db), "docs").unwrap();
+        assert_eq!(entry, None);
     }
 
     #[test]
