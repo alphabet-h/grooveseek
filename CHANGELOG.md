@@ -14,6 +14,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Internal
+
+- **The embedder's in-crate HTTP mock no longer panics when the client closes (end of stream, or a
+  reset or aborted connection) before the headers.** `a_transport_error_names_its_cause_without_the_url`
+  failed in nightly run 38541146112 (windows-latest) and in local full runs while the product
+  behaved correctly: under load, the test's 10 ms client timeout can fire after the connection is
+  made but before the request is written, the mock's first read sees the close as end of stream,
+  and its assertion panicked the mock thread. The mock thread now returns how its connection ended
+  (answered, or closed by the client before the headers); any other read error still panics. New
+  tests close a connection on purpose, and feed the reader a reset, an aborted connection and
+  another error.
+
 ## [1.20.2] - 2026-10-20
 
 ### Fixed
