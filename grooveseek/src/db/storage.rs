@@ -847,6 +847,19 @@ impl Database {
     /// ([`Database::begin_transaction`]) it joins that one, and the immediate
     /// guarantee is then the caller's: a deferred caller transaction reads on its
     /// snapshot. The watcher calls it with no transaction open.
+    ///
+    /// Outside a transaction a read-only `EXISTS` pre-check runs first, so that a
+    /// Remove with nothing under it (most events in excluded trees such as
+    /// `.git/objects` or `target/`) never takes the write lock. It is an
+    /// optimisation only: the read that decides the deletes is the one inside the
+    /// immediate transaction. Worst case, a row inserted under `dir` between the
+    /// pre-check and the transaction is missed by this call and is pruned by the
+    /// next full index, the same as a row inserted after the call. Inside a
+    /// caller's transaction there is no pre-check; the rows are read inside it.
+    ///
+    /// On `Err` inside a caller's transaction, the deletes that already ran stay in
+    /// that transaction: the caller must roll back its own transaction, or the
+    /// store is left torn (e.g. `vec_chunks` gone, `documents` left).
     pub fn delete_documents_under(&self, dir: &str) -> Result<Vec<String>> {
         if dir.is_empty() {
             anyhow::bail!(
@@ -861,10 +874,18 @@ impl Database {
         let lo = format!("{dir}/");
         let hi = format!("{dir}0");
         let local_tx = if self.conn.is_autocommit() {
-            Some(rusqlite::Transaction::new_unchecked(
-                &self.conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?)
+            // Optimisation only: a Remove with nothing under it never takes
+            // the write lock. The read that decides the deletes is the one
+            // inside the immediate transaction below.
+            let any: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM documents WHERE path >= ?1 AND path < ?2)",
+                params![lo, hi],
+                |r| r.get(0),
+            )?;
+            if !any {
+                return Ok(Vec::new());
+            }
+            Some(self.begin_immediate_transaction()?)
         } else {
             None
         };

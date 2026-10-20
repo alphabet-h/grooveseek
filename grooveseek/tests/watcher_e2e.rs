@@ -278,9 +278,10 @@ fn watcher_reloads_grooveseekignore_while_running() {
 /// in the same window, so only the directory's event may reach groove. The
 /// watcher has to expand that one event from its own store.
 ///
-/// `sub-other/` shares the name prefix without the `/` and must survive: it is
-/// both the anchoring check and the proof that the watcher was alive when the
-/// `sub/` documents disappeared (an absence alone proves nothing). Only the end
+/// The `sub/` documents disappearing is what proves the watcher was alive.
+/// `sub-other/` shares the name prefix without the `/` and must survive: that is
+/// the anchoring check only, since its survival alone is indistinguishable from
+/// nothing having happened. Only the end
 /// state is asserted, so a platform whose backend does not fold the events
 /// (single-file deletes then do the work) stays green.
 #[test]

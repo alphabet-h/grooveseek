@@ -462,8 +462,8 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // returning **stale hits that cannot be opened** alongside the new
                 // ones. Today that rename is skipped entirely, so no such
                 // duplicate exists. Closing this properly means deindexing the
-                // source subtree too, which is a new database capability and a
-                // different change. Until then a full `groove index` is the
+                // source subtree too, which this branch does not do yet; wiring
+                // it in is a different change. Until then a full `groove index` is the
                 // recovery, exactly as it was before this branch.
                 //
                 // Tracked in `.dev/known-issues.md`.
@@ -931,15 +931,28 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
 ///
 /// `None` when `p` is not under the KB or is the KB root itself: an empty
 /// prefix would name the whole KB (the helper refuses it too). Otherwise the
-/// rows under `rel/` are deleted. Nothing is stat'ed and no exclusion /
-/// extension / link gate is asked: a removed directory cannot be stat'ed, and
-/// whatever the store still holds under it is gone from disk.
-fn deindex_subtree_parts(db: &Database, kb_path: &Path, p: &Path) -> Option<Result<Vec<String>>> {
+/// rows under `rel/` are deleted, and `rel` is returned with the outcome so the
+/// caller logs the same spelling it deleted by. The subtree path stats nothing
+/// of its own and asks no exclusion / extension / link gate: a removed
+/// directory cannot be stat'ed, and whatever the store still holds under it is
+/// gone from disk. Relativisation is the existing [`to_rel`], shared with the
+/// single-file path, whose canonicalize fallback returns `None` for a path that
+/// no longer exists.
+///
+/// Known limitation: on Unix a non-UTF-8 directory name is spelled lossily
+/// (U+FFFD) by [`indexer::index_rel_path`], so two sibling directories whose
+/// names collapse to the same spelling share a prefix and both fall in the range.
+fn deindex_subtree_parts(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+) -> Option<(String, Result<Vec<String>>)> {
     let rel = to_rel(kb_path, p)?;
     if rel.is_empty() {
         return None;
     }
-    Some(indexer::deindex_subtree(db, &rel))
+    let outcome = indexer::deindex_subtree(db, &rel);
+    Some((rel, outcome))
 }
 
 /// (feature-67, kuriya issue #479) Delete what the store holds under a removed
@@ -947,10 +960,9 @@ fn deindex_subtree_parts(db: &Database, kb_path: &Path, p: &Path) -> Option<Resu
 /// in the same window, so the directory event is the only one that arrives.
 fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
     let db = recover_db(state.db.lock());
-    let Some(outcome) = deindex_subtree_parts(&db, &state.kb_path, p) else {
+    let Some((rel, outcome)) = deindex_subtree_parts(&db, &state.kb_path, p) else {
         return;
     };
-    let rel = to_rel(&state.kb_path, p).unwrap_or_default();
     match outcome {
         Ok(deleted) if deleted.is_empty() => {}
         Ok(deleted) => wdiag!(
@@ -2028,9 +2040,10 @@ mod tests {
         assert!(deindex_subtree_parts(&db, &kb, &kb).is_none());
         assert_eq!(db.all_document_paths().unwrap().len(), 3);
 
-        let deleted = deindex_subtree_parts(&db, &kb, &kb.join("sub"))
-            .expect("a path under the KB is handled")
-            .unwrap();
+        let (rel, outcome) = deindex_subtree_parts(&db, &kb, &kb.join("sub"))
+            .expect("a path under the KB is handled");
+        assert_eq!(rel, "sub");
+        let deleted = outcome.unwrap();
         assert_eq!(
             deleted,
             vec!["sub/a.md".to_string(), "sub/b.md".to_string()]
