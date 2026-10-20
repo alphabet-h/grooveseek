@@ -1545,11 +1545,23 @@ mod tests {
         }
     }
 
+    /// How [`mock_embedding_server`]'s one connection ended, returned by its
+    /// thread so that joining the thread is the wait for it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum MockEnd {
+        /// The request arrived and the answer was written (or tried).
+        Answered,
+        /// The client closed the connection before its headers were whole:
+        /// a client timeout that fires after the connect but before the
+        /// request is written does this, under load (kuriya issue #494).
+        ClientClosed,
+    }
+
     fn mock_embedding_server(
         status: &str,
         response_body: &str,
         delay: Duration,
-    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<MockEnd>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let addr = listener.local_addr().expect("mock server address");
         let status = status.to_string();
@@ -1557,20 +1569,32 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept mock request");
-            tx.send(read_http_request(&mut stream))
-                .expect("send captured request");
+            let Some(request) = try_read_http_request(&mut stream) else {
+                return MockEnd::ClientClosed;
+            };
+            tx.send(request).expect("send captured request");
             thread::sleep(delay);
             write_http_response(&mut stream, &status, &response_body);
+            MockEnd::Answered
         });
         (format!("http://{addr}/v1/embeddings"), rx, handle)
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        try_read_http_request(stream).expect("request ended before its headers")
+    }
+
+    /// Reads one request, or `None` when the client closed the connection
+    /// (a read of `Ok(0)`) before the headers were whole. Windows shows a
+    /// client's close to the mock that way (kuriya issue #308 saw the same).
+    fn try_read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
         let mut request = Vec::new();
         let mut buf = [0_u8; 4096];
         let (header_end, content_length) = loop {
             let read = stream.read(&mut buf).expect("read mock request");
-            assert!(read > 0, "request ended before its headers");
+            if read == 0 {
+                return None;
+            }
             request.extend_from_slice(&buf[..read]);
             if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                 let end = end + 4;
@@ -1593,7 +1617,7 @@ mod tests {
             }
             request.extend_from_slice(&buf[..read]);
         }
-        String::from_utf8_lossy(&request).into_owned()
+        Some(String::from_utf8_lossy(&request).into_owned())
     }
 
     fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
@@ -3401,6 +3425,36 @@ mod tests {
         assert!(chain.contains("timed out"), "{chain}");
         assert!(!chain.contains(&host), "the URL leaked: {chain}");
         handle.join().expect("mock server thread");
+    }
+
+    /// (kuriya issue #494) A client that connects and closes before its
+    /// headers are whole, as a short client timeout does under load, ends
+    /// [`mock_embedding_server`]'s thread with [`MockEnd::ClientClosed`]: it does
+    /// not panic, and it captures no request.
+    ///
+    /// Red if [`try_read_http_request`] panics on a read of `Ok(0)` before the
+    /// headers: the thread panics and joining it fails.
+    #[test]
+    fn the_mock_server_records_a_client_that_closed_before_its_headers() {
+        for sent in [&b""[..], &b"POST /v1/embeddings HTTP/1.1\r\n"[..]] {
+            let (endpoint, captured, handle) =
+                mock_embedding_server("200 OK", "{}", Duration::ZERO);
+            let addr = endpoint
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .expect("host:port")
+                .to_string();
+            let mut client = std::net::TcpStream::connect(addr).expect("connect to the mock");
+            client.write_all(sent).expect("write the partial request");
+            drop(client);
+            assert_eq!(
+                handle.join().expect("mock server thread"),
+                MockEnd::ClientClosed,
+                "sent {sent:?}"
+            );
+            assert!(captured.try_recv().is_err(), "sent {sent:?}");
+        }
     }
 
     /// (codex P1 round 1 on PR #332) An `io::Error` under a transport error
