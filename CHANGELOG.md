@@ -14,6 +14,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The live watcher now follows a directory rename.** Renaming a directory left its documents
+  searchable only under the old path, which could no longer be opened, and skipped files written
+  into it just before the rename, until the next full index. On macOS the watcher's removal path
+  currently leaves the rows of a removed or renamed directory in place until the next full index
+  (the same holds for the directory removal fixed in 1.20.2); tracked separately.
+
 ### Internal
 
 - **The embedder's in-crate HTTP mock no longer panics when the client closes (end of stream, or a

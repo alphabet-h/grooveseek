@@ -860,18 +860,7 @@ impl Database {
     /// that transaction: the caller must roll back its own transaction, or the
     /// store is left torn (e.g. the vectors gone but the document rows left).
     pub fn delete_documents_under(&self, dir: &str) -> Result<Vec<String>> {
-        if dir.is_empty() {
-            anyhow::bail!(
-                "delete_documents_under: refusing an empty directory prefix (it would name the whole KB)"
-            );
-        }
-        if dir.ends_with('/') {
-            anyhow::bail!(
-                "delete_documents_under: the directory prefix must not end in '/': {dir:?}"
-            );
-        }
-        let lo = format!("{dir}/");
-        let hi = format!("{dir}0");
+        let (lo, hi) = Self::prefix_range(dir, "delete_documents_under")?;
         let local_tx = if self.conn.is_autocommit() {
             // No unlocked pre-check: the read below must be behind the write
             // lock, or a row a concurrent writer commits after it is missed.
@@ -879,13 +868,7 @@ impl Database {
         } else {
             None
         };
-        let paths: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT path FROM documents WHERE path >= ?1 AND path < ?2 ORDER BY path",
-            )?;
-            let rows = stmt.query_map(params![lo, hi], |r| r.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
+        let paths = self.paths_in_range(&lo, &hi)?;
         if paths.is_empty() {
             // Nothing written: dropping `local_tx` rolls back an empty transaction.
             return Ok(paths);
@@ -922,6 +905,40 @@ impl Database {
             tx.commit()?;
         }
         Ok(paths)
+    }
+
+    /// (feature-68) The paths of every document strictly under `dir` (`dir/...`, any depth), sorted.
+    /// `dir` itself is not included. Refuses an empty `dir` and one ending in `/`.
+    /// Same byte range as [`Database::delete_documents_under`]; reads only, opens no transaction.
+    pub fn document_paths_under(&self, dir: &str) -> Result<Vec<String>> {
+        let (lo, hi) = Self::prefix_range(dir, "document_paths_under")?;
+        self.paths_in_range(&lo, &hi)
+    }
+
+    /// (feature-68) The byte range `[dir/, dir0)` that holds every path under `dir`, shared by
+    /// [`Database::delete_documents_under`] and [`Database::document_paths_under`]. Refuses an
+    /// empty `dir` (it would name the whole KB) and one ending in `/`; the message starts with
+    /// `caller`, so each public fn keeps its own wording.
+    fn prefix_range(dir: &str, caller: &str) -> Result<(String, String)> {
+        if dir.is_empty() {
+            anyhow::bail!(
+                "{caller}: refusing an empty directory prefix (it would name the whole KB)"
+            );
+        }
+        if dir.ends_with('/') {
+            anyhow::bail!("{caller}: the directory prefix must not end in '/': {dir:?}");
+        }
+        Ok((format!("{dir}/"), format!("{dir}0")))
+    }
+
+    /// (feature-68) The document paths in `[lo, hi)`, sorted. Opens no transaction of its own:
+    /// inside a caller's transaction it reads that transaction's view.
+    fn paths_in_range(&self, lo: &str, hi: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM documents WHERE path >= ?1 AND path < ?2 ORDER BY path")?;
+        let rows = stmt.query_map(params![lo, hi], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// (feature-62) Overwrite the `content_hash` of each document in `paths` with `hash`,
