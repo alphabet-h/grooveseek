@@ -1223,10 +1223,8 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 ///   [`dispatch_deindex`] / [`dispatch_reindex`]); then every listed row is
 ///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
 ///   already moved), so no listed row stays there even when the old directory
-///   was recreated; then the row stored under `old_rel` itself (a file
-///   renamed onto a name that became a directory before handling); rows added
-///   under the old prefix after the listing are swept by
-///   [`dispatch_deindex_subtree`] once `from` is gone; last,
+///   was recreated; rows added under the old prefix after the listing are
+///   swept by [`dispatch_deindex_subtree`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
 /// - [`DirRenameEntry::SweepOnly`]: no move and no scan. When `from` is gone,
 ///   one range sweep by [`dispatch_deindex_subtree`] drops the listed rows and
@@ -1235,6 +1233,11 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 ///   [`dispatch_deindex`], so a recreated directory's own rows are kept.
 ///   Renaming the rows onto a destination that no longer exists would drop
 ///   them while logging a rename; the later event for the new name scans it.
+///
+/// On both paths, the row stored under `old_rel` itself (a file, not under
+/// `old_rel/`) is dropped through [`dispatch_deindex`], once, before the
+/// destination scan: the file rename the event may stand for would have
+/// dropped it, and for a real directory rename it is a no-op.
 ///
 /// The db is locked only while listing, never across the loop, so the MCP search
 /// tool is not held up for the size of the directory. The listing guard is
@@ -1333,13 +1336,6 @@ fn dispatch_directory_rename(
                 dispatch_deindex(state, p);
             }
         }
-        // (local Codex r6) The row stored under the old path itself, which is
-        // not under `old_rel/` and so neither listed above nor in the sweep's
-        // range below: a file renamed onto a name that is a directory by the
-        // time the event is handled. The file rename would have dropped it. For
-        // a real directory rename there is no such row and this is a no-op
-        // (one deletes the exact row, the sweep what is strictly under it).
-        dispatch_deindex(state, old_rel);
     }
     // The old prefix is swept only when `from` is known to be gone. A stat that
     // fails for another reason does not prove that, and sweeping a directory
@@ -1366,6 +1362,14 @@ fn dispatch_directory_rename(
             dispatch_deindex(state, p);
         }
     }
+    // (local Codex r6, r7) On both paths, the row stored under the old path
+    // itself, which is not under `old_rel/` and so neither listed above nor in
+    // the sweep's range: a file renamed onto a name that is a directory by the
+    // time the event is handled, or a file once stored at the name the renamed
+    // directory later took. The file rename would have dropped it. For a real
+    // directory rename there is no such row and this is a no-op (one deletes
+    // the exact row, the sweep what is strictly under it, as in feature-67).
+    dispatch_deindex(state, old_rel);
     if entry == DirRenameEntry::ScanDestination {
         dispatch_new_directory(state, to, new_rel);
     }
