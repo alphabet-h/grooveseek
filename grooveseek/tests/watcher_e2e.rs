@@ -434,11 +434,12 @@ fn rename_retrying(from: &std::path::Path, to: &std::path::Path) {
 /// `docs-other/` shares the name prefix without the `/` and must survive.
 ///
 /// Not run on macOS. In nightly run 39471586474 (2026-10-21) this test and the
-/// other two directory-rename tests failed there in the same shape as the
-/// feature-67 subtree deindex test above: the new path was indexed and the old
-/// path's rows stayed. The cause is common to the removal and rename paths on
-/// macOS and outside this change (<kuriya issue>). Remove the gate once it is
-/// closed.
+/// other two directory-rename tests failed there: the new path was indexed and
+/// the old path's rows stayed. The subtree-deindex e2e from feature-67 already
+/// fails there on main in the same shape (nightly run 39398233208), so the
+/// cause is common to the removal and rename paths on macOS and outside this
+/// change. It is tracked in the private issue tracker as #520. Remove the gate
+/// once that issue is closed.
 #[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
@@ -568,8 +569,8 @@ fn watcher_moves_an_indexed_directory_on_rename() {
 /// the arrival.
 ///
 /// Not run on macOS, for the measured failure described on the moves test
-/// above (nightly run 39471586474, <kuriya issue>). Remove the gate once that
-/// issue is closed.
+/// above (nightly run 39471586474, tracked in the private issue tracker as
+/// #520). Remove the gate once that issue is closed.
 #[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
@@ -685,8 +686,8 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
 /// above). The paired path is asserted through its stderr line, as there.
 ///
 /// Not run on macOS, for the measured failure described on the moves test
-/// above (nightly run 39471586474, <kuriya issue>). Remove the gate once that
-/// issue is closed.
+/// above (nightly run 39471586474, tracked in the private issue tracker as
+/// #520). Remove the gate once that issue is closed.
 #[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
