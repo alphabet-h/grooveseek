@@ -2399,6 +2399,29 @@ mod tests {
         assert_eq!(entry, None);
     }
 
+    /// feature-68: something other than a directory at the destination is left
+    /// to the file rename even when a store with rows under the old prefix is
+    /// handed in. This test and the next carry the proof that `NotDir` and
+    /// `Dir` do not list; the earlier `NotDir` / `Dir` tests pass no store.
+    #[test]
+    fn test_dir_rename_entry_not_dir_ignores_rows_even_with_a_db() {
+        let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
+
+        let entry = dir_rename_entry(ToState::NotDir, Some(&db), "docs").unwrap();
+        assert_eq!(entry, None);
+    }
+
+    /// feature-68: a directory at the destination is scanned even when the
+    /// store handed in has no rows under the old prefix (a directory written
+    /// under a temporary name before the watch window).
+    #[test]
+    fn test_dir_rename_entry_dir_scans_even_with_an_empty_db() {
+        let db = dir_rename_db(&[]);
+
+        let entry = dir_rename_entry(ToState::Dir, Some(&db), "docs").unwrap();
+        assert_eq!(entry, Some(DirRenameEntry::ScanDestination));
+    }
+
     #[test]
     fn test_classify_rename_both_two_paths_is_rename() {
         let evt = mk_evt(
