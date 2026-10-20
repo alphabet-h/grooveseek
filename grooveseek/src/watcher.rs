@@ -457,12 +457,13 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `dispatch_directory_rename` expands it into the file rename of each
                 // document under the old prefix, sweeps what is left there once the
                 // old directory is gone, and scans the destination for files not
-                // indexed yet (which covers the directory populated under a temporary
-                // name and renamed inside one debounce window, codex P2 on PR #168).
-                // It used to be skipped here because indexing the destination alone
-                // would have left the source subtree's rows behind as stale hits that
-                // cannot be opened: there was no delete by prefix. feature-67 added
-                // one and this branch uses it.
+                // indexed yet (which covers a directory created under a temporary
+                // name before the debounce window, written to, and renamed inside it,
+                // codex P2 on PR #168; one created inside the same window already
+                // arrives as a Create). It used to be skipped here because indexing
+                // the destination alone would have left the source subtree's rows
+                // behind as stale hits that cannot be opened: there was no delete by
+                // prefix. feature-67 added one and `dispatch_directory_rename` uses it.
                 if dispatch_directory_rename(state, from, to, &old_rel, &new_rel) {
                     continue;
                 }
@@ -1204,14 +1205,14 @@ fn dispatch_directory_rename(
     if old_rel.is_empty() || new_rel.is_empty() {
         return false;
     }
-    let to_state = to_state(to);
-    let entry = match to_state {
+    let to_kind = to_state(to);
+    let entry = match to_kind {
         ToState::Missing => {
             let db = recover_db(state.db.lock());
-            dir_rename_entry(to_state, Some(&db), old_rel)
+            dir_rename_entry(to_kind, Some(&db), old_rel)
             // `db` is dropped here, before the outcome is acted on.
         }
-        ToState::Dir | ToState::NotDir => dir_rename_entry(to_state, None, old_rel),
+        ToState::Dir | ToState::NotDir => dir_rename_entry(to_kind, None, old_rel),
     };
     let entry = match entry {
         Ok(Some(entry)) => entry,
@@ -1232,7 +1233,7 @@ fn dispatch_directory_rename(
             Ok(paths) => paths,
             Err(e) => {
                 wdiag!(
-                    "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index`."
+                    "watcher: listing the documents of a renamed directory failed: {e}. Their rows are not moved: the old directory is deindexed if it is gone, and the destination is scanned as new."
                 );
                 Vec::new()
             }
