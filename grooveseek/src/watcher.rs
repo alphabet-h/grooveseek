@@ -451,22 +451,21 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 else {
                     continue;
                 };
-                // A *directory* rename is deliberately not routed into the
-                // arrival scan (codex P2 on PR #168 asked for it). Populating a
-                // directory under a temporary name and renaming it inside one
-                // debounce window does leave its files unindexed — but indexing
-                // the destination alone would be worse, not better: this branch
-                // does not delete by prefix (`Database::delete_documents_under`
-                // exists since feature-67, but is not used here yet), so the
-                // source subtree's rows would survive and `search` would start
-                // returning **stale hits that cannot be opened** alongside the new
-                // ones. Today that rename is skipped entirely, so no such
-                // duplicate exists. Closing this properly means deindexing the
-                // source subtree too, which this branch does not do yet; wiring
-                // it in is a different change. Until then a full `groove index` is the
-                // recovery, exactly as it was before this branch.
+                // (feature-68) A directory rename: the file system reports only the directory.
+                // Returns false when this is not one, and the file rename below runs as before.
                 //
-                // Tracked in `.dev/known-issues.md`.
+                // `dispatch_directory_rename` expands it into the file rename of each
+                // document under the old prefix, sweeps what is left there once the
+                // old directory is gone, and scans the destination for files not
+                // indexed yet (which covers the directory populated under a temporary
+                // name and renamed inside one debounce window, codex P2 on PR #168).
+                // It used to be skipped here because indexing the destination alone
+                // would have left the source subtree's rows behind as stale hits that
+                // cannot be opened: there was no delete by prefix. feature-67 added
+                // one and this branch uses it.
+                if dispatch_directory_rename(state, from, to, &old_rel, &new_rel) {
+                    continue;
+                }
                 // 両端の可否で 3 分岐する (codex P2 on PR #81)。以前は
                 // 「どちらかが通れば rename」だったため、index 済みファイルを
                 // `.git/` や `node_modules/` へ rename すると
@@ -1136,8 +1135,8 @@ enum DirRenameEntry {
 /// - [`ToState::Missing`]: list the rows under `old_rel` in `db`; any row
 ///   means [`DirRenameEntry::SweepOnly`], none (or no `db`) means `None`.
 ///
-/// The stat and the lock belong to the caller (the directory-rename dispatch
-/// in the watcher), the decision lives here, and the caller keeps the db
+/// The stat and the lock belong to the caller
+/// ([`dispatch_directory_rename`]), the decision lives here, and the caller keeps the db
 /// guard inside the scope of this call. This function stats, locks and logs
 /// nothing. A listing error is returned as `Err` rather than folded into
 /// `None`, so the caller can log it before falling back to the file rename.
@@ -1158,6 +1157,117 @@ fn dir_rename_entry(
             }
         }
     }
+}
+
+/// (feature-68) What is at a rename's destination, from one `symlink_metadata`.
+/// A symlink is not followed. A failed stat of any kind reads as
+/// [`ToState::Missing`], the way [`gate_parts`] treats a stat it cannot take.
+fn to_state(p: &Path) -> ToState {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_dir() => ToState::Dir,
+        Ok(_) => ToState::NotDir,
+        Err(_) => ToState::Missing,
+    }
+}
+
+/// (feature-68) Handle a paired rename as a directory rename when it is one.
+/// Returns `true` when it was handled here, `false` to fall through to the
+/// file rename, which is left exactly as it was.
+///
+/// It is a directory rename when `to` is a real directory (a symlink is not
+/// followed), or when `to` is already gone and the store holds rows under
+/// `old_rel/` (the handler fell behind a chain of renames). The decision is
+/// [`dir_rename_entry`]; the KB root (an empty rel at either end) never enters.
+///
+/// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
+///   through its file rename ([`dir_rename_steps`], judged by the existing
+///   [`rename_decision`] and run by the existing [`dispatch_rename`] /
+///   [`dispatch_deindex`] / [`dispatch_reindex`]); whatever is left under the
+///   old prefix is swept by [`dispatch_deindex_subtree`] once `from` is gone;
+///   then [`dispatch_new_directory`] scans `to` for files not indexed yet.
+/// - [`DirRenameEntry::SweepOnly`]: only the sweep, and only when `from` is
+///   gone. Renaming the rows onto a destination that no longer exists would
+///   drop them while logging a rename; the later event for the new name scans it.
+///
+/// The db is locked only while listing, never across the loop, so `search`
+/// is not held up for the size of the directory. The listing guard is
+/// dropped before any `dispatch_*` call, because each of those locks the db
+/// again and a std `Mutex` is not reentrant. The embedder is not locked here.
+/// When `to` exists and is not a directory, the db is not locked at all.
+fn dispatch_directory_rename(
+    state: &WatcherState,
+    from: &Path,
+    to: &Path,
+    old_rel: &str,
+    new_rel: &str,
+) -> bool {
+    if old_rel.is_empty() || new_rel.is_empty() {
+        return false;
+    }
+    let to_state = to_state(to);
+    let entry = match to_state {
+        ToState::Missing => {
+            let db = recover_db(state.db.lock());
+            dir_rename_entry(to_state, Some(&db), old_rel)
+            // `db` is dropped here, before the outcome is acted on.
+        }
+        ToState::Dir | ToState::NotDir => dir_rename_entry(to_state, None, old_rel),
+    };
+    let entry = match entry {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return false,
+        Err(e) => {
+            wdiag!(
+                "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index`."
+            );
+            return false;
+        }
+    };
+    if entry == DirRenameEntry::ScanDestination {
+        let listed = {
+            let db = recover_db(state.db.lock());
+            db.document_paths_under(old_rel)
+        };
+        let paths = match listed {
+            Ok(paths) => paths,
+            Err(e) => {
+                wdiag!(
+                    "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index`."
+                );
+                Vec::new()
+            }
+        };
+        if !paths.is_empty() {
+            let n = paths.len();
+            wdiag!(
+                "watcher: a renamed directory held {n} indexed document{}; following the rename for them (the file system reports only the directory).",
+                if n == 1 { "" } else { "s" }
+            );
+            let steps = dir_rename_steps(
+                &paths,
+                &state.kb_path,
+                old_rel,
+                new_rel,
+                &state.registry,
+                &state.rules,
+            );
+            for step in &steps {
+                match step.action {
+                    RenameAction::Rename => dispatch_rename(state, &step.old_rel, &step.new_rel),
+                    RenameAction::Deindex => dispatch_deindex(state, &step.old_rel),
+                    RenameAction::Reindex => dispatch_reindex(state, &step.new_rel),
+                    RenameAction::Skip => {}
+                }
+            }
+        }
+    }
+    if std::fs::symlink_metadata(from).is_err() {
+        dispatch_deindex_subtree(state, from);
+    }
+    if entry == DirRenameEntry::ScanDestination {
+        dispatch_new_directory(state, to, new_rel);
+    }
+    true
 }
 
 // ===========================================================================
