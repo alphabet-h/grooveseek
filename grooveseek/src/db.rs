@@ -1590,6 +1590,89 @@ mod tests {
         drop(b);
     }
 
+    /// feature-68: [`Database::document_paths_under`] reads the same `[dir/, dir0)`
+    /// range the prefix delete uses, and leaves every row in place.
+    #[test]
+    fn test_document_paths_under_is_anchored_at_slash() {
+        let db = db_with_384();
+        let all = [
+            "a",
+            "a.md",
+            "a/x.md",
+            "a/b/y.md",
+            "a-b/x.md",
+            "a0/x.md",
+            "ab/x.md",
+            "日本語/x.md",
+            "日本語x/y.md",
+        ];
+        for p in all {
+            upsert_bare(&db, p);
+        }
+
+        assert_eq!(
+            db.document_paths_under("a").unwrap(),
+            vec!["a/b/y.md".to_string(), "a/x.md".to_string()]
+        );
+        assert_eq!(
+            db.document_paths_under("日本語").unwrap(),
+            vec!["日本語/x.md".to_string()]
+        );
+        assert_eq!(db.all_document_paths().unwrap().len(), 9, "rows untouched");
+    }
+
+    /// feature-68: `_` and `%` in the prefix are bytes, not LIKE wildcards.
+    #[test]
+    fn test_document_paths_under_treats_like_metacharacters_literally() {
+        let db = db_with_384();
+        for p in ["a_b/x.md", "aXb/x.md", "100%/x.md", "1000/x.md"] {
+            upsert_bare(&db, p);
+        }
+
+        assert_eq!(
+            db.document_paths_under("a_b").unwrap(),
+            vec!["a_b/x.md".to_string()]
+        );
+        assert_eq!(
+            db.document_paths_under("100%").unwrap(),
+            vec!["100%/x.md".to_string()]
+        );
+    }
+
+    /// feature-68: the refusals name the caller, so a failed listing is not
+    /// reported as a failed delete.
+    #[test]
+    fn test_document_paths_under_refuses_empty_and_trailing_slash() {
+        let db = db_with_384();
+        for p in ["a.md", "a/x.md"] {
+            upsert_bare(&db, p);
+        }
+
+        for dir in ["", "a/"] {
+            let e = db.document_paths_under(dir).unwrap_err();
+            assert!(
+                e.to_string().starts_with("document_paths_under:"),
+                "{dir:?}: {e}"
+            );
+        }
+    }
+
+    /// feature-68: sharing the refusals with the listing must not change the
+    /// prefix delete's messages by a single character.
+    #[test]
+    fn test_prefix_range_keeps_the_delete_refusal_text() {
+        let db = db_with_384();
+
+        assert_eq!(
+            db.delete_documents_under("").unwrap_err().to_string(),
+            "delete_documents_under: refusing an empty directory prefix (it would name the whole KB)"
+        );
+        assert_eq!(
+            db.delete_documents_under("a/").unwrap_err().to_string(),
+            "delete_documents_under: the directory prefix must not end in '/': \"a/\""
+        );
+    }
+
     #[test]
     fn test_search_similar_executes_knn_query() {
         // Regression: sqlite-vec requires `k = ?` (or literal LIMIT) on knn
