@@ -848,14 +848,13 @@ impl Database {
     /// guarantee is then the caller's: a deferred caller transaction reads on its
     /// snapshot. The watcher calls it with no transaction open.
     ///
-    /// Outside a transaction a read-only `EXISTS` pre-check runs first, so that a
-    /// Remove with nothing under it (most events in excluded trees such as
-    /// `.git/objects` or `target/`) never takes the write lock. It is an
-    /// optimisation only: the read that decides the deletes is the one inside the
-    /// immediate transaction. Worst case, a row inserted under `dir` between the
-    /// pre-check and the transaction is missed by this call and is pruned by the
-    /// next full index, the same as a row inserted after the call. Inside a
-    /// caller's transaction there is no pre-check; the rows are read inside it.
+    /// Outside a transaction the immediate transaction is taken on every call, also
+    /// when nothing is under `dir`. An unlocked emptiness check could miss a row a
+    /// concurrent writer commits after the check, so the read that decides the
+    /// deletes has to be behind the write lock. The cost under the one-writer rule
+    /// is a write lock on an idle database; under a competing writer the call waits
+    /// up to the connection's busy timeout, exactly as a single-file delete already
+    /// does.
     ///
     /// On `Err` inside a caller's transaction, the deletes that already ran stay in
     /// that transaction: the caller must roll back its own transaction, or the
@@ -874,17 +873,8 @@ impl Database {
         let lo = format!("{dir}/");
         let hi = format!("{dir}0");
         let local_tx = if self.conn.is_autocommit() {
-            // Optimisation only: a Remove with nothing under it never takes
-            // the write lock. The read that decides the deletes is the one
-            // inside the immediate transaction below.
-            let any: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM documents WHERE path >= ?1 AND path < ?2)",
-                params![lo, hi],
-                |r| r.get(0),
-            )?;
-            if !any {
-                return Ok(Vec::new());
-            }
+            // No unlocked pre-check: the read below must be behind the write
+            // lock, or a row a concurrent writer commits after it is missed.
             Some(self.begin_immediate_transaction()?)
         } else {
             None

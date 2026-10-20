@@ -1544,6 +1544,52 @@ mod tests {
         assert_eq!(db.document_count().unwrap(), 2, "rows came back");
     }
 
+    /// feature-67 (local Codex round 2): a writer holding an uncommitted row under
+    /// the removed directory must not be raced past. Connection A holds `sub/late.md`
+    /// in an open immediate transaction; `delete_documents_under("sub")` on
+    /// connection B has to wait on `BEGIN IMMEDIATE` (busy timeout) and then delete
+    /// the row A commits. An unlocked emptiness pre-check would have returned `[]`
+    /// at once and left the row behind.
+    #[test]
+    fn test_delete_documents_under_waits_for_a_concurrent_writer_and_then_deletes_its_row() {
+        let dir = TempDir::new("prefix-delete-waits");
+        let db_path = dir.path().join(".groove.db");
+        let db_path = db_path.to_str().unwrap();
+        let a = Database::open(db_path).unwrap();
+        a.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let b = Database::open(db_path).unwrap();
+
+        let tx = a.begin_immediate_transaction().unwrap();
+        upsert_bare(&a, "sub/late.md");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            let deleted = b.delete_documents_under("sub");
+            (b, deleted, t0.elapsed())
+        });
+        started_rx.recv().unwrap();
+        // Only makes the wait observable; correctness does not depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "the delete must wait for A's write lock, not return before A commits"
+        );
+        tx.commit().unwrap();
+
+        let (b, deleted, waited) = handle.join().unwrap();
+        assert_eq!(deleted.unwrap(), vec!["sub/late.md".to_string()]);
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "the delete returned after {waited:?}, so it did not wait for A"
+        );
+        assert!(a.all_document_paths().unwrap().is_empty(), "gone on A");
+        assert!(b.all_document_paths().unwrap().is_empty(), "gone on B");
+        drop(a);
+        drop(b);
+    }
+
     #[test]
     fn test_search_similar_executes_knn_query() {
         // Regression: sqlite-vec requires `k = ?` (or literal LIMIT) on knn
