@@ -1220,15 +1220,18 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 ///   [`dispatch_deindex`] / [`dispatch_reindex`]); then every listed row is
 ///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
 ///   already moved), so no listed row stays there even when the old directory
-///   was recreated; rows added under the old prefix after the listing are
-///   swept by [`dispatch_deindex_subtree`] once `from` is gone; last,
+///   was recreated; then the row stored under `old_rel` itself (a file
+///   renamed onto a name that became a directory before handling); rows added
+///   under the old prefix after the listing are swept by
+///   [`dispatch_deindex_subtree`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
-/// - [`DirRenameEntry::SweepOnly`]: no move and no scan. The rows the entry
-///   decision listed are dropped through [`dispatch_deindex`], whether or not
-///   the old directory was recreated since, and the old prefix is swept by
-///   [`dispatch_deindex_subtree`] only when `from` is gone. Renaming the rows
-///   onto a destination that no longer exists would drop them while logging a
-///   rename; the later event for the new name scans it.
+/// - [`DirRenameEntry::SweepOnly`]: no move and no scan. When `from` is gone,
+///   one range sweep by [`dispatch_deindex_subtree`] drops the listed rows and
+///   any added since. Otherwise (`from` recreated, or its stat failed) only
+///   the rows the entry decision listed are dropped, one by one through
+///   [`dispatch_deindex`], so a recreated directory's own rows are kept.
+///   Renaming the rows onto a destination that no longer exists would drop
+///   them while logging a rename; the later event for the new name scans it.
 ///
 /// The db is locked only while listing, never across the loop, so the MCP search
 /// tool is not held up for the size of the directory. The listing guard is
@@ -1316,25 +1319,38 @@ fn dispatch_directory_rename(
                 dispatch_deindex(state, p);
             }
         }
-    }
-    // (local Codex r5) The same on the sweep-only path: the rows listed by the
-    // entry decision predate the rename, so they go whether or not `from` was
-    // recreated since. Only those rows: no prefix sweep while `from` exists,
-    // which would take a recreated directory's own rows with it.
-    if let DirRenameEntry::SweepOnly(paths) = &entry {
-        for p in paths {
-            dispatch_deindex(state, p);
-        }
+        // (local Codex r6) The row stored under the old path itself, which is
+        // not under `old_rel/` and so neither listed above nor in the sweep's
+        // range below: a file renamed onto a name that is a directory by the
+        // time the event is handled. The file rename would have dropped it. For
+        // a real directory rename there is no such row and this is a no-op
+        // (one deletes the exact row, the sweep what is strictly under it).
+        dispatch_deindex(state, old_rel);
     }
     // The old prefix is swept only when `from` is known to be gone. A stat that
     // fails for another reason does not prove that, and sweeping a directory
     // that is still there would delete its live rows.
-    match stat_unless_gone(from) {
-        Ok(None) => dispatch_deindex_subtree(state, from),
-        Ok(Some(_)) => {}
-        Err(e) => wdiag!(
-            "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
-        ),
+    let from_gone = match stat_unless_gone(from) {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(e) => {
+            wdiag!(
+                "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
+            );
+            false
+        }
+    };
+    if from_gone {
+        // One range delete; on the sweep-only path it takes the listed rows too.
+        dispatch_deindex_subtree(state, from);
+    } else if let DirRenameEntry::SweepOnly(paths) = &entry {
+        // (local Codex r5, r6) `from` was recreated, or cannot be stat'ed: the
+        // listed rows predate the rename and go, but one by one, so a recreated
+        // directory's own rows are not taken by a prefix sweep. Rare, so the
+        // per-row cost (a lock and a delete each) is paid only here.
+        for p in paths {
+            dispatch_deindex(state, p);
+        }
     }
     if entry == DirRenameEntry::ScanDestination {
         dispatch_new_directory(state, to, new_rel);
