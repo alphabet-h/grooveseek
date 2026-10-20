@@ -14,6 +14,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The live watcher now deindexes the documents under a deleted directory.** When a directory's files were removed within one debounce window (`git rm -r`, a branch switch), only the directory's own removal reached groove, and its documents stayed searchable until the next full index.
+
 ## [1.20.1] - 2026-10-20
 
 ### Security

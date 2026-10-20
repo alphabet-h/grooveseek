@@ -831,6 +831,99 @@ impl Database {
         Ok(())
     }
 
+    /// (feature-67) Delete every document strictly under `dir` (`dir/...`, any depth),
+    /// with its chunks / vectors / FTS rows / fields. Returns the deleted paths, sorted.
+    /// `dir` itself is not touched. Refuses an empty `dir` and one ending in `/`.
+    ///
+    /// The predicate is the byte range `[dir/, dir0)` (`'0'` is the byte after `'/'`),
+    /// not `LIKE`: under the BINARY collation of `documents.path` exactly the strings
+    /// starting with `dir/` fall in it, `_` / `%` need no escaping, and the implicit
+    /// unique index on `documents.path` serves it. Keys are `/`-separated (the indexer folds
+    /// Windows `\`), so `dir` never matches `dir-v0/...` or `dir0/...`.
+    ///
+    /// The read (which rows are under `dir`) and the deletes share one transaction.
+    /// Called outside a transaction it opens its own `BEGIN IMMEDIATE`, so no other
+    /// writer commits between the two. Called inside a caller's transaction
+    /// ([`Database::begin_transaction`]) it joins that one, and the immediate
+    /// guarantee is then the caller's: a deferred caller transaction reads on its
+    /// snapshot. The watcher calls it with no transaction open.
+    ///
+    /// Outside a transaction the immediate transaction is taken on every call, also
+    /// when nothing is under `dir`. An unlocked emptiness check could miss a row a
+    /// concurrent writer commits after the check, so the read that decides the
+    /// deletes has to be behind the write lock. The cost under the one-writer rule
+    /// is a write lock on an idle database; under a competing writer the call waits
+    /// up to the connection's busy timeout, exactly as a single-file delete already
+    /// does.
+    ///
+    /// On `Err` inside a caller's transaction, the deletes that already ran stay in
+    /// that transaction: the caller must roll back its own transaction, or the
+    /// store is left torn (e.g. the vectors gone but the document rows left).
+    pub fn delete_documents_under(&self, dir: &str) -> Result<Vec<String>> {
+        if dir.is_empty() {
+            anyhow::bail!(
+                "delete_documents_under: refusing an empty directory prefix (it would name the whole KB)"
+            );
+        }
+        if dir.ends_with('/') {
+            anyhow::bail!(
+                "delete_documents_under: the directory prefix must not end in '/': {dir:?}"
+            );
+        }
+        let lo = format!("{dir}/");
+        let hi = format!("{dir}0");
+        let local_tx = if self.conn.is_autocommit() {
+            // No unlocked pre-check: the read below must be behind the write
+            // lock, or a row a concurrent writer commits after it is missed.
+            Some(self.begin_immediate_transaction()?)
+        } else {
+            None
+        };
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT path FROM documents WHERE path >= ?1 AND path < ?2 ORDER BY path",
+            )?;
+            let rows = stmt.query_map(params![lo, hi], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        if paths.is_empty() {
+            // Nothing written: dropping `local_tx` rolls back an empty transaction.
+            return Ok(paths);
+        }
+        // Same tables in the same order as `delete_document`, with `path = ?1`
+        // replaced by the range.
+        self.conn.execute(
+            "DELETE FROM vec_chunks WHERE chunk_id IN \
+             (SELECT c.id FROM chunks c JOIN documents d ON c.document_id = d.id \
+              WHERE d.path >= ?1 AND d.path < ?2)",
+            params![lo, hi],
+        )?;
+        self.conn.execute(
+            "DELETE FROM fts_chunks WHERE rowid IN \
+             (SELECT c.id FROM chunks c JOIN documents d ON c.document_id = d.id \
+              WHERE d.path >= ?1 AND d.path < ?2)",
+            params![lo, hi],
+        )?;
+        self.conn.execute(
+            "DELETE FROM document_fields WHERE document_id IN \
+             (SELECT id FROM documents WHERE path >= ?1 AND path < ?2)",
+            params![lo, hi],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chunks WHERE document_id IN \
+             (SELECT id FROM documents WHERE path >= ?1 AND path < ?2)",
+            params![lo, hi],
+        )?;
+        self.conn.execute(
+            "DELETE FROM documents WHERE path >= ?1 AND path < ?2",
+            params![lo, hi],
+        )?;
+        if let Some(tx) = local_tx {
+            tx.commit()?;
+        }
+        Ok(paths)
+    }
+
     /// (feature-62) Overwrite the `content_hash` of each document in `paths` with `hash`,
     /// leaving every other column and the chunks as they are; a path without a row is skipped.
     /// Returns how many rows changed. A caller's transaction ([`Database::begin_transaction`])

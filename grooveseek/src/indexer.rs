@@ -2734,6 +2734,14 @@ pub fn deindex_single_file(db: &Database, rel: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// (feature-67) Delete every document indexed under the directory `rel`
+/// (`rel/...`, any depth) and return the deleted paths. `rel` itself is not
+/// touched; that is [`deindex_single_file`]'s job. See
+/// [`Database::delete_documents_under`] for the predicate and the transaction.
+pub fn deindex_subtree(db: &Database, rel: &str) -> Result<Vec<String>> {
+    db.delete_documents_under(rel)
+}
+
 /// The key a version up to 1.12.0 stored for `rel` on a platform where `\` is
 /// a filename character: `rel` with every `\` folded into `/`. `None` when
 /// that is the same key -- no `\` in `rel`, or a platform where `\` separates
