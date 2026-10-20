@@ -1546,7 +1546,7 @@ mod tests {
 
     /// feature-67 (local Codex round 2): a writer holding an uncommitted row under
     /// the removed directory must not be raced past. Connection A holds `sub/late.md`
-    /// in an open immediate transaction; `delete_documents_under("sub")` on
+    /// in an open immediate transaction; [`Database::delete_documents_under`] (`"sub"`) on
     /// connection B has to wait on `BEGIN IMMEDIATE` (busy timeout) and then delete
     /// the row A commits. An unlocked emptiness pre-check would have returned `[]`
     /// at once and left the row behind.
