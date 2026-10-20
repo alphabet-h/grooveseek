@@ -859,7 +859,7 @@ impl Database {
     ///
     /// On `Err` inside a caller's transaction, the deletes that already ran stay in
     /// that transaction: the caller must roll back its own transaction, or the
-    /// store is left torn (e.g. `vec_chunks` gone, `documents` left).
+    /// store is left torn (e.g. the vectors gone but the document rows left).
     pub fn delete_documents_under(&self, dir: &str) -> Result<Vec<String>> {
         if dir.is_empty() {
             anyhow::bail!(
