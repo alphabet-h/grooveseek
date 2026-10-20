@@ -1408,7 +1408,7 @@ mod tests {
         println!("test_delete_document: OK");
     }
 
-    /// feature-67: insert a bare document row (no chunks) at `path`.
+    /// feature-67: insert a bare document row (no chunks) under the given path.
     fn upsert_bare(db: &Database, path: &str) -> i64 {
         db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
             .unwrap()

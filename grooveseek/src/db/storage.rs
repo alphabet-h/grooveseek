@@ -838,7 +838,7 @@ impl Database {
     /// The predicate is the byte range `[dir/, dir0)` (`'0'` is the byte after `'/'`),
     /// not `LIKE`: under the BINARY collation of `documents.path` exactly the strings
     /// starting with `dir/` fall in it, `_` / `%` need no escaping, and the implicit
-    /// unique index on `path` serves it. Keys are `/`-separated (the indexer folds
+    /// unique index on `documents.path` serves it. Keys are `/`-separated (the indexer folds
     /// Windows `\`), so `dir` never matches `dir-v0/...` or `dir0/...`.
     ///
     /// The read (which rows are under `dir`) and the deletes share one transaction.

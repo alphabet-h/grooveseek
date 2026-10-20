@@ -927,7 +927,7 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
 }
 
 /// (feature-67) The decision behind [`dispatch_deindex_subtree`], split out so
-/// a test can run it with no `Embedder` (as [`should_process_parts`] is).
+/// a test can run it with no [`crate::embedder::Embedder`] (as [`should_process_parts`] is).
 ///
 /// `None` when `p` is not under the KB or is the KB root itself: an empty
 /// prefix would name the whole KB (the helper refuses it too). Otherwise the
