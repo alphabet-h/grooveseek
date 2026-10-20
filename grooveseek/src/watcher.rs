@@ -1177,11 +1177,25 @@ fn dir_rename_entry(
 /// sweep that deletes rows, so a failure that does not prove absence must not
 /// count as one.
 fn to_state(p: &Path) -> (ToState, Option<std::io::Error>) {
-    match std::fs::symlink_metadata(p) {
-        Ok(m) if m.file_type().is_dir() => (ToState::Dir, None),
-        Ok(_) => (ToState::NotDir, None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ToState::Missing, None),
+    match stat_unless_gone(p) {
+        Ok(Some(m)) if m.file_type().is_dir() => (ToState::Dir, None),
+        Ok(Some(_)) => (ToState::NotDir, None),
+        Ok(None) => (ToState::Missing, None),
         Err(e) => (ToState::Unknown, Some(e)),
+    }
+}
+
+/// (feature-68) The one answer to "is this end of a directory rename gone?",
+/// for both ends: `symlink_metadata` (a symlink is not followed), with
+/// `Ok(None)` only for `std::io::ErrorKind::NotFound`. Any other failure
+/// (permission, a sharing violation, I/O) is returned as `Err`, because on
+/// this path "gone" leads to deleting rows and such a failure does not prove
+/// absence (local Codex r4, and the source end after the re-review of it).
+fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -1194,9 +1208,11 @@ fn to_state(p: &Path) -> (ToState, Option<std::io::Error>) {
 /// `old_rel/` (the handler fell behind a chain of renames). The decision is
 /// [`dir_rename_entry`]; the KB root (an empty rel at either end) never enters.
 /// A destination that cannot be stat'ed for a reason other than "not found"
-/// is logged and left to the file rename (a skip for two directory names), so
-/// the rows stay under the old path rather than being swept while the
-/// directory may still be there; a full index recovers them.
+/// is logged and left to the file rename. If the event was a directory
+/// rename, that is a skip for two directory names: its rows stay under the
+/// old path rather than being swept while the directory may still be there,
+/// and a full index recovers them. "Gone" is decided the same way at both
+/// ends, by [`stat_unless_gone`].
 ///
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
@@ -1232,7 +1248,7 @@ fn dispatch_directory_rename(
     let (to_kind, stat_err) = to_state(to);
     if let Some(e) = &stat_err {
         wdiag!(
-            "watcher: could not stat the destination of a renamed directory: {e}. Its rows stay under the old path until the next full `groove index`."
+            "watcher: could not stat a rename destination: {e}. Handled as a file rename; if it was a directory, the rows under its old path stay until the next full `groove index`."
         );
     }
     let entry = match to_kind {
@@ -1310,8 +1326,15 @@ fn dispatch_directory_rename(
             dispatch_deindex(state, p);
         }
     }
-    if std::fs::symlink_metadata(from).is_err() {
-        dispatch_deindex_subtree(state, from);
+    // The old prefix is swept only when `from` is known to be gone. A stat that
+    // fails for another reason does not prove that, and sweeping a directory
+    // that is still there would delete its live rows.
+    match stat_unless_gone(from) {
+        Ok(None) => dispatch_deindex_subtree(state, from),
+        Ok(Some(_)) => {}
+        Err(e) => wdiag!(
+            "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
+        ),
     }
     if entry == DirRenameEntry::ScanDestination {
         dispatch_new_directory(state, to, new_rel);
