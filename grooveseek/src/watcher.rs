@@ -1126,8 +1126,10 @@ enum DirRenameEntry {
     /// sweep what is left there, and scan the destination.
     ScanDestination,
     /// The destination is already gone but rows sit under the old prefix:
-    /// only sweep the old prefix (no move, no scan).
-    SweepOnly,
+    /// drop the rows listed here, sweep the old prefix if the old directory
+    /// is gone too, and neither move nor scan (local Codex r5: the listing is
+    /// kept so a recreated old directory does not keep the listed rows).
+    SweepOnly(Vec<String>),
 }
 
 /// (feature-68) Decide whether a paired rename is a directory rename.
@@ -1137,8 +1139,8 @@ enum DirRenameEntry {
 ///   or looking at the store argument.
 /// - [`ToState::NotDir`] and [`ToState::Unknown`]: `None`, without listing.
 /// - [`ToState::Missing`]: list the rows under `old_rel` in the store
-///   argument; any row means [`DirRenameEntry::SweepOnly`], none (or no
-///   store given) means `None`.
+///   argument; any row means [`DirRenameEntry::SweepOnly`] carrying them
+///   (sorted, as listed), none (or no store given) means `None`.
 ///
 /// The stat and the lock belong to the caller
 /// ([`dispatch_directory_rename`]), the decision lives here, and the caller keeps the db
@@ -1157,10 +1159,11 @@ fn dir_rename_entry(
         (ToState::NotDir | ToState::Unknown, _) => Ok(None),
         (ToState::Missing, None) => Ok(None),
         (ToState::Missing, Some(db)) => {
-            if db.document_paths_under(old_rel)?.is_empty() {
+            let paths = db.document_paths_under(old_rel)?;
+            if paths.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(DirRenameEntry::SweepOnly))
+                Ok(Some(DirRenameEntry::SweepOnly(paths)))
             }
         }
     }
@@ -1204,9 +1207,12 @@ fn to_state(p: &Path) -> (ToState, Option<std::io::Error>) {
 ///   was recreated; rows added under the old prefix after the listing are
 ///   swept by [`dispatch_deindex_subtree`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
-/// - [`DirRenameEntry::SweepOnly`]: only the sweep, and only when `from` is
-///   gone. Renaming the rows onto a destination that no longer exists would
-///   drop them while logging a rename; the later event for the new name scans it.
+/// - [`DirRenameEntry::SweepOnly`]: no move and no scan. The rows the entry
+///   decision listed are dropped through [`dispatch_deindex`], whether or not
+///   the old directory was recreated since, and the old prefix is swept by
+///   [`dispatch_deindex_subtree`] only when `from` is gone. Renaming the rows
+///   onto a destination that no longer exists would drop them while logging a
+///   rename; the later event for the new name scans it.
 ///
 /// The db is locked only while listing, never across the loop, so the MCP search
 /// tool is not held up for the size of the directory. The listing guard is
@@ -1293,6 +1299,15 @@ fn dispatch_directory_rename(
             for p in &paths {
                 dispatch_deindex(state, p);
             }
+        }
+    }
+    // (local Codex r5) The same on the sweep-only path: the rows listed by the
+    // entry decision predate the rename, so they go whether or not `from` was
+    // recreated since. Only those rows: no prefix sweep while `from` exists,
+    // which would take a recreated directory's own rows with it.
+    if let DirRenameEntry::SweepOnly(paths) = &entry {
+        for p in paths {
+            dispatch_deindex(state, p);
         }
     }
     if std::fs::symlink_metadata(from).is_err() {
@@ -2503,7 +2518,7 @@ mod tests {
         let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
 
         let entry = dir_rename_entry(ToState::Missing, Some(&db), "docs").unwrap();
-        assert_eq!(entry, Some(DirRenameEntry::SweepOnly));
+        assert!(matches!(entry, Some(DirRenameEntry::SweepOnly(_))));
     }
 
     /// feature-68: nothing at the destination and no rows under the old name as
@@ -2571,6 +2586,24 @@ mod tests {
     /// listing, even when a store with rows under the old prefix is handed in.
     /// Read as "gone", those rows would be swept while the directory may well
     /// be there.
+    /// feature-68 (local Codex r5): the sweep-only entry carries exactly the
+    /// rows it listed under the old directory, sorted, so the caller can drop
+    /// them even when the old directory has been recreated. A sibling sharing
+    /// the name as a prefix is not among them.
+    #[test]
+    fn test_dir_rename_entry_missing_carries_the_listed_rows() {
+        let db = dir_rename_db(&["docs/deep/b.md", "docs-other/c.md", "docs/a.md"]);
+
+        let entry = dir_rename_entry(ToState::Missing, Some(&db), "docs").unwrap();
+        assert_eq!(
+            entry,
+            Some(DirRenameEntry::SweepOnly(vec![
+                "docs/a.md".to_string(),
+                "docs/deep/b.md".to_string(),
+            ]))
+        );
+    }
+
     #[test]
     fn test_dir_rename_entry_unknown_does_not_list() {
         let db = dir_rename_db(&["docs/a.md", "docs/deep/b.md"]);
