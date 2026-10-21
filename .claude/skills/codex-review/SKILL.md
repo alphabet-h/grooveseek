@@ -72,7 +72,11 @@ python .dev/tools/doc_link_sweep.py
 ```
 
 **push 前の呼び出しは引数なし。縮めない。** diff の範囲を変える引数は存在せず、受けるのは
-計測専用の `--whole-tree` だけ (下記。push 前には使わない)。script が内部で
+計測専用の `--whole-tree` (下記。push 前には使わない) と、見る checkout を決める `--root <path>` だけ。
+**root は cwd の git toplevel で決まる** — worktree (`.dev` を持たない) では cwd を worktree にして、main の
+checkout の script を絶対 path で打つ (`python <main の checkout>/.dev/tools/doc_link_sweep.py`)。出力の 1 行目が
+見ている root。`0 added lines` が出たら `git -C <root> diff --stat main...HEAD` と比べる (script の置き場所で
+root を決めていた頃は、worktree から打つと main の checkout の空 diff を見て exit 0 になった。kuriya trap #528)。script が内部で
 `git diff main...HEAD -- '*.rs'` を固定で打ち、
 tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
 bucket に振り分ける。exit 1 なら直してから push。**exit 0 は sweep の終わりではない** —
@@ -80,7 +84,7 @@ bucket に振り分ける。exit 1 なら直してから push。**exit 0 は swe
 全部読んで初めて終わる。script が決めるのは **diff の範囲、tree にあるかどうか、複合項の中の名前の列挙**
 の 3 つ (人が決めると、範囲を縮める / private だからと外す / 形で skip する — 台帳 #39 / #43 / #52)。
 何を link にするかの判断は残る (だから bucket ごとに直し方が書いてある)。
-`.dev/` が無い環境では旧形を打つ:
+main の checkout にも `.dev/` が無い環境 (worktree は該当しない、上記) では旧形を打つ:
 `` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
 (pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
 
