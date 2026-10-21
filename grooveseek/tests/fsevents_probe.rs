@@ -29,7 +29,9 @@ fn scratch(tag: &str) -> PathBuf {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("probe520-{tag}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // Canonical, as `groove serve` passes kb_path: the file-id cache keys on
+    // the watched spelling, and FSEvents reports /private/var.
+    dir.canonicalize().unwrap()
 }
 
 fn write(root: &Path, rel: &str) {

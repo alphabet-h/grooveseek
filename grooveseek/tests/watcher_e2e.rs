@@ -396,7 +396,6 @@ fn watcher_deindexes_a_subdirectory_removed_file_by_file() {
 ///
 /// Compiled out on macOS with the three tests that call it, so it is not dead
 /// code there.
-#[cfg(not(target_os = "macos"))]
 fn rename_retrying(from: &std::path::Path, to: &std::path::Path) {
     const ATTEMPTS: u32 = 20;
     const INTERVAL: Duration = Duration::from_millis(100);
@@ -440,7 +439,6 @@ fn rename_retrying(from: &std::path::Path, to: &std::path::Path) {
 /// cause is common to the removal and rename paths on macOS and outside this
 /// change. It is tracked in the private issue tracker as #520. Remove the gate
 /// once that issue is closed.
-#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_moves_an_indexed_directory_on_rename() {
@@ -571,7 +569,6 @@ fn watcher_moves_an_indexed_directory_on_rename() {
 /// Not run on macOS, for the measured failure described on the moves test
 /// above (nightly run 39471586474, tracked in the private issue tracker as
 /// #520). Remove the gate once that issue is closed.
-#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
@@ -688,7 +685,6 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
 /// Not run on macOS, for the measured failure described on the moves test
 /// above (nightly run 39471586474, tracked in the private issue tracker as
 /// #520). Remove the gate once that issue is closed.
-#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
@@ -800,7 +796,6 @@ fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
 /// Not run on macOS, for the measured failure described on the moves test
 /// above (nightly run 39471586474, tracked in the private issue tracker as
 /// #520). Remove the gate once that issue is closed.
-#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_leaves_a_directory_alone_when_a_rename_returns_within_the_window() {
