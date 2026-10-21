@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.20.3] - 2026-10-21
+
 ### Fixed
 
 - **The live watcher now follows a directory rename.** Renaming a directory left its documents
@@ -6197,7 +6199,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.3...HEAD
+[1.20.3]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...v1.20.3
 [1.20.2]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...v1.20.2
 [1.20.1]: https://github.com/alphabet-h/grooveseek/compare/v1.20.0...v1.20.1
 [1.20.0]: https://github.com/alphabet-h/grooveseek/compare/v1.19.0...v1.20.0
