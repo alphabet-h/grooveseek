@@ -10368,7 +10368,7 @@ For these and/or other purposes and motivations, and without any expectation of 
 Used by:
 
 - webpki-roots 0.26.11 (https://github.com/rustls/webpki-roots)
-- webpki-roots 1.0.7 (https://github.com/rustls/webpki-roots)
+- webpki-roots 1.0.10 (https://github.com/rustls/webpki-roots)
 
 ```text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -11082,7 +11082,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- rustls-webpki 0.103.15 (https://github.com/rustls/webpki)
+- rustls-webpki 0.103.16 (https://github.com/rustls/webpki)
 
 ```text
 Except as otherwise noted, this project is licensed under the following
