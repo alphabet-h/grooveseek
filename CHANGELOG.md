@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.20.4] - 2026-10-21
+
 ### Fixed
 
 - **On macOS the live watcher now drops the documents of a removed file or directory, and follows a
@@ -6218,7 +6220,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.3...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...HEAD
+[1.20.4]: https://github.com/alphabet-h/grooveseek/compare/v1.20.3...v1.20.4
 [1.20.3]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...v1.20.3
 [1.20.2]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...v1.20.2
 [1.20.1]: https://github.com/alphabet-h/grooveseek/compare/v1.20.0...v1.20.1
