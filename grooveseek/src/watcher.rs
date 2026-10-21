@@ -305,8 +305,8 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// The backend the debouncer drives. On macOS the FSEvents watcher sits behind
-/// [`StaleCreateFilter`] (kuriya issue #520); elsewhere the recommended watcher
-/// is used as it is.
+/// [`StaleCreateFilter`] (kuriya issues #520 and #525); elsewhere the
+/// recommended watcher is used as it is.
 #[cfg(target_os = "macos")]
 type Backend = StaleCreateFilter<notify::RecommendedWatcher>;
 #[cfg(not(target_os = "macos"))]
@@ -334,9 +334,19 @@ type Backend = notify::RecommendedWatcher;
 /// arrival; what is left is the `Remove` or rename half, which the debouncer
 /// then hands on. `Modify(Name(_))` (the rename halves), `Remove`, every other
 /// kind and every error pass through untouched.
+///
+/// Known limitation (kuriya issue #525): FSEvents does not say which end of a
+/// rename a path is, so the debouncer guesses from whether the path exists
+/// (`Modify(Name(Any))`). When the source directory is created again before
+/// the event is delivered, both ends exist, the rename is not paired, and the
+/// rows under the old directory stay until the next full index. Dropping
+/// events cannot recover that; it is the same family as the unpaired macOS
+/// renames the watcher tests already allow for.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct StaleCreateFilter<W>(W);
 
+/// The [`notify::EventHandler`] [`StaleCreateFilter`] hands the inner watcher:
+/// asks [`is_stale_create`] and forwards everything it keeps.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct StaleCreateHandler<H>(H);
 
