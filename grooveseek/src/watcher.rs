@@ -312,14 +312,14 @@ type Backend = StaleCreateFilter<notify::RecommendedWatcher>;
 #[cfg(not(target_os = "macos"))]
 type Backend = notify::RecommendedWatcher;
 
-/// (kuriya issue #520) A [`notify::Watcher`] that drops a `Create` or a
+/// (kuriya issue #520) A `notify::Watcher` that drops a `Create` or a
 /// content / metadata `Modify` for a path that is no longer there, before the
 /// debouncer sees it.
 ///
 /// FSEvents reports one record per path carrying every flag that path has
 /// collected, not only what just happened, and notify turns each flag into
-/// its own event in a fixed order, `Create` first (notify 8.2.0
-/// `src/fsevent.rs` `translate_flags`). Measured on the macOS runner (nightly
+/// its own event in a fixed order, `Create` first (how notify 8.2.0's FSEvents
+/// backend, its `fsevent` module, translates the flags). Measured on the macOS runner (nightly
 /// run 39578259680): deleting a file written 8 s before the watch started
 /// arrives as `Create(File)`, `Remove(File)`, `Modify(Data(Content))`.
 /// notify-debouncer-full reads that as "created and gone within the window":
@@ -345,7 +345,7 @@ type Backend = notify::RecommendedWatcher;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct StaleCreateFilter<W>(W);
 
-/// The [`notify::EventHandler`] [`StaleCreateFilter`] hands the inner watcher:
+/// The `notify::EventHandler` [`StaleCreateFilter`] hands the inner watcher:
 /// asks [`is_stale_create`] and forwards everything it keeps.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct StaleCreateHandler<H>(H);
@@ -2999,7 +2999,8 @@ mod tests {
     }
 
     /// A backend that watches nothing: the test hands the debouncer the raw
-    /// events FSEvents would, through the handler `new` was given.
+    /// events FSEvents would, through the handler the debouncer passes to
+    /// `Watcher::new`.
     struct InjectWatcher;
 
     impl notify::Watcher for InjectWatcher {
