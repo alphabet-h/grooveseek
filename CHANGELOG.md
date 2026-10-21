@@ -22,6 +22,19 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   currently leaves the rows of a removed or renamed directory in place until the next full index
   (the same holds for the directory removal fixed in 1.20.2); tracked separately.
 
+### Security
+
+- **`rustls-webpki` was updated 0.103.15 → 0.103.16, `webpki-roots` 1.0.7 → 1.0.10 and
+  `webpki-root-certs` 1.0.7 → 1.0.10 to clear RUSTSEC-2026-0382 (`rustls-webpki`: certificate
+  verification may accept distrusted intermediates), RUSTSEC-2026-0381 (`webpki-roots`) and
+  RUSTSEC-2026-0383 (`webpki-root-certs`) (bundled roots allowed trust in distrusted emSign
+  intermediates).** All three are transitive. `rustls-webpki` is reached through `rustls`, used by
+  `reqwest` (the `openai-compatible` embedding client and `groove-tray`'s HTTP client) and by
+  `ureq`, which `hf-hub` uses to fetch embedding models; `webpki-roots` is reached through that
+  `ureq` — outbound HTTP clients only. `webpki-root-certs` is only a build dependency (the `ureq`
+  that `ort-sys`'s build script uses to download ONNX Runtime) and a wasm32 / dev dependency of
+  `rustls-platform-verifier`, so no shipped binary links it. No other crate moved.
+
 ### Internal
 
 - **The embedder's in-crate HTTP mock no longer panics when the client closes (end of stream, or a
