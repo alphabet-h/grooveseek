@@ -74,8 +74,8 @@ python .dev/tools/doc_link_sweep.py
 **push 前の呼び出しは引数なし。縮めない。** diff の範囲を変える引数は存在せず、受けるのは
 計測専用の `--whole-tree` (下記。push 前には使わない) と、見る checkout を決める `--root <path>` だけ。
 **root は cwd の git toplevel で決まる** — worktree (`.dev` を持たない) では cwd を worktree にして、main の
-checkout の script を絶対 path で打つ (`python <main の checkout>/.dev/tools/doc_link_sweep.py`)。出力の 1 行目が
-見ている root。`0 added lines` が出たら `git -C <root> diff --stat main...HEAD` と比べる (script の置き場所で
+checkout の script を絶対 path で打つ (`python "<main の checkout>/.dev/tools/doc_link_sweep.py"`。path は空白を含み得るので引用符で囲む)。出力の 1 行目が
+見ている root。`0 added lines` が出たら `git -C "<root>" diff --stat main...HEAD` と比べる (script の置き場所で
 root を決めていた頃は、worktree から打つと main の checkout の空 diff を見て exit 0 になった。kuriya trap #528)。script が内部で
 `git diff main...HEAD -- '*.rs'` を固定で打ち、
 tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
