@@ -25,6 +25,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   keeps its old rows until the next full index, because FSEvents does not say which end of a rename
   a path is.
 
+### Security
+
+- **`anyhow` was updated 1.0.102 → 1.0.103 to clear RUSTSEC-2026-0190 (informational, unsound:
+  `Error::downcast_mut` on an error that had context added through `Error::context` violated borrow
+  rules, which is undefined behavior).** `anyhow` is a direct dependency of `grooveseek` and
+  `groove-tray`; neither calls `downcast_mut` (they use `downcast_ref` and `downcast` only). No other
+  crate moved.
+
 ## [1.20.3] - 2026-10-21
 
 ### Fixed
