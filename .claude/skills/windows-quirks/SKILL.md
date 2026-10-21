@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing, testing, or debugging anything in this repo that runs on Windows — Task Scheduler and service registration, spawning subprocesses and background processes, console and encoding behaviour on Japanese Windows (CP932, UTF-16, ANSI colour in stderr), PowerShell 5.1 and Git Bash quoting, redirection and output handling, line endings after scripted edits, path comparison (canonicalize, junctions, long paths), cargo build or test failures the code did not cause (LNK1102, os error 1455), test assertions that pass on one OS and fail on another, and any "works on Linux, fails on Windows" failure
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing, testing, or debugging anything in this repo that runs on Windows — Task Scheduler and service registration, spawning subprocesses and background processes, console and encoding behaviour on Japanese Windows (CP932, UTF-16, ANSI colour in stderr), PowerShell 5.1 and Git Bash quoting, redirection and output handling, line endings after scripted edits, path comparison (canonicalize, junctions, long paths), cargo build or test failures the code did not cause (LNK1102, os error 1455, LNK1104 on a deep path), test assertions that pass on one OS and fail on another, and any "works on Linux, fails on Windows" failure
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -763,7 +763,7 @@ stderr が要る検証には使わない**。
 コードの 1 か所を読んで「これが理由だ」と決め、その下の層 (std) を読まなかった形。
 
 **残る範囲 (std の fs を通らないもの)**: Win32 API を直接呼ぶコード、C/C++ の依存へパス文字列を渡す箇所、
-長いパスを子プロセスの引数や cwd として渡す場合 (受け側のプログラムの制限になる)。
+長いパスを子プロセスの引数や cwd として渡す場合 (受け側のプログラムの制限になる)。実例は罠 26 (cargo の build で、MSVC の `link.exe` が MAX_PATH に届く出力 path を開けない)。
 groove の索引経路でこれに当たるものがあるかは**未調査**。`LongPathsEnabled = 0` の機械での実測も**未**
 (std の読みからは通る見込み)。
 
@@ -945,6 +945,65 @@ Read tool で読み、`user32` の P/Invoke で押す形の実機確認をした
 script の実物は DT の .dev の tools の下の gui-smoke (private。KB からは読まない)。撮った PNG は Read tool で開いて見る (真っ黒なら前面に出ていない)。
 
 出典: 2026-10-20、DT の記録 desktop-gui-smoke-via-powershell-notes.md (KB からは読まない)
+
+## 26. 深い path (scratchpad の worktree) で `cargo build` すると `LNK1104: ファイル '…build_script_build-<hash>.exe' を開くことができません` — link.exe の出力 path が MAX_PATH 260 に届く (`LongPathsEnabled = 1` でも)
+
+**症状**: scratchpad の中に切った worktree (`git worktree add <scratchpad>\main-wt main`) で
+`cargo build --release --locked -j 4 --manifest-path <main-wt>\Cargo.toml` を打つと、約 37 秒で
+`windows_x86_64_msvc` の build script の link が落ちる (via: kuriya trap #512 の本文)。
+コードは無関係で、依存の build script の段階で止まる:
+
+```
+error: linking with `link.exe` failed: exit code: 1104
+  = note: LINK : fatal error LNK1104: ファイル '<scratchpad>\main-wt\target\release\build\windows_x86_64_msvc-<hash>\build_script_build-<hash>.exe' を開くことができません。
+```
+<!-- via: 失敗した build のログ main-build.log の 83-87 行目 (その session の scratchpad にあった一時 file。後から読めるとは限らない)。エラー文は path を <...> に置き換えて引いた -->
+
+**原因**: link.exe が出力の exe を開く path が長すぎる。
+
+- path は `<scratchpad>\main-wt\target\release\build\windows_x86_64_msvc-<hash>\build_script_build-<hash>.exe` で、**260 文字ちょうど**
+  (via: PowerShell の `$p.Length`、trap #512 の本文。ログの `LNK1104` 行の path を python で数え直しても 260、2026-10-21)。
+  scratchpad は harness が session ごとに `%TEMP%\claude\<repo の絶対 path を - でつないだ名前>\<session uuid>\scratchpad` に作る深い dir で、
+  その下に worktree と `target\release\build\…` が積まれる
+- Win32 の MAX_PATH (260) は終端の NUL を含むので、260 文字の path は上限を 1 越える
+  (via: 公式 docs の Maximum Path Length Limitation、`learn.microsoft.com/windows/win32/fileio/maximum-file-path-limitation` の「D:\<256 文字の path><NUL>」の例)
+- **Rust std ではなく MSVC の `link.exe` が path を開く**。罠 21 の「std が `\\?\` を付ける」は std の fs 呼び出しにだけ効く保証で、
+  link.exe はその外にある (罠 21 の「残る範囲」の実例)
+- **`LongPathsEnabled = 1` の機械でも落ちた** (via: trap #512 の本文)。レジストリは link.exe を救わない
+- 効いているのは path の深さである。repo 本体の `target` を使う branch の build は、同じ session で通っている
+  (via: DT の記録 acceptance-pr2-results.md:55 の「repo の `target` を使う branch の build は通る」)
+- **罠 16 の `LNK1102` (メモリ) とは別物**。原因が path の長さなので、並列度 (`-j`) を下げても直らない
+
+**対処**: `$env:CARGO_TARGET_DIR` を、worktree の外にある短い dir に向けて打ち直す:
+
+```powershell
+$env:CARGO_TARGET_DIR = '<scratchpad>\mt'
+cargo build --release --locked -j 4 --manifest-path <main-wt>\Cargo.toml
+```
+
+- `<scratchpad>` は 8.3 名 (`C:\Users\YABUSH~1\…`) の形で、その直下に置いた dir 名は `mt`。同じ出力 path は **247 文字**になり、
+  exit 0 で通った。ログの末尾は `Finished release profile [optimized] target(s) in 14m 58s`、つまり **898 秒**
+  (via: trap #512 の本文、2026-10-20)
+- 260 と 247 の差 13 は、`main-wt\target` → `mt` の 12 文字と `yabushita` → `YABUSH~1` の 1 文字の合計に一致する (引き算の結果)。
+  余裕は大きくないので、さらに短い dir (例 `C:\t`) の方が安全かもしれない (推定、試していない)
+- これは **worktree の外に target を置くだけ**で、worktree 間で target を共有する案ではない
+  (共有は user の判断で保留のまま。KB の kuriya trap #270)。worktree 1 つに dir を 1 つ使う — 同じ dir を複数の worktree が使えば、それが共有になる
+- 898 秒は 10 分の tool timeout を越えたので、tool が background に回した。cargo は他に打たず、終わるまで待った
+  (via: DT の記録 acceptance-pr2-results.md:55)
+
+**見分け方**:
+
+- `exit code: 1104` / `LNK1104` で、名指しされたファイルが自分の `target\…\build_script_build-<hash>.exe` なら、まず path の長さを数える:
+  `$p = '<エラー文の path>'; $p.Length`。260 以上なら、この節の原因の見込みが高い
+- `LNK1102` なら罠 16 (並列度)
+- path が 260 よりずっと短い `LNK1104` は、この節の原因ではない (別の原因は未調査)
+
+出典: 2026-10-20、grooveseek-desktop の PR #42 (why-matched の PR-2) の受入 8 で、main と比べる worktree を scratchpad に切った時。
+kuriya trap #512 (grooveseek-desktop の project)。記録は grooveseek-desktop の private な `.dev` の archive、
+`.dev/archive/2026-10-20-why-matched-sdd/acceptance-pr2-results.md` の「想定外のこと」(DT からのみ読める。KB からは読まない)。
+trap #512 が指す元の `.superpowers/sdd/desktop-v1-2-why-matched/` には無く、archive に移っている。
+関連: 罠 21 (std の fs は自分で `\\?\` を付けるが、std を通らない経路はこの節)、罠 16 (同じ link.exe の別の失敗)、
+罠 18 (同じ `YABUSH~1` の 8.3 短縮名。ここでは path を縮める側に効いた)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
