@@ -974,12 +974,15 @@ error: linking with `link.exe` failed: exit code: 1104
   (via: DT の記録 acceptance-pr2-results.md:55 の「repo の `target` を使う branch の build は通る」)
 - **罠 16 の `LNK1102` (メモリ) とは別物**。原因が path の長さなので、並列度 (`-j`) を下げても直らない
 
-**対処**: `$env:CARGO_TARGET_DIR` を、worktree の外にある短い dir に向けて打ち直す:
+**対処**: target dir を、worktree の外にある短い dir に向けて打ち直す。`--target-dir` で command の中だけに効かせる:
 
 ```powershell
-$env:CARGO_TARGET_DIR = '<scratchpad>\mt'
-cargo build --release --locked -j 4 --manifest-path <main-wt>\Cargo.toml
+cargo build --release --locked -j 4 --manifest-path <main-wt>\Cargo.toml --target-dir '<scratchpad>\mt'
 ```
+
+- `$env:CARGO_TARGET_DIR = …` で向けない。PowerShell の `$env:` は session の残りと子 process 全部に効くので、
+  同じ session で次の worktree を build すると同じ dir を使い続け、下の「worktree 1 つに dir を 1 つ」を黙って破る
+  (codex P2 on grooveseek PR #382。PowerShell の about_Environment_Variables)
 
 - `<scratchpad>` は 8.3 名 (`C:\Users\YABUSH~1\…`) の形で、その直下に置いた dir 名は `mt`。同じ出力 path は **247 文字**になり、
   exit 0 で通った。ログの末尾は `Finished release profile [optimized] target(s) in 14m 58s`、つまり **898 秒**
