@@ -14,6 +14,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **On macOS the live watcher now drops the documents of a removed file or directory, and follows a
+  directory rename.** FSEvents reports every flag a path has collected, so a deletion arrived as a
+  stale "created" followed by "removed", and the debouncer discarded the pair as a file created and
+  deleted within its window; a rename was lost the same way. Removed or renamed documents stayed
+  searchable under their old paths until the next full index (the limitation noted in 1.20.3). The watcher now drops such stale events before the debouncer sees them. One case remains:
+  a directory renamed and then created again under its old name before the watcher handles the event
+  keeps its old rows until the next full index, because FSEvents does not say which end of a rename
+  a path is.
+
 ## [1.20.3] - 2026-10-21
 
 ### Fixed

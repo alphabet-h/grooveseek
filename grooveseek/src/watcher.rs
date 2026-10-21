@@ -40,7 +40,7 @@ use crate::poison::{recover, recover_db};
 use anyhow::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::notify::event::{EventKind, ModifyKind, RenameMode};
-use notify_debouncer_full::{DebouncedEvent, new_debouncer};
+use notify_debouncer_full::{DebouncedEvent, RecommendedCache, new_debouncer_opt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -179,7 +179,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
             let max_backoff = Duration::from_secs(30);
             loop {
                 let tx_clone = tx_async.clone();
-                let debouncer_result = new_debouncer(
+                let debouncer_result = new_debouncer_opt::<_, Backend, RecommendedCache>(
                     debounce,
                     None,
                     move |res: notify_debouncer_full::DebounceEventResult| match res {
@@ -212,6 +212,8 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                             }
                         }
                     },
+                    RecommendedCache::new(),
+                    notify::Config::default(),
                 );
                 let mut debouncer = match debouncer_result {
                     Ok(d) => d,
@@ -301,6 +303,105 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+/// The backend the debouncer drives. On macOS the FSEvents watcher sits behind
+/// [`StaleCreateFilter`] (kuriya issues #520 and #525); elsewhere the
+/// recommended watcher is used as it is.
+#[cfg(target_os = "macos")]
+type Backend = StaleCreateFilter<notify::RecommendedWatcher>;
+#[cfg(not(target_os = "macos"))]
+type Backend = notify::RecommendedWatcher;
+
+/// (kuriya issue #520) A `notify::Watcher` that drops a `Create` or a
+/// content / metadata `Modify` for a path that is no longer there, before the
+/// debouncer sees it.
+///
+/// FSEvents reports one record per path carrying every flag that path has
+/// collected, not only what just happened, and notify turns each flag into
+/// its own event in a fixed order, `Create` first (how notify 8.2.0's FSEvents
+/// backend, its `fsevent` module, translates the flags). Measured on the macOS runner (nightly
+/// run 39578259680): deleting a file written 8 s before the watch started
+/// arrives as `Create(File)`, `Remove(File)`, `Modify(Data(Content))`.
+/// notify-debouncer-full reads that as "created and gone within the window":
+/// on a `Remove` it drops the whole queue of a path whose first event is a
+/// `Create` (`push_remove_event`), so only the trailing `Modify` is handed on,
+/// and for a directory nothing at all. A rename whose source queue starts with
+/// a `Create` likewise loses its rename event (`push_rename_event`). The
+/// watcher then never hears that the old path went away and its rows stay.
+///
+/// Such an event for a path that does not exist when it is delivered
+/// announces nothing the watcher could index, so dropping it loses no
+/// arrival; what is left is the `Remove` or rename half, which the debouncer
+/// then hands on. `Modify(Name(_))` (the rename halves), `Remove`, every other
+/// kind and every error pass through untouched.
+///
+/// Known limitation (kuriya issue #525): FSEvents does not say which end of a
+/// rename a path is, so the debouncer guesses from whether the path exists
+/// (`Modify(Name(Any))`). When the source directory is created again before
+/// the event is delivered, both ends exist, the rename is not paired, and the
+/// rows under the old directory stay until the next full index. Dropping
+/// events cannot recover that; it is the same family as the unpaired macOS
+/// renames the watcher tests already allow for.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct StaleCreateFilter<W>(W);
+
+/// The `notify::EventHandler` [`StaleCreateFilter`] hands the inner watcher:
+/// asks [`is_stale_create`] and forwards everything it keeps.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct StaleCreateHandler<H>(H);
+
+/// Whether [`StaleCreateFilter`] drops `event`: a `Create` or a non-rename
+/// `Modify` whose first path is gone ("not found", not any other stat failure,
+/// which may hide a path that is there).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_stale_create(event: &notify::Event) -> bool {
+    let arrival_or_change = match event.kind {
+        EventKind::Create(_) => true,
+        EventKind::Modify(ModifyKind::Name(_)) => false,
+        EventKind::Modify(_) => true,
+        _ => false,
+    };
+    arrival_or_change
+        && event.paths.first().is_some_and(|p| {
+            std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+}
+
+impl<H: notify::EventHandler> notify::EventHandler for StaleCreateHandler<H> {
+    fn handle_event(&mut self, event: notify::Result<notify::Event>) {
+        if let Ok(ev) = &event
+            && is_stale_create(ev)
+        {
+            return;
+        }
+        self.0.handle_event(event);
+    }
+}
+
+impl<W: notify::Watcher> notify::Watcher for StaleCreateFilter<W> {
+    fn new<F: notify::EventHandler>(
+        event_handler: F,
+        config: notify::Config,
+    ) -> notify::Result<Self> {
+        W::new(StaleCreateHandler(event_handler), config).map(Self)
+    }
+
+    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+        self.0.watch(path, recursive_mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.0.unwatch(path)
+    }
+
+    fn configure(&mut self, option: notify::Config) -> notify::Result<bool> {
+        self.0.configure(option)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        W::kind()
+    }
+}
 
 /// 単一 event を以下のどれかに分類する (evaluator High #1 対応):
 /// - Rename (from, to): notify-debouncer-full が paths.len()==2 で渡してきたペア
@@ -2883,5 +2984,181 @@ mod tests {
             Err(mpsc::error::TrySendError::Closed(_)) => {}
             other => panic!("expected Closed, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // (kuriya issue #520) StaleCreateFilter in front of the real debouncer
+    // -----------------------------------------------------------------------
+
+    use notify_debouncer_full::notify::event::{CreateKind, RemoveKind};
+
+    std::thread_local! {
+        /// The handler the debouncer gave [`InjectWatcher::new`] on this thread.
+        static INJECTED: std::cell::RefCell<Option<Box<dyn notify::EventHandler>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A backend that watches nothing: the test hands the debouncer the raw
+    /// events FSEvents would, through the handler the debouncer passes to
+    /// `Watcher::new`.
+    struct InjectWatcher;
+
+    impl notify::Watcher for InjectWatcher {
+        fn new<F: notify::EventHandler>(h: F, _: notify::Config) -> notify::Result<Self> {
+            INJECTED.with(|slot| *slot.borrow_mut() = Some(Box::new(h)));
+            Ok(Self)
+        }
+        fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+            Ok(())
+        }
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    fn inject(kind: EventKind, path: &Path) {
+        INJECTED.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .expect("the debouncer built its backend on this thread")
+                .handle_event(Ok(notify::Event::new(kind).add_path(path.to_path_buf())));
+        });
+    }
+
+    /// Every debounced event (kind, paths) that arrives within `wait`.
+    fn drain_debounced(
+        rx: &std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
+        wait: Duration,
+    ) -> Vec<(EventKind, Vec<PathBuf>)> {
+        let end = std::time::Instant::now() + wait;
+        let mut got = Vec::new();
+        while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(Ok(evs)) => got.extend(evs.into_iter().map(|e| (e.event.kind, e.event.paths))),
+                Ok(Err(errs)) => panic!("debouncer errors: {errs:?}"),
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    struct RemoveDirOnDrop(PathBuf);
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// What FSEvents hands over for a removed file that was created before the
+    /// watch: one record, `Create`, `Remove`, `Modify(Data)`, for a path that is
+    /// gone. Unfiltered, notify-debouncer-full drops the `Remove`; through the
+    /// filter only the `Remove` reaches the watcher.
+    #[test]
+    fn stale_create_filter_lets_the_remove_of_a_recently_created_file_through() {
+        let root = crate::test_support::unique_temp_path("kb-watch-stale-create-rm");
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = RemoveDirOnDrop(root.clone());
+        let gone = root.join("a.md");
+
+        let run = |filtered: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let window = Duration::from_millis(100);
+            let cache = notify_debouncer_full::NoCache;
+            let cfg = notify::Config::default();
+            let _d: Box<dyn std::any::Any> = if filtered {
+                Box::new(
+                    new_debouncer_opt::<_, StaleCreateFilter<InjectWatcher>, _>(
+                        window, None, tx, cache, cfg,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                Box::new(
+                    new_debouncer_opt::<_, InjectWatcher, _>(window, None, tx, cache, cfg).unwrap(),
+                )
+            };
+            // The order notify gives one FSEvents record (nightly run 39578259680).
+            inject(EventKind::Create(CreateKind::File), &gone);
+            inject(EventKind::Remove(RemoveKind::File), &gone);
+            inject(
+                EventKind::Modify(ModifyKind::Data(
+                    notify_debouncer_full::notify::event::DataChange::Content,
+                )),
+                &gone,
+            );
+            drain_debounced(&rx, Duration::from_millis(800))
+        };
+
+        let unfiltered = run(false);
+        assert!(
+            !unfiltered
+                .iter()
+                .any(|(k, _)| matches!(k, EventKind::Remove(_))),
+            "control: the unfiltered debouncer is expected to drop a create+remove pair; \
+             if it now passes the Remove on, the filter may no longer be needed; got {unfiltered:?}"
+        );
+        assert_eq!(
+            run(true),
+            vec![(EventKind::Remove(RemoveKind::File), vec![gone.clone()])]
+        );
+    }
+
+    /// What FSEvents hands over for a directory renamed shortly after it was
+    /// created: for each end a `Create` and a `Modify(Name(Any))`. Unfiltered,
+    /// the debouncer turns this into a bare `Create` of the new name and the
+    /// old rows stay; through the filter it stitches the rename the watcher's
+    /// directory-rename path handles.
+    #[test]
+    fn stale_create_filter_keeps_a_directory_rename_stitched() {
+        let root = crate::test_support::unique_temp_path("kb-watch-stale-create-mv");
+        let _cleanup = RemoveDirOnDrop(root.clone());
+
+        let run = |filtered: bool| {
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::write(root.join("docs").join("a.md"), "# a\n").unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let window = Duration::from_millis(100);
+            let cache = notify_debouncer_full::FileIdMap::new();
+            let cfg = notify::Config::default();
+            let mut kept: Vec<Box<dyn std::any::Any>> = Vec::new();
+            // `watch` seeds the file-id cache from disk while `docs/` is
+            // still there, as the watcher's initial watch does.
+            if filtered {
+                let mut d = new_debouncer_opt::<_, StaleCreateFilter<InjectWatcher>, _>(
+                    window, None, tx, cache, cfg,
+                )
+                .unwrap();
+                d.watch(&root, RecursiveMode::Recursive).unwrap();
+                kept.push(Box::new(d));
+            } else {
+                let mut d =
+                    new_debouncer_opt::<_, InjectWatcher, _>(window, None, tx, cache, cfg).unwrap();
+                d.watch(&root, RecursiveMode::Recursive).unwrap();
+                kept.push(Box::new(d));
+            }
+            let (from, to) = (root.join("docs"), root.join("notes"));
+            std::fs::rename(&from, &to).unwrap();
+            inject(EventKind::Create(CreateKind::Folder), &from);
+            inject(EventKind::Modify(ModifyKind::Name(RenameMode::Any)), &from);
+            inject(EventKind::Create(CreateKind::Folder), &to);
+            inject(EventKind::Modify(ModifyKind::Name(RenameMode::Any)), &to);
+            (drain_debounced(&rx, Duration::from_millis(800)), from, to)
+        };
+
+        let both = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+        let (got, ..) = run(false);
+        assert!(
+            !got.iter().any(|(k, _)| *k == both),
+            "control: the unfiltered debouncer is expected to lose the rename; got {got:?}"
+        );
+        let (got, from, to) = run(true);
+        assert!(
+            got.contains(&(both, vec![from, to])),
+            "the filtered debouncer must stitch the directory rename; got {got:?}"
+        );
     }
 }
