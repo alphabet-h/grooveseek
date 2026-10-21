@@ -393,10 +393,6 @@ fn watcher_deindexes_a_subdirectory_removed_file_by_file() {
 ///
 /// 20 attempts 100 ms apart (about 2 s in all) is a guess at "a scanner's
 /// brief look", well under the 8 s poll budget the tests spend afterwards.
-///
-/// Compiled out on macOS with the three tests that call it, so it is not dead
-/// code there.
-#[cfg(not(target_os = "macos"))]
 fn rename_retrying(from: &std::path::Path, to: &std::path::Path) {
     const ATTEMPTS: u32 = 20;
     const INTERVAL: Duration = Duration::from_millis(100);
@@ -433,14 +429,11 @@ fn rename_retrying(from: &std::path::Path, to: &std::path::Path) {
 ///
 /// `docs-other/` shares the name prefix without the `/` and must survive.
 ///
-/// Not run on macOS. In nightly run 39471586474 (2026-10-21) this test and the
-/// other two directory-rename tests failed there: the new path was indexed and
-/// the old path's rows stayed. The subtree-deindex e2e from feature-67 already
-/// fails there on main in the same shape (nightly run 39398233208), so the
-/// cause is common to the removal and rename paths on macOS and outside this
-/// change. It is tracked in the private issue tracker as #520. Remove the gate
-/// once that issue is closed.
-#[cfg(not(target_os = "macos"))]
+/// On macOS this and the other directory-rename tests failed in nightly run
+/// 39471586474 (2026-10-21): FSEvents hands back flags a path collected
+/// earlier, so the rename arrived behind a stale `Create` and the debouncer
+/// dropped it. The watcher drops such stale events before the debouncer now
+/// (kuriya issue #520), and the tests run there again.
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_moves_an_indexed_directory_on_rename() {
@@ -567,11 +560,6 @@ fn watcher_moves_an_indexed_directory_on_rename() {
 /// The seed row also exercises the rewrite of an already indexed row, so this
 /// one test covers the rewrite, the sweep of the old prefix and the scan of
 /// the arrival.
-///
-/// Not run on macOS, for the measured failure described on the moves test
-/// above (nightly run 39471586474, tracked in the private issue tracker as
-/// #520). Remove the gate once that issue is closed.
-#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
@@ -685,9 +673,12 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
 /// Red without that step on Windows (the rename is paired as in the moves test
 /// above). The paired path is asserted through its stderr line, as there.
 ///
-/// Not run on macOS, for the measured failure described on the moves test
-/// above (nightly run 39471586474, tracked in the private issue tracker as
-/// #520). Remove the gate once that issue is closed.
+/// Not run on macOS: FSEvents does not say which end of a rename a path is,
+/// and the debouncer guesses from whether the path exists. With `docs/`
+/// created again before the event is delivered, both ends exist, the rename
+/// is never paired, and the old rows stay (nightly run 39580455945, after the
+/// fix for kuriya issue #520). Same family as the unpaired macOS renames of
+/// the private trap #280; tracked in the private issue tracker as #525.
 #[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
@@ -796,11 +787,6 @@ fn watcher_drops_the_old_rows_when_the_source_is_recreated_during_a_rename() {
 /// the batches in turn, so once the sentinel is searchable the renames have
 /// been handled. A fixed sleep could end before the handler ran on a slow
 /// host, and the test would be green without the guard.
-///
-/// Not run on macOS, for the measured failure described on the moves test
-/// above (nightly run 39471586474, tracked in the private issue tracker as
-/// #520). Remove the gate once that issue is closed.
-#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "spawns groove serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
 fn watcher_leaves_a_directory_alone_when_a_rename_returns_within_the_window() {
