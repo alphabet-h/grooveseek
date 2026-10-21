@@ -82,7 +82,10 @@ fn debounced(tag: &str, gap: Duration, setup: &dyn Fn(&Path), act: &dyn Fn(&Path
             Ok(Ok(evs)) => {
                 for ev in evs {
                     any = true;
-                    out(&format!("debounced {tag}: {:?} {:?}", ev.event.kind, ev.event.paths));
+                    out(&format!(
+                        "debounced {tag}: {:?} {:?}",
+                        ev.event.kind, ev.event.paths
+                    ));
                 }
             }
             Ok(Err(errs)) => out(&format!("debounced {tag}: errors {errs:?}")),
