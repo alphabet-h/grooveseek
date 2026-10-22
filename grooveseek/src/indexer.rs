@@ -715,7 +715,7 @@ pub struct IndexResult {
     pub forced_rejected: u32,
     /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
     /// vector was embedded this run. Counted with [`Self::chunks_reused`] by
-    /// [`ChunkVectorCounts`]. For a [`Self::cancelled`] run, the count up to the stop.
+    /// `ChunkVectorCounts`. For a [`Self::cancelled`] run, the count up to the stop.
     pub chunks_embedded: u32,
     /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
     /// stored vector was copied over, or kept as it was by the fast path for a document whose
