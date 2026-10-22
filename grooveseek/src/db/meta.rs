@@ -1377,12 +1377,31 @@ impl Database {
     /// `chunks` / `vec_chunks` / `fts_chunks` は `document_id` 経由で紐付いて
     /// いるため、`documents.path` のみを UPDATE すれば embedding の再計算は
     /// 不要。移動先 path が既に使われている場合は UNIQUE 制約違反でエラー。
+    ///
+    /// (AX-01) path から導出する列も同じ UPDATE で書き換える。同じ bytes の rename は
+    /// content hash が一致するので、ここで直さないと次の incremental run も fast path を
+    /// 通って旧 directory の値が `--force` か内容の編集まで残る。規則は
+    /// [`crate::indexer::extract_category_topic`] の書き手 (index 時の merge) と同じ:
+    /// - `category` は frontmatter に対応する key が無く常に path 由来なので、新 path から
+    ///   無条件に導出し直す
+    /// - `topic` は index 時に `frontmatter.topic.or(path 由来)` で決まる。保存値が旧 path の
+    ///   導出値と等しい時だけ新 path の導出値に置き換え、それ以外 (frontmatter 由来) は保つ。
+    ///   比較は `IS` で、旧 path が topic を持たない (NULL) 場合も等しいと数える
+    ///
+    /// watcher の [`crate::indexer::rename_single_file`] と full run の
+    /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
     pub fn rename_document(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let (_, old_topic) = crate::indexer::extract_category_topic(old_path);
+        let (new_category, new_topic) = crate::indexer::extract_category_topic(new_path);
         let updated = self
             .conn
             .execute(
-                "UPDATE documents SET path = ?1 WHERE path = ?2",
-                params![new_path, old_path],
+                "UPDATE documents
+                 SET path = ?1,
+                     category = ?2,
+                     topic = CASE WHEN topic IS ?3 THEN ?4 ELSE topic END
+                 WHERE path = ?5",
+                params![new_path, new_category, old_topic, new_topic, old_path],
             )
             .with_context(|| {
                 format!(

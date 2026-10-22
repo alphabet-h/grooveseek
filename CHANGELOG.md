@@ -24,6 +24,32 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   every other changed document was served from stored vectors now exits 1 (MCP: an `error`), since
   the endpoint accepted nothing.
 
+### Fixed
+
+- **Moving a document without changing its bytes now moves its `category` and `topic` with it.**
+  Under the default `context_mode = "off"` such a move — a file or a whole directory, seen by
+  `groove index` or by the live watcher — rewrote only the path, so a search filtered on the new
+  directory missed the document and one filtered on the old directory still found it, until
+  `--force` or an edit. The category is now taken from the new path, and so is the topic unless the
+  document's frontmatter sets one, which is kept. A frontmatter topic that happens to equal the old
+  path's directory name is indistinguishable from a path-derived one and moves too.
+
+### Security
+
+- **The live watcher no longer walks into a directory that was replaced by a link.** When a new
+  directory appears the watcher scans it once, and that scan followed the directory itself if it
+  had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time
+  the scan started, indexing files outside the knowledge base under in-KB names. Links below it
+  were already skipped.
+- **`groove.toml` is read through a size limit, and a found one through the checked read.** Any
+  config file over 1 MiB is now refused instead of read whole. A `groove.toml` discovery found in
+  the working directory or at the git root — not one named with `--config` — is also refused when
+  it is a hard link, not a regular file (a named pipe would hang startup) or, on Linux and macOS, a
+  symlink, as the frontmatter schema and the golden file already were. Name a linked config with
+  `--config` to use it. See [Config file discovery](docs/configuration.md#config-file-discovery).
+- **CI runs with a read-only `GITHUB_TOKEN`.** `ci.yml` now declares `permissions: contents: read`
+  at the top level instead of inheriting the repository default.
+
 ## [1.20.4] - 2026-10-21
 
 ### Fixed

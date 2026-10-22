@@ -3482,8 +3482,14 @@ pub(crate) fn collect_source_files_counted(
         unspellable.set(unspellable.get() + 1);
     };
 
+    // (AX-35) `follow_links(false)` leaves the root alone: walkdir follows a root that is a
+    // link unless `follow_root_links(false)` says otherwise. The watcher's `start` is a name
+    // inside the KB that a writer can swap for a link (or, on Windows, a junction) to a
+    // directory outside it. The full index hands in the canonicalized KB root, which is never
+    // a link, so this changes nothing there.
     for entry in WalkDir::new(start)
         .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_entry(|e| {
             // `kb_path` itself relativizes to the empty string, which is never
@@ -3547,7 +3553,10 @@ pub(crate) fn collect_source_files_counted(
 /// "ai-news/2026-04-16.md"         → (Some("ai-news"), None)
 /// "index.md"                       → (None, None)
 /// ```
-fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
+///
+/// (AX-01) Also read by [`Database::rename_document`], which re-derives both from the new path
+/// when a rename moves a row without re-parsing it.
+pub(crate) fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
     let parts: Vec<&str> = rel_path.split('/').collect();
     match parts.len() {
         // "index.md" — no category, no topic
@@ -4629,6 +4638,61 @@ mod tests {
         assert!(
             files.is_empty(),
             "handing in an excluded directory must yield nothing, got {files:?}"
+        );
+    }
+
+    /// (AX-35) `start` itself is not followed when it is a symlink. The watcher hands in the
+    /// directory an event named, and a KB writer can swap it for a link to a directory outside
+    /// the KB between the event and the walk. walkdir follows the **root** regardless of
+    /// `follow_links(false)` unless told otherwise (`follow_root_links` defaults to `true`), so
+    /// without that the walk would collect the outside files under KB-relative names.
+    ///
+    /// On Windows the link is a directory junction: a symlink there needs Developer Mode or an
+    /// elevated token, while `mklink /J` needs neither, so the junction is the form a KB writer
+    /// can actually make (the same reasoning as the `grammar_dir` junction test in
+    /// [`crate::config`]). std reports a junction as a symlink, and so does walkdir. No std API
+    /// creates one, hence the `cmd` call; it is asserted rather than skipped.
+    #[test]
+    fn collect_source_files_under_does_not_follow_a_symlinked_start() {
+        let kb = mk_tmp("under-symlinked-start-kb");
+        let outside = mk_tmp("under-symlinked-start-out");
+        write_file(&outside.0, "pay.md", "# outside the knowledge base");
+        write_file(&kb.0, "real.md", "# real");
+        let link = kb.0.join("fresh");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside.0, &link).expect("symlinks need no privilege on unix");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &outside.0.display().to_string(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("mklink must be runnable");
+            assert!(
+                made.success(),
+                "mklink /J needs no elevation and must succeed"
+            );
+        }
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "premise: the start is a link"
+        );
+
+        let reg = Registry::defaults();
+        let files = collect_source_files_under(&kb.0, &link, &reg, &excl(&kb.0, &[])).unwrap();
+        assert!(
+            files.is_empty(),
+            "a symlinked start must not be walked into, got {files:?}"
         );
     }
 

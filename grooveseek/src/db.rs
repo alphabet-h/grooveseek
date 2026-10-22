@@ -2165,6 +2165,98 @@ mod tests {
         db.rename_documents_atomic(&[]).unwrap();
     }
 
+    /// `(category, topic)` of the row at `path`.
+    fn category_topic_of(db: &Database, path: &str) -> (Option<String>, Option<String>) {
+        db.conn
+            .query_row(
+                "SELECT category, topic FROM documents WHERE path = ?1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// (AX-01) A rename moves the path-derived columns with the path: the category always comes
+    /// from the path, and a topic that was the old path's is replaced by the new path's.
+    #[test]
+    fn rename_document_rederives_the_path_category_and_topic() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.upsert_document("a/e.md", None, None, Some("a"), None, &[], None, "h2", 0)
+            .unwrap();
+
+        db.rename_document("a/x/d.md", "b/y/d.md").unwrap();
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("y".to_string()))
+        );
+
+        // A topic the old path did not have is gained from the new one, and one the new path
+        // does not have is dropped.
+        db.rename_document("a/e.md", "c/z/e.md").unwrap();
+        assert_eq!(
+            category_topic_of(&db, "c/z/e.md"),
+            (Some("c".to_string()), Some("z".to_string()))
+        );
+        db.rename_document("c/z/e.md", "root.md").unwrap();
+        assert_eq!(category_topic_of(&db, "root.md"), (None, None));
+    }
+
+    /// (AX-01) A topic that is not the old path's came from the frontmatter, which a rename does
+    /// not touch, so it stays; the category still follows the path.
+    #[test]
+    fn rename_document_keeps_a_frontmatter_topic() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("pinned"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.upsert_document(
+            "a/e.md",
+            None,
+            Some("pinned"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h2",
+            0,
+        )
+        .unwrap();
+        db.rename_documents_atomic(&[
+            ("a/x/d.md".to_string(), "b/y/d.md".to_string()),
+            ("a/e.md".to_string(), "b/e.md".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("pinned".to_string()))
+        );
+        assert_eq!(
+            category_topic_of(&db, "b/e.md"),
+            (Some("b".to_string()), Some("pinned".to_string()))
+        );
+    }
+
     /// F-32 regression: dropping a `begin_transaction()` handle without
     /// `commit()` must roll back every write performed under it (upsert +
     /// insert_chunk). This is the contract the indexer relies on for

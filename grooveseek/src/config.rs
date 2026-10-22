@@ -647,6 +647,65 @@ impl Default for ContextualConfig {
     }
 }
 
+/// (AX-34) The most of a `groove.toml` that is read. The schema's megabyte
+/// ([`crate::schema::MAX_SCHEMA_FILE_BYTES`]) for the same reason: a person writes it, and
+/// nothing a person writes for this file comes near it, while an unbounded read of whatever
+/// lands on the name (a device, a multi-gigabyte file) takes the whole process with it.
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// (AX-34) How a config file is read, by how it was reached.
+#[derive(Clone, Copy)]
+enum ConfigRead {
+    /// Named by the operator (`--config`, or the file beside the binary): links are followed
+    /// and only the size is bounded. A config kept in a dotfiles tree is commonly reached
+    /// through a symlink or a hard link, and refusing it would break a setup that only its
+    /// owner could have made.
+    Named,
+    /// Found by discovery in the cwd or at the git root: [`crate::links::read_required`].
+    Found,
+}
+
+/// The bytes of the config at `path`, or `None` when there is no file there.
+fn read_config_bytes(path: &Path, read: ConfigRead) -> Result<Option<Vec<u8>>> {
+    match read {
+        ConfigRead::Found => crate::links::read_required(path, MAX_CONFIG_FILE_BYTES, "config"),
+        ConfigRead::Named => {
+            use std::io::Read as _;
+            if !path.exists() {
+                return Ok(None);
+            }
+            let failed = || format!("failed to read config: {}", path.display());
+            let file = std::fs::File::open(path).with_context(failed)?;
+            let mut bytes = Vec::new();
+            (&file)
+                .take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .with_context(failed)?;
+            let read = bytes.len() as u64;
+            if read > MAX_CONFIG_FILE_BYTES {
+                // The handle's own length when it has one; a device or a pipe reports none,
+                // and then what was read is the most that can be said.
+                let len = file
+                    .metadata()
+                    .map(|m| m.len())
+                    .ok()
+                    .filter(|&len| len > MAX_CONFIG_FILE_BYTES)
+                    .unwrap_or(read);
+                let refused = crate::links::Refused::TooLarge {
+                    len,
+                    cap: MAX_CONFIG_FILE_BYTES,
+                };
+                anyhow::bail!(
+                    "refusing to read the config: {}: {}",
+                    path.display(),
+                    refused.reason()
+                );
+            }
+            Ok(Some(bytes))
+        }
+    }
+}
+
 impl Config {
     /// 後方互換シム。`discover(None)` に委譲し `ConfigSource` を捨てる。
     /// 実際の探索順は CWD → `.git` 祖先 → バイナリ隣 (legacy) で、
@@ -756,7 +815,7 @@ impl Config {
         // 2. CWD 直下
         let cwd_toml = cwd.join("groove.toml");
         if cwd_toml.exists() {
-            let cfg = Self::load_from(&cwd_toml).with_context(|| {
+            let cfg = Self::load_found(&cwd_toml).with_context(|| {
                 format!("failed to load config from cwd {}", cwd_toml.display())
             })?;
             return Ok((cfg, ConfigSource::Cwd, Some(cwd_toml)));
@@ -766,7 +825,7 @@ impl Config {
         if let Some(root) = find_git_root(cwd) {
             let git_toml = root.join("groove.toml");
             if git_toml.exists() {
-                let cfg = Self::load_from(&git_toml).with_context(|| {
+                let cfg = Self::load_found(&git_toml).with_context(|| {
                     format!("failed to load config from git root {}", git_toml.display())
                 })?;
                 return Ok((cfg, ConfigSource::GitRoot, Some(git_toml)));
@@ -1151,11 +1210,31 @@ impl Config {
     /// 指定パスから読み込む。ファイルが存在しない場合は空の `Config`。
     /// 相対パスで書かれたフィールドは**設定ファイルのあるディレクトリ**を
     /// 基点に解決する (cwd ではない)。
+    ///
+    /// (AX-34) The file is read the way an explicit `--config` is: links are followed, and
+    /// only [`MAX_CONFIG_FILE_BYTES`] bounds the read. A config groove found by itself goes
+    /// through [`Self::load_found`] instead.
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        Self::load_with(path, ConfigRead::Named)
+    }
+
+    /// (AX-34) [`Self::load_from`] for a config discovery found in the cwd or at the git root
+    /// rather than one the operator named. Those are names whoever writes the directory
+    /// controls -- the reason [`classify_trust`] can call them untrusted -- so the file goes
+    /// through the checked read the schema and the golden file use
+    /// ([`crate::links::read_required`]): a hard link, anything that is not a regular file (a
+    /// named pipe would otherwise hang startup) and, on Unix, a symlink are refused, as is a
+    /// file over the cap. Which read applies is decided by where the file was found, before
+    /// trust is classified, because trust is classified from what the file says.
+    fn load_found(path: &Path) -> Result<Self> {
+        Self::load_with(path, ConfigRead::Found)
+    }
+
+    fn load_with(path: &Path, read: ConfigRead) -> Result<Self> {
+        let Some(bytes) = read_config_bytes(path, read)? else {
             return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(path)
+        };
+        let text = String::from_utf8(bytes)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
         let mut cfg: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
@@ -6049,5 +6128,120 @@ lambda = 0.5
             refused.is_err(),
             "deny_unknown_fields must catch a misspelt key"
         );
+    }
+
+    // =======================================================================
+    // AX-34: how much of a config file is read, and which files are read at all
+    // =======================================================================
+
+    /// A valid `groove.toml` one byte over [`MAX_CONFIG_FILE_BYTES`]: a comment, so that
+    /// without the cap it parses and loads.
+    fn oversized_toml() -> String {
+        let pad = usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap() - 1;
+        format!("#{}\n", "x".repeat(pad))
+    }
+
+    /// `(error chain, source)` of discovering from `cwd` with no `--config`.
+    fn discover_err(cwd: &Path) -> String {
+        let err = Config::discover_in(None, cwd, None, &roots_for(None, None))
+            .expect_err("the found config must be refused");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn a_found_config_over_the_cap_is_refused() {
+        let dir = TempDir::new("groove-ax34-found-big");
+        std::fs::write(dir.path().join("groove.toml"), oversized_toml()).unwrap();
+        let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(
+            err.contains(&format!("over the {MAX_CONFIG_FILE_BYTES} byte limit")),
+            "{err}"
+        );
+    }
+
+    /// The cap is not about trust: an explicit `--config` is bounded the same way.
+    #[test]
+    fn an_explicit_config_over_the_cap_is_refused() {
+        let dir = TempDir::new("groove-ax34-explicit-big");
+        let toml = dir.path().join("big.toml");
+        std::fs::write(&toml, oversized_toml()).unwrap();
+        let err = format!(
+            "{:#}",
+            Config::load_from(&toml).expect_err("over the cap must be refused")
+        );
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(
+            err.contains(&format!("over the {MAX_CONFIG_FILE_BYTES} byte limit")),
+            "{err}"
+        );
+    }
+
+    /// A config at the cap still loads: the limit is "over", not "at".
+    #[test]
+    fn a_config_at_the_cap_still_loads() {
+        let dir = TempDir::new("groove-ax34-at-cap");
+        let toml = dir.path().join("groove.toml");
+        let mut body = oversized_toml();
+        body.remove(1);
+        assert_eq!(body.len() as u64, MAX_CONFIG_FILE_BYTES);
+        std::fs::write(&toml, body).unwrap();
+        Config::load_from(&toml).expect("at the cap loads");
+        let d = Config::discover_in(None, dir.path(), None, &roots_for(None, None))
+            .expect("at the cap loads when found too");
+        assert_eq!(d.source, ConfigSource::Cwd);
+    }
+
+    /// A found config is a name whoever writes the directory controls, so it goes through the
+    /// same checked read as the schema and the golden file: a hard link (which needs no
+    /// privilege anywhere) is refused.
+    #[test]
+    fn a_found_config_that_is_a_hard_link_is_refused() {
+        let dir = TempDir::new("groove-ax34-found-hardlink");
+        let elsewhere = TempDir::new("groove-ax34-found-hardlink-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        std::fs::hard_link(&original, dir.path().join("groove.toml"))
+            .expect("hard links need no privilege");
+        let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("hard link"), "{err}");
+    }
+
+    /// `--config` is the operator's own word (it is what [`classify_trust`] calls trusted), and
+    /// a config kept in a dotfiles tree is often reached through a link. Only the cap applies.
+    #[test]
+    fn an_explicit_config_that_is_a_hard_link_still_loads() {
+        let dir = TempDir::new("groove-ax34-explicit-hardlink");
+        let original = dir.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        let link = dir.path().join("groove.toml");
+        std::fs::hard_link(&original, &link).expect("hard links need no privilege");
+        let cfg = Config::load_from(&link).expect("an explicit hard link loads");
+        assert_eq!(cfg.model, Some(ModelChoice::BgeM3));
+        let d = Config::discover_in(Some(&link), dir.path(), None, &roots_for(None, None))
+            .expect("--config through a hard link loads");
+        assert_eq!(d.source, ConfigSource::Explicit);
+    }
+
+    /// The Unix half of the checked read: a found config that is a symlink is refused, while
+    /// the same link named by `--config` is followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_found_config_symlink_is_refused_but_an_explicit_one_is_followed() {
+        let dir = TempDir::new("groove-ax34-symlink");
+        let elsewhere = TempDir::new("groove-ax34-symlink-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        let link = dir.path().join("groove.toml");
+        std::os::unix::fs::symlink(&original, &link).expect("symlinks need no privilege on unix");
+
+        let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let d = Config::discover_in(Some(&link), dir.path(), None, &roots_for(None, None))
+            .expect("--config through a symlink loads");
+        assert_eq!(d.config.model, Some(ModelChoice::BgeM3));
     }
 }

@@ -304,6 +304,16 @@ bind = "127.0.0.1:3100"
 `--config` に渡した `~` は全プラットフォームで home に展開する (`~` を展開
 しない Windows `cmd.exe` でも動く)。
 
+どのファイルが選ばれても、groove が読むのは最大 1 MiB で、それより大きいファイルは
+拒否する (`refusing to read the config: <path>: it is N bytes, over the
+1048576 byte limit`)。優先度 2 / 3 で見つけたファイルは、さらに frontmatter の
+スキーマや golden ファイルと同じ読み方をする: ハードリンク、通常ファイルでないもの
+(名前付きパイプ、デバイス)、Linux / macOS ではシンボリックリンクを、辿らずに拒否する。
+その名前に何を置くかを決めたのは、そのディレクトリに書ける者だからである。
+`--config` で名指ししたファイルとバイナリの隣のファイルは、シンボリックリンクでも
+ハードリンクでもよい (dotfiles の管理下に置いた config はたいていそうなる)。
+プロジェクトルートの `groove.toml` がリンクなら、`--config` で名指しすること。
+
 起動時に stderr へ `grooveseek::config: loaded config source=... path=... trust=...`
 が出るので、**どの toml が効いているか**と**どこまで信用したか**をログで確認できる。
 

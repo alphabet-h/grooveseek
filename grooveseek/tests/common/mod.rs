@@ -43,6 +43,12 @@
 //!   calls made against it. Used by the AW-04 failure tests
 //!   (`openai_compatible_failures.rs`); `openai_compatible_provider.rs` keeps
 //!   its own older copy because existing tests are not edited.
+//! - [`crate::common::in_process`] — rerunning a test body in a hermetic child
+//!   and opening the index and the embedder in-process, for tests that call
+//!   the indexer's library functions against `embed_mock`. Used by the AX-01
+//!   rename tests (`rename_path_metadata.rs`); the older private copies in the
+//!   size-cap, chunk-reuse and table-policy tests stay because existing tests
+//!   are not edited.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -56,6 +62,7 @@ pub mod docs;
 pub mod embed_cli;
 pub mod embed_mock;
 pub mod eval_gate;
+pub mod in_process;
 pub mod mcp;
 pub mod source;
 pub mod temp;
