@@ -13,7 +13,7 @@ mod common;
 use common::embed_cli::{Fixture, REJECT_MARKER, fixture, note, rejects_marker, stderr_of};
 use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic};
 use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
-use common::temp::TempRoot;
+use common::temp::{TempKbLayout, TempRoot};
 use grooveseek::config::Config;
 use grooveseek::db::{Database, StoredChunkVector};
 use grooveseek::embedder::Embedder;
@@ -629,4 +629,143 @@ fn mcp_rebuild_index_returns_the_chunk_counts() {
 
     assert_index_consistent(&fx);
     assert_dir_empty(&fx.cache);
+}
+
+/// `groove.toml` for the real-model test: BGE-small with no context, as
+/// `CONTEXTUAL_OFF` in `tests/contextual_retrieval_cli.rs`.
+const BGE_SMALL_NO_CONTEXT: &str = "model = \"bge-small-en-v1.5\"\n[contextual]\nenabled = false\n";
+
+/// `groove --config <cfg> index --kb-path <kb> [--force]` with the real model, which must
+/// succeed; its `Done in` line.
+fn index_real(layout: &TempKbLayout, cfg: &std::path::Path, force: bool) -> String {
+    let mut cmd = Command::new(common::mcp::grooveseek_bin());
+    cmd.arg("--config")
+        .arg(cfg)
+        .args(["index", "--kb-path"])
+        .arg(layout.kb());
+    if force {
+        cmd.arg("--force");
+    }
+    let out = cmd.output().expect("groove index");
+    assert!(
+        out.status.success(),
+        "groove index failed:\n{}",
+        stderr_of(&out)
+    );
+    summary(&out)
+}
+
+/// The `M` of `(this run: N embedded, M reused)` in `line`.
+fn reused_in(line: &str) -> u64 {
+    line.split("embedded, ")
+        .nth(1)
+        .and_then(|rest| rest.split(" reused").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no reused count: {line}"))
+}
+
+/// `(path, heading, score)` of each hit of `query` in the top five, with the quality filter and
+/// the confidence cutoff off so both indexes answer from the same candidates.
+fn top5_real(
+    layout: &TempKbLayout,
+    cfg: &std::path::Path,
+    query: &str,
+) -> Vec<(String, String, f64)> {
+    let out = Command::new(common::mcp::grooveseek_bin())
+        .arg("--config")
+        .arg(cfg)
+        .args(["search", query, "--kb-path"])
+        .arg(layout.kb())
+        .args([
+            "--format",
+            "json",
+            "--limit",
+            "5",
+            "--include-low-quality",
+            "--min-confidence-ratio",
+            "0",
+        ])
+        .output()
+        .expect("groove search");
+    assert!(
+        out.status.success(),
+        "groove search failed:\n{}",
+        stderr_of(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "search stdout is not JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    v["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no results array: {v}"))
+        .iter()
+        .map(|h| {
+            (
+                h["path"].as_str().unwrap_or_default().to_string(),
+                h["heading"].as_str().unwrap_or_default().to_string(),
+                h["score"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("no score: {h}")),
+            )
+        })
+        .collect()
+}
+
+/// Spec §8 g (D11): an index that reused stored vectors ranks like one built from scratch with
+/// `--force` over the same final content, under the real BGE-small model.
+#[test]
+#[ignore = "requires embedding model download"]
+fn reused_vectors_rank_like_a_forced_rebuild() {
+    let notes = note(
+        "Notes",
+        "The ferry timetable changes on the first Monday of each month.",
+    );
+    let s3 = s3_changed();
+    let edited = runbook(&[S1, INS, S2, ("Verify", &s3), S4]);
+
+    let reused = TempKbLayout::new("f69-real-reuse");
+    let reused_cfg = reused.root().join("groove.toml");
+    std::fs::write(&reused_cfg, BGE_SMALL_NO_CONTEXT).expect("write groove.toml");
+    reused.write(RUNBOOK, &runbook(&[S1, S2, S3, S4]));
+    reused.write("notes.md", &notes);
+    index_real(&reused, &reused_cfg, false);
+    reused.write(RUNBOOK, &edited);
+    let line = index_real(&reused, &reused_cfg, false);
+    assert!(reused_in(&line) >= 1, "{line}");
+
+    let forced = TempKbLayout::new("f69-real-force");
+    let forced_cfg = forced.root().join("groove.toml");
+    std::fs::write(&forced_cfg, BGE_SMALL_NO_CONTEXT).expect("write groove.toml");
+    forced.write(RUNBOOK, &edited);
+    forced.write("notes.md", &notes);
+    index_real(&forced, &forced_cfg, true);
+
+    for query in [
+        "smoke check endpoint",
+        "queue depth dashboard",
+        "ferry timetable",
+    ] {
+        let a = top5_real(&reused, &reused_cfg, query);
+        let b = top5_real(&forced, &forced_cfg, query);
+        let keys = |hits: &[(String, String, f64)]| -> Vec<(String, String)> {
+            hits.iter()
+                .map(|(p, h, _)| (p.clone(), h.clone()))
+                .collect()
+        };
+        assert!(!a.is_empty(), "{query}: no hits");
+        assert_eq!(keys(&a), keys(&b), "{query}: reused {a:?} / forced {b:?}");
+        for (x, y) in a.iter().zip(&b) {
+            assert!(
+                (x.2 - y.2).abs() <= 1e-4,
+                "{query}: score {} vs {} at {}/{}",
+                x.2,
+                y.2,
+                x.0,
+                x.1
+            );
+        }
+    }
 }
