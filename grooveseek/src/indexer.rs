@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-use crate::db::Database;
+use crate::db::{ChunkVector, Database};
 use crate::embedder::Embedder;
 use crate::parser::{ParserExt, Registry};
 use crate::quality;
@@ -1776,8 +1776,8 @@ struct ReusePlan {
 /// shifts every later index and still keeps the vectors of the ones that did not change. When
 /// the stored side holds the same input more than once, the first (the smallest `chunk_index`)
 /// is taken; every copy carries the vector of the same string. New chunks that share an input
-/// are not merged: each one is matched or embedded on its own, so the counts of reused and
-/// embedded vectors are counted per chunk.
+/// are not merged: each one is matched or embedded on its own, so [`ChunkVectorCounts`] counts
+/// reused and embedded vectors per chunk.
 fn plan_vector_reuse(new_inputs: &[String], stored_inputs: &[String]) -> ReusePlan {
     let mut stored: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (j, input) in stored_inputs.iter().enumerate() {
@@ -2552,13 +2552,49 @@ fn index_single_disk_entry(
     // hundreds of ms (BGE-small) or seconds (BGE-M3) per file, and we don't
     // want a long-lived write tx blocking concurrent readers in WAL mode.
     // feature-46: Static モードでは context を前置して embed する (§4.5)。
+    //
+    // (feature-69) Only the chunks whose embedding input is new are embedded. Each new input is
+    // matched byte for byte against the inputs of this document's stored rows -- no other
+    // document's -- rebuilt under the same `context_mode` ([`plan_vector_reuse`]). A matched
+    // chunk is written with the stored vector as its BLOB, not through JSON: `vec_to_json`
+    // prints with `%f` and would round it. The stored rows are read here, outside the tx; the
+    // copy, the delete of the old rows and the insert of the new ones all happen in the one tx
+    // below. What a document sent and kept is counted by [`ChunkVectorCounts`]. `--force` and
+    // the forced re-parse of a rename read nothing and embed every chunk (spec R7).
     let embed_inputs: Vec<String> = parsed
         .chunks
         .iter()
         .map(|c| embed_input_for(c, context_mode))
         .collect();
-    let texts: Vec<&str> = embed_inputs.iter().map(String::as_str).collect();
-    let embeddings = match embedder.embed_texts(&texts) {
+    let stored = if force {
+        Vec::new()
+    } else {
+        db.stored_chunk_vectors_for_path(&entry.rel)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "warning: {}: could not read the stored vectors, so every chunk is embedded \
+                     again: {e}",
+                    entry.rel
+                );
+                Vec::new()
+            })
+    };
+    let stored_inputs: Vec<String> = stored
+        .iter()
+        .map(|row| embed_input_from(&row.content, row.context_text.as_deref(), context_mode))
+        .collect();
+    let plan = plan_vector_reuse(&embed_inputs, &stored_inputs);
+    let texts: Vec<&str> = plan
+        .to_embed
+        .iter()
+        .map(|&i| embed_inputs[i].as_str())
+        .collect();
+    let embed_result = if texts.is_empty() {
+        Ok(Vec::new())
+    } else {
+        embedder.embed_texts(&texts)
+    };
+    let embeddings = match embed_result {
         Ok(embeddings) => embeddings,
         Err(e) => {
             // (AW-04) A refusal of this file's input is this file's problem: skip it and
@@ -2589,17 +2625,33 @@ fn index_single_disk_entry(
         }
     };
 
+    anyhow::ensure!(
+        embeddings.len() == plan.to_embed.len(),
+        "{}: {} chunks to embed but {} embeddings",
+        entry.rel,
+        plan.to_embed.len(),
+        embeddings.len()
+    );
+    let vectors: Vec<ChunkVector<'_>> = plan
+        .sources
+        .iter()
+        .map(|source| match *source {
+            VectorSource::Stored(j) => ChunkVector::Stored(&stored[j].embedding),
+            VectorSource::Computed(k) => ChunkVector::Computed(&embeddings[k]),
+        })
+        .collect();
+
     // Per-file atomicity (F-32): wrap upsert_document + N x insert_chunk
     // in a single tx so that a partial failure (e.g. vec_chunks dim
     // mismatch on the 3rd chunk) rolls the whole file back instead of
     // leaving a documents row with M < N chunks.
     let tx = db.begin_transaction()?;
-    write_parsed_document(
+    write_parsed_document_with_vectors(
         db,
         &entry.rel,
         &parsed,
         parser,
-        &embeddings,
+        &vectors,
         context_mode,
         &entry.hash,
         size_bytes,
@@ -2646,6 +2698,9 @@ fn index_single_disk_entry(
 ///
 /// `topic` and `category` are the values derived from the path ([`extract_category_topic`]);
 /// a topic in the frontmatter wins over the derived one, as it always has.
+///
+/// (feature-69) The write itself has one implementation, which also takes vectors carried over
+/// from the document's previous chunks; this entry point hands it every vector as computed.
 #[allow(clippy::too_many_arguments)]
 pub fn write_parsed_document(
     db: &Database,
@@ -2659,11 +2714,46 @@ pub fn write_parsed_document(
     topic: Option<&str>,
     category: Option<&str>,
 ) -> Result<i64> {
+    let vectors: Vec<ChunkVector<'_>> = embeddings
+        .iter()
+        .map(|e| ChunkVector::Computed(e))
+        .collect();
+    write_parsed_document_with_vectors(
+        db,
+        rel,
+        parsed,
+        parser,
+        &vectors,
+        context_mode,
+        content_hash,
+        size_bytes,
+        topic,
+        category,
+    )
+}
+
+/// (feature-69) [`write_parsed_document`] with each chunk's vector either computed this run or
+/// carried over as the bytes the index already held for an unchanged chunk
+/// ([`Database::stored_chunk_vectors_for_path`]). `vectors` holds one per chunk, in chunk
+/// order, under the same mismatch rule as `embeddings` there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_parsed_document_with_vectors(
+    db: &Database,
+    rel: &str,
+    parsed: &crate::parser::ParsedDocument,
+    parser: &dyn crate::parser::Parser,
+    vectors: &[ChunkVector<'_>],
+    context_mode: ContextMode,
+    content_hash: &str,
+    size_bytes: u64,
+    topic: Option<&str>,
+    category: Option<&str>,
+) -> Result<i64> {
     anyhow::ensure!(
-        embeddings.len() == parsed.chunks.len(),
+        vectors.len() == parsed.chunks.len(),
         "{rel}: {} chunks but {} embeddings",
         parsed.chunks.len(),
-        embeddings.len()
+        vectors.len()
     );
     let doc_id = db.upsert_document(
         rel,
@@ -2677,7 +2767,7 @@ pub fn write_parsed_document(
         size_bytes,
     )?;
 
-    for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
+    for (chunk, vector) in parsed.chunks.iter().zip(vectors.iter()) {
         let score = quality::chunk_quality_score(
             chunk.heading.as_deref(),
             &chunk.content,
@@ -2687,14 +2777,14 @@ pub fn write_parsed_document(
             ContextMode::Static => chunk.context.as_deref(),
             ContextMode::Off => None,
         };
-        db.insert_chunk_with_table_rows(
+        db.insert_chunk_with_vector(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
             chunk.level,
             &chunk.content,
             context,
-            embedding,
+            *vector,
             score,
             crate::db::CodeMeta {
                 line_range: chunk.line_range,
