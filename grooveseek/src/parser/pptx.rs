@@ -794,8 +794,8 @@ fn collect_a_t(xml: &[u8], path_hint: &str, part: &str) -> String {
 }
 
 /// `<a:t>` テキストの entity-unescape 済み文字列を取り出す (docx.rs と同じ
-/// `decode()` → `escape::unescape()` の 2 段パターン。parse_slide_xml /
-/// collect_a_t の 2 箇所で使うため pptx.rs 内 helper として共通化する)。
+/// `decode()` → `escape::unescape()` の 2 段パターン。[`parse_slide_xml`] /
+/// [`collect_a_t`] の 2 箇所で使うため pptx.rs 内 helper として共通化する)。
 fn decode_text(t: &quick_xml::events::BytesText) -> String {
     let decoded = t.decode().unwrap_or_default();
     quick_xml::escape::unescape(&decoded)

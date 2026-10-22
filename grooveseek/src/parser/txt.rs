@@ -108,7 +108,7 @@ fn derive_title(path_hint: &str) -> Option<String> {
     }
 }
 
-/// `derive_title` の crate 内公開ラッパ (parser::single_text_chunk / markdown::parse 用)。
+/// [`derive_title`] の crate 内公開ラッパ (title を path から導く fallback として各 parser が使う)。
 pub(crate) fn derive_title_pub(path_hint: &str) -> Option<String> {
     derive_title(path_hint)
 }

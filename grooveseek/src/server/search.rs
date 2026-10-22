@@ -848,7 +848,7 @@ pub(super) fn merge_disjoint_spans(
 }
 
 /// `search` MCP tool が受理する query 文字列の最大バイト数 (1 KiB)。
-/// 上限超えは ErrorResponse で reject する。embedder / FTS5 layer は内部で
+/// 上限超えは [`crate::server::ErrorResponse`] で reject する。embedder / FTS5 layer は内部で
 /// truncate するが、上流で reject した方がレスポンスが予測可能になり、
 /// `compute_match_spans` の O(N×M) を query 側からも抑制できる。F-35。
 pub(crate) const SEARCH_QUERY_MAX_BYTES: usize = 1024;

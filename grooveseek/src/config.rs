@@ -276,7 +276,8 @@ pub struct IndexConfig {
     /// [`Config::restrict_untrusted`]).
     #[serde(default)]
     pub max_binary_file_size: Option<crate::parser::FileSizeLimit>,
-    /// (feature-61) The same for md / txt. `None` is [`crate::parser::MAX_RAW_TEXT_BYTES`].
+    /// (feature-61) The same for md / txt / source code (every file that is not binary).
+    /// `None` is [`crate::parser::MAX_RAW_TEXT_BYTES`].
     #[serde(default)]
     pub max_text_file_size: Option<crate::parser::FileSizeLimit>,
     /// (feature-61) How far an .xlsx / .docx / .pptx may inflate in total, and how much text a
@@ -651,7 +652,7 @@ impl Config {
     /// 後方互換シム。`discover(None)` に委譲し `ConfigSource` を捨てる。
     /// 実際の探索順は CWD → `.git` 祖先 → バイナリ隣 (legacy) で、
     /// 関数名は historical naming のまま残している。新規コードは
-    /// [`Config::discover`] を直接呼び ConfigSource を tracing に乗せること。
+    /// [`Config::discover`] を直接呼び [`ConfigSource`] を tracing に乗せること。
     pub fn load_alongside_binary() -> Result<Self> {
         Self::discover(None).map(|d| d.config)
     }

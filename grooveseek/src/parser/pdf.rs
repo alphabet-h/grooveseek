@@ -388,7 +388,7 @@ impl Parser for PdfParser {
     }
 
     /// trait 契約用 fallback: 既に抽出済みテキストを 1 チャンクに包む
-    /// (実運用では parse_bytes 経由でしか呼ばれない)。panic しない。
+    /// (実運用では [`crate::parser::ParserExt::parse_bytes`] 経由でしか呼ばれない)。panic しない。
     fn parse(&self, raw: &str, path_hint: &str, _exclude_headings: &[&str]) -> ParsedDocument {
         single_text_chunk(raw, path_hint)
     }

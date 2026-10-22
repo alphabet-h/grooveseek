@@ -1,7 +1,8 @@
 //! `groove eval` — retrieval quality evaluation subcommand.
 //!
-//! Opt-in パワーユーザ向け機能。Golden query YAML を読み、`db::search_hybrid`
-//! で検索し、recall@k / MRR / nDCG@k を計算する。直前実行との diff を表示する。
+//! Opt-in パワーユーザ向け機能。Golden query YAML を読み、MCP / CLI の検索と同じ
+//! [`crate::server::run_search_pipeline`] (reranker / MMR 込み) と parent retriever で
+//! 検索し、recall@k / MRR / nDCG@k を計算する。直前実行との diff を表示する。
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -219,7 +220,7 @@ pub fn recall_at_k(expected: &[ExpectedHit], top: &[HitRecord], k: usize) -> f64
 
 /// MRR 用: 最初にヒットした expected の rank の逆数。無ければ 0.0。
 /// rank は 1-origin を期待。万一 rank=0 が渡された場合は 0.0 を返し
-/// 1.0/0.0 = inf 汚染を防ぐ (HitRecord は pub なので外部経路の防衛線として残す)。
+/// 1.0/0.0 = inf 汚染を防ぐ ([`HitRecord`] は pub なので外部経路の防衛線として残す)。
 pub fn reciprocal_rank(expected: &[ExpectedHit], top: &[HitRecord]) -> f64 {
     if expected.is_empty() || top.is_empty() {
         return 0.0;
@@ -1464,7 +1465,8 @@ pub fn normalize_eval_limit_and_k(limit: u32, k_values: &[usize]) -> (u32, Vec<u
     (limit, k_values)
 }
 
-/// Golden を読み、search_hybrid で評価し、EvalRun を返す。履歴書き込みは呼び出し側責務。
+/// Golden を読み、[`crate::server::run_search_pipeline`] と parent retriever で評価し、
+/// [`EvalRun`] を返す。履歴書き込みは呼び出し側責務。
 pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     let (gs, golden_bytes) = GoldenSet::load_with_bytes(&opts.golden_path)?;
     let golden_hash = GoldenSet::hash_bytes(&golden_bytes);

@@ -105,7 +105,7 @@ max_chunk_chars = 3500
 # 件数と一緒に `error` を返す。watcher はこのキーを読まない。
 #
 # 任意: サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
-# `max_text_file_size` (md / txt) は `groove index` / `rebuild_index` / watcher が読む
+# `max_text_file_size` (md / txt / ソースコード) は `groove index` / `rebuild_index` / watcher が読む
 # ファイル 1 本の生バイト上限で、超えたファイルは warning 付きで skip される。
 # `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF から取り出す
 # テキスト量の上限。どれも既定は 50 MiB で、バイト数、単位付きの大きさ ("300 MiB"、

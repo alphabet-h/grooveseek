@@ -227,7 +227,7 @@ route が生える。有効化の設定は無く HTTP transport があれば常�
 | `/ui` | **運用者向けの画面**。状態帯 (version / 文書数 / チャンク数 / モデル / watcher / uptime / pid) の下に検索。検索は **`/mcp` を呼んで**行うので、このページ自体が「Streamable HTTP 上の MCP クライアントの最小の実例」になっている |
 | `/api/admin/status` | daemon / indexing / watcher / KB の状態を JSON で返す。Windows tray が 5 秒間隔で polling しているのはこれで、上の状態帯もこれを読む |
 
-> **`/api/search` は v0.27.0 で削除した。** `search` tool が取る 17 パラメータのうち 2 つしか受け取っておらず、プロセスの外から使う口としては `/mcp` の方が既に優れていたため。`/ui` も `/mcp` を使うようになった。[docs/stability.ja.md](stability.ja.md) 参照
+> **`/api/search` は v0.27.0 で削除した。** `search` tool が取るパラメータ (当時 17、v1.9.0 から 19) のうち 2 つしか受け取っておらず、プロセスの外から使う口としては `/mcp` の方が既に優れていたため。`/ui` も `/mcp` を使うようになった。[docs/stability.ja.md](stability.ja.md) 参照
 
 ```bash
 curl http://127.0.0.1:3100/api/admin/status
@@ -261,7 +261,7 @@ peer で、既定の `Host` も allow-list に載るため、`/ui` を proxy す
 到達できる相手全員にページが渡る。転送するのは `/mcp` と `/healthz` だけにする。
 
 ## ライブ同期 (file watcher)
-`groove serve` は既定で `notify` ベースのファイルウォッチャを走らせる。`--kb-path` 配下の任意の変更 (create / modify / delete / rename) が検知され、debounce ののち該当ファイルのみが再インデックスされる。手動の editor save・`git pull`・外部スクリプトといった、PostToolUse hook では捕まえられないケースをカバーする。
+`groove serve` は既定で `notify` ベースのファイルウォッチャを走らせる。`--kb-path` 配下の任意の変更 (create / modify / delete / rename) が検知され、debounce ののち該当ファイルのみが再インデックスされる (ディレクトリの削除・rename ではその下の文書も。変更された文書は、embed 入力が変わった chunk だけが embed し直される — [behavior.ja.md](behavior.ja.md) 参照)。手動の editor save・`git pull`・外部スクリプトといった、PostToolUse hook では捕まえられないケースをカバーする。
 
 - **既定 on**。`groove.toml` の `[watch].enabled = false` または CLI `--no-watch` で無効化
 - **Debounce** は既定 500 ms。`[watch].debounce_ms` または `--debounce-ms` で調整

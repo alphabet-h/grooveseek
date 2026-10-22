@@ -452,7 +452,8 @@ impl Registry {
     }
 
     /// `is_binary()` が true な parser の拡張子だけを返す。indexer の size-skip
-    /// 判定 (§4.2) と backfill_quality の is_binary 伝搬 (§4.8) で使う。
+    /// 判定 (§4.2) と [`crate::db::Database::backfill_quality`] の [`crate::parser::Parser::is_binary`]
+    /// 伝搬 (§4.8) で使う。
     pub fn binary_extensions(&self) -> Vec<&'static str> {
         self.parsers
             .iter()

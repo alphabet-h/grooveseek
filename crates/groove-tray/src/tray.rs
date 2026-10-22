@@ -63,7 +63,7 @@ pub fn build(tooltip: &str) -> Result<Tray> {
     })
 }
 
-/// Map a StatusDot to the embedded PNG icon bytes.
+/// Map a [`StatusDot`] to the embedded PNG icon bytes.
 pub fn icon_for(dot: StatusDot) -> Result<Icon> {
     match dot {
         StatusDot::Gray => load_icon(ICON_GRAY),

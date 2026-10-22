@@ -196,7 +196,7 @@ running, use `/mcp`** — it avoids loading the model a second time.
 The official TypeScript SDK's `StdioClientTransport` spawns `groove` as a child,
 which is the same thing Claude Code does. No port is opened, so `Host`
 validation, `Origin` validation and authentication do not arise. All six tools
-and all seventeen `search` parameters are reachable ([mcp-tools.md](mcp-tools.md));
+and all nineteen `search` parameters are reachable ([mcp-tools.md](mcp-tools.md));
 the application keeps the screen, the login, the per-user scoping and the audit
 log.
 
@@ -370,7 +370,7 @@ consequence of them.
 |---|---|
 | Close `/mcp` to the same host only? | **No** — the line is drawn by declaration instead of by code. `--i-know` stays; the refusal it acknowledges was rewritten to state the consequence. [stability.md](stability.md) |
 | Validate `Origin`? | **Yes, on by default** (v0.27.0), and in v1.0.0 GrooveSeek took both `Host` and `Origin` away from the library and answers them itself for every route. [ADR-0009](decisions/0009-one-dns-rebinding-gate.md) |
-| Promote `/api/*` to a public API? | **No — `/api/search` was removed** in v0.27.0 rather than frozen. It passed 2 of `search`'s 17 parameters, and 1 tool of 6; `/mcp` was already better at the job. `/api/admin/status` stays, deliberately unstable, because the tray polls it. [ADR-0008](decisions/0008-declare-what-1-0-freezes.md) |
+| Promote `/api/*` to a public API? | **No — `/api/search` was removed** in v0.27.0 rather than frozen. It passed 2 of `search`'s parameters (17 then, 19 since v1.9.0), and 1 tool of 6; `/mcp` was already better at the job. `/api/admin/status` stays, deliberately unstable, because the tray polls it. [ADR-0008](decisions/0008-declare-what-1-0-freezes.md) |
 | What is `/ui` for? | **An operator's window onto their own server** — and one scheduled to go away during 1.x, once a client that speaks `/mcp` well enough exists. Keeping it outside the 1.0 freeze is what makes that a minor release. [stability.md](stability.md) |
 
 ## How the numbers were taken

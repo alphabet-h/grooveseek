@@ -17,10 +17,11 @@
 #
 # TRUST DEPENDS ON WHERE THE FILE WAS FOUND. A file reached through (2) or (3)
 # was found, not named, so it is trusted only in part: everything about how the
-# knowledge base is presented is honoured, but the seven settings that decide
-# which code runs, what is read or leaves the machine and who can reach the
-# server -- kb_path (in part), [parsers], grammar_dir, fastembed_cache_dir,
-# [embedding], [eval].golden and the [transport.http] gates -- are reset to safe defaults
+# knowledge base is presented is honoured, but the eight settings that decide
+# which code runs, what is read or leaves the machine, how much of a file a run
+# holds in memory and who can reach the server -- kb_path (in part), [parsers],
+# grammar_dir, fastembed_cache_dir, [embedding], [eval].golden, the [index]
+# size caps and the [transport.http] gates -- are reset to safe defaults
 # with a warning. Name the
 # file with `--config` (1) to have it honoured in full; (4) is trusted as well,
 # and so is a file that (2) or (3) finds inside the config home that
@@ -225,7 +226,7 @@ enabled = ["md"]
 # [index]
 #fail_on_frontmatter_error = false
 #max_binary_file_size  = "50 MiB"   # pdf / docx / xlsx / pptx, raw bytes       (default: 50 MiB)
-#max_text_file_size    = "50 MiB"   # md / txt, raw bytes                       (default: 50 MiB)
+#max_text_file_size    = "50 MiB"   # md / txt / source code, raw bytes         (default: 50 MiB)
 #max_decompressed_size = "50 MiB"   # xlsx/docx/pptx inflated total, PDF text   (default: 50 MiB)
 # A 300 MB workbook needs both of these; the second is what it expands to:
 # max_binary_file_size  = "unlimited"

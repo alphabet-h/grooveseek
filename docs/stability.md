@@ -415,7 +415,7 @@ what the page uses added back, so an external script or stylesheet added to
 `/ui` fails there rather than loading.
 
 `/api/search` **has already been removed**, before 1.0.0 rather than during it.
-It only ever accepted two of the seventeen parameters the `search` tool takes,
+It only ever accepted two of the `search` tool's parameters (seventeen then, nineteen since v1.9.0),
 so `/mcp` was the better endpoint for anything outside the process — and `/ui`
 now uses `/mcp` itself, which makes the page the smallest working example of an
 MCP client.

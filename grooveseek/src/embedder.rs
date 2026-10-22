@@ -1485,7 +1485,7 @@ impl Reranker {
         Ok(Some(Self { model, choice }))
     }
 
-    /// `candidates` (chunk_id, SearchResult) を cross-encoder でスコア付けし、
+    /// `candidates` (chunk_id, [`crate::db::SearchResult`]) を cross-encoder でスコア付けし、
     /// 降順にソートした上位 `limit` 件の `SearchResult` を返す。
     /// `score` フィールドには reranker の raw score が入る (大きいほど良い)。
     pub fn rerank_candidates(
