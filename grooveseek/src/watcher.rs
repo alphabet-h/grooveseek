@@ -980,6 +980,8 @@ fn reindexed_message(
 ) -> String {
     let chunks = counts.embedded + counts.reused;
     let reused = counts.reused;
+    // (#251) The per-file warning naming the file is already on stderr
+    // from the indexer; this only says the reindex kept the tag.
     let note = if frontmatter_unparsed {
         ", frontmatter unparsed"
     } else {
@@ -1004,8 +1006,6 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             chunks,
             frontmatter_unparsed,
         }) => {
-            // (#251) The per-file warning naming the file is already on stderr
-            // from the indexer; this only says the reindex kept the tag.
             let counts = indexer::ChunkVectorCounts::of_updated(chunks, texts_before, &embedder);
             wdiag!("{}", reindexed_message(rel, counts, frontmatter_unparsed));
         }
