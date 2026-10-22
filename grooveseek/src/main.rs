@@ -1906,7 +1906,7 @@ fn run_validate(
 }
 
 /// validate 専用の `.md` ファイル列挙。除外判定と deterministic ordering は
-/// indexer の collect_source_files と同じ方針。
+/// [`grooveseek::indexer`] の `collect_source_files` と同じ方針。
 ///
 /// (feature-49) 判定は [`grooveseek::exclusion::ExclusionRules`] に一本化した。
 /// この関数は bin target 側にいるので lib の `pub` を跨いで呼ぶ形になり、

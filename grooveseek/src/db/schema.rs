@@ -390,13 +390,13 @@ impl Database {
     }
 
     /// `fts_chunks` に context 列が無ければ 3 列 schema へ rebuild migration する
-    /// (feature-46、init 内 one-time)。status / search / serve は rebuild_index を
+    /// (feature-46、init 内 one-time)。status / search / serve は [`crate::indexer::rebuild_index`] を
     /// 経由しないため、init で全 entry point の schema を保証する。table_info ガードで
     /// 2 回目以降 O(1) no-op。DROP+CREATE+repopulate は BEGIN IMMEDIATE + double-checked
     /// locking で multi-process race を防ぐ (spec §4.4)。**`ensure_context_text_column`
     /// の後に呼ぶこと** (repopulate が chunks.context_text を読むため)。
     ///
-    /// `backfill_fts` (rebuild_index 冒頭の欠損 rowid 補充) とは責務が別 (schema 変換 vs
+    /// [`Self::backfill_fts`] ([`crate::indexer::rebuild_index`] 冒頭の欠損 rowid 補充) とは責務が別 (schema 変換 vs
     /// 欠損補充)。本 fn は schema を 2→3 列へ変換するだけ。
     fn ensure_fts_context_column(&self) -> Result<()> {
         // 1) 高速パス: context 列が既にあれば no-op (O(1))

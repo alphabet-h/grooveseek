@@ -67,7 +67,7 @@ impl Condition {
         self.weight_index() * RRF_K_GRID.len() + self.k
     }
 
-    /// 重み組だけの添字 (0..WEIGHT_CONDITIONS)。SQL 往復の単位。
+    /// 重み組だけの添字 (0..[`WEIGHT_CONDITIONS`])。SQL 往復の単位。
     pub fn weight_index(self) -> usize {
         (self.h * BM25_WEIGHT_GRID.len() + self.ctx) * BM25_WEIGHT_GRID.len() + self.content
     }

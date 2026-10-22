@@ -517,7 +517,7 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// 指定 `path` に属するチャンクを (chunk_id, embedding, SearchResult) で返す。
+    /// 指定 `path` に属するチャンクを (chunk_id, embedding, [`crate::db::SearchResult`]) で返す。
     /// Connection Graph の起点シード取得用。存在しなければ empty Vec。
     ///
     /// 上限なし。**新規の呼び出しは [`Self::chunks_for_path_limited`] を使うこと**

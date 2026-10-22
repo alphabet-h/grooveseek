@@ -717,7 +717,7 @@ impl Drop for ProgressReporter {
 }
 
 /// 非 TTY mode で emit を判定するヘルパ。
-/// `count` は 1-based (= report_indexed が呼ばれた回数)。
+/// `count` は 1-based (= [`ProgressReporter::report_indexed`] が呼ばれた回数)。
 /// `total == 0` のとき `start_indexing` で early return するので呼ばれない
 /// 想定だが、defensive に false を返す。
 fn should_emit(count: u64, total: u64, step: u64) -> bool {

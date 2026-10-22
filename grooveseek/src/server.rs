@@ -137,7 +137,7 @@ pub(crate) struct KbCore {
     /// watcher とも共有するため Arc。
     parser_registry: Arc<Registry>,
     /// `search` ツール既定の rank-based low_confidence ratio 閾値。
-    /// 0.0 = 判定無効。SearchParams.min_confidence_ratio が指定されたら override。
+    /// 0.0 = 判定無効。[`SearchParams::min_confidence_ratio`] が指定されたら override。
     min_confidence_ratio: f32,
     /// `[search]` セクション (toml) のスナップショット。MMR / parent_retriever
     /// の per-call override 解決時に `SearchOverrides::resolve(&search_config)`

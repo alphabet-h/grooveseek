@@ -24,7 +24,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   every other changed document was served from stored vectors now exits 1 (MCP: an `error`), since
   the endpoint accepted nothing.
 
-## [1.20.4] - 2026-10-21
+### Documentation
+
+- **Pages and doc comments that had fallen behind the code are corrected.** The 1.20.4 heading
+  carries the date its tag was created, 2026-10-22 rather than 2026-10-21. `docs/behavior.md` and
+  `docs/clients.md` now say that a changed document is re-embedded chunk by chunk and that the
+  watcher handles a deleted or renamed directory; `groove.toml.example` counts eight settings an
+  untrusted config cannot set (the `[index]` size caps were missing from its list); and
+  `max_text_file_size` is described as covering source code as well as `.md` / `.txt`. The
+  `groove eval` descriptions in `docs/ARCHITECTURE.md` and `eval.rs` name `run_search_pipeline`
+  (reranker, MMR, then the parent retriever), which is what it runs, not `search_hybrid`. The
+  `search` tool has nineteen parameters, not seventeen, since v1.9.0: `docs/deployment-topologies.md`
+  says so, and the places that quote seventeen for the `/api/search` removal now say it was
+  seventeen then. 26 names that doc comments wrote as plain prose now link to the item (or were
+  reworded or removed), and three orphaned lines above `GET_DOCUMENT_MAX_BYTES` are gone. No
+  behaviour changes.
+
+## [1.20.4] - 2026-10-22
 
 ### Fixed
 
