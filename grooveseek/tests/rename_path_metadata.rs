@@ -4,7 +4,7 @@
 //! [`grooveseek::indexer::rename_single_file`].
 //!
 //! Under the default `context_mode = "off"` both take the same-hash fast path: no re-parse, no
-//! embedding. Before the fix that path wrote the new `path` alone, so the row kept the old
+//! embedding. Before the fix that path wrote only the new path, so the row kept the old
 //! directory's category and topic, and since the content hash still matched, no later
 //! incremental run rewrote them either.
 //!

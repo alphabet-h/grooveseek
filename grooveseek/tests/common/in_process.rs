@@ -2,7 +2,7 @@
 //! embedder in-process the way `groove index` opens them.
 //!
 //! The in-process calls ([`grooveseek::indexer::rename_single_file`] and its neighbours) build an
-//! [`Embedder`] from the process environment, so a test that makes them reruns itself in a child
+//! [`grooveseek::embedder::Embedder`] from the process environment, so a test that makes them reruns itself in a child
 //! under [`crate::common::embed_mock::hermetic`]. Several older test crates each carry a private
 //! copy of these two helpers; they stay as they are because existing tests are not edited, and a
 //! new test uses this module instead of adding another copy.
@@ -20,7 +20,7 @@ use std::process::Command;
 /// Set on the child [`run_in_hermetic_child`] starts, so the child runs the test body.
 const HERMETIC_CHILD: &str = "GROOVE_IN_PROCESS_HERMETIC_CHILD";
 
-/// Run the test `name` again in a child of this test binary under the environment
+/// Run the named test again in a child of this test binary under the environment
 /// [`crate::common::embed_mock::hermetic`] pins. `true` in the parent, after the child passed
 /// exactly one test; `false` in the child, which then runs the body.
 pub fn run_in_hermetic_child(name: &str) -> bool {

@@ -2165,7 +2165,7 @@ mod tests {
         db.rename_documents_atomic(&[]).unwrap();
     }
 
-    /// `(category, topic)` of the row at `path`.
+    /// The category and the topic stored for the row under the given path.
     fn category_topic_of(db: &Database, path: &str) -> (Option<String>, Option<String>) {
         db.conn
             .query_row(

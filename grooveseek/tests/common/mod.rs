@@ -45,8 +45,8 @@
 //!   its own older copy because existing tests are not edited.
 //! - [`crate::common::in_process`] — rerunning a test body in a hermetic child
 //!   and opening the index and the embedder in-process, for tests that call
-//!   the indexer's library functions against `embed_mock`. Used by the AX-01
-//!   rename tests (`rename_path_metadata.rs`); the older private copies in the
+//!   the indexer's library functions against [`crate::common::embed_mock`].
+//!   Used by the AX-01 rename tests; the older private copies in the
 //!   size-cap, chunk-reuse and table-policy tests stay because existing tests
 //!   are not edited.
 //!

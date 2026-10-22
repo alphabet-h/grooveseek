@@ -665,7 +665,7 @@ enum ConfigRead {
     Found,
 }
 
-/// The bytes of the config at `path`, or `None` when there is no file there.
+/// The bytes of the config file, or `None` when there is no file at that name.
 fn read_config_bytes(path: &Path, read: ConfigRead) -> Result<Option<Vec<u8>>> {
     match read {
         ConfigRead::Found => crate::links::read_required(path, MAX_CONFIG_FILE_BYTES, "config"),
@@ -6141,7 +6141,8 @@ lambda = 0.5
         format!("#{}\n", "x".repeat(pad))
     }
 
-    /// `(error chain, source)` of discovering from `cwd` with no `--config`.
+    /// The error chain of discovering from the given directory with no `--config`, which must
+    /// fail.
     fn discover_err(cwd: &Path) -> String {
         let err = Config::discover_in(None, cwd, None, &roots_for(None, None))
             .expect_err("the found config must be refused");

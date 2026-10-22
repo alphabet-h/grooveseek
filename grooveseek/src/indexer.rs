@@ -4641,7 +4641,8 @@ mod tests {
         );
     }
 
-    /// (AX-35) `start` itself is not followed when it is a symlink. The watcher hands in the
+    /// (AX-35) The directory the walk starts at is not followed when it is a symlink. The
+    /// watcher hands in the
     /// directory an event named, and a KB writer can swap it for a link to a directory outside
     /// the KB between the event and the walk. walkdir follows the **root** regardless of
     /// `follow_links(false)` unless told otherwise (`follow_root_links` defaults to `true`), so
@@ -4651,7 +4652,7 @@ mod tests {
     /// elevated token, while `mklink /J` needs neither, so the junction is the form a KB writer
     /// can actually make (the same reasoning as the `grammar_dir` junction test in
     /// [`crate::config`]). std reports a junction as a symlink, and so does walkdir. No std API
-    /// creates one, hence the `cmd` call; it is asserted rather than skipped.
+    /// creates one, hence `mklink /J` through the shell; it is asserted rather than skipped.
     #[test]
     fn collect_source_files_under_does_not_follow_a_symlinked_start() {
         let kb = mk_tmp("under-symlinked-start-kb");
