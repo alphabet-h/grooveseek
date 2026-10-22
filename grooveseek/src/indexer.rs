@@ -6515,6 +6515,78 @@ mod tests {
         }
     }
 
+    /// (feature-69, spec §8 e) A stored vector whose length does not fit the index fails the
+    /// write after the old rows were deleted and the first new chunk went in; dropping the
+    /// transaction leaves the document exactly as it was, with no row half-written.
+    #[test]
+    fn test_write_with_a_stored_vector_of_the_wrong_length_rolls_the_document_back() {
+        let db = test_db();
+        let registry = Registry::default();
+        let parser = registry.by_extension("md").expect("the md parser");
+        let parsed = parser.parse(
+            concat!(
+                "---\ntitle: Runbook\n---\n\n",
+                "## Install\n\nDownload the archive and unpack it into the tools folder ",
+                "before anything else.\n\n",
+                "## Configure\n\nPoint the config file at the shared cache directory on the ",
+                "build machine.\n",
+            ),
+            "a.md",
+            &[],
+        );
+        assert_eq!(parsed.chunks.len(), 2, "premise: one chunk per section");
+
+        let first = vec![0.25_f32; 384];
+        let tx = db.begin_transaction().unwrap();
+        write_parsed_document_with_vectors(
+            &db,
+            "a.md",
+            &parsed,
+            parser,
+            &[ChunkVector::Computed(&first), ChunkVector::Computed(&first)],
+            ContextMode::Off,
+            "h1",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let before = db.stored_chunk_vectors_for_path("a.md").unwrap();
+        assert_eq!(before.len(), 2);
+
+        let second = vec![0.5_f32; 384];
+        let tx = db.begin_transaction().unwrap();
+        let written = write_parsed_document_with_vectors(
+            &db,
+            "a.md",
+            &parsed,
+            parser,
+            &[
+                ChunkVector::Computed(&second),
+                ChunkVector::Stored(&[0u8; 8]),
+            ],
+            ContextMode::Off,
+            "h2",
+            0,
+            None,
+            None,
+        );
+        assert!(written.is_err(), "an 8-byte vector cannot go into 384 dims");
+        drop(tx);
+
+        assert_eq!(db.stored_chunk_vectors_for_path("a.md").unwrap(), before);
+        for (name, scan) in [
+            ("chunks without embedding", db.chunks_without_embedding(5)),
+            ("embeddings without chunk", db.embeddings_without_chunk(5)),
+            ("chunks without fts", db.chunks_without_fts(5)),
+            ("fts without chunk", db.fts_without_chunk(5)),
+        ] {
+            let scan = scan.unwrap();
+            assert!(scan.is_clean(), "{name}: {scan:?}");
+        }
+    }
+
     /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is
     /// skipped for having no chunks, and still has to be counted, so the
     /// skipped result carries the flag too.

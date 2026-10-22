@@ -11,9 +11,13 @@
 mod common;
 
 use common::embed_cli::{Fixture, REJECT_MARKER, fixture, note, rejects_marker, stderr_of};
-use common::embed_mock::{DOC_MODEL, assert_dir_empty};
+use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic};
+use common::temp::TempRoot;
+use grooveseek::config::Config;
 use grooveseek::db::{Database, StoredChunkVector};
-use std::process::Output;
+use grooveseek::embedder::Embedder;
+use grooveseek::indexer::{RenameOutcome, rename_single_file};
+use std::process::{Command, Output};
 
 const S1: (&str, &str) = (
     "Install",
@@ -349,6 +353,241 @@ fn a_refusal_beside_a_fully_reused_document_fails_the_run() {
         contents(&vectors(&fx, RUNBOOK)),
         vec![S2.1, S1.1, S3.1, S4.1]
     );
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// The `groove.toml` lines that turn on the static context ([`ContextMode::Static`]).
+///
+/// [`ContextMode::Static`]: grooveseek::db::ContextMode::Static
+const STATIC: &str = "[contextual]\nenabled = true\n";
+
+/// [`indexed_runbook`] under [`STATIC`]: each chunk is embedded as
+/// `Runbook > {heading}\n\n{body}`.
+fn indexed_static_runbook(prefix: &str, sections: &[(&str, &str)]) -> Fixture {
+    let fx = fixture(prefix, &[(RUNBOOK, &runbook(sections))], STATIC);
+    index_ok(&fx);
+    fx
+}
+
+/// The embedding input of `(heading, body)` under [`STATIC`] in a document titled `title`.
+fn static_input(title: &str, (heading, body): (&str, &str)) -> String {
+    format!("{title} > {heading}\n\n{body}")
+}
+
+#[test]
+fn static_mode_title_change_recomputes_every_chunk() {
+    let fx = indexed_static_runbook("f69-static-title", &[S1, S2, S3, S4]);
+
+    let retitled = runbook(&[S1, S2, S3, S4]).replacen("title: Runbook\n", "title: Playbook\n", 1);
+    fx.layout.write(RUNBOOK, &retitled);
+    let before = fx.mock.requests().len();
+    let line = index_ok(&fx);
+    let sent = embedded_since(&fx, before);
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    assert!(
+        sent.iter().all(|t| t.starts_with("Playbook > ")),
+        "{sent:?}"
+    );
+    assert!(line.contains("(this run: 4 embedded, 0 reused)"), "{line}");
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+#[test]
+fn static_mode_heading_change_recomputes_that_chunk() {
+    let fx = indexed_static_runbook("f69-static-heading", &[S1, S2, S3, S4]);
+
+    let renamed = ("Configuration", S2.1);
+    fx.layout.write(RUNBOOK, &runbook(&[S1, renamed, S3, S4]));
+    let before = fx.mock.requests().len();
+    let line = index_ok(&fx);
+    assert_eq!(
+        embedded_since(&fx, before),
+        vec![static_input("Runbook", renamed)]
+    );
+    assert!(line.contains("(this run: 1 embedded, 3 reused)"), "{line}");
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+#[test]
+fn static_mode_reuses_the_unchanged_chunks() {
+    let fx = indexed_static_runbook("f69-static-reuse", &[S1, S2, S3, S4]);
+
+    let s3 = s3_changed();
+    fx.layout
+        .write(RUNBOOK, &runbook(&[S1, S2, ("Verify", &s3), S4]));
+    let before = fx.mock.requests().len();
+    let line = index_ok(&fx);
+    assert_eq!(
+        embedded_since(&fx, before),
+        vec![static_input("Runbook", ("Verify", &s3))]
+    );
+    assert!(line.contains("(this run: 1 embedded, 3 reused)"), "{line}");
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+#[test]
+fn a_refused_chunk_leaves_the_document_as_it_was() {
+    const OTHER: &str = "The ferry timetable changes on the first Monday of each month.";
+    let fx = fixture(
+        "f69-refused",
+        &[
+            (RUNBOOK, &runbook(&[S1, S2, S3, S4])),
+            ("other.md", &note("Other", OTHER)),
+        ],
+        "",
+    );
+    index_ok(&fx);
+    let before = vectors(&fx, RUNBOOK);
+
+    let s3 = format!("{} {REJECT_MARKER}", S3.1);
+    fx.layout
+        .write(RUNBOOK, &runbook(&[S1, S2, ("Verify", &s3), S4]));
+    fx.layout.write(
+        "other.md",
+        &note("Other", &OTHER.replace("first Monday", "last Friday")),
+    );
+    fx.answer_with(rejects_marker(413));
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "groove index failed:\n{stderr}");
+    let line = summary(&out);
+    assert!(line.contains("1 updated"), "{line}");
+    assert!(line.contains("1 skipped"), "{line}");
+    assert!(
+        stderr.contains("warning: runbook.md: embedding endpoint rejected the input (HTTP 413)"),
+        "{stderr}"
+    );
+    assert_eq!(vectors(&fx, RUNBOOK), before);
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// Set on the child [`run_in_hermetic_child`] starts, so the child runs the test body.
+const HERMETIC_CHILD: &str = "GROOVE_F69_HERMETIC_CHILD";
+
+/// Run the test `name` again in a child of this test binary under the environment
+/// [`common::embed_mock::hermetic`] pins. `true` in the parent, after the child passed exactly
+/// one test; `false` in the child.
+///
+/// Copy of the helper of the same name in `tests/index_pptx_table_policy.rs`: opening up
+/// another test crate's private helper would edit an existing test.
+fn run_in_hermetic_child(name: &str) -> bool {
+    if std::env::var_os(HERMETIC_CHILD).is_some() {
+        return false;
+    }
+    let cache = TempRoot::new("groove-f69-fastembed");
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(HERMETIC_CHILD, "1");
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("run the test in a child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed in the child:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the child ran no test named {name}:\n{stdout}\n{stderr}"
+    );
+    assert_dir_empty(cache.path());
+    true
+}
+
+/// The index and the embedder under `cfg`, opened the way `groove index` opens them.
+///
+/// Copy of the helper of the same name in `tests/index_pptx_table_policy.rs`, for the reason
+/// [`run_in_hermetic_child`] gives.
+fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
+    let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
+    let db_path = grooveseek::resolve_db_path(fx.kb());
+    let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
+    db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
+        .expect("embedding meta");
+    let embedder = Embedder::with_settings(embedding).expect("build the embedder");
+    (db, embedder)
+}
+
+/// Spec R7 on the watcher's side: a same-bytes rename under the static context re-parses the
+/// document with `Force`, which reads no stored vector, so every chunk is embedded again even
+/// though the title keeps every input as it was and an incremental pass would reuse them all.
+#[test]
+fn a_static_same_bytes_rename_recomputes_every_chunk() {
+    if run_in_hermetic_child("a_static_same_bytes_rename_recomputes_every_chunk") {
+        return;
+    }
+    let fx = indexed_static_runbook("f69-static-rename", &[S1, S2, S3, S4]);
+    std::fs::rename(fx.kb().join(RUNBOOK), fx.kb().join("renamed.md")).expect("rename");
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let before = fx.mock.requests().len();
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        RUNBOOK,
+        "renamed.md",
+        None,
+        &registry,
+    )
+    .expect("rename the runbook");
+    assert_eq!(outcome, RenameOutcome::RenamedAndReindexed { chunks: 4 });
+    let mut sent = embedded_since(&fx, before);
+    sent.sort();
+    let mut inputs: Vec<String> = [S1, S2, S3, S4]
+        .into_iter()
+        .map(|s| static_input("Runbook", s))
+        .collect();
+    inputs.sort();
+    assert_eq!(sent, inputs);
+
+    drop(db);
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// Spec §6.2: the copy of the stored vectors, the delete of the old rows and the insert of the
+/// new ones share one transaction, so an insert that fails after the reused chunks went in
+/// leaves the document's old rows.
+#[test]
+fn a_write_that_fails_midway_leaves_the_document_as_it_was() {
+    let fx = indexed_runbook("f69-midway", &[S1, S2, S3, S4]);
+    {
+        let conn = rusqlite::Connection::open(grooveseek::resolve_db_path(fx.kb()))
+            .expect("open the index");
+        conn.execute_batch("CREATE TRIGGER inject_chunk_failure BEFORE INSERT ON chunks WHEN NEW.content LIKE '%injectfail%' BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+            .expect("create the trigger");
+        let probe = conn
+            .execute(
+                "INSERT INTO chunks (content) VALUES ('probe injectfail')",
+                [],
+            )
+            .expect_err("premise: the trigger stops a chunk that carries the word");
+        assert!(probe.to_string().contains("injected"), "{probe}");
+    }
+    let before = vectors(&fx, RUNBOOK);
+
+    let s3 = format!("{} injectfail", S3.1);
+    fx.layout
+        .write(RUNBOOK, &runbook(&[S1, S2, ("Verify", &s3), S4]));
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "groove index must fail:\n{stderr}");
+    assert!(stderr.contains("injected"), "{stderr}");
+    assert_eq!(vectors(&fx, RUNBOOK), before);
 
     assert_index_consistent(&fx);
     assert_dir_empty(&fx.cache);
