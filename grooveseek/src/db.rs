@@ -25,6 +25,10 @@ pub use search::FIELD_FILTERS_PENDING;
 // (feature-56) The indexer names this when it hands a code chunk's line range and definition
 // kind to the storage layer; every other caller uses the constructor that defaults it away.
 pub use storage::CodeMeta;
+// (feature-69) The indexer reads a document's stored vectors to reuse the ones whose chunk
+// did not change, and writes each chunk with either a computed or a carried-over vector.
+pub(crate) use storage::ChunkVector;
+pub use storage::StoredChunkVector;
 // `server::compute_match_spans` が citation の offset を求めるのに同じ分割規則を使う。
 pub(crate) use fts_query::query_phrases;
 
@@ -9007,5 +9011,153 @@ mod tests {
             params![999_i64, blob[..8].to_vec()],
         );
         assert!(short.is_err(), "vec0 refuses a BLOB of the wrong length");
+    }
+
+    /// feature-69: the vector `test_vec_chunks_embedding_reads_and_writes_as_a_blob` uses.
+    fn third_steps() -> Vec<f32> {
+        (0..384).map(|i| (i as f32 + 1.0) / 3.0).collect()
+    }
+
+    /// feature-69: the stored vector of one chunk, as bytes.
+    fn stored_blob(db: &Database, chunk_id: i64) -> Vec<u8> {
+        db.conn
+            .query_row(
+                "SELECT embedding FROM vec_chunks WHERE chunk_id = ?1",
+                params![chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// feature-69 (R3): a document's chunks come back in chunk_index order, not insert
+    /// order, with their text, context and vector bytes, and nothing from another document.
+    #[test]
+    fn test_stored_chunk_vectors_for_path_returns_text_context_and_bytes_in_chunk_order() {
+        let db = db_with_384();
+        let v = third_steps();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(a, 1, None, None, "second", Some("T > S"), &v, 0.5)
+            .unwrap();
+        db.insert_chunk(a, 0, None, None, "first", None, &vec![0.5; 384], 0.5)
+            .unwrap();
+        let b = db
+            .upsert_document("b.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(b, 0, None, None, "other", None, &vec![0.25; 384], 0.5)
+            .unwrap();
+
+        assert_eq!(
+            db.stored_chunk_vectors_for_path("a.md").unwrap(),
+            vec![
+                StoredChunkVector {
+                    content: "first".to_string(),
+                    context_text: None,
+                    embedding: le(&vec![0.5; 384]),
+                },
+                StoredChunkVector {
+                    content: "second".to_string(),
+                    context_text: Some("T > S".to_string()),
+                    embedding: le(&v),
+                },
+            ]
+        );
+    }
+
+    /// feature-69 (Review Focus 3): the read joins vec_chunks, so a chunk whose vector row
+    /// is gone is not offered for reuse.
+    #[test]
+    fn test_stored_chunk_vectors_for_path_leaves_out_a_chunk_without_a_vector() {
+        let db = db_with_384();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(a, 0, None, None, "kept", None, &vec![0.5; 384], 0.5)
+            .unwrap();
+        let gone = db
+            .insert_chunk(a, 1, None, None, "gone", None, &vec![0.25; 384], 0.5)
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![gone])
+            .unwrap();
+
+        let got = db.stored_chunk_vectors_for_path("a.md").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "kept");
+    }
+
+    #[test]
+    fn test_stored_chunk_vectors_for_path_is_empty_for_an_unknown_path() {
+        let db = db_with_384();
+        assert_eq!(db.stored_chunk_vectors_for_path("nope.md").unwrap(), vec![]);
+    }
+
+    /// feature-69 (D5): a stored vector goes back in as the bytes it was read as; a
+    /// computed one goes in through JSON and lands as its f32 bytes, as before.
+    #[test]
+    fn test_insert_chunk_with_vector_writes_stored_bytes_as_given() {
+        let db = db_with_384();
+        let v = third_steps();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let first = db
+            .insert_chunk(a, 0, None, None, "one", None, &v, 0.5)
+            .unwrap();
+        let blob = stored_blob(&db, first);
+
+        let second = db
+            .insert_chunk_with_vector(
+                a,
+                1,
+                None,
+                None,
+                "two",
+                None,
+                ChunkVector::Stored(&blob),
+                0.5,
+                CodeMeta::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(stored_blob(&db, second), blob);
+
+        let third = db
+            .insert_chunk_with_vector(
+                a,
+                2,
+                None,
+                None,
+                "three",
+                None,
+                ChunkVector::Computed(&v),
+                0.5,
+                CodeMeta::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(stored_blob(&db, third), le(&v));
+    }
+
+    #[test]
+    fn test_insert_chunk_with_vector_refuses_a_stored_vector_of_the_wrong_length() {
+        let db = db_with_384();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let r = db.insert_chunk_with_vector(
+            a,
+            0,
+            None,
+            None,
+            "short",
+            None,
+            ChunkVector::Stored(&[0u8; 8]),
+            0.5,
+            CodeMeta::default(),
+            None,
+        );
+        assert!(r.is_err());
     }
 }

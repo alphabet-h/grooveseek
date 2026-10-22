@@ -29,6 +29,29 @@ pub struct CodeMeta<'a> {
     pub symbol_kind: Option<&'a str>,
 }
 
+/// (feature-69) One chunk of an indexed document as it is stored: the text and context its
+/// vector was embedded from, and the vector as the bytes `vec_chunks` holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChunkVector {
+    pub content: String,
+    pub context_text: Option<String>,
+    /// Little-endian f32s, `dim × 4` bytes.
+    pub embedding: Vec<u8>,
+}
+
+/// (feature-69) The vector a chunk is written with.
+///
+/// `Stored` holds bytes read back from `vec_chunks` and is written as that BLOB, not turned
+/// back into JSON: the only way to get JSON out of vec0 is `vec_to_json`, which prints each
+/// value with `%f` and so rounds it, while the BLOB is the f32s exactly as first written.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChunkVector<'a> {
+    /// A vector the embedder just produced.
+    Computed(&'a [f32]),
+    /// A vector carried over from the document's previous chunks, as stored.
+    Stored(&'a [u8]),
+}
+
 impl Database {
     /// Insert or update a document row. On update the old chunks (and their
     /// vec_chunks entries) are deleted so the caller can re-insert fresh ones.
@@ -212,6 +235,9 @@ impl Database {
     /// Another constructor rather than a field on [`CodeMeta`] or a parameter on
     /// [`Self::insert_chunk_with_code`], for the reason that one gives: tests build both with
     /// every field spelled out.
+    ///
+    /// (feature-69) The version that writes a computed vector; it goes through
+    /// insert_chunk_with_vector, which can also write a stored one.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_table_rows(
         &self,
@@ -222,6 +248,38 @@ impl Database {
         content: &str,
         context: Option<&str>,
         embedding: &[f32],
+        quality_score: f32,
+        code: CodeMeta<'_>,
+        table_rows: Option<&[TableRowSpan]>,
+    ) -> Result<i64> {
+        self.insert_chunk_with_vector(
+            document_id,
+            chunk_index,
+            heading,
+            level,
+            content,
+            context,
+            ChunkVector::Computed(embedding),
+            quality_score,
+            code,
+            table_rows,
+        )
+    }
+
+    /// (feature-69) Same, with the vector either computed or carried over as the bytes
+    /// [`Self::stored_chunk_vectors_for_path`] read. A stored vector of the wrong length
+    /// for the current `vec_chunks` is refused by vec0, and the whole chunk is rolled back
+    /// with it (when this call opened the tx).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_chunk_with_vector(
+        &self,
+        document_id: i64,
+        chunk_index: i32,
+        heading: Option<&str>,
+        level: Option<u8>,
+        content: &str,
+        context: Option<&str>,
+        vector: ChunkVector<'_>,
         quality_score: f32,
         code: CodeMeta<'_>,
         table_rows: Option<&[TableRowSpan]>,
@@ -255,12 +313,23 @@ impl Database {
         )?;
         let chunk_id = self.conn.last_insert_rowid();
 
-        // sqlite-vec accepts embeddings as a JSON array string
-        let embedding_json = serde_json::to_string(embedding)?;
-        self.conn.execute(
-            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-            params![chunk_id, embedding_json],
-        )?;
+        match vector {
+            // sqlite-vec accepts embeddings as a JSON array string
+            ChunkVector::Computed(embedding) => {
+                let embedding_json = serde_json::to_string(embedding)?;
+                self.conn.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                    params![chunk_id, embedding_json],
+                )?;
+            }
+            // ... and the little-endian f32 BLOB it stores them as.
+            ChunkVector::Stored(bytes) => {
+                self.conn.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                    params![chunk_id, bytes],
+                )?;
+            }
+        }
 
         self.conn.execute(
             "INSERT INTO fts_chunks (rowid, heading, context, content) VALUES (?1, ?2, ?3, ?4)",
@@ -336,6 +405,37 @@ impl Database {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
             ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// (feature-69) Each chunk of the given document with its stored vector, in chunk_index
+    /// order: what a re-index may reuse instead of embedding again.
+    ///
+    /// An inner join on `vec_chunks`, so a chunk with no vector row (a broken index) is left
+    /// out and gets embedded. Opens no transaction; it reads before the indexer's write tx.
+    /// The caller uses the result only as candidates for reuse, matched against the new
+    /// chunks' embed input; on `Err` it embeds everything.
+    pub fn stored_chunk_vectors_for_path(&self, path: &str) -> Result<Vec<StoredChunkVector>> {
+        let sql = "
+            SELECT c.content, c.context_text, v.embedding
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            JOIN vec_chunks v ON v.chunk_id = c.id
+            WHERE d.path = ?1
+            ORDER BY c.chunk_index
+        ";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![path], |row| {
+            Ok(StoredChunkVector {
+                content: row.get(0)?,
+                context_text: row.get(1)?,
+                embedding: row.get(2)?,
+            })
         })?;
         let mut out = Vec::new();
         for r in rows {
