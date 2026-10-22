@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing, testing, or debugging anything in this repo that runs on Windows — Task Scheduler and service registration, spawning subprocesses and background processes, console and encoding behaviour on Japanese Windows (CP932, UTF-16, ANSI colour in stderr), PowerShell 5.1 and Git Bash quoting, redirection and output handling, line endings after scripted edits, path comparison (canonicalize, junctions, long paths), cargo build or test failures the code did not cause (LNK1102, os error 1455, LNK1104 on a deep path), test assertions that pass on one OS and fail on another, and any "works on Linux, fails on Windows" failure
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing, testing, or debugging anything in this repo that runs on Windows — Task Scheduler and service registration, spawning subprocesses and background processes, console and encoding behaviour on Japanese Windows (CP932, UTF-16, ANSI colour in stderr), PowerShell 5.1 and Git Bash quoting, redirection and output handling, line endings after scripted edits, path comparison (canonicalize, junctions, long paths), deleting read-only files or temp dirs (git objects, rmtree with ignore_errors), cargo build or test failures the code did not cause (LNK1102, os error 1455, LNK1104 on a deep path), test assertions that pass on one OS and fail on another, and any "works on Linux, fails on Windows" failure
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -1007,6 +1007,51 @@ kuriya trap #512 (grooveseek-desktop の project)。記録は grooveseek-desktop
 trap #512 が指す元の `.superpowers/sdd/desktop-v1-2-why-matched/` には無く、archive に移っている。
 関連: 罠 21 (std の fs は自分で `\\?\` を付けるが、std を通らない経路はこの節)、罠 16 (同じ link.exe の別の失敗)、
 罠 18 (同じ `YABUSH~1` の 8.3 短縮名。ここでは path を縮める側に効いた)
+
+## 27. 一時 dir の git repo を `shutil.rmtree(path, ignore_errors=True)` で消すと dir が残る (エラーは出ない) — git は `.git/objects/` を読み取り専用で書く
+
+**症状**: Python の test が一時 dir に git repo を作り、後片付けに `shutil.rmtree(path, ignore_errors=True)` を呼ぶ。
+Windows では dir が残る。例外も warning も無く、test は緑のまま。今回は 1 回の run で 3 つ残った
+(via: 呼び出し元から受けた観測。残った dir を数え直してはいない)。
+
+**原因**: git は `.git/objects/` の object file を読み取り専用属性で書く。Windows は読み取り専用の file を削除できず
+(`PermissionError` / WinError 5)、`ignore_errors=True` がその失敗を黙って捨てる。POSIX では file の削除可否が
+親 dir の書き込み権で決まるので同じ形では出ない (POSIX 側は実測していない — unlink の仕様どおりという理解)。
+
+同じ git repo を `ignore_errors` の有無と後片付けの関数で比べた出力:
+
+<!-- via: Python 3.13.11、Windows 11。scratchpad の中で git init → a.txt を add → commit した repo を 3 つ作り (os.getpid() でつけた名前)、(a) shutil.rmtree(a, ignore_errors=True)、(b) shutil.rmtree(b)、(c) 下の remove_readonly を onexc に渡した shutil.rmtree(c, onexc=...) を比べた。os.walk で .git/objects の file の S_IWRITE を数えた。2026-10-22 に実行し、probe の dir は片付けた -->
+
+```
+read-only object files: 3
+ignore_errors=True  -> exists after: True
+plain rmtree        -> PermissionError [WinError 5] ...\.git\objects\93\75a50d54bf5374615a3378349e298761a4b116
+onexc chmod+retry   -> exists after: False
+```
+
+**正しいやり方**: rmtree のエラー handler (`onexc`。Python 3.12 で追加、同時に `onerror` は deprecated) で
+`os.chmod(path, stat.S_IWRITE)` してから失敗した操作をもう一度呼ぶ。Python 公式 docs の `shutil.rmtree` の
+Windows 向け例と同じ形 (via: docs.python.org/3/library/shutil.html を 2026-10-22 に読んだ):
+
+```python
+import os, stat, shutil
+
+def remove_readonly(func, path, _):
+    "Clear the readonly bit and reattempt the removal"
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+shutil.rmtree(directory, onexc=remove_readonly)   # 3.11 以前は onerror=remove_readonly
+```
+
+- handler の中の再試行がまた失敗すれば、その例外は呼び出し元へ伝わる (docs: "Any subsequent failure will propagate")。これが `ignore_errors=True` との違い
+- **`ignore_errors=True` は残骸を隠す**。test の後片付けで使うなら、片付けた後に「残っていないこと」を数えて確かめる
+  (`assert not os.path.exists(path)`、または親 dir の `os.listdir` が空かを suite の最後に 1 回見る)。
+  緑のまま dir が溜まるのが、この罠の害
+- PowerShell 側の `Remove-Item -Recurse -Force` は同じ形の dir を消せた (via: 上の probe の dir を片付けた時、`Test-Path` が False)
+
+出典: 2026-10-22、grooveseek の private tooling の test (doc link sweep の test) で踏んだ。
+関連: 罠 23 / 24 (dir を消せない・改名できない別の原因 — あちらは process が cwd で掴んでいる)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
