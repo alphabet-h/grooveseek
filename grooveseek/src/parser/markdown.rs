@@ -1052,4 +1052,68 @@ larger body enough enough enough enough enough enough enough.";
         // merge 後も Big の ancestry (= title のみ) を保持
         assert_eq!(merged.context.as_deref(), Some("T > Big"));
     }
+
+    /// feature-69 (D9): inserting a section leaves every other chunk's text and context as
+    /// they were, so a re-index has only that one chunk to embed. A section under 50
+    /// characters merges into the one before it, which then becomes the changed chunk.
+    #[test]
+    fn test_inserting_a_section_changes_only_its_own_chunk() {
+        const S1: (&str, &str) = (
+            "Install",
+            "Download the archive and unpack it into the tools folder before anything else.",
+        );
+        const S2: (&str, &str) = (
+            "Configure",
+            "Point the config file at the shared cache directory on the build machine.",
+        );
+        const S3: (&str, &str) = (
+            "Verify",
+            "Run the smoke check against the staging endpoint and compare the counts.",
+        );
+        const S4: (&str, &str) = (
+            "Rollback",
+            "Restore the previous release from the archive when the smoke check fails.",
+        );
+        const INS: (&str, &str) = (
+            "Monitor",
+            "Watch the queue depth dashboard during the first hour after rollout.",
+        );
+        fn doc(sections: &[(&str, &str)]) -> ParsedDocument {
+            let mut md = String::from("---\ntitle: Runbook\n---\n\n");
+            for (heading, body) in sections {
+                md.push_str(&format!("## {heading}\n\n{body}\n\n"));
+            }
+            parse(&md)
+        }
+        fn changed<'a>(old: &ParsedDocument, new: &'a ParsedDocument) -> Vec<&'a Chunk> {
+            let known: std::collections::HashSet<(&str, Option<&str>)> = old
+                .chunks
+                .iter()
+                .map(|c| (c.content.as_str(), c.context.as_deref()))
+                .collect();
+            new.chunks
+                .iter()
+                .filter(|c| !known.contains(&(c.content.as_str(), c.context.as_deref())))
+                .collect()
+        }
+
+        let old = doc(&[S1, S2, S3, S4]);
+
+        let middle = doc(&[S1, INS, S2, S3, S4]);
+        assert_eq!(middle.chunks.len(), 5);
+        let diff = changed(&old, &middle);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].content, INS.1);
+
+        let end = doc(&[S1, S2, S3, S4, INS]);
+        let diff = changed(&old, &end);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].content, INS.1);
+
+        let short = doc(&[S1, ("Note", "Short note here."), S2, S3, S4]);
+        assert_eq!(short.chunks.len(), 4);
+        let diff = changed(&old, &short);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].heading.as_deref(), Some("Install"));
+    }
 }
