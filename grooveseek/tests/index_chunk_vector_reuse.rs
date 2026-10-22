@@ -3,7 +3,7 @@
 //! holds.
 //!
 //! Each test drives `groove index` over a generated knowledge base against the mock endpoint of
-//! [`crate::common::embed_cli`], so nothing downloads a model. The mock answers each input with
+//! `common::embed_cli`, so nothing downloads a model. The mock answers each input with
 //! a vector derived from its text alone, which is what makes "the same bytes as before" a claim
 //! about reuse only once the fixture's sensitivity has been checked (see
 //! `an_unchanged_chunk_keeps_its_stored_bytes`).

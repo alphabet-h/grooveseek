@@ -2572,9 +2572,11 @@ fn index_single_disk_entry(
         db.stored_chunk_vectors_for_path(&entry.rel)
             .unwrap_or_else(|e| {
                 eprintln!(
-                    "warning: {}: could not read the stored vectors, so every chunk is embedded \
-                     again: {e}",
-                    entry.rel
+                    concat!(
+                        "warning: {}: could not read the stored vectors, ",
+                        "so every chunk is embedded again: {}"
+                    ),
+                    entry.rel, e
                 );
                 Vec::new()
             })
