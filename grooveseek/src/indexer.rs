@@ -714,8 +714,8 @@ pub struct IndexResult {
     /// incremental run, where a refused file keeps its previous row.
     pub forced_rejected: u32,
     /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
-    /// vector was embedded this run. Counted with [`Self::chunks_reused`] by
-    /// `ChunkVectorCounts`. For a [`Self::cancelled`] run, the count up to the stop.
+    /// vector was embedded this run. Counted with [`Self::chunks_reused`] per document from the
+    /// embedder's running total of accepted inputs. For a [`Self::cancelled`] run, the count up to the stop.
     pub chunks_embedded: u32,
     /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
     /// stored vector was copied over, or kept as it was by the fast path for a document whose
@@ -1766,7 +1766,8 @@ enum VectorSource {
 struct ReusePlan {
     /// One entry per new chunk, in chunk order.
     sources: Vec<VectorSource>,
-    /// The new chunks still to embed: `to_embed[k]` is the chunk that takes `Computed(k)`.
+    /// The new chunks still to embed: entry `k` is the chunk that takes
+    /// [`VectorSource::Computed`] with `k`.
     to_embed: Vec<usize>,
 }
 
@@ -6355,7 +6356,7 @@ mod tests {
         items.iter().map(|item| item.to_string()).collect()
     }
 
-    /// (feature-69, Review Focus 4) `embed_input_from` builds what `embed_input_for` always built.
+    /// (feature-69, Review Focus 4) [`embed_input_from`] builds what [`embed_input_for`] always built.
     #[test]
     fn test_embed_input_from_follows_embed_input_for() {
         assert_eq!(

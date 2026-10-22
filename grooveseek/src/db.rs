@@ -9013,7 +9013,7 @@ mod tests {
         assert!(short.is_err(), "vec0 refuses a BLOB of the wrong length");
     }
 
-    /// feature-69: the vector `test_vec_chunks_embedding_reads_and_writes_as_a_blob` uses.
+    /// feature-69: the vector [`test_vec_chunks_embedding_reads_and_writes_as_a_blob`] uses.
     fn third_steps() -> Vec<f32> {
         (0..384).map(|i| (i as f32 + 1.0) / 3.0).collect()
     }

@@ -500,7 +500,8 @@ struct StrictIndexFailure {
     stats: IndexStats,
 }
 
-/// (feature-69, spec R9) A `rebuild_index` reply with the run's chunk counts beside it:
+/// (feature-69, spec R9) A reply of the MCP tool [`KbServer::rebuild_index`] serves, with the
+/// run's chunk counts beside it:
 /// how many chunks of the updated documents were embedded, and how many kept the vector
 /// the index already held. Wraps the reply rather than adding the two to [`IndexStats`],
 /// whose existing tests build it as a literal naming every field; flattened, so the reply

@@ -3,10 +3,10 @@
 //! holds.
 //!
 //! Each test drives `groove index` over a generated knowledge base against the mock endpoint of
-//! `common::embed_cli`, so nothing downloads a model. The mock answers each input with
+//! [`crate::common::embed_cli`], so nothing downloads a model. The mock answers each input with
 //! a vector derived from its text alone, which is what makes "the same bytes as before" a claim
 //! about reuse only once the fixture's sensitivity has been checked (see
-//! `an_unchanged_chunk_keeps_its_stored_bytes`).
+//! [`crate::an_unchanged_chunk_keeps_its_stored_bytes`]).
 
 mod common;
 
@@ -40,7 +40,7 @@ const INS: (&str, &str) = (
     "Monitor",
     "Watch the queue depth dashboard during the first hour after rollout.",
 );
-/// A body two sections of `duplicate_chunks_share_one_stored_vector_and_the_counts_add_up` share.
+/// A body two sections of [`duplicate_chunks_share_one_stored_vector_and_the_counts_add_up`] share.
 const DUP: &str = "Keep the spare keys in the grey cabinet beside the loading dock door.";
 
 const RUNBOOK: &str = "runbook.md";
@@ -479,7 +479,7 @@ const HERMETIC_CHILD: &str = "GROOVE_F69_HERMETIC_CHILD";
 /// [`common::embed_mock::hermetic`] pins. `true` in the parent, after the child passed exactly
 /// one test; `false` in the child.
 ///
-/// Copy of the helper of the same name in `tests/index_pptx_table_policy.rs`: opening up
+/// Copy of the helper of the same name in the PPTX table-policy index test: opening up
 /// another test crate's private helper would edit an existing test.
 fn run_in_hermetic_child(name: &str) -> bool {
     if std::env::var_os(HERMETIC_CHILD).is_some() {
@@ -507,7 +507,7 @@ fn run_in_hermetic_child(name: &str) -> bool {
 
 /// The index and the embedder under `cfg`, opened the way `groove index` opens them.
 ///
-/// Copy of the helper of the same name in `tests/index_pptx_table_policy.rs`, for the reason
+/// Copy of the helper of the same name in the PPTX table-policy index test, for the reason
 /// [`run_in_hermetic_child`] gives.
 fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
     let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
@@ -601,7 +601,7 @@ fn count_in(resp: &serde_json::Value, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("no count {key}: {resp}"))
 }
 
-/// Spec R9 (§8 d): MCP `rebuild_index` answers with the run's chunk counts beside its other
+/// Spec R9 (§8 d): the MCP tool that runs [`grooveseek::indexer::rebuild_index`] answers with the run's chunk counts beside its other
 /// counters, and an unchanged second run still carries both keys, at zero.
 #[test]
 fn mcp_rebuild_index_returns_the_chunk_counts() {
@@ -632,7 +632,7 @@ fn mcp_rebuild_index_returns_the_chunk_counts() {
 }
 
 /// `groove.toml` for the real-model test: BGE-small with no context, as
-/// `CONTEXTUAL_OFF` in `tests/contextual_retrieval_cli.rs`.
+/// `CONTEXTUAL_OFF` in the contextual-retrieval CLI test.
 const BGE_SMALL_NO_CONTEXT: &str = "model = \"bge-small-en-v1.5\"\n[contextual]\nenabled = false\n";
 
 /// `groove --config <cfg> index --kb-path <kb> [--force]` with the real model, which must
