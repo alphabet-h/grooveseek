@@ -1041,7 +1041,8 @@ def remove_readonly(func, path, _):
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
-shutil.rmtree(directory, onexc=remove_readonly)   # 3.11 以前は onerror=remove_readonly
+def remove_tree(path):
+    shutil.rmtree(path, onexc=remove_readonly)   # 3.11 以前は onerror=remove_readonly
 ```
 
 - handler の中の再試行がまた失敗すれば、その例外は呼び出し元へ伝わる (docs: "Any subsequent failure will propagate")。これが `ignore_errors=True` との違い
