@@ -236,8 +236,8 @@ impl Database {
     /// [`Self::insert_chunk_with_code`], for the reason that one gives: tests build both with
     /// every field spelled out.
     ///
-    /// (feature-69) The version that writes a computed vector; it goes through
-    /// insert_chunk_with_vector, which can also write a stored one.
+    /// (feature-69) The version that writes a freshly computed vector; it goes through the
+    /// crate's single chunk writer, which can also write a stored one.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_table_rows(
         &self,
