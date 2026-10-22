@@ -183,7 +183,8 @@ fn index_skips_a_file_whose_second_batch_is_rejected_without_writing_the_first()
     let before = fx.mock.requests().len();
     fx.layout.write(
         "long.md",
-        &sections(&format!("The final paragraph talks about {REJECT_MARKER}.")),
+        &sections(&format!("The final paragraph talks about {REJECT_MARKER}."))
+            .replace("talks about", "now talks about"),
     );
     fx.layout.write(
         "short.md",
@@ -717,7 +718,8 @@ fn index_exits_zero_when_its_only_changed_file_is_refused_after_an_accepted_batc
     let before = fx.mock.requests().len();
     fx.layout.write(
         "long.md",
-        &sections(&format!("The final paragraph talks about {REJECT_MARKER}.")),
+        &sections(&format!("The final paragraph talks about {REJECT_MARKER}."))
+            .replace("talks about", "now talks about"),
     );
     fx.answer_with(rejects_marker(413));
     let out = fx.run_index();
@@ -781,7 +783,8 @@ fn index_exits_zero_when_an_outright_refusal_meets_a_refusal_after_an_accepted_b
     let before = fx.mock.requests().len();
     fx.layout.write(
         "long.md",
-        &two_batch_note(&format!("The final paragraph talks about {REJECT_MARKER}.")),
+        &two_batch_note(&format!("The final paragraph talks about {REJECT_MARKER}."))
+            .replace("talks about", "now talks about"),
     );
     fx.layout.write(
         "short.md",
