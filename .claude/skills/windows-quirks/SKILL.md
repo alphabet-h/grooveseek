@@ -1015,8 +1015,10 @@ Windows では dir が残る。例外も warning も無く、test は緑のま�
 (via: 呼び出し元から受けた観測。残った dir を数え直してはいない)。
 
 **原因**: git は `.git/objects/` の object file を読み取り専用属性で書く。Windows は読み取り専用の file を削除できず
-(`PermissionError` / WinError 5)、`ignore_errors=True` がその失敗を黙って捨てる。POSIX では file の削除可否が
-親 dir の書き込み権で決まるので同じ形では出ない (POSIX 側は実測していない — unlink の仕様どおりという理解)。
+(`PermissionError` / WinError 5)、`ignore_errors=True` がその失敗を黙って捨てる。POSIX では file 自身の
+読み取り専用の bit は削除を妨げない (要るのは親 dir の書き込み権と、path をたどる検索権。sticky bit の付いた dir では
+持ち主の条件も加わる) ので、この形では出ない。ただし POSIX でも権限で消せないことはあるので、`ignore_errors=True` が
+失敗を隠す点は同じ (POSIX 側は実測していない — unlink の仕様どおりという理解)。
 
 同じ git repo を `ignore_errors` の有無と後片付けの関数で比べた出力:
 
