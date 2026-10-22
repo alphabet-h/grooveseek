@@ -87,6 +87,10 @@ bucket に振り分ける。exit 1 なら直してから push。**exit 0 は swe
 main の checkout にも `.dev/` が無い環境 (worktree は該当しない、上記) では旧形を打つ:
 `` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
 (pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
+**旧形は backtick の中しか抜き出さないので、`PUB_DOC_NAMES_HIDDEN` の形 (backtick の外の散文での名指し) は
+出ない。** 旧形のときは、追加行のうち crate の外に見える item の `///` / `//!` を、散文に `pub(crate)` /
+private / bin の名前が無いかを人が読む (`git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]'`
+の出力をそのまま読む。rustdoc は link しか検査しないので、ここは拾わない)。
 
 script の bucket と、それぞれの直し方 (角括弧を残して抽出しているので、**bare backtick と
 `` [`..`] `` が同じ出力の中で区別できる** — sweep は両方向):
