@@ -182,7 +182,7 @@ daemon の `/mcp` に POST するかのどちらか。**daemon が既に居る�
 
 公式 TypeScript SDK の `StdioClientTransport` が `groove` を子プロセスとして起こす。
 Claude Code がやっているのと同じ形。ポートを開かないので、`Host` 検証も `Origin`
-検証も認証も発生しない。**6 つの tool と `search` の 17 パラメータすべてに到達できる**
+検証も認証も発生しない。**6 つの tool と `search` の 19 パラメータすべてに到達できる**
 ([mcp-tools.ja.md](mcp-tools.ja.md))。画面・ログイン・ユーザ単位のスコープ・監査ログは
 アプリ側が持つ。
 
@@ -347,7 +347,7 @@ loopback 以外への bind を許すのは、コンテナがそうせざるを�
 |---|---|
 | `/mcp` を同一ホストのみに閉じるか | **閉じない** — 線はコードではなく宣言で引いた。`--i-know` は残し、それが承認する拒否文の方を「何が起きるか」を述べる形に書き換えた。[stability.ja.md](stability.ja.md) |
 | `Origin` を検証するか | **する。既定で有効** (v0.27.0)。さらに v1.0.0 で `Host` と `Origin` の両方をライブラリから取り上げ、全経路について GrooveSeek 自身が答えるようにした。[ADR-0009](decisions/0009-one-dns-rebinding-gate.ja.md) |
-| `/api/*` を公開 API に格上げするか | **しない — `/api/search` は凍結ではなく削除**した (v0.27.0)。`search` の 17 パラメータのうち 2 つ、6 tool のうち 1 つしか通しておらず、`/mcp` の方が既に優れていた。`/api/admin/status` は tray が polling するので**意図的に unstable のまま**残す。[ADR-0008](decisions/0008-declare-what-1-0-freezes.ja.md) |
+| `/api/*` を公開 API に格上げするか | **しない — `/api/search` は凍結ではなく削除**した (v0.27.0)。`search` のパラメータ (当時 17、v1.9.0 から 19) のうち 2 つ、6 tool のうち 1 つしか通しておらず、`/mcp` の方が既に優れていた。`/api/admin/status` は tray が polling するので**意図的に unstable のまま**残す。[ADR-0008](decisions/0008-declare-what-1-0-freezes.ja.md) |
 | `/ui` の位置づけ | **運用者が自分のサーバを覗く窓**。そして **1.x のうちに引退させる**予定 — `/mcp` を十分に話すクライアントが出てきた時点で。1.0 の凍結対象から外してあることが、それを minor リリースで済ませられる理由。[stability.ja.md](stability.ja.md) |
 
 ## 数値の取り方

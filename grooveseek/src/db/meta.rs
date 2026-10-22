@@ -962,7 +962,7 @@ impl Database {
     /// legacy / 前回 index 済み DB のチャンクを [`crate::quality::chunk_quality_score`]
     /// で再計算して UPDATE する (冪等)。
     ///
-    /// `binary_exts` = is_binary な parser の拡張子集合。document の path 拡張子が
+    /// `binary_exts` = [`crate::parser::Parser::is_binary`] が true な parser の拡張子集合。document の path 拡張子が
     /// これに含まれれば [`crate::quality::QualityProfile::Binary`] で再計算し、
     /// length/structure penalty を免除する。これを怠ると初回 index で免除された
     /// binary chunk が 2 回目 backfill で penalty 転落する (§4.8 P0)。

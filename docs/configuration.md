@@ -111,7 +111,7 @@ max_chunk_chars = 3500
 # watcher ignores this key.
 #
 # Optional: the size caps. `max_binary_file_size` (pdf / docx / xlsx / pptx)
-# and `max_text_file_size` (md / txt) are the largest file, in raw bytes, that
+# and `max_text_file_size` (md / txt / source code) are the largest file, in raw bytes, that
 # `groove index`, `rebuild_index` and the watcher read; a larger one is skipped
 # with a warning. `max_decompressed_size` is how far an .xlsx / .docx / .pptx
 # may inflate in total and how much text a PDF may yield. Each defaults to

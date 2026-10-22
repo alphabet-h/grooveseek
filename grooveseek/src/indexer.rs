@@ -2251,8 +2251,8 @@ enum Reindex {
     Reparse,
 }
 
-/// 単一 DiskEntry を index する内部関数。
-/// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
+/// 単一 [`DiskEntry`] を index する内部関数。
+/// [`rebuild_index`] 本体と、watcher が呼ぶ [`reindex_single_file`] の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
 /// 同時呼び出し不可)。呼び出し側で Mutex 経由の相互排他を保証すること。
 ///

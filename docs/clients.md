@@ -233,7 +233,7 @@ keeps that true.
 | `/ui` | The operator's view: a status band (version, documents, chunks, model, watcher, uptime, pid) over a search box. It searches by calling **`/mcp`**, which makes the page the smallest working example of an MCP client over Streamable HTTP. |
 | `/api/admin/status` | Daemon / indexing / watcher / KB status as JSON. This is what the Windows tray polls every 5 seconds, and what the band above reads. |
 
-> **`/api/search` was removed in v0.27.0.** It accepted 2 of the 17 parameters the `search` tool takes, so `/mcp` was already the better endpoint for anything outside the process; `/ui` uses `/mcp` now. See [docs/stability.md](stability.md).
+> **`/api/search` was removed in v0.27.0.** It accepted 2 of the `search` tool's parameters (17 then, 19 since v1.9.0), so `/mcp` was already the better endpoint for anything outside the process; `/ui` uses `/mcp` now. See [docs/stability.md](stability.md).
 
 ```bash
 curl http://127.0.0.1:3100/api/admin/status
@@ -267,7 +267,7 @@ peer and its default `Host` is allow-listed, so proxying `/ui` hands the page to
 whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
 
 ## Live-sync via file watcher
-`groove serve` runs a `notify`-based file watcher by default. Any change under `--kb-path` (create / modify / delete / rename) is detected, debounced, and only the affected file is re-indexed. This covers manual editor saves, `git pull`, and external scripts — cases the PostToolUse hook cannot intercept.
+`groove serve` runs a `notify`-based file watcher by default. Any change under `--kb-path` (create / modify / delete / rename) is detected, debounced, and only the affected file is re-indexed (for a deleted or renamed directory, the documents under it; within a changed document, only the chunks whose embedding input changed are re-embedded — see [behavior.md](behavior.md)). This covers manual editor saves, `git pull`, and external scripts — cases the PostToolUse hook cannot intercept.
 
 - **Default on**. `[watch].enabled = false` in `groove.toml` or `--no-watch` on the command line disables it.
 - **Debounce** is 500 ms by default. Tune with `[watch].debounce_ms` or `--debounce-ms`.

@@ -207,9 +207,6 @@ impl KbCore {
     }
 }
 
-/// `get_document` ツール用に、拡張子に対応する Parser で
-/// frontmatter (title/date/topic/tags) を抽出し DocumentResponse を組む。
-/// 純粋関数化してテスト可能にしている。
 /// `get_document` の最大バイト数。1 MiB を超える文書は `fs::read` による
 /// バイト一括読みでのメモリ膨張・レスポンス過大を避けるため拒否する。
 pub(crate) const GET_DOCUMENT_MAX_BYTES: u64 = 1024 * 1024;
@@ -578,7 +575,7 @@ pub(crate) fn validate_get_document_path(
 
 /// `get_document` ツール用に、拡張子に対応する Parser で
 /// [`crate::parser::ParserExt::parse_bytes_for_read`] を呼び、
-/// frontmatter + 抽出テキストから DocumentResponse を組む。抽出失敗 (不正 UTF-8 /
+/// frontmatter + 抽出テキストから [`crate::server::DocumentResponse`] を組む。抽出失敗 (不正 UTF-8 /
 /// 暗号化 PDF 等) は `Err` にして handler が既存のエラー応答形式へ流す。
 /// 登録されていない拡張子はフォールバックで Markdown parser を使う (pre-feature-20 挙動)。
 pub(super) fn build_document_response(

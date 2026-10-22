@@ -4,7 +4,7 @@ use std::time::Duration;
 use tao::event_loop::EventLoopProxy;
 
 /// Long-running tokio task that polls `/api/admin/status` every 5 seconds and
-/// publishes the resulting StatusDot/text via the event loop proxy so the
+/// publishes the resulting [`crate::state::StatusDot`]/text via the event loop proxy so the
 /// tray (running on the main thread) can update its icon and menu label.
 ///
 /// Failures increment a counter; 12 consecutive failures (= 1 minute at 5s
