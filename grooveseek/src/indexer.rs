@@ -713,6 +713,15 @@ pub struct IndexResult {
     /// the index first, so each of them is missing from it. Zero in an
     /// incremental run, where a refused file keeps its previous row.
     pub forced_rejected: u32,
+    /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
+    /// vector was embedded this run. Counted with [`Self::chunks_reused`] by
+    /// [`ChunkVectorCounts`]. For a [`Self::cancelled`] run, the count up to the stop.
+    pub chunks_embedded: u32,
+    /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
+    /// stored vector was copied over, or kept as it was by the fast path for a document whose
+    /// chunks all match. Always 0 under `force`, which embeds every chunk. For a
+    /// [`Self::cancelled`] run, the count up to the stop.
+    pub chunks_reused: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
     /// (v1.14.0+) The run stopped at a check point because the
@@ -807,7 +816,9 @@ impl IndexResult {
 
     /// The `Done in ...` line `groove index` prints. [`Self::unspellable`] is
     /// appended only when it is not zero, so the line an ordinary run prints
-    /// -- which tests and scripts match -- does not change.
+    /// -- which tests and scripts match -- does not change. (feature-69) This
+    /// run's [`Self::chunks_embedded`] and [`Self::chunks_reused`] follow the
+    /// chunk count only when either is not zero, for the same reason.
     pub fn summary_line(&self) -> String {
         let mut line = format!(
             "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped, {} frontmatter unparsed), {} chunks",
@@ -820,6 +831,12 @@ impl IndexResult {
             self.frontmatter_unparsed,
             self.total_chunks
         );
+        if self.chunks_embedded > 0 || self.chunks_reused > 0 {
+            line.push_str(&format!(
+                " (this run: {} embedded, {} reused)",
+                self.chunks_embedded, self.chunks_reused
+            ));
+        }
         if self.unspellable > 0 {
             line.push_str(&format!(
                 ", {} not indexed (a name get_document cannot take, see the warnings above)",
@@ -1344,6 +1361,9 @@ pub fn rebuild_index(
         // (AW-04) Read before the call, so a refusal below can tell whether the endpoint
         // accepted part of this file first.
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
+        // (feature-69) Read before the call too: the inputs this document sends are the chunks
+        // it embedded, and the rest of an updated document's chunks were reused.
+        let texts_before = embedder.texts_embedded();
         let crossed = crossed_parser_renames.contains(&entry.rel);
         let single_result = index_single_disk_entry(
             db,
@@ -1393,6 +1413,9 @@ pub fn rebuild_index(
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
                 }
+                let counts = ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
+                tally.chunks_embedded = tally.chunks_embedded.saturating_add(counts.embedded);
+                tally.chunks_reused = tally.chunks_reused.saturating_add(counts.reused);
                 progress.report_indexed(&entry.rel, chunks);
             }
             // A skip that still failed to parse its frontmatter was named on
@@ -1605,6 +1628,35 @@ impl EmbeddedBaseline {
         let accepted = (embedder.documents_embedded() - self.embedded)
             + (embedder.documents_refused_after_accepting() - self.refused_after_accepting);
         u32::try_from(accepted).unwrap_or(u32::MAX)
+    }
+}
+
+/// (feature-69) How an updated document's chunks got their vectors: embedded this run, or
+/// reused from the store. The one place these two counts are worked out (AGENTS.md "One
+/// question gets one implementation"), and handed on as one value so the two cannot be
+/// swapped. Measured the way [`EmbeddedBaseline`] measures files: what the document did not
+/// send to the embedder was kept from the store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ChunkVectorCounts {
+    pub(crate) embedded: u32,
+    pub(crate) reused: u32,
+}
+
+impl ChunkVectorCounts {
+    /// Splits a document's `chunks` given the inputs the embedder was sent for it. More
+    /// inputs than chunks count as every chunk embedded.
+    pub(crate) fn from_texts(chunks: u32, texts_embedded: u64) -> Self {
+        let embedded = u32::try_from(texts_embedded).map_or(chunks, |texts| texts.min(chunks));
+        Self {
+            embedded,
+            reused: chunks - embedded,
+        }
+    }
+
+    /// The counts of a document that ended in [`SingleResult::Updated`] with `chunks`, where
+    /// `texts_before` is [`Embedder::texts_embedded`] read before it was indexed.
+    pub(crate) fn of_updated(chunks: u32, texts_before: u64, embedder: &Embedder) -> Self {
+        Self::from_texts(chunks, embedder.texts_embedded() - texts_before)
     }
 }
 
@@ -6277,6 +6329,98 @@ mod tests {
         let plan = plan_vector_reuse(&[], &s(&["a"]));
         assert!(plan.sources.is_empty());
         assert!(plan.to_embed.is_empty());
+    }
+
+    /// (feature-69) What a changed document did not send to the embedder was kept from the
+    /// store; more inputs than chunks cannot make the reused count negative.
+    #[test]
+    fn test_chunk_vector_counts_split_an_updated_document() {
+        assert_eq!(
+            ChunkVectorCounts::from_texts(5, 2),
+            ChunkVectorCounts {
+                embedded: 2,
+                reused: 3
+            }
+        );
+        assert_eq!(
+            ChunkVectorCounts::from_texts(5, 0),
+            ChunkVectorCounts {
+                embedded: 0,
+                reused: 5
+            }
+        );
+        assert_eq!(
+            ChunkVectorCounts::from_texts(5, 9),
+            ChunkVectorCounts {
+                embedded: 5,
+                reused: 0
+            }
+        );
+    }
+
+    /// (feature-69) The `Done in` line gains this run's chunk counts only when either is not
+    /// zero, before the unspellable clause, so a run that embedded nothing prints the line it
+    /// always printed.
+    #[test]
+    fn test_summary_line_names_this_runs_chunk_counts_only_when_there_are_some() {
+        let clean = IndexResult {
+            total_documents: 3,
+            updated: 1,
+            total_chunks: 7,
+            duration_ms: 12,
+            ..IndexResult::default()
+        };
+        assert_eq!(
+            clean.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks"
+            )
+        );
+        let both = IndexResult {
+            chunks_embedded: 5,
+            chunks_reused: 135,
+            ..clean
+        };
+        assert_eq!(
+            both.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks (this run: 5 embedded, 135 reused)"
+            )
+        );
+        let reused_only = IndexResult {
+            chunks_embedded: 0,
+            chunks_reused: 3,
+            ..clean
+        };
+        assert_eq!(
+            reused_only.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks (this run: 0 embedded, 3 reused)"
+            )
+        );
+        let with_unspellable = IndexResult {
+            unspellable: 2,
+            ..both
+        };
+        assert_eq!(
+            with_unspellable.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks (this run: 5 embedded, 135 reused), ",
+                "2 not indexed (a name get_document cannot take, see the warnings above)"
+            )
+        );
+        for line in [
+            clean.summary_line(),
+            both.summary_line(),
+            reused_only.summary_line(),
+            with_unspellable.summary_line(),
+        ] {
+            assert!(line.is_ascii(), "{line}");
+        }
     }
 
     /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is

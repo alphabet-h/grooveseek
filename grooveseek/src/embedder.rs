@@ -1183,6 +1183,7 @@ pub struct Embedder {
     identity: EmbeddingIdentity,
     documents_embedded: u64,
     documents_refused_after_accepting: u64,
+    texts_embedded: u64,
 }
 
 impl Embedder {
@@ -1227,6 +1228,7 @@ impl Embedder {
             identity,
             documents_embedded: 0,
             documents_refused_after_accepting: 0,
+            texts_embedded: 0,
         }
     }
 
@@ -1240,6 +1242,7 @@ impl Embedder {
         match self.provider.embed_documents(texts) {
             Ok(embeddings) => {
                 self.documents_embedded += 1;
+                self.texts_embedded += texts.len() as u64;
                 Ok(embeddings)
             }
             Err(error) => {
@@ -1264,6 +1267,14 @@ impl Embedder {
     /// configuration is wrong: the endpoint did answer.
     pub(crate) fn documents_refused_after_accepting(&self) -> u64 {
         self.documents_refused_after_accepting
+    }
+
+    /// (feature-69) How many inputs the successful [`Embedder::embed_texts`] calls were
+    /// given, summed. The indexer passes one input per chunk it did not reuse, so the
+    /// difference across a call for one document is the number of that document's chunks it
+    /// embedded. Failed calls, queries and the probe are not counted.
+    pub(crate) fn texts_embedded(&self) -> u64 {
+        self.texts_embedded
     }
 
     /// Embed one search query, on the query side of the provider (the
@@ -3288,6 +3299,33 @@ mod tests {
         let mut ok = Embedder::from_provider(Box::new(StubProvider), identity);
         ok.embed_texts(&["a"]).unwrap();
         assert_eq!(ok.documents_refused_after_accepting(), 0);
+    }
+
+    /// (feature-69) The inputs of the document embeds that succeeded, which the indexer
+    /// reads before and after a document. Queries, the probe and refused calls add nothing.
+    #[test]
+    fn texts_embedded_counts_the_inputs_of_successful_document_embeds() {
+        let identity = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15).identity;
+        let mut ok = Embedder::from_provider(Box::new(StubProvider), identity.clone());
+        ok.embed_texts(&["a"]).unwrap();
+        ok.embed_texts(&["b", "c"]).unwrap();
+        ok.embed_single("query").unwrap();
+        ok.embed_queries(&["q1", "q2"]).unwrap();
+        ok.probe_before_reset().unwrap();
+        assert_eq!(
+            ok.texts_embedded(),
+            3,
+            "one per input of a successful embed_texts"
+        );
+
+        let mut refused = Embedder::from_provider(Box::new(RefusingProvider), identity.clone());
+        assert!(refused.embed_texts(&["a", "b"]).is_err());
+        assert_eq!(refused.texts_embedded(), 0);
+
+        let mut partial =
+            Embedder::from_provider(Box::new(RefusingAfterAcceptingProvider), identity);
+        assert!(partial.embed_texts(&["a", "b"]).is_err());
+        assert_eq!(partial.texts_embedded(), 0);
     }
 
     /// (AW-04) What an MCP reply may say about an embedding error: a non-2xx
