@@ -1387,6 +1387,9 @@ impl Database {
     /// - `topic` は index 時に `frontmatter.topic.or(path 由来)` で決まる。保存値が旧 path の
     ///   導出値と等しい時だけ新 path の導出値に置き換え、それ以外 (frontmatter 由来) は保つ。
     ///   比較は `IS` で、旧 path が topic を持たない (NULL) 場合も等しいと数える
+    /// - 残る穴: frontmatter の topic が旧 path の directory 名とたまたま等しいと、path 由来と
+    ///   区別できずに置き換わる。content hash は一致したままなので次の incremental run でも
+    ///   戻らず、`--force` か文書の編集まで新 path の値のまま
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
     /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。

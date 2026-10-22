@@ -4642,11 +4642,11 @@ mod tests {
     }
 
     /// (AX-35) The directory the walk starts at is not followed when it is a symlink. The
-    /// watcher hands in the
-    /// directory an event named, and a KB writer can swap it for a link to a directory outside
-    /// the KB between the event and the walk. walkdir follows the **root** regardless of
-    /// `follow_links(false)` unless told otherwise (`follow_root_links` defaults to `true`), so
-    /// without that the walk would collect the outside files under KB-relative names.
+    /// watcher hands in the directory an event named, and a KB writer can swap it for a link to
+    /// a directory outside the KB between the event and the walk. walkdir follows the **root**
+    /// regardless of `follow_links(false)` unless told otherwise (`follow_root_links` defaults
+    /// to `true`), so without that the walk would collect the outside files under KB-relative
+    /// names.
     ///
     /// On Windows the link is a directory junction: a symlink there needs Developer Mode or an
     /// elevated token, while `mklink /J` needs neither, so the junction is the form a KB writer

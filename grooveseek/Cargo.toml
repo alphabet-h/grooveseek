@@ -80,7 +80,9 @@ chrono = "0.4"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-walkdir = "2"
+# (AX-35) `WalkDir::follow_root_links` is called; 2.5.0 is the version whose source was read
+# for it. Which release first had it was not checked, so the floor is the verified one.
+walkdir = "2.5"
 dirs = { workspace = true }
 # [feature 17] frontmatter スキーマ検証の pattern フィールド用
 regex = "1"

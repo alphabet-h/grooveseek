@@ -322,14 +322,17 @@ and stops at the first hit:
 
 Whichever file is chosen, groove reads at most 1 MiB of it and refuses a
 larger one (`refusing to read the config: <path>: it is N bytes, over the
-1048576 byte limit`). A file found at priority 2 or 3 is also read the way
-the frontmatter schema and the golden file are: a hard link, anything that is
-not a regular file (a named pipe, a device) and, on Linux and macOS, a symlink
-are refused rather than followed, because whoever writes that directory chose
-what is at that name. A file named with `--config`, or the one beside the
-binary, may be a symlink or a hard link — a config kept in a dotfiles tree
-usually is — so to use a linked `groove.toml` from a project root, name it
-with `--config`.
+1048576 byte limit`). A file in an untrusted location (see
+[Trusted and untrusted config locations](#trusted-and-untrusted-config-locations):
+found at priority 2 or 3 outside every trusted root) is also read the way the
+frontmatter schema and the golden file are: a hard link, anything that is not
+a regular file (a named pipe, a device) and, on Linux and macOS, a symlink are
+refused rather than followed, because whoever writes that directory chose what
+is at that name. A file in a trusted location — named with `--config`, beside
+the binary, or found under a trusted root such as the config home
+`groove service install` writes to — may be a symlink or a hard link, as a config kept
+in a dotfiles tree usually is. To use a linked `groove.toml` from a project
+root, name it with `--config`.
 
 The chosen file is logged to stderr at startup as
 `grooveseek::config: loaded config source=... path=... trust=...`, so you can see

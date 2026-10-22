@@ -306,12 +306,15 @@ bind = "127.0.0.1:3100"
 
 どのファイルが選ばれても、groove が読むのは最大 1 MiB で、それより大きいファイルは
 拒否する (`refusing to read the config: <path>: it is N bytes, over the
-1048576 byte limit`)。優先度 2 / 3 で見つけたファイルは、さらに frontmatter の
+1048576 byte limit`)。信頼しない置き場所のファイル
+([信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。
+優先度 2 / 3 で、信頼する根のどれの下でもない場所で見つけたもの) は、さらに frontmatter の
 スキーマや golden ファイルと同じ読み方をする: ハードリンク、通常ファイルでないもの
 (名前付きパイプ、デバイス)、Linux / macOS ではシンボリックリンクを、辿らずに拒否する。
 その名前に何を置くかを決めたのは、そのディレクトリに書ける者だからである。
-`--config` で名指ししたファイルとバイナリの隣のファイルは、シンボリックリンクでも
-ハードリンクでもよい (dotfiles の管理下に置いた config はたいていそうなる)。
+信頼する置き場所のファイル — `--config` で名指ししたもの、バイナリの隣のもの、
+`groove service install` が書く config home のような信頼する根の下で見つけたもの — は、
+シンボリックリンクでもハードリンクでもよい (dotfiles の管理下に置いた config はたいていそうなる)。
 プロジェクトルートの `groove.toml` がリンクなら、`--config` で名指しすること。
 
 起動時に stderr へ `grooveseek::config: loaded config source=... path=... trust=...`

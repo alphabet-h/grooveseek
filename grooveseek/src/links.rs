@@ -345,9 +345,54 @@ pub(crate) fn read_checked(path: &Path, cap: u64) -> std::io::Result<Content> {
 /// One conversion for all of them (AGENTS.md, "One question gets one
 /// implementation"); eval and the schema loader each carried their own copy.
 pub(crate) fn read_required(path: &Path, cap: u64, what: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    required(read_checked(path, cap), path, what)
+}
+
+/// (AX-34) [`read_required`] for a file the operator named themselves, such as
+/// `groove --config <PATH>`: the read is bounded by `cap` the same way, but
+/// links are followed and the link count is not asked. The operator chose the
+/// name, and a file kept in a dotfiles tree is commonly a symlink or a hard
+/// link to one elsewhere. Absence and failures are worded as in
+/// [`read_required`], through the same conversion.
+pub(crate) fn read_required_following(
+    path: &Path,
+    cap: u64,
+    what: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    required(read_following(path, cap), path, what)
+}
+
+/// The bounded read behind [`read_required_following`]: plain `File::open`,
+/// then the same two size checks [`read_checked`] makes -- the handle's length,
+/// and what was actually read, so a device or a pipe with no length is bounded
+/// too.
+fn read_following(path: &Path, cap: u64) -> std::io::Result<Content> {
+    use std::io::Read;
+
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > cap {
+        return Ok(Content::Refused(Refused::TooLarge { len, cap }));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    let read = bytes.len() as u64;
+    if read > cap {
+        return Ok(Content::Refused(Refused::TooLarge { len: read, cap }));
+    }
+    Ok(Content::Bytes(bytes))
+}
+
+/// The one conversion from a read's outcome to what a caller that cannot go on
+/// without the file gets back.
+fn required(
+    outcome: std::io::Result<Content>,
+    path: &Path,
+    what: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
     use anyhow::Context as _;
 
-    match read_checked(path, cap) {
+    match outcome {
         Ok(Content::Bytes(bytes)) => Ok(Some(bytes)),
         Ok(Content::Refused(refused)) => anyhow::bail!(
             "refusing to read the {what}: {}: {}",

@@ -32,7 +32,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   directory missed the document and one filtered on the old directory still found it, until
   `--force` or an edit. The category is now taken from the new path, and so is the topic unless the
   document's frontmatter sets one, which is kept. A frontmatter topic that happens to equal the old
-  path's directory name is indistinguishable from a path-derived one and moves too.
+  path's directory name is indistinguishable from a path-derived one and is replaced too; since the
+  content hash still matches, the next incremental run does not restore it either, and it stays
+  replaced until `--force` or an edit to the document.
 
 ### Security
 
@@ -41,12 +43,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time
   the scan started, indexing files outside the knowledge base under in-KB names. Links below it
   were already skipped.
-- **`groove.toml` is read through a size limit, and a found one through the checked read.** Any
-  config file over 1 MiB is now refused instead of read whole. A `groove.toml` discovery found in
-  the working directory or at the git root — not one named with `--config` — is also refused when
-  it is a hard link, not a regular file (a named pipe would hang startup) or, on Linux and macOS, a
-  symlink, as the frontmatter schema and the golden file already were. Name a linked config with
-  `--config` to use it. See [Config file discovery](docs/configuration.md#config-file-discovery).
+- **The `groove.toml` that commands load is read through a size limit, and an untrusted one
+  through the checked read.** The config `groove` loads at startup (`--config`, the working
+  directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole;
+  `groove service` and the tray, which read their own configs, are unchanged. A `groove.toml` found
+  in the working directory or at the git root outside every trusted config location is also
+  refused when it is a hard link, not a regular file (a named pipe would hang startup) or, on Linux
+  and macOS, a symlink, as the frontmatter schema and the golden file already were. Name a linked
+  config with `--config` to use it. See
+  [Config file discovery](docs/configuration.md#config-file-discovery).
 - **CI runs with a read-only `GITHUB_TOKEN`.** `ci.yml` now declares `permissions: contents: read`
   at the top level instead of inheriting the repository default.
 

@@ -653,56 +653,37 @@ impl Default for ContextualConfig {
 /// lands on the name (a device, a multi-gigabyte file) takes the whole process with it.
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
-/// (AX-34) How a config file is read, by how it was reached.
+/// (AX-34) How a config file is read. Chosen from [`classify_trust`], which decides from where
+/// the file is and never from what it says, so it is known before the file is opened.
 #[derive(Clone, Copy)]
 enum ConfigRead {
-    /// Named by the operator (`--config`, or the file beside the binary): links are followed
-    /// and only the size is bounded. A config kept in a dotfiles tree is commonly reached
-    /// through a symlink or a hard link, and refusing it would break a setup that only its
-    /// owner could have made.
-    Named,
-    /// Found by discovery in the cwd or at the git root: [`crate::links::read_required`].
-    Found,
+    /// A trusted location (`--config`, the file beside the binary, or a found file under a
+    /// [`TrustRoots`] root): links are followed and only the size is bounded
+    /// ([`crate::links::read_required_following`]). A config kept in a dotfiles tree is
+    /// commonly reached through a symlink or a hard link, and refusing it would break a setup
+    /// that only its owner could have made.
+    Following,
+    /// An untrusted location (found in the cwd or at the git root, outside every root): the
+    /// checked read the schema and the golden file use ([`crate::links::read_required`]).
+    Checked,
+}
+
+impl ConfigRead {
+    fn for_trust(trust: ConfigTrust) -> Self {
+        match trust {
+            ConfigTrust::Trusted => Self::Following,
+            ConfigTrust::Untrusted => Self::Checked,
+        }
+    }
 }
 
 /// The bytes of the config file, or `None` when there is no file at that name.
 fn read_config_bytes(path: &Path, read: ConfigRead) -> Result<Option<Vec<u8>>> {
     match read {
-        ConfigRead::Found => crate::links::read_required(path, MAX_CONFIG_FILE_BYTES, "config"),
-        ConfigRead::Named => {
-            use std::io::Read as _;
-            if !path.exists() {
-                return Ok(None);
-            }
-            let failed = || format!("failed to read config: {}", path.display());
-            let file = std::fs::File::open(path).with_context(failed)?;
-            let mut bytes = Vec::new();
-            (&file)
-                .take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .with_context(failed)?;
-            let read = bytes.len() as u64;
-            if read > MAX_CONFIG_FILE_BYTES {
-                // The handle's own length when it has one; a device or a pipe reports none,
-                // and then what was read is the most that can be said.
-                let len = file
-                    .metadata()
-                    .map(|m| m.len())
-                    .ok()
-                    .filter(|&len| len > MAX_CONFIG_FILE_BYTES)
-                    .unwrap_or(read);
-                let refused = crate::links::Refused::TooLarge {
-                    len,
-                    cap: MAX_CONFIG_FILE_BYTES,
-                };
-                anyhow::bail!(
-                    "refusing to read the config: {}: {}",
-                    path.display(),
-                    refused.reason()
-                );
-            }
-            Ok(Some(bytes))
+        ConfigRead::Following => {
+            crate::links::read_required_following(path, MAX_CONFIG_FILE_BYTES, "config")
         }
+        ConfigRead::Checked => crate::links::read_required(path, MAX_CONFIG_FILE_BYTES, "config"),
     }
 }
 
@@ -755,7 +736,7 @@ impl Config {
         alongside: Option<&Path>,
         roots: &TrustRoots,
     ) -> Result<Discovered> {
-        let (mut config, source, path) = Self::discover_located(explicit, cwd, alongside)?;
+        let (mut config, source, path) = Self::discover_located(explicit, cwd, alongside, roots)?;
         let trust = classify_trust(source, path.as_deref(), roots);
         if trust == ConfigTrust::Untrusted {
             // path は Cwd / GitRoot でのみ Untrusted になり、その 2 つは必ず
@@ -772,22 +753,36 @@ impl Config {
     }
 
     /// `discover` のフル注入版 (テスト専用)。バイナリ隣のパスも override する。
+    ///
+    /// 信頼の根は空で渡す: 見つけたファイルは checked read で読まれる (AX-34)。
     #[cfg(test)]
     pub(crate) fn discover_with_alongside(
         explicit: Option<&Path>,
         cwd: &Path,
         alongside: Option<&Path>,
     ) -> Result<(Self, ConfigSource)> {
-        let (cfg, source, _) = Self::discover_located(explicit, cwd, alongside)?;
+        let no_roots = TrustRoots::new(Vec::new(), None);
+        let (cfg, source, _) = Self::discover_located(explicit, cwd, alongside, &no_roots)?;
         Ok((cfg, source))
     }
 
     /// 探索本体。読んだファイルのパスも返す (信頼判定に要る)。
+    ///
+    /// (AX-34) `roots` は読み方を選ぶためだけに使う。[`classify_trust`] は置き場所だけで
+    /// 決まるので、ファイルを開く前に呼べる。制限 ([`Self::restrict_untrusted`]) を掛けるのは
+    /// 呼び出し側 ([`Self::discover_in`]) のまま。
     fn discover_located(
         explicit: Option<&Path>,
         cwd: &Path,
         alongside: Option<&Path>,
+        roots: &TrustRoots,
     ) -> Result<(Self, ConfigSource, Option<PathBuf>)> {
+        let found = |source: ConfigSource, path: &Path| {
+            Self::load_with(
+                path,
+                ConfigRead::for_trust(classify_trust(source, Some(path), roots)),
+            )
+        };
         // 1. 明示 (--config)
         if let Some(p) = explicit {
             // `~` 展開を噛ませる。OsStr → String の変換は lossy で十分 (パスが
@@ -815,7 +810,7 @@ impl Config {
         // 2. CWD 直下
         let cwd_toml = cwd.join("groove.toml");
         if cwd_toml.exists() {
-            let cfg = Self::load_found(&cwd_toml).with_context(|| {
+            let cfg = found(ConfigSource::Cwd, &cwd_toml).with_context(|| {
                 format!("failed to load config from cwd {}", cwd_toml.display())
             })?;
             return Ok((cfg, ConfigSource::Cwd, Some(cwd_toml)));
@@ -825,7 +820,7 @@ impl Config {
         if let Some(root) = find_git_root(cwd) {
             let git_toml = root.join("groove.toml");
             if git_toml.exists() {
-                let cfg = Self::load_found(&git_toml).with_context(|| {
+                let cfg = found(ConfigSource::GitRoot, &git_toml).with_context(|| {
                     format!("failed to load config from git root {}", git_toml.display())
                 })?;
                 return Ok((cfg, ConfigSource::GitRoot, Some(git_toml)));
@@ -1212,22 +1207,15 @@ impl Config {
     /// 基点に解決する (cwd ではない)。
     ///
     /// (AX-34) The file is read the way an explicit `--config` is: links are followed, and
-    /// only [`MAX_CONFIG_FILE_BYTES`] bounds the read. A config groove found by itself goes
-    /// through [`Self::load_found`] instead.
+    /// only [`MAX_CONFIG_FILE_BYTES`] bounds the read. A config discovery found in the cwd or
+    /// at the git root is read by [`Self::discover_located`] instead, the way its location's
+    /// trust says: an untrusted one goes through the checked read the schema and the golden
+    /// file use ([`crate::links::read_required`]), which refuses a hard link, anything that is
+    /// not a regular file (a named pipe would otherwise hang startup) and, on Unix, a symlink.
+    /// The read can be chosen before the file is opened because [`classify_trust`] decides
+    /// from the location alone.
     pub fn load_from(path: &Path) -> Result<Self> {
-        Self::load_with(path, ConfigRead::Named)
-    }
-
-    /// (AX-34) [`Self::load_from`] for a config discovery found in the cwd or at the git root
-    /// rather than one the operator named. Those are names whoever writes the directory
-    /// controls -- the reason [`classify_trust`] can call them untrusted -- so the file goes
-    /// through the checked read the schema and the golden file use
-    /// ([`crate::links::read_required`]): a hard link, anything that is not a regular file (a
-    /// named pipe would otherwise hang startup) and, on Unix, a symlink are refused, as is a
-    /// file over the cap. Which read applies is decided by where the file was found, before
-    /// trust is classified, because trust is classified from what the file says.
-    fn load_found(path: &Path) -> Result<Self> {
-        Self::load_with(path, ConfigRead::Found)
+        Self::load_with(path, ConfigRead::Following)
     }
 
     fn load_with(path: &Path, read: ConfigRead) -> Result<Self> {
@@ -1235,7 +1223,7 @@ impl Config {
             return Ok(Self::default());
         };
         let text = String::from_utf8(bytes)
-            .with_context(|| format!("failed to read config: {}", path.display()))?;
+            .with_context(|| format!("failed to read the config: {}", path.display()))?;
         let mut cfg: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
 
@@ -6193,9 +6181,9 @@ lambda = 0.5
         assert_eq!(d.source, ConfigSource::Cwd);
     }
 
-    /// A found config is a name whoever writes the directory controls, so it goes through the
-    /// same checked read as the schema and the golden file: a hard link (which needs no
-    /// privilege anywhere) is refused.
+    /// A found config outside every trust root is a name whoever writes the directory controls,
+    /// so it goes through the same checked read as the schema and the golden file: a hard link
+    /// (which needs no privilege anywhere) is refused.
     #[test]
     fn a_found_config_that_is_a_hard_link_is_refused() {
         let dir = TempDir::new("groove-ax34-found-hardlink");
@@ -6205,6 +6193,37 @@ lambda = 0.5
         std::fs::hard_link(&original, dir.path().join("groove.toml"))
             .expect("hard links need no privilege");
         let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("hard link"), "{err}");
+    }
+
+    /// The read follows the location's trust, not the fact that the file was found: the same
+    /// hard-linked `groove.toml` loads when its directory is under a trust root (the config
+    /// home `groove service install` writes to, for one) and is refused when it is not.
+    #[test]
+    fn a_found_hard_link_loads_under_a_trust_root_and_is_refused_outside_one() {
+        let home = TempDir::new("groove-ax34-root-home");
+        let outside = TempDir::new("groove-ax34-root-outside");
+        let elsewhere = TempDir::new("groove-ax34-root-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        for dir in [home.path(), outside.path()] {
+            std::fs::hard_link(&original, dir.join("groove.toml"))
+                .expect("hard links need no privilege");
+        }
+        let roots = roots_for(Some(home.path()), None);
+
+        let d = Config::discover_in(None, home.path(), None, &roots)
+            .expect("a found hard link under a trust root loads");
+        assert_eq!(d.source, ConfigSource::Cwd);
+        assert_eq!(d.trust, ConfigTrust::Trusted);
+        assert_eq!(d.config.model, Some(ModelChoice::BgeM3));
+
+        let err = format!(
+            "{:#}",
+            Config::discover_in(None, outside.path(), None, &roots)
+                .expect_err("the same link outside every root is refused")
+        );
         assert!(err.contains("refusing to read the config"), "{err}");
         assert!(err.contains("hard link"), "{err}");
     }
