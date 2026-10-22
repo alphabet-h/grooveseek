@@ -351,6 +351,12 @@ it as yours:
   and "no file at all".
 - **Untrusted**: anything else found under the cwd or a `.git` ancestor.
 
+The directory holding a found file is resolved (its links followed) once, before
+the file is opened, and the file is then opened in that resolved directory. The
+same answer decides whether the restrictions below apply and is the `trust=` the
+startup log reports, so repointing a link on the way while groove starts cannot
+change it.
+
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
 `[watch]`, `[contextual]`, `[index].fail_on_frontmatter_error` — is honoured

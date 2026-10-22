@@ -348,12 +348,14 @@ pub(crate) fn read_required(path: &Path, cap: u64, what: &str) -> anyhow::Result
     required(read_checked(path, cap), path, what)
 }
 
-/// (AX-34) [`read_required`] for a file the operator named themselves, such as
-/// `groove --config <PATH>`: the read is bounded by `cap` the same way, but
-/// links are followed and the link count is not asked. The operator chose the
-/// name, and a file kept in a dotfiles tree is commonly a symlink or a hard
-/// link to one elsewhere. Absence and failures are worded as in
-/// [`read_required`], through the same conversion.
+/// (AX-34) [`read_required`] for a file at a trusted location: one the operator
+/// named themselves, such as `groove --config <PATH>`, or a config found under
+/// a trust root (the config home `groove service install` writes to). The read
+/// is bounded by `cap` the same way, but links are followed and the link count
+/// is not asked. Whoever could put a file there is the operator, and a file
+/// kept in a dotfiles tree is commonly a symlink or a hard link to one
+/// elsewhere. Absence and failures are worded as in [`read_required`], through
+/// the same conversion.
 pub(crate) fn read_required_following(
     path: &Path,
     cap: u64,

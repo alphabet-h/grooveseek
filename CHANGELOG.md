@@ -50,7 +50,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   in the working directory or at the git root outside every trusted config location is also
   refused when it is a hard link, not a regular file (a named pipe would hang startup) or, on Linux
   and macOS, a symlink, as the frontmatter schema and the golden file already were. Name a linked
-  config with `--config` to use it. See
+  config with `--config` to use it. Whether a found config is trusted is decided once, before it
+  is opened, and that one answer chooses how it is read, which file is opened (the one in the
+  directory that was judged), whether the restrictions apply and what the startup log reports, so
+  repointing a parent directory while the file is read can no longer make it count as trusted. See
   [Config file discovery](docs/configuration.md#config-file-discovery).
 - **CI runs with a read-only `GITHUB_TOKEN`.** `ci.yml` now declares `permissions: contents: read`
   at the top level instead of inheriting the repository default.

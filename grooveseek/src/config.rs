@@ -654,8 +654,9 @@ impl Default for ContextualConfig {
 /// lands on the name (a device, a multi-gigabyte file) takes the whole process with it.
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
-/// (AX-34) How a config file is read. Chosen from [`classify_trust`], which decides from where
-/// the file is and never from what it says, so it is known before the file is opened.
+/// (AX-34) How a config file is read. Chosen from [`classify_trust_located`], which decides
+/// from where the file is and never from what it says, so it is known before the file is
+/// opened.
 #[derive(Clone, Copy)]
 enum ConfigRead {
     /// A trusted location (`--config`, the file beside the binary, or a found file under a
@@ -737,18 +738,25 @@ impl Config {
         alongside: Option<&Path>,
         roots: &TrustRoots,
     ) -> Result<Discovered> {
-        let (mut config, source, path) = Self::discover_located(explicit, cwd, alongside, roots)?;
-        let trust = classify_trust(source, path.as_deref(), roots);
-        if trust == ConfigTrust::Untrusted {
-            // path は Cwd / GitRoot でのみ Untrusted になり、その 2 つは必ず
-            // ファイル由来なので `Some`。防御的に unwrap は避ける。
-            let dir = path.as_deref().and_then(Path::parent);
-            config.restrict_untrusted(path.as_deref(), dir, roots)?;
+        // (codex P1, round 2 on PR #388) The trust comes back from the read: it was decided
+        // once, before the file was opened, and the same value chooses the restriction and is
+        // reported. Deciding it again here would resolve the location after the read, and a
+        // parent directory swapped in between would turn a file read as untrusted into one
+        // treated as trusted.
+        let Located {
+            mut config,
+            source,
+            path,
+            decision,
+        } = Self::discover_located(explicit, cwd, alongside, roots)?;
+        if decision.trust == ConfigTrust::Untrusted {
+            // The directory the decision resolved, not the path's parent resolved anew.
+            config.restrict_untrusted(path.as_deref(), decision.canonical_dir.as_deref(), roots)?;
         }
         Ok(Discovered {
             config,
             source,
-            trust,
+            trust: decision.trust,
             path,
         })
     }
@@ -763,26 +771,36 @@ impl Config {
         alongside: Option<&Path>,
     ) -> Result<(Self, ConfigSource)> {
         let no_roots = TrustRoots::new(Vec::new(), None);
-        let (cfg, source, _) = Self::discover_located(explicit, cwd, alongside, &no_roots)?;
-        Ok((cfg, source))
+        let located = Self::discover_located(explicit, cwd, alongside, &no_roots)?;
+        Ok((located.config, located.source))
     }
 
-    /// 探索本体。読んだファイルのパスも返す (信頼判定に要る)。
+    /// 探索本体。読んだファイルのパスと、読む前に決めた信頼判定も返す。
     ///
-    /// (AX-34) `roots` は読み方を選ぶためだけに使う。[`classify_trust`] は置き場所だけで
-    /// 決まるので、ファイルを開く前に呼べる。制限 ([`Self::restrict_untrusted`]) を掛けるのは
-    /// 呼び出し側 ([`Self::discover_in`]) のまま。
+    /// (AX-34) [`classify_trust_located`] は置き場所だけで決まるので、ファイルを開く前に
+    /// 呼べる。その判定で読み方を選び、見つけた config は判定が解決したパス
+    /// ([`TrustDecision::open`]) で開く。制限 ([`Self::restrict_untrusted`]) を掛けるのは
+    /// 呼び出し側 ([`Self::discover_in`]) のままで、同じ判定 ([`Located::decision`]) を使う
+    /// (codex P1, round 2 on PR #388: 判定は 1 回、読んだ後に解き直さない)。
     fn discover_located(
         explicit: Option<&Path>,
         cwd: &Path,
         alongside: Option<&Path>,
         roots: &TrustRoots,
-    ) -> Result<(Self, ConfigSource, Option<PathBuf>)> {
-        let found = |source: ConfigSource, path: &Path| {
-            Self::load_with(
-                path,
-                ConfigRead::for_trust(classify_trust(source, Some(path), roots)),
-            )
+    ) -> Result<Located> {
+        let found = |source: ConfigSource, path: &Path| -> Result<(Self, TrustDecision)> {
+            let decision = classify_trust_located(source, Some(path), roots);
+            let open = decision.open.as_deref().unwrap_or(path);
+            let cfg = Self::load_opening(path, open, ConfigRead::for_trust(decision.trust))?;
+            Ok((cfg, decision))
+        };
+        // Sources whose trust does not depend on where the file is: deciding it touches no
+        // file, and it is still the one decision that is carried out.
+        let fixed = |config: Self, source: ConfigSource, path: Option<PathBuf>| Located {
+            decision: classify_trust_located(source, path.as_deref(), roots),
+            config,
+            source,
+            path,
         };
         // 1. 明示 (--config)
         if let Some(p) = explicit {
@@ -805,26 +823,37 @@ impl Config {
             let cfg = Self::load_from(&resolved).with_context(|| {
                 format!("failed to load config from --config {}", resolved.display())
             })?;
-            return Ok((cfg, ConfigSource::Explicit, Some(resolved)));
+            return Ok(fixed(cfg, ConfigSource::Explicit, Some(resolved)));
         }
 
         // 2. CWD 直下
         let cwd_toml = cwd.join("groove.toml");
         if cwd_toml.exists() {
-            let cfg = found(ConfigSource::Cwd, &cwd_toml).with_context(|| {
+            let (cfg, decision) = found(ConfigSource::Cwd, &cwd_toml).with_context(|| {
                 format!("failed to load config from cwd {}", cwd_toml.display())
             })?;
-            return Ok((cfg, ConfigSource::Cwd, Some(cwd_toml)));
+            return Ok(Located {
+                config: cfg,
+                source: ConfigSource::Cwd,
+                path: Some(cwd_toml),
+                decision,
+            });
         }
 
         // 3. .git 祖先
         if let Some(root) = find_git_root(cwd) {
             let git_toml = root.join("groove.toml");
             if git_toml.exists() {
-                let cfg = found(ConfigSource::GitRoot, &git_toml).with_context(|| {
-                    format!("failed to load config from git root {}", git_toml.display())
-                })?;
-                return Ok((cfg, ConfigSource::GitRoot, Some(git_toml)));
+                let (cfg, decision) =
+                    found(ConfigSource::GitRoot, &git_toml).with_context(|| {
+                        format!("failed to load config from git root {}", git_toml.display())
+                    })?;
+                return Ok(Located {
+                    config: cfg,
+                    source: ConfigSource::GitRoot,
+                    path: Some(git_toml),
+                    decision,
+                });
             }
         }
 
@@ -835,11 +864,15 @@ impl Config {
             let cfg = Self::load_from(side).with_context(|| {
                 format!("failed to load config alongside binary {}", side.display())
             })?;
-            return Ok((cfg, ConfigSource::AlongsideBinary, Some(side.to_path_buf())));
+            return Ok(fixed(
+                cfg,
+                ConfigSource::AlongsideBinary,
+                Some(side.to_path_buf()),
+            ));
         }
 
         // 5. 未発見 → Default
-        Ok((Self::default(), ConfigSource::NotFound, None))
+        Ok(fixed(Self::default(), ConfigSource::NotFound, None))
     }
 
     /// 信頼できない場所で見つかった config に制限を掛ける (BU-07)。
@@ -858,6 +891,11 @@ impl Config {
     /// (または落とすだけ) で続行する。ここで起動を止めると、Windows daemon が **何の出力も残さずに
     /// 死ぬ** (`groove-svc` が stdio を `Stdio::null()` にするため、利用者には
     /// 「動かない」以上の情報が出ない)。
+    ///
+    /// `config_dir` is the directory holding the config **as the trust decision resolved it**
+    /// ([`TrustDecision::canonical_dir`]), and it is compared as handed: resolving it again
+    /// after the read would look at whatever its links point to by then (codex P1, round 2 on
+    /// PR #388).
     fn restrict_untrusted(
         &mut self,
         config_path: Option<&Path>,
@@ -1006,7 +1044,7 @@ impl Config {
         // 「--kb-path is required」で止める — 危険な値が使われないことは
         // 変わらず、正当な上書きだけが通るようになる。
         if let Some(kb) = self.kb_path.as_deref()
-            && let Some(reason) = forbidden_kb_path(kb, config_dir, roots)
+            && let Some(reason) = forbidden_kb_path_resolved(kb, config_dir, roots)
         {
             tracing::warn!(
                 config = %shown.display(),
@@ -1213,14 +1251,19 @@ impl Config {
     /// trust says: an untrusted one goes through the checked read the schema and the golden
     /// file use ([`crate::links::read_required`]), which refuses a hard link, anything that is
     /// not a regular file (a named pipe would otherwise hang startup) and, on Unix, a symlink.
-    /// The read can be chosen before the file is opened because [`classify_trust`] decides
-    /// from the location alone.
+    /// The read can be chosen before the file is opened because [`classify_trust_located`]
+    /// decides from the location alone.
     pub fn load_from(path: &Path) -> Result<Self> {
-        Self::load_with(path, ConfigRead::Following)
+        Self::load_opening(path, path, ConfigRead::Following)
     }
 
-    fn load_with(path: &Path, read: ConfigRead) -> Result<Self> {
-        let Some(bytes) = read_config_bytes(path, read)? else {
+    /// Reads a config, given two paths: the one to name and the one to open. They differ for a
+    /// found config: the one opened is the file under the directory its trust decision
+    /// resolved ([`TrustDecision::open`]), so the file read is the one in the directory that
+    /// was judged, while the path as found names the file in messages and is the base relative
+    /// fields resolve against, as before.
+    fn load_opening(path: &Path, open: &Path, read: ConfigRead) -> Result<Self> {
+        let Some(bytes) = read_config_bytes(open, read)? else {
             return Ok(Self::default());
         };
         let text = String::from_utf8(bytes)
@@ -1616,6 +1659,38 @@ pub struct Discovered {
     pub path: Option<PathBuf>,
 }
 
+/// What [`Config::discover_located`] found, together with the trust decision the read was
+/// chosen by. [`Config::discover_in`] takes the restriction and [`Discovered::trust`] from
+/// that decision instead of deciding again (codex P1, round 2 on PR #388).
+struct Located {
+    config: Config,
+    source: ConfigSource,
+    /// The file as found (`None` for [`ConfigSource::NotFound`]).
+    path: Option<PathBuf>,
+    decision: TrustDecision,
+}
+
+/// The trust of a config's location, decided once before the file is opened
+/// ([`classify_trust_located`]), with what the decision resolved on the way.
+///
+/// Everything that depends on where a found config is reads it from here: how the file is
+/// read, which file is opened, whether [`Config::restrict_untrusted`] applies and what its
+/// `kb_path` check compares with, and what is reported. Resolving the location a second
+/// time is the window in which a swapped parent directory changes the answer.
+#[derive(Debug, Clone)]
+struct TrustDecision {
+    trust: ConfigTrust,
+    /// For a found config (`Cwd` / `GitRoot`), the directory holding it as the decision
+    /// resolved it: canonical, or as written when it could not be canonicalized
+    /// ([`canonical_or_as_is`]). `None` for the sources whose trust does not depend on the
+    /// location.
+    canonical_dir: Option<PathBuf>,
+    /// The path to open: for a found config, its file name under
+    /// [`Self::canonical_dir`], so the file read is the one in the directory that was judged
+    /// even if a link on the way is repointed after the decision. Otherwise the path as given.
+    open: Option<PathBuf>,
+}
+
 /// 発見した `groove.toml` を**運用者が書いたもの**として扱ってよいか。
 ///
 /// 判定材料は**置き場所だけ**で、ファイルの中身は一切見ない (git が
@@ -1766,12 +1841,31 @@ impl TrustRoots {
         }
     }
 
-    fn contains(&self, dir: &Path) -> bool {
-        let dir = canonical_or_as_is(dir);
+    /// Whether `dir` -- already resolved by the caller, [`classify_trust_located`] -- is under
+    /// a root. Only the roots are canonicalized here: they come from the environment, not from
+    /// the directory being judged, and resolving `dir` again would be a second resolution of
+    /// the found config's location.
+    fn contains_resolved(&self, dir: &Path) -> bool {
+        #[cfg(test)]
+        TRUST_ROOT_CHECKS.with(|c| c.set(c.get() + 1));
         self.roots
             .iter()
             .any(|r| dir.starts_with(canonical_or_as_is(r)))
     }
+}
+
+// (codex P1, round 2 on PR #388) How many times the current thread asked the trust roots
+// whether a found config's directory is under one of them -- that is, how many times a
+// found config's location was resolved for its trust. Discovery must resolve it once,
+// before the read, and carry the answer; a second resolution after the read is the
+// window in which a swapped parent directory changes the answer.
+//
+// Thread-local and reset-before-use for the same reasons as `db::FTS_CANDIDATE_CALLS`.
+// (A doc comment cannot be used here -- `thread_local!` is a macro.)
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TRUST_ROOT_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// `canonicalize` できればそれを、できなければ入力をそのまま返す。
@@ -1784,25 +1878,66 @@ fn canonical_or_as_is(p: &Path) -> PathBuf {
 }
 
 /// 置き場所だけから信頼を決める (BU-07)。ファイル内容は見ない。
+///
+/// (codex P1, round 2 on PR #388) 見つけた config (`Cwd` / `GitRoot`) の置き場所を解決するのは
+/// **ここで 1 回だけ**。親ディレクトリを [`canonical_or_as_is`] で解き、その値で root の内外を
+/// 決め、同じ値の下のファイル名を開く path にして [`TrustDecision`] に入れて返す。呼び出し側は
+/// それを読み方・開く file・[`Config::restrict_untrusted`]・報告のすべてに使い、読んだ後に
+/// 解き直さない。
+///
+/// 親ディレクトリを `canonicalize` できない時 (権限で辿れない等) は字面のまま判定し、字面の
+/// path を開く — 以前と同じ挙動。字面が root の下にあれば Trusted、そうでなければ Untrusted。
+fn classify_trust_located(
+    source: ConfigSource,
+    path: Option<&Path>,
+    roots: &TrustRoots,
+) -> TrustDecision {
+    let fixed = |trust| TrustDecision {
+        trust,
+        canonical_dir: None,
+        open: path.map(Path::to_path_buf),
+    };
+    match source {
+        // argv は信頼する入力。argv が敵性なら `command` 自体が敵性なので、
+        // この層で守れるものは無い。
+        ConfigSource::Explicit => fixed(ConfigTrust::Trusted),
+        // 書き込むにはインストール先への書き込み権限が要る。それがあるなら
+        // バイナリ自体を差し替える方が早い。
+        ConfigSource::AlongsideBinary => fixed(ConfigTrust::Trusted),
+        // ファイルが無い = 組み込み既定値。
+        ConfigSource::NotFound => fixed(ConfigTrust::Trusted),
+        ConfigSource::Cwd | ConfigSource::GitRoot => {
+            let (Some(path), Some(dir)) = (path, path.and_then(Path::parent)) else {
+                return fixed(ConfigTrust::Untrusted);
+            };
+            let canonical_dir = canonical_or_as_is(dir);
+            let trust = if roots.contains_resolved(&canonical_dir) {
+                ConfigTrust::Trusted
+            } else {
+                ConfigTrust::Untrusted
+            };
+            let open = match path.file_name() {
+                Some(name) => canonical_dir.join(name),
+                None => path.to_path_buf(),
+            };
+            TrustDecision {
+                trust,
+                canonical_dir: Some(canonical_dir),
+                open: Some(open),
+            }
+        }
+    }
+}
+
+/// [`classify_trust_located`] の trust だけ。production は判定を運ぶために
+/// [`classify_trust_located`] を直接呼ぶ。置き場所の規則そのものを確かめる test の入口。
+#[cfg(test)]
 pub(crate) fn classify_trust(
     source: ConfigSource,
     path: Option<&Path>,
     roots: &TrustRoots,
 ) -> ConfigTrust {
-    match source {
-        // argv は信頼する入力。argv が敵性なら `command` 自体が敵性なので、
-        // この層で守れるものは無い。
-        ConfigSource::Explicit => ConfigTrust::Trusted,
-        // 書き込むにはインストール先への書き込み権限が要る。それがあるなら
-        // バイナリ自体を差し替える方が早い。
-        ConfigSource::AlongsideBinary => ConfigTrust::Trusted,
-        // ファイルが無い = 組み込み既定値。
-        ConfigSource::NotFound => ConfigTrust::Trusted,
-        ConfigSource::Cwd | ConfigSource::GitRoot => match path.and_then(Path::parent) {
-            Some(dir) if roots.contains(dir) => ConfigTrust::Trusted,
-            _ => ConfigTrust::Untrusted,
-        },
-    }
+    classify_trust_located(source, path, roots).trust
 }
 
 /// `SocketAddr` の IP が loopback でないか。
@@ -1920,6 +2055,19 @@ pub(crate) fn env_cache_dir_is_usable() -> bool {
     env_dir("FASTEMBED_CACHE_DIR").is_some()
 }
 
+/// [`forbidden_kb_path_resolved`] の test の入口。`config_dir` を `canonicalize` してから渡す。
+/// production ([`Config::restrict_untrusted`]) は信頼判定が解決した dir
+/// ([`TrustDecision::canonical_dir`]) をそのまま渡し、読んだ後に解き直さない。
+#[cfg(test)]
+pub(crate) fn forbidden_kb_path(
+    kb_path: &Path,
+    config_dir: Option<&Path>,
+    roots: &TrustRoots,
+) -> Option<&'static str> {
+    let config_dir = config_dir.map(canonical_or_as_is);
+    forbidden_kb_path_resolved(kb_path, config_dir.as_deref(), roots)
+}
+
 /// 信頼できない config が `kb_path` に指定してはいけない場所か。
 /// 該当すれば理由 (エラーメッセージ用) を返す。
 ///
@@ -1928,7 +2076,12 @@ pub(crate) fn env_cache_dir_is_usable() -> bool {
 /// (「project root に置いて絶対パスの `kb_path` を書く」と明記されている) が
 /// 壊れるため。塞ぐのは**ユーザ名を知らなくても書ける昇格**:
 /// `../..` / `/` / `C:\Users` / `/home` と、それらを指す symlink。
-pub(crate) fn forbidden_kb_path(
+///
+/// `config_dir` is compared **as handed**: it is the directory the trust decision resolved
+/// before the read ([`TrustDecision::canonical_dir`]), and resolving it again here would look
+/// at whatever its links point to after the read (codex P1, round 2 on PR #388). `kb_path`
+/// itself is still resolved here -- it is a value the config names, not the config's location.
+fn forbidden_kb_path_resolved(
     kb_path: &Path,
     config_dir: Option<&Path>,
     roots: &TrustRoots,
@@ -1963,7 +2116,6 @@ pub(crate) fn forbidden_kb_path(
         }
     }
     if let Some(dir) = config_dir {
-        let dir = canonical_or_as_is(dir);
         // 等しい場合は許す = 「このリポジトリ自身を索引する」通常の使い方。
         if dir.starts_with(&canon) && dir != canon {
             return Some("it is an ancestor of the directory holding the config file");
@@ -2013,14 +2165,14 @@ fn canonical_with_unresolved_tail(p: &Path) -> PathBuf {
 /// ない**」と宣言している。2 つが交わる — 置き場が KB の内側にある — と、「このフォルダを
 /// index して」が「このコードを実行して」に化ける。
 ///
-/// **[`forbidden_kb_path`] と違い trust では分岐しない。** あちらは「信頼できない config が
+/// **[`forbidden_kb_path_resolved`] と違い trust では分岐しない。** あちらは「信頼できない config が
 /// 書いてよい値か」を問うが、こちらの危険は config がどこで見つかったかと無関係に成り立つ。
 /// ADR-0013 が「有効化された言語が解決できなければ実行を止める。これは設定が trusted か
 /// どうかに関わらず成り立つ」と書いたのと同じ理由 — **同じ物理的状況が「どこで見つかったか」で
 /// 2 通りの意味を持ってはならない**。
 ///
 /// **存在しないパスは拒否しない。** plugin をまだ置いていない KB は正常な状態で、置き場が
-/// 無いことは R4 (iii) の文言が受ける。[`forbidden_kb_path`] が「解決できない symlink」を
+/// 無いことは R4 (iii) の文言が受ける。[`forbidden_kb_path_resolved`] が「解決できない symlink」を
 /// 拒否するのは、あちらが*索引される場所*を決めていて判定不能を素通しにできないからで、
 /// ここで同じ扱いをすると Markdown だけの利用者まで止まる。
 ///
@@ -6264,5 +6416,228 @@ lambda = 0.5
         let d = Config::discover_in(Some(&link), dir.path(), None, &roots_for(None, None))
             .expect("--config through a symlink loads");
         assert_eq!(d.config.model, Some(ModelChoice::BgeM3));
+    }
+
+    // =======================================================================
+    // codex P1, round 2 on PR #388: a found config's trust is decided once, before it is
+    // read, and that one answer chooses the read, decides the restriction and is reported
+    // =======================================================================
+
+    /// A directory link `link` -> `target`: a junction on Windows (`mklink /J` needs no
+    /// elevation, while a symlink does), a symlink on Unix. Asserted rather than skipped, as
+    /// the AX-35 / AV-11 junction tests do.
+    fn dir_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlinks need no privilege on unix");
+    }
+
+    /// How many times discovering from `cwd` asks the trust roots about a found config.
+    fn trust_root_checks_for(cwd: &Path, roots: &TrustRoots) -> (usize, Discovered) {
+        TRUST_ROOT_CHECKS.with(|c| c.set(0));
+        let d = Config::discover_in(None, cwd, None, roots).expect("discover ok");
+        (TRUST_ROOT_CHECKS.with(std::cell::Cell::get), d)
+    }
+
+    /// The location of a found config is resolved for its trust exactly once. A second
+    /// resolution after the read is what let a swapped parent directory turn a file read as
+    /// untrusted into one restricted -- and reported -- as trusted.
+    #[test]
+    fn a_found_config_has_its_location_resolved_for_trust_once() {
+        // Cwd, outside every root (untrusted) and under one (trusted).
+        let untrusted = TempDir::new("groove-pr388-once-cwd");
+        std::fs::write(untrusted.path().join("groove.toml"), "model = \"bge-m3\"\n").unwrap();
+        let (checks, d) = trust_root_checks_for(untrusted.path(), &roots_for(None, None));
+        assert_eq!(d.source, ConfigSource::Cwd);
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(checks, 1, "the cwd config's location is resolved once");
+
+        let home = TempDir::new("groove-pr388-once-root");
+        std::fs::write(home.path().join("groove.toml"), "model = \"bge-m3\"\n").unwrap();
+        let (checks, d) = trust_root_checks_for(home.path(), &roots_for(Some(home.path()), None));
+        assert_eq!(d.trust, ConfigTrust::Trusted);
+        assert_eq!(
+            checks, 1,
+            "a trusted cwd config's location is resolved once"
+        );
+
+        // GitRoot.
+        let repo = TempDir::new("groove-pr388-once-git");
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join("groove.toml"), "model = \"bge-m3\"\n").unwrap();
+        let nested = repo.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (checks, d) = trust_root_checks_for(&nested, &roots_for(None, None));
+        assert_eq!(d.source, ConfigSource::GitRoot);
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(checks, 1, "the git root config's location is resolved once");
+    }
+
+    /// [`Config::restrict_untrusted`] compares `kb_path` with the directory it is handed, as
+    /// handed: that directory is the one the trust decision resolved before the read, and
+    /// resolving it again here would look at whatever the link points to now. The directory
+    /// handed in below is a link into a child of `kb_path`; compared as written it is not
+    /// under `kb_path`, so `kb_path` stays. Resolving it again would drop it.
+    #[test]
+    fn restrict_untrusted_compares_with_the_directory_it_is_handed_without_resolving_it() {
+        let tmp = TempDir::new("groove-pr388-restrict-dir");
+        let top = tmp.path().join("top");
+        let deep = top.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &deep);
+
+        let mut cfg = Config {
+            kb_path: Some(top.clone()),
+            ..Config::default()
+        };
+        let shown = link.join("groove.toml");
+        cfg.restrict_untrusted(Some(&shown), Some(&link), &roots_for(None, None))
+            .expect("restrict ok");
+        assert_eq!(
+            cfg.kb_path.as_deref(),
+            Some(top.as_path()),
+            "the directory handed in is compared as written, not resolved again"
+        );
+    }
+
+    /// A found config is opened under the directory its trust was decided for: the decision
+    /// carries the canonical directory and the file name under it, so repointing a link on
+    /// the way after the decision cannot make the read land on another directory's file.
+    #[test]
+    fn a_found_config_is_opened_under_the_directory_its_trust_was_decided_for() {
+        let tmp = TempDir::new("groove-pr388-open");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &real);
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+
+        for source in [ConfigSource::Cwd, ConfigSource::GitRoot] {
+            let decision = classify_trust_located(
+                source,
+                Some(&link.join("groove.toml")),
+                &roots_for(None, None),
+            );
+            assert_eq!(decision.trust, ConfigTrust::Untrusted);
+            assert_eq!(
+                decision.canonical_dir.as_deref(),
+                Some(canonical_real.as_path())
+            );
+            assert_eq!(
+                decision.open,
+                Some(canonical_real.join("groove.toml")),
+                "{source:?}: the path opened is the one the trust was decided for"
+            );
+        }
+
+        // The same holds when the link leads under a trust root: the trusted (link-following)
+        // read opens the file in the root, not whatever the link points to later.
+        let decision = classify_trust_located(
+            ConfigSource::Cwd,
+            Some(&link.join("groove.toml")),
+            &roots_for(Some(&real), None),
+        );
+        assert_eq!(decision.trust, ConfigTrust::Trusted);
+        assert_eq!(decision.open, Some(canonical_real.join("groove.toml")));
+    }
+
+    /// Discovery opens [`TrustDecision::open`], not the path as found: the refusal of a
+    /// hard-linked config in a linked cwd names the file under the canonical directory,
+    /// which is the path the read was given (the outer context still names the file as
+    /// found).
+    #[test]
+    fn discovery_opens_the_path_the_trust_decision_resolved() {
+        let tmp = TempDir::new("groove-pr388-opened");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let elsewhere = TempDir::new("groove-pr388-opened-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        std::fs::hard_link(&original, real.join("groove.toml"))
+            .expect("hard links need no privilege");
+        let link = tmp.path().join("link");
+        dir_link(&link, &real);
+        let opened = std::fs::canonicalize(&real).unwrap().join("groove.toml");
+
+        let err = discover_err(&link);
+        assert!(err.contains("hard link"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "refusing to read the config: {}",
+                opened.display()
+            )),
+            "the read was given the canonical path: {err}"
+        );
+        assert!(
+            err.contains(&link.join("groove.toml").display().to_string()),
+            "the file as found is still named: {err}"
+        );
+    }
+
+    /// When the directory cannot be canonicalized, the decision keeps the path as written
+    /// (the behaviour before the fix): it opens that path, and judges it as written -- under
+    /// a root's spelling it is trusted, elsewhere untrusted.
+    #[test]
+    fn a_found_config_whose_directory_cannot_be_resolved_is_judged_and_opened_as_written() {
+        let tmp = TempDir::new("groove-pr388-unresolved");
+        let missing = tmp.path().join("missing").join("groove.toml");
+        let decision =
+            classify_trust_located(ConfigSource::Cwd, Some(&missing), &roots_for(None, None));
+        assert_eq!(decision.trust, ConfigTrust::Untrusted);
+        assert_eq!(
+            decision.canonical_dir,
+            missing.parent().map(Path::to_path_buf)
+        );
+        assert_eq!(decision.open.as_deref(), Some(missing.as_path()));
+
+        // A root that does not exist either is compared as written too.
+        let root = tmp.path().join("missing");
+        let decision = classify_trust_located(
+            ConfigSource::Cwd,
+            Some(&missing),
+            &roots_for(Some(&root), None),
+        );
+        assert_eq!(decision.trust, ConfigTrust::Trusted);
+        assert_eq!(decision.open.as_deref(), Some(missing.as_path()));
+    }
+
+    /// The end-to-end half: a cwd reached through a link still has `kb_path` checked
+    /// against the real directory holding the config, because discovery resolved it (once)
+    /// when it decided the trust.
+    #[test]
+    fn a_found_config_through_a_linked_cwd_is_checked_against_the_real_directory() {
+        let tmp = TempDir::new("groove-pr388-linked-cwd");
+        let top = tmp.path().join("top");
+        let deep = top.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(
+            deep.join("groove.toml"),
+            format!("kb_path = '{}'\n", top.display()),
+        )
+        .unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &deep);
+
+        let d =
+            Config::discover_in(None, &link, None, &roots_for(None, None)).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(
+            d.config.kb_path, None,
+            "an ancestor of the real directory holding the config is refused"
+        );
     }
 }
