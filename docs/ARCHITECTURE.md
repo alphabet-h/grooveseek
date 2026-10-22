@@ -74,7 +74,7 @@ indexer.rs: SHA-256 content-hash diff vs documents.content_hash (per document)
      ▼ changed files only
 parser/: dispatch by extension → extract frontmatter + title + chunk
      │
-     ▼
+     ▼ chunks whose embedding input changed (the rest keep their stored vector)
 embedder.rs: embedding via FastEmbed by default
               (BGE-small-en-v1.5 → 384 dim, BGE-M3 → 1024 dim)
              or an opt-in OpenAI-compatible HTTP endpoint

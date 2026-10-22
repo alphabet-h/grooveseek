@@ -500,6 +500,30 @@ struct StrictIndexFailure {
     stats: IndexStats,
 }
 
+/// (feature-69, spec R9) A reply of the MCP tool [`KbServer::rebuild_index`] serves, with the
+/// run's chunk counts beside it:
+/// how many chunks of the updated documents were embedded, and how many kept the vector
+/// the index already held. Wraps the reply rather than adding the two to [`IndexStats`],
+/// whose existing tests build it as a literal naming every field; flattened, so the reply
+/// only gains two top-level keys. The error replies ([`StrictIndexFailure`]) carry them
+/// too, because the run did happen.
+#[derive(Serialize)]
+struct WithChunkCounts<T: Serialize> {
+    #[serde(flatten)]
+    body: T,
+    chunks_embedded: u32,
+    chunks_reused: u32,
+}
+
+/// `body` with the chunk counts of `result`.
+fn with_chunk_counts<T: Serialize>(body: T, result: &indexer::IndexResult) -> WithChunkCounts<T> {
+    WithChunkCounts {
+        body,
+        chunks_embedded: result.chunks_embedded,
+        chunks_reused: result.chunks_reused,
+    }
+}
+
 #[derive(Serialize, Debug)]
 pub(crate) struct ErrorResponse {
     error: String,
@@ -706,7 +730,8 @@ impl KbCore {
                         ),
                         stats,
                     };
-                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                    return serde_json::to_string_pretty(&with_chunk_counts(reply, &result))
+                        .unwrap_or_default();
                 }
                 if result.fails_forced_rebuild_rejections() {
                     let reply = StrictIndexFailure {
@@ -715,7 +740,8 @@ impl KbCore {
                         ),
                         stats,
                     };
-                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                    return serde_json::to_string_pretty(&with_chunk_counts(reply, &result))
+                        .unwrap_or_default();
                 }
                 if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
                     let reply = StrictIndexFailure {
@@ -727,9 +753,10 @@ impl KbCore {
                         ),
                         stats,
                     };
-                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                    return serde_json::to_string_pretty(&with_chunk_counts(reply, &result))
+                        .unwrap_or_default();
                 }
-                serde_json::to_string_pretty(&stats).unwrap_or_default()
+                serde_json::to_string_pretty(&with_chunk_counts(stats, &result)).unwrap_or_default()
             }
             // (AW-04, AW-16) Through `body_free_message`, like the search tool's embed error:
             // the indexer wraps every embed failure in its own context, and the reply names
@@ -1654,6 +1681,48 @@ mod tests {
         assert_eq!(json["total_documents"], 3);
         assert!(json["error"].as_str().unwrap().contains("frontmatter"));
         assert!(json.get("stats").is_none(), "flattened, not nested: {json}");
+    }
+
+    /// (feature-69, spec §8 i) The chunk counts sit at the top level of both the plain
+    /// reply and the error reply, beside the counters, not nested under the wrapped value.
+    #[test]
+    fn rebuild_reply_carries_the_chunk_counts_flattened() {
+        let stats = || IndexStats {
+            total_documents: 3,
+            updated: 1,
+            renamed: 0,
+            deleted: 0,
+            skipped: 0,
+            frontmatter_unparsed: 0,
+            total_chunks: 140,
+            duration_ms: 7,
+        };
+        let failure = WithChunkCounts {
+            body: StrictIndexFailure {
+                error: "boom".to_string(),
+                stats: stats(),
+            },
+            chunks_embedded: 5,
+            chunks_reused: 135,
+        };
+        let plain = WithChunkCounts {
+            body: stats(),
+            chunks_embedded: 5,
+            chunks_reused: 135,
+        };
+        let failure: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&failure).unwrap()).unwrap();
+        let plain: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
+        for json in [&failure, &plain] {
+            assert_eq!(json["total_documents"], 3, "{json}");
+            assert_eq!(json["chunks_embedded"], 5, "{json}");
+            assert_eq!(json["chunks_reused"], 135, "{json}");
+            assert!(json.get("body").is_none(), "flattened, not nested: {json}");
+            assert!(json.get("stats").is_none(), "flattened, not nested: {json}");
+        }
+        assert_eq!(failure["error"], "boom");
+        assert!(plain.get("error").is_none(), "{plain}");
     }
 
     /// The half of the naming rule that values are held to: a caller who

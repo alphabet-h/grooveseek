@@ -25,6 +25,10 @@ pub use search::FIELD_FILTERS_PENDING;
 // (feature-56) The indexer names this when it hands a code chunk's line range and definition
 // kind to the storage layer; every other caller uses the constructor that defaults it away.
 pub use storage::CodeMeta;
+// (feature-69) The indexer reads a document's stored vectors to reuse the ones whose chunk
+// did not change, and writes each chunk with either a computed or a carried-over vector.
+pub(crate) use storage::ChunkVector;
+pub use storage::StoredChunkVector;
 // `server::compute_match_spans` が citation の offset を求めるのに同じ分割規則を使う。
 pub(crate) use fts_query::query_phrases;
 
@@ -8900,5 +8904,260 @@ mod tests {
             db.read_pptx_table_break_policy().unwrap().as_deref(),
             Some("tab-joined-rows-kept-breaks")
         );
+    }
+
+    /// feature-69: an f32 vector as the little-endian bytes vec0 stores it as.
+    fn le(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// feature-69 (D8): chunk-level reuse copies a vector as its bytes. A vec0 embedding
+    /// written through the JSON path reads back as exactly the f32 bytes it started from,
+    /// inserts from a BLOB unchanged, and comes out of the join the reuse reads; only
+    /// `vec_to_json` rounds it.
+    #[test]
+    fn test_vec_chunks_embedding_reads_and_writes_as_a_blob() {
+        let db = db_with_384();
+        // Values a 6-digit decimal cannot hold, so a rounding JSON hop would show.
+        let v: Vec<f32> = (0..384).map(|i| (i as f32 + 1.0) / 3.0).collect();
+        let doc = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let id1 = db
+            .insert_chunk(doc, 0, None, None, "alpha body", None, &v, 0.5)
+            .unwrap();
+        let id2 = db
+            .insert_chunk(
+                doc,
+                1,
+                None,
+                None,
+                "beta body",
+                Some("T > B"),
+                &vec![0.0; 384],
+                0.5,
+            )
+            .unwrap();
+
+        let read_blob = |id: i64| -> Vec<u8> {
+            db.conn
+                .query_row(
+                    "SELECT embedding FROM vec_chunks WHERE chunk_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let blob = read_blob(id1);
+        assert_eq!(blob.len(), 384 * 4);
+        assert_eq!(blob, le(&v), "the JSON write keeps the f32 bytes");
+
+        db.conn
+            .execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id2])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                params![id2, blob.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            read_blob(id2),
+            blob,
+            "a BLOB insert stores the bytes as given"
+        );
+
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT c.content, c.context_text, v.embedding FROM chunks c \
+                 JOIN documents d ON d.id = c.document_id \
+                 JOIN vec_chunks v ON v.chunk_id = c.id \
+                 WHERE d.path = ?1 ORDER BY c.chunk_index",
+            )
+            .unwrap();
+        let rows: Vec<(String, Option<String>, Vec<u8>)> = stmt
+            .query_map(params!["a.md"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("alpha body".to_string(), None, blob.clone()),
+                (
+                    "beta body".to_string(),
+                    Some("T > B".to_string()),
+                    blob.clone()
+                ),
+            ]
+        );
+
+        let json: String = db
+            .conn
+            .query_row(
+                "SELECT vec_to_json(embedding) FROM vec_chunks WHERE chunk_id = ?1",
+                params![id1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let through_json: Vec<f32> = serde_json::from_str(&json).unwrap();
+        assert_ne!(le(&through_json), blob, "vec_to_json rounds the vector");
+
+        let short = db.conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+            params![999_i64, blob[..8].to_vec()],
+        );
+        assert!(short.is_err(), "vec0 refuses a BLOB of the wrong length");
+    }
+
+    /// feature-69: the vector [`test_vec_chunks_embedding_reads_and_writes_as_a_blob`] uses.
+    fn third_steps() -> Vec<f32> {
+        (0..384).map(|i| (i as f32 + 1.0) / 3.0).collect()
+    }
+
+    /// feature-69: the stored vector of one chunk, as bytes.
+    fn stored_blob(db: &Database, chunk_id: i64) -> Vec<u8> {
+        db.conn
+            .query_row(
+                "SELECT embedding FROM vec_chunks WHERE chunk_id = ?1",
+                params![chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// feature-69 (R3): a document's chunks come back in chunk_index order, not insert
+    /// order, with their text, context and vector bytes, and nothing from another document.
+    #[test]
+    fn test_stored_chunk_vectors_for_path_returns_text_context_and_bytes_in_chunk_order() {
+        let db = db_with_384();
+        let v = third_steps();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(a, 1, None, None, "second", Some("T > S"), &v, 0.5)
+            .unwrap();
+        db.insert_chunk(a, 0, None, None, "first", None, &vec![0.5; 384], 0.5)
+            .unwrap();
+        let b = db
+            .upsert_document("b.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(b, 0, None, None, "other", None, &vec![0.25; 384], 0.5)
+            .unwrap();
+
+        assert_eq!(
+            db.stored_chunk_vectors_for_path("a.md").unwrap(),
+            vec![
+                StoredChunkVector {
+                    content: "first".to_string(),
+                    context_text: None,
+                    embedding: le(&vec![0.5; 384]),
+                },
+                StoredChunkVector {
+                    content: "second".to_string(),
+                    context_text: Some("T > S".to_string()),
+                    embedding: le(&v),
+                },
+            ]
+        );
+    }
+
+    /// feature-69 (Review Focus 3): the read joins vec_chunks, so a chunk whose vector row
+    /// is gone is not offered for reuse.
+    #[test]
+    fn test_stored_chunk_vectors_for_path_leaves_out_a_chunk_without_a_vector() {
+        let db = db_with_384();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(a, 0, None, None, "kept", None, &vec![0.5; 384], 0.5)
+            .unwrap();
+        let gone = db
+            .insert_chunk(a, 1, None, None, "gone", None, &vec![0.25; 384], 0.5)
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![gone])
+            .unwrap();
+
+        let got = db.stored_chunk_vectors_for_path("a.md").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "kept");
+    }
+
+    #[test]
+    fn test_stored_chunk_vectors_for_path_is_empty_for_an_unknown_path() {
+        let db = db_with_384();
+        assert_eq!(db.stored_chunk_vectors_for_path("nope.md").unwrap(), vec![]);
+    }
+
+    /// feature-69 (D5): a stored vector goes back in as the bytes it was read as; a
+    /// computed one goes in through JSON and lands as its f32 bytes, as before.
+    #[test]
+    fn test_insert_chunk_with_vector_writes_stored_bytes_as_given() {
+        let db = db_with_384();
+        let v = third_steps();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let first = db
+            .insert_chunk(a, 0, None, None, "one", None, &v, 0.5)
+            .unwrap();
+        let blob = stored_blob(&db, first);
+
+        let second = db
+            .insert_chunk_with_vector(
+                a,
+                1,
+                None,
+                None,
+                "two",
+                None,
+                ChunkVector::Stored(&blob),
+                0.5,
+                CodeMeta::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(stored_blob(&db, second), blob);
+
+        let third = db
+            .insert_chunk_with_vector(
+                a,
+                2,
+                None,
+                None,
+                "three",
+                None,
+                ChunkVector::Computed(&v),
+                0.5,
+                CodeMeta::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(stored_blob(&db, third), le(&v));
+    }
+
+    #[test]
+    fn test_insert_chunk_with_vector_refuses_a_stored_vector_of_the_wrong_length() {
+        let db = db_with_384();
+        let a = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let r = db.insert_chunk_with_vector(
+            a,
+            0,
+            None,
+            None,
+            "short",
+            None,
+            ChunkVector::Stored(&[0u8; 8]),
+            0.5,
+            CodeMeta::default(),
+            None,
+        );
+        assert!(r.is_err());
     }
 }

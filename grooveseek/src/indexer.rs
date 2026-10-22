@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-use crate::db::Database;
+use crate::db::{ChunkVector, Database};
 use crate::embedder::Embedder;
 use crate::parser::{ParserExt, Registry};
 use crate::quality;
@@ -713,6 +713,15 @@ pub struct IndexResult {
     /// the index first, so each of them is missing from it. Zero in an
     /// incremental run, where a refused file keeps its previous row.
     pub forced_rejected: u32,
+    /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
+    /// vector was embedded this run. Counted with [`Self::chunks_reused`] per document from the
+    /// embedder's running total of accepted inputs. For a [`Self::cancelled`] run, the count up to the stop.
+    pub chunks_embedded: u32,
+    /// (feature-69) Chunks of the documents this run ended in [`SingleResult::Updated`] whose
+    /// stored vector was copied over, or kept as it was by the fast path for a document whose
+    /// chunks all match. Always 0 under `force`, which embeds every chunk. For a
+    /// [`Self::cancelled`] run, the count up to the stop.
+    pub chunks_reused: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
     /// (v1.14.0+) The run stopped at a check point because the
@@ -807,7 +816,9 @@ impl IndexResult {
 
     /// The `Done in ...` line `groove index` prints. [`Self::unspellable`] is
     /// appended only when it is not zero, so the line an ordinary run prints
-    /// -- which tests and scripts match -- does not change.
+    /// -- which tests and scripts match -- does not change. (feature-69) This
+    /// run's [`Self::chunks_embedded`] and [`Self::chunks_reused`] follow the
+    /// chunk count only when either is not zero, for the same reason.
     pub fn summary_line(&self) -> String {
         let mut line = format!(
             "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped, {} frontmatter unparsed), {} chunks",
@@ -820,6 +831,12 @@ impl IndexResult {
             self.frontmatter_unparsed,
             self.total_chunks
         );
+        if self.chunks_embedded > 0 || self.chunks_reused > 0 {
+            line.push_str(&format!(
+                " (this run: {} embedded, {} reused)",
+                self.chunks_embedded, self.chunks_reused
+            ));
+        }
         if self.unspellable > 0 {
             line.push_str(&format!(
                 ", {} not indexed (a name get_document cannot take, see the warnings above)",
@@ -1344,6 +1361,9 @@ pub fn rebuild_index(
         // (AW-04) Read before the call, so a refusal below can tell whether the endpoint
         // accepted part of this file first.
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
+        // (feature-69) Read before the call too: the inputs this document sends are the chunks
+        // it embedded, and the rest of an updated document's chunks were reused.
+        let texts_before = embedder.texts_embedded();
         let crossed = crossed_parser_renames.contains(&entry.rel);
         let single_result = index_single_disk_entry(
             db,
@@ -1393,6 +1413,9 @@ pub fn rebuild_index(
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
                 }
+                let counts = ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
+                tally.chunks_embedded = tally.chunks_embedded.saturating_add(counts.embedded);
+                tally.chunks_reused = tally.chunks_reused.saturating_add(counts.reused);
                 progress.report_indexed(&entry.rel, chunks);
             }
             // A skip that still failed to parse its frontmatter was named on
@@ -1608,6 +1631,35 @@ impl EmbeddedBaseline {
     }
 }
 
+/// (feature-69) How an updated document's chunks got their vectors: embedded this run, or
+/// reused from the store. The one place these two counts are worked out (AGENTS.md "One
+/// question gets one implementation"), and handed on as one value so the two cannot be
+/// swapped. Measured the way [`EmbeddedBaseline`] measures files: what the document did not
+/// send to the embedder was kept from the store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ChunkVectorCounts {
+    pub(crate) embedded: u32,
+    pub(crate) reused: u32,
+}
+
+impl ChunkVectorCounts {
+    /// Splits a document's `chunks` given the inputs the embedder was sent for it. More
+    /// inputs than chunks count as every chunk embedded.
+    pub(crate) fn from_texts(chunks: u32, texts_embedded: u64) -> Self {
+        let embedded = u32::try_from(texts_embedded).map_or(chunks, |texts| texts.min(chunks));
+        Self {
+            embedded,
+            reused: chunks - embedded,
+        }
+    }
+
+    /// The counts of a document that ended in [`SingleResult::Updated`] with `chunks`, where
+    /// `texts_before` is [`Embedder::texts_embedded`] read before it was indexed.
+    pub(crate) fn of_updated(chunks: u32, texts_before: u64, embedder: &Embedder) -> Self {
+        Self::from_texts(chunks, embedder.texts_embedded() - texts_before)
+    }
+}
+
 /// (feature-60) Fill in what a run measures rather than counts -- the files the endpoint
 /// accepted, the index's size, the time taken -- and whether it stopped early. The one place
 /// an [`IndexResult`] is completed, for a run that finished and for one that stopped at a
@@ -1684,12 +1736,66 @@ fn stop_cancelled_run(
 /// `context\n\ncontent`、それ以外 (Off / context なし) は content のみ。
 /// Anthropic 原典 cookbook の結合形 `f"{context}\n\n{chunk}"` に忠実。
 fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
-    match (mode, chunk.context.as_deref()) {
+    embed_input_from(&chunk.content, chunk.context.as_deref(), mode)
+}
+
+/// The embedding input for a chunk's `content` and `context` under `mode`, as
+/// [`embed_input_for`] describes it. (feature-69) A newly parsed chunk and a row the index
+/// already holds both go through here, so the two sides of [`plan_vector_reuse`] are built
+/// the same way (spec R1, AGENTS.md "One question gets one implementation").
+fn embed_input_from(content: &str, context: Option<&str>, mode: ContextMode) -> String {
+    match (mode, context) {
         (ContextMode::Static, Some(ctx)) if !ctx.trim().is_empty() => {
-            format!("{ctx}\n\n{}", chunk.content)
+            format!("{ctx}\n\n{content}")
         }
-        _ => chunk.content.clone(),
+        _ => content.to_string(),
     }
+}
+
+/// Where a new chunk's vector comes from (feature-69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorSource {
+    /// The vector of the `j`-th stored row, kept as it is.
+    Stored(usize),
+    /// The `k`-th vector the embedder returns for [`ReusePlan::to_embed`].
+    Computed(usize),
+}
+
+/// What [`plan_vector_reuse`] decided for a document's new chunks (feature-69).
+#[derive(Debug, PartialEq, Eq)]
+struct ReusePlan {
+    /// One entry per new chunk, in chunk order.
+    sources: Vec<VectorSource>,
+    /// The new chunks still to embed: entry `k` is the chunk that takes
+    /// [`VectorSource::Computed`] with `k`.
+    to_embed: Vec<usize>,
+}
+
+/// Matches each new chunk's embedding input against the stored ones (feature-69, spec R1, D1).
+///
+/// The match is on the input's bytes, not on the chunk's position: a chunk inserted above
+/// shifts every later index and still keeps the vectors of the ones that did not change. When
+/// the stored side holds the same input more than once, the first (the smallest `chunk_index`)
+/// is taken; every copy carries the vector of the same string. New chunks that share an input
+/// are not merged: each one is matched or embedded on its own, so [`ChunkVectorCounts`] counts
+/// reused and embedded vectors per chunk.
+fn plan_vector_reuse(new_inputs: &[String], stored_inputs: &[String]) -> ReusePlan {
+    let mut stored: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (j, input) in stored_inputs.iter().enumerate() {
+        stored.entry(input.as_str()).or_insert(j);
+    }
+    let mut sources = Vec::with_capacity(new_inputs.len());
+    let mut to_embed = Vec::new();
+    for (i, input) in new_inputs.iter().enumerate() {
+        match stored.get(input.as_str()) {
+            Some(&j) => sources.push(VectorSource::Stored(j)),
+            None => {
+                sources.push(VectorSource::Computed(to_embed.len()));
+                to_embed.push(i);
+            }
+        }
+    }
+    ReusePlan { sources, to_embed }
 }
 
 /// Whether the chunks the index holds for `rel` are `chunks`, compared the way `context_mode`
@@ -2447,13 +2553,51 @@ fn index_single_disk_entry(
     // hundreds of ms (BGE-small) or seconds (BGE-M3) per file, and we don't
     // want a long-lived write tx blocking concurrent readers in WAL mode.
     // feature-46: Static モードでは context を前置して embed する (§4.5)。
+    //
+    // (feature-69) Only the chunks whose embedding input is new are embedded. Each new input is
+    // matched byte for byte against the inputs of this document's stored rows -- no other
+    // document's -- rebuilt under the same `context_mode` ([`plan_vector_reuse`]). A matched
+    // chunk is written with the stored vector as its BLOB, not through JSON: `vec_to_json`
+    // prints with `%f` and would round it. The stored rows are read here, outside the tx; the
+    // copy, the delete of the old rows and the insert of the new ones all happen in the one tx
+    // below. What a document sent and kept is counted by [`ChunkVectorCounts`]. `--force` and
+    // the forced re-parse of a rename read nothing and embed every chunk (spec R7).
     let embed_inputs: Vec<String> = parsed
         .chunks
         .iter()
         .map(|c| embed_input_for(c, context_mode))
         .collect();
-    let texts: Vec<&str> = embed_inputs.iter().map(String::as_str).collect();
-    let embeddings = match embedder.embed_texts(&texts) {
+    let stored = if force {
+        Vec::new()
+    } else {
+        db.stored_chunk_vectors_for_path(&entry.rel)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    concat!(
+                        "warning: {}: could not read the stored vectors, ",
+                        "so every chunk is embedded again: {}"
+                    ),
+                    entry.rel, e
+                );
+                Vec::new()
+            })
+    };
+    let stored_inputs: Vec<String> = stored
+        .iter()
+        .map(|row| embed_input_from(&row.content, row.context_text.as_deref(), context_mode))
+        .collect();
+    let plan = plan_vector_reuse(&embed_inputs, &stored_inputs);
+    let texts: Vec<&str> = plan
+        .to_embed
+        .iter()
+        .map(|&i| embed_inputs[i].as_str())
+        .collect();
+    let embed_result = if texts.is_empty() {
+        Ok(Vec::new())
+    } else {
+        embedder.embed_texts(&texts)
+    };
+    let embeddings = match embed_result {
         Ok(embeddings) => embeddings,
         Err(e) => {
             // (AW-04) A refusal of this file's input is this file's problem: skip it and
@@ -2484,17 +2628,33 @@ fn index_single_disk_entry(
         }
     };
 
+    anyhow::ensure!(
+        embeddings.len() == plan.to_embed.len(),
+        "{}: {} chunks to embed but {} embeddings",
+        entry.rel,
+        plan.to_embed.len(),
+        embeddings.len()
+    );
+    let vectors: Vec<ChunkVector<'_>> = plan
+        .sources
+        .iter()
+        .map(|source| match *source {
+            VectorSource::Stored(j) => ChunkVector::Stored(&stored[j].embedding),
+            VectorSource::Computed(k) => ChunkVector::Computed(&embeddings[k]),
+        })
+        .collect();
+
     // Per-file atomicity (F-32): wrap upsert_document + N x insert_chunk
     // in a single tx so that a partial failure (e.g. vec_chunks dim
     // mismatch on the 3rd chunk) rolls the whole file back instead of
     // leaving a documents row with M < N chunks.
     let tx = db.begin_transaction()?;
-    write_parsed_document(
+    write_parsed_document_with_vectors(
         db,
         &entry.rel,
         &parsed,
         parser,
-        &embeddings,
+        &vectors,
         context_mode,
         &entry.hash,
         size_bytes,
@@ -2541,6 +2701,9 @@ fn index_single_disk_entry(
 ///
 /// `topic` and `category` are the values derived from the path ([`extract_category_topic`]);
 /// a topic in the frontmatter wins over the derived one, as it always has.
+///
+/// (feature-69) The write itself has one implementation, which also takes vectors carried over
+/// from the document's previous chunks; this entry point hands it every vector as computed.
 #[allow(clippy::too_many_arguments)]
 pub fn write_parsed_document(
     db: &Database,
@@ -2554,11 +2717,46 @@ pub fn write_parsed_document(
     topic: Option<&str>,
     category: Option<&str>,
 ) -> Result<i64> {
+    let vectors: Vec<ChunkVector<'_>> = embeddings
+        .iter()
+        .map(|e| ChunkVector::Computed(e))
+        .collect();
+    write_parsed_document_with_vectors(
+        db,
+        rel,
+        parsed,
+        parser,
+        &vectors,
+        context_mode,
+        content_hash,
+        size_bytes,
+        topic,
+        category,
+    )
+}
+
+/// (feature-69) [`write_parsed_document`] with each chunk's vector either computed this run or
+/// carried over as the bytes the index already held for an unchanged chunk
+/// ([`Database::stored_chunk_vectors_for_path`]). `vectors` holds one per chunk, in chunk
+/// order, under the same mismatch rule as `embeddings` there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_parsed_document_with_vectors(
+    db: &Database,
+    rel: &str,
+    parsed: &crate::parser::ParsedDocument,
+    parser: &dyn crate::parser::Parser,
+    vectors: &[ChunkVector<'_>],
+    context_mode: ContextMode,
+    content_hash: &str,
+    size_bytes: u64,
+    topic: Option<&str>,
+    category: Option<&str>,
+) -> Result<i64> {
     anyhow::ensure!(
-        embeddings.len() == parsed.chunks.len(),
+        vectors.len() == parsed.chunks.len(),
         "{rel}: {} chunks but {} embeddings",
         parsed.chunks.len(),
-        embeddings.len()
+        vectors.len()
     );
     let doc_id = db.upsert_document(
         rel,
@@ -2572,7 +2770,7 @@ pub fn write_parsed_document(
         size_bytes,
     )?;
 
-    for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
+    for (chunk, vector) in parsed.chunks.iter().zip(vectors.iter()) {
         let score = quality::chunk_quality_score(
             chunk.heading.as_deref(),
             &chunk.content,
@@ -2582,14 +2780,14 @@ pub fn write_parsed_document(
             ContextMode::Static => chunk.context.as_deref(),
             ContextMode::Off => None,
         };
-        db.insert_chunk_with_table_rows(
+        db.insert_chunk_with_vector(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
             chunk.level,
             &chunk.content,
             context,
-            embedding,
+            *vector,
             score,
             crate::db::CodeMeta {
                 line_range: chunk.line_range,
@@ -6152,6 +6350,242 @@ mod tests {
             )
         );
         assert!(with.summary_line().is_ascii());
+    }
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// (feature-69, Review Focus 4) [`embed_input_from`] builds what [`embed_input_for`] always built.
+    #[test]
+    fn test_embed_input_from_follows_embed_input_for() {
+        assert_eq!(
+            embed_input_from("c", Some("T > H"), ContextMode::Static),
+            "T > H\n\nc"
+        );
+        assert_eq!(embed_input_from("c", Some("  "), ContextMode::Static), "c");
+        assert_eq!(embed_input_from("c", None, ContextMode::Static), "c");
+        assert_eq!(embed_input_from("c", Some("T > H"), ContextMode::Off), "c");
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_embeds_everything_when_nothing_is_stored() {
+        let plan = plan_vector_reuse(&s(&["a", "b"]), &[]);
+        assert_eq!(
+            plan.sources,
+            vec![VectorSource::Computed(0), VectorSource::Computed(1)]
+        );
+        assert_eq!(plan.to_embed, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_matches_by_text_not_position() {
+        let plan = plan_vector_reuse(&s(&["x", "a", "b"]), &s(&["a", "b"]));
+        assert_eq!(
+            plan.sources,
+            vec![
+                VectorSource::Computed(0),
+                VectorSource::Stored(0),
+                VectorSource::Stored(1)
+            ]
+        );
+        assert_eq!(plan.to_embed, vec![0]);
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_embeds_nothing_when_every_chunk_matches() {
+        let plan = plan_vector_reuse(&s(&["b", "a"]), &s(&["a", "b"]));
+        assert_eq!(
+            plan.sources,
+            vec![VectorSource::Stored(1), VectorSource::Stored(0)]
+        );
+        assert!(plan.to_embed.is_empty());
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_maps_duplicates_one_to_many_and_keeps_misses_apart() {
+        let plan = plan_vector_reuse(&s(&["a", "a", "c", "c"]), &s(&["a", "a"]));
+        assert_eq!(
+            plan.sources,
+            vec![
+                VectorSource::Stored(0),
+                VectorSource::Stored(0),
+                VectorSource::Computed(0),
+                VectorSource::Computed(1)
+            ]
+        );
+        assert_eq!(plan.to_embed, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_of_no_chunks_is_empty() {
+        let plan = plan_vector_reuse(&[], &s(&["a"]));
+        assert!(plan.sources.is_empty());
+        assert!(plan.to_embed.is_empty());
+    }
+
+    /// (feature-69) What a changed document did not send to the embedder was kept from the
+    /// store; more inputs than chunks cannot make the reused count negative.
+    #[test]
+    fn test_chunk_vector_counts_split_an_updated_document() {
+        assert_eq!(
+            ChunkVectorCounts::from_texts(5, 2),
+            ChunkVectorCounts {
+                embedded: 2,
+                reused: 3
+            }
+        );
+        assert_eq!(
+            ChunkVectorCounts::from_texts(5, 0),
+            ChunkVectorCounts {
+                embedded: 0,
+                reused: 5
+            }
+        );
+        assert_eq!(
+            ChunkVectorCounts::from_texts(5, 9),
+            ChunkVectorCounts {
+                embedded: 5,
+                reused: 0
+            }
+        );
+    }
+
+    /// (feature-69) The `Done in` line gains this run's chunk counts only when either is not
+    /// zero, before the unspellable clause, so a run that embedded nothing prints the line it
+    /// always printed.
+    #[test]
+    fn test_summary_line_names_this_runs_chunk_counts_only_when_there_are_some() {
+        let clean = IndexResult {
+            total_documents: 3,
+            updated: 1,
+            total_chunks: 7,
+            duration_ms: 12,
+            ..IndexResult::default()
+        };
+        assert_eq!(
+            clean.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks"
+            )
+        );
+        let both = IndexResult {
+            chunks_embedded: 5,
+            chunks_reused: 135,
+            ..clean
+        };
+        assert_eq!(
+            both.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks (this run: 5 embedded, 135 reused)"
+            )
+        );
+        let reused_only = IndexResult {
+            chunks_embedded: 0,
+            chunks_reused: 3,
+            ..clean
+        };
+        assert_eq!(
+            reused_only.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks (this run: 0 embedded, 3 reused)"
+            )
+        );
+        let with_unspellable = IndexResult {
+            unspellable: 2,
+            ..both
+        };
+        assert_eq!(
+            with_unspellable.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks (this run: 5 embedded, 135 reused), ",
+                "2 not indexed (a name get_document cannot take, see the warnings above)"
+            )
+        );
+        for line in [
+            clean.summary_line(),
+            both.summary_line(),
+            reused_only.summary_line(),
+            with_unspellable.summary_line(),
+        ] {
+            assert!(line.is_ascii(), "{line}");
+        }
+    }
+
+    /// (feature-69, spec §8 e) A stored vector whose length does not fit the index fails the
+    /// write after the old rows were deleted and the first new chunk went in; dropping the
+    /// transaction leaves the document exactly as it was, with no row half-written.
+    #[test]
+    fn test_write_with_a_stored_vector_of_the_wrong_length_rolls_the_document_back() {
+        let db = test_db();
+        let registry = Registry::default();
+        let parser = registry.by_extension("md").expect("the md parser");
+        let parsed = parser.parse(
+            concat!(
+                "---\ntitle: Runbook\n---\n\n",
+                "## Install\n\nDownload the archive and unpack it into the tools folder ",
+                "before anything else.\n\n",
+                "## Configure\n\nPoint the config file at the shared cache directory on the ",
+                "build machine.\n",
+            ),
+            "a.md",
+            &[],
+        );
+        assert_eq!(parsed.chunks.len(), 2, "premise: one chunk per section");
+
+        let first = vec![0.25_f32; 384];
+        let tx = db.begin_transaction().unwrap();
+        write_parsed_document_with_vectors(
+            &db,
+            "a.md",
+            &parsed,
+            parser,
+            &[ChunkVector::Computed(&first), ChunkVector::Computed(&first)],
+            ContextMode::Off,
+            "h1",
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let before = db.stored_chunk_vectors_for_path("a.md").unwrap();
+        assert_eq!(before.len(), 2);
+
+        let second = vec![0.5_f32; 384];
+        let tx = db.begin_transaction().unwrap();
+        let written = write_parsed_document_with_vectors(
+            &db,
+            "a.md",
+            &parsed,
+            parser,
+            &[
+                ChunkVector::Computed(&second),
+                ChunkVector::Stored(&[0u8; 8]),
+            ],
+            ContextMode::Off,
+            "h2",
+            0,
+            None,
+            None,
+        );
+        assert!(written.is_err(), "an 8-byte vector cannot go into 384 dims");
+        drop(tx);
+
+        assert_eq!(db.stored_chunk_vectors_for_path("a.md").unwrap(), before);
+        for (name, scan) in [
+            ("chunks without embedding", db.chunks_without_embedding(5)),
+            ("embeddings without chunk", db.embeddings_without_chunk(5)),
+            ("chunks without fts", db.chunks_without_fts(5)),
+            ("fts without chunk", db.fts_without_chunk(5)),
+        ] {
+            let scan = scan.unwrap();
+            assert!(scan.is_clean(), "{name}: {scan:?}");
+        }
     }
 
     /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is
