@@ -1684,12 +1684,65 @@ fn stop_cancelled_run(
 /// `context\n\ncontent`、それ以外 (Off / context なし) は content のみ。
 /// Anthropic 原典 cookbook の結合形 `f"{context}\n\n{chunk}"` に忠実。
 fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
-    match (mode, chunk.context.as_deref()) {
+    embed_input_from(&chunk.content, chunk.context.as_deref(), mode)
+}
+
+/// The embedding input for a chunk's `content` and `context` under `mode`, as
+/// [`embed_input_for`] describes it. (feature-69) A newly parsed chunk and a row the index
+/// already holds both go through here, so the two sides of [`plan_vector_reuse`] are built
+/// the same way (spec R1, AGENTS.md "One question gets one implementation").
+fn embed_input_from(content: &str, context: Option<&str>, mode: ContextMode) -> String {
+    match (mode, context) {
         (ContextMode::Static, Some(ctx)) if !ctx.trim().is_empty() => {
-            format!("{ctx}\n\n{}", chunk.content)
+            format!("{ctx}\n\n{content}")
         }
-        _ => chunk.content.clone(),
+        _ => content.to_string(),
     }
+}
+
+/// Where a new chunk's vector comes from (feature-69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorSource {
+    /// The vector of the `j`-th stored row, kept as it is.
+    Stored(usize),
+    /// The `k`-th vector the embedder returns for [`ReusePlan::to_embed`].
+    Computed(usize),
+}
+
+/// What [`plan_vector_reuse`] decided for a document's new chunks (feature-69).
+#[derive(Debug, PartialEq, Eq)]
+struct ReusePlan {
+    /// One entry per new chunk, in chunk order.
+    sources: Vec<VectorSource>,
+    /// The new chunks still to embed: `to_embed[k]` is the chunk that takes `Computed(k)`.
+    to_embed: Vec<usize>,
+}
+
+/// Matches each new chunk's embedding input against the stored ones (feature-69, spec R1, D1).
+///
+/// The match is on the input's bytes, not on the chunk's position: a chunk inserted above
+/// shifts every later index and still keeps the vectors of the ones that did not change. When
+/// the stored side holds the same input more than once, the first (the smallest `chunk_index`)
+/// is taken; every copy carries the vector of the same string. New chunks that share an input
+/// are not merged: each one is matched or embedded on its own, so the counts of reused and
+/// embedded vectors are counted per chunk.
+fn plan_vector_reuse(new_inputs: &[String], stored_inputs: &[String]) -> ReusePlan {
+    let mut stored: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (j, input) in stored_inputs.iter().enumerate() {
+        stored.entry(input.as_str()).or_insert(j);
+    }
+    let mut sources = Vec::with_capacity(new_inputs.len());
+    let mut to_embed = Vec::new();
+    for (i, input) in new_inputs.iter().enumerate() {
+        match stored.get(input.as_str()) {
+            Some(&j) => sources.push(VectorSource::Stored(j)),
+            None => {
+                sources.push(VectorSource::Computed(to_embed.len()));
+                to_embed.push(i);
+            }
+        }
+    }
+    ReusePlan { sources, to_embed }
 }
 
 /// Whether the chunks the index holds for `rel` are `chunks`, compared the way `context_mode`
@@ -6152,6 +6205,78 @@ mod tests {
             )
         );
         assert!(with.summary_line().is_ascii());
+    }
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// (feature-69, Review Focus 4) `embed_input_from` builds what `embed_input_for` always built.
+    #[test]
+    fn test_embed_input_from_follows_embed_input_for() {
+        assert_eq!(
+            embed_input_from("c", Some("T > H"), ContextMode::Static),
+            "T > H\n\nc"
+        );
+        assert_eq!(embed_input_from("c", Some("  "), ContextMode::Static), "c");
+        assert_eq!(embed_input_from("c", None, ContextMode::Static), "c");
+        assert_eq!(embed_input_from("c", Some("T > H"), ContextMode::Off), "c");
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_embeds_everything_when_nothing_is_stored() {
+        let plan = plan_vector_reuse(&s(&["a", "b"]), &[]);
+        assert_eq!(
+            plan.sources,
+            vec![VectorSource::Computed(0), VectorSource::Computed(1)]
+        );
+        assert_eq!(plan.to_embed, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_matches_by_text_not_position() {
+        let plan = plan_vector_reuse(&s(&["x", "a", "b"]), &s(&["a", "b"]));
+        assert_eq!(
+            plan.sources,
+            vec![
+                VectorSource::Computed(0),
+                VectorSource::Stored(0),
+                VectorSource::Stored(1)
+            ]
+        );
+        assert_eq!(plan.to_embed, vec![0]);
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_embeds_nothing_when_every_chunk_matches() {
+        let plan = plan_vector_reuse(&s(&["b", "a"]), &s(&["a", "b"]));
+        assert_eq!(
+            plan.sources,
+            vec![VectorSource::Stored(1), VectorSource::Stored(0)]
+        );
+        assert!(plan.to_embed.is_empty());
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_maps_duplicates_one_to_many_and_keeps_misses_apart() {
+        let plan = plan_vector_reuse(&s(&["a", "a", "c", "c"]), &s(&["a", "a"]));
+        assert_eq!(
+            plan.sources,
+            vec![
+                VectorSource::Stored(0),
+                VectorSource::Stored(0),
+                VectorSource::Computed(0),
+                VectorSource::Computed(1)
+            ]
+        );
+        assert_eq!(plan.to_embed, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_plan_vector_reuse_of_no_chunks_is_empty() {
+        let plan = plan_vector_reuse(&[], &s(&["a"]));
+        assert!(plan.sources.is_empty());
+        assert!(plan.to_embed.is_empty());
     }
 
     /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is
