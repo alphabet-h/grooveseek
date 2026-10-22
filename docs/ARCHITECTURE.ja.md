@@ -74,7 +74,7 @@ indexer.rs: SHA-256 content-hash を documents.content_hash と比較 (文書単
      ▼ 変更ありのファイルのみ
 parser/: 拡張子で Parser を選択 → frontmatter + title 抽出 + チャンク化
      │
-     ▼
+     ▼ embed 入力が変わった chunk だけ (残りは保存済みの vector を使い回す)
 embedder.rs: 既定は FastEmbed で embedding 生成
               (BGE-small-en-v1.5 → 384 次元、BGE-M3 → 1024 次元)
              または opt-in の OpenAI 互換 HTTP endpoint

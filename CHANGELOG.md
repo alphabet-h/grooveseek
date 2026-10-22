@@ -14,6 +14,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **Re-indexing a changed document re-embeds only the chunks whose text changed.** Chunks whose
+  embedding input is unchanged keep their stored vectors, byte for byte; `groove index` reports
+  `this run: N embedded, M reused` after its chunk count, MCP `rebuild_index` returns
+  `chunks_embedded` / `chunks_reused`, and the watcher's reindex line names the reused chunks.
+  `--force` still recomputes everything. A run in which the endpoint refused a file's input and
+  every other changed document was served from stored vectors now exits 1 (MCP: an `error`), since
+  the endpoint accepted nothing.
+
 ## [1.20.4] - 2026-10-21
 
 ### Fixed
