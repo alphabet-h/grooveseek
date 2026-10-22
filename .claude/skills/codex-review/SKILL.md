@@ -80,16 +80,16 @@ root を決めていた頃は、worktree から打つと main の checkout の�
 `git diff main...HEAD -- '*.rs'` を固定で打ち、
 tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
 bucket に振り分ける。exit 1 なら直してから push。**exit 0 は sweep の終わりではない** —
-下の表の advisory bucket (`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` / `PUB_DOC_NAMES_HIDDEN`) を
+下の表の advisory bucket (`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` / `PROSE_TREE_NAME`) を
 全部読んで初めて終わる。script が決めるのは **diff の範囲、tree にあるかどうか、複合項の中の名前の列挙**
 の 3 つ (人が決めると、範囲を縮める / private だからと外す / 形で skip する — 台帳 #39 / #43 / #52)。
 何を link にするかの判断は残る (だから bucket ごとに直し方が書いてある)。
 main の checkout にも `.dev/` が無い環境 (worktree は該当しない、上記) では旧形を打つ:
 `` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
 (pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
-**旧形は backtick の中しか抜き出さないので、`PUB_DOC_NAMES_HIDDEN` の形 (backtick の外の散文での名指し) は
-出ない。** 旧形のときは、追加行のうち crate の外に見える item の `///` / `//!` を、散文に `pub(crate)` /
-private / bin の名前が無いかを人が読む (`git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]'`
+**旧形は backtick の中しか抜き出さないので、`PROSE_TREE_NAME` の形 (backtick の外の散文での名指し) は
+出ない。** 旧形のときは、追加行の `///` / `//!` を (公開・非公開を問わず、test code 以外の全部)、散文に
+tree の名前が無いかを人が読む (`git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]'`
 の出力をそのまま読む。rustdoc は link しか検査しないので、ここは拾わない)。
 
 script の bucket と、それぞれの直し方 (角括弧を残して抽出しているので、**bare backtick と
@@ -104,10 +104,10 @@ script の bucket と、それぞれの直し方 (角括弧を残して抽出し
 | `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
 | `FILE_NAME` | `` `foo.rs` `` / `` `ADR-0013` `` で名指し | module link か markdown link か散文に。**file 名は書かない** (台帳 #41 / #42 / #46) |
 | `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `#[test]` / `tests/` の item だけ (同 file でも、ここが先)。**bare でも `` [`..`] `` でも出す** — link 済みは `linked:` 印 (`cargo doc` が検証しない link は通っていても未検証) | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
-| `PUB_DOC_NAMES_HIDDEN` | crate の外に見える doc (祖先の module まで `pub` でつながるか re-export されて crate の外から届く item の `///`、そうした module の `//!`。private / `pub(crate)` の module の下にある `pub` item は含まない — それは上の `PRIVATE_ELSEWHERE` の規則のまま) が、backtick の外の散文で、`pub(crate)` / private / bin にしか定義の無い名前を書いている。散文の名前は rustdoc にも他の bucket にも見えない | **MCP の tool / prompt の引数 struct の field の `///` は例外で、名前を書かない** (schemars が client の schema の `description` にそのまま出すので、link も backtick も不可。していることを言い直し、tool 名が要るなら `#[tool(description = "...")]` 側へ — `AGENTS.md` の同じ節の 2 つ目の例外)。それ以外は **link にする** — 張れるなら `` [`Self::name`] `` / `` [`name`] `` (公開 doc から private item への link は workspace の `Cargo.toml` が `private_intra_doc_links = "allow"` で許している)。他 module に private で張れないなら `PRIVATE_ELSEWHERE` と同じく持ち主の module を link して item は backtick。名前を出す必要が無ければ外して言い直してもよい。PR #386 の P1 (codex は `` [`Self::insert_chunk_with_vector`] `` を求めた) |
+| `PROSE_TREE_NAME` | test code 以外の全ての doc (`///` / `//!`。公開・非公開を問わない) が、backtick の外の散文で tree の item の名前 (snake_case の `_` 入り / SCREAMING_SNAKE / こぶが複数の CamelCase) を書いている。散文の名前は rustdoc にも他の bucket にも見えない (`PRIVATE_ELSEWHERE` も backtick の中だけ)。script が行ごとに直し方の候補を添える: `link:` / `module link:` / `test item only` / `[MCP arg field]` 印、cfg で消える item には cfg-gated の注記。英語の語や OS の用語、MCP tool 名と綴りが重なる誤検知が混ざる | **MCP の tool / prompt の引数 struct の field の `///` は例外で、名前を書かない** (`[MCP arg field]` 印。schemars が client の schema の `description` にそのまま出すので、link も backtick も不可。していることを言い直し、tool 名が要るなら `#[tool(description = "...")]` 側へ — `AGENTS.md` の同じ節の 2 つ目の例外)。それ以外は **link にする** — 張れるなら `` [`Self::name`] `` / `` [`name`] `` / `` [`crate::…`] `` (公開 doc から private item への link は workspace の `Cargo.toml` が `private_intra_doc_links = "allow"` で許している)。直し方は item の公開性ではなく **この doc から link が張れるか**で選ぶ: 他 module に private で張れないなら `PRIVATE_ELSEWHERE` と同じく持ち主の module を link して item は backtick。`test item only` は `TEST_FN_NAME` と同じく script は決めない。名前を出す必要が無ければ外して言い直してもよい。PR #386 の P1 (codex は `` [`Self::insert_chunk_with_vector`] `` を求めた)、PR #387 の P2 (非公開の doc の散文も同じ規則) |
 
 exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_RELATIVE_LINK`。
-`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` / `PUB_DOC_NAMES_HIDDEN` は人が読む
+`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` / `PROSE_TREE_NAME` は人が読む
 (誤検出もあるが、**形で skip すると #52 になる**)。script の「張れる」は近似 (同 file か
 `pub` 系か) なので、迷ったら下の規則の最後の行 = link にして `cargo doc --no-deps` を 1 回回す。`--whole-tree` は diff ではなく tree 全体を
 出す計測用で、push 前には使わない。
