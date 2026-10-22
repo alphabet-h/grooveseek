@@ -12,6 +12,7 @@ mod common;
 
 use common::embed_cli::{Fixture, REJECT_MARKER, fixture, note, rejects_marker, stderr_of};
 use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic};
+use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
 use common::temp::TempRoot;
 use grooveseek::config::Config;
 use grooveseek::db::{Database, StoredChunkVector};
@@ -588,6 +589,43 @@ fn a_write_that_fails_midway_leaves_the_document_as_it_was() {
     assert!(!out.status.success(), "groove index must fail:\n{stderr}");
     assert!(stderr.contains("injected"), "{stderr}");
     assert_eq!(vectors(&fx, RUNBOOK), before);
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// `key` of the MCP reply `resp`, which must be a non-negative integer.
+fn count_in(resp: &serde_json::Value, key: &str) -> u64 {
+    resp.get(key)
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("no count {key}: {resp}"))
+}
+
+/// Spec R9 (§8 d): MCP `rebuild_index` answers with the run's chunk counts beside its other
+/// counters, and an unchanged second run still carries both keys, at zero.
+#[test]
+fn mcp_rebuild_index_returns_the_chunk_counts() {
+    let fx = indexed_runbook("f69-mcp", &[S1, S2, S3, S4]);
+    let s3 = s3_changed();
+    fx.layout
+        .write(RUNBOOK, &runbook(&[S1, S2, ("Verify", &s3), S4]));
+
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    let first = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    let second = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    drop(guard);
+
+    assert!(first.get("error").is_none(), "{first}");
+    assert_eq!(count_in(&first, "updated"), 1, "{first}");
+    assert_eq!(count_in(&first, "chunks_embedded"), 1, "{first}");
+    assert_eq!(count_in(&first, "chunks_reused"), 3, "{first}");
+
+    assert!(second.get("error").is_none(), "{second}");
+    assert_eq!(count_in(&second, "chunks_embedded"), 0, "{second}");
+    assert_eq!(count_in(&second, "chunks_reused"), 0, "{second}");
 
     assert_index_consistent(&fx);
     assert_dir_empty(&fx.cache);

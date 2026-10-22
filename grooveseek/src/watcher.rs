@@ -970,9 +970,28 @@ fn sweep_legacy_row(db: &Database, kb_path: &Path, rel: &str, require_real_key: 
     }
 }
 
+/// (feature-69) The line [`dispatch_reindex`] prints for a reindexed document. Takes the
+/// counts as one value so the embedded and reused halves cannot be swapped on the way in;
+/// the total is their sum. The `frontmatter unparsed` note is #251's.
+fn reindexed_message(
+    rel: &str,
+    counts: indexer::ChunkVectorCounts,
+    frontmatter_unparsed: bool,
+) -> String {
+    let chunks = counts.embedded + counts.reused;
+    let reused = counts.reused;
+    let note = if frontmatter_unparsed {
+        ", frontmatter unparsed"
+    } else {
+        ""
+    };
+    format!("watcher: reindexed {rel} ({chunks} chunks, {reused} reused{note})")
+}
+
 fn dispatch_reindex(state: &WatcherState, rel: &str) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
+    let texts_before = embedder.texts_embedded();
     match indexer::reindex_single_file(
         &db,
         &mut embedder,
@@ -987,12 +1006,8 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         }) => {
             // (#251) The per-file warning naming the file is already on stderr
             // from the indexer; this only says the reindex kept the tag.
-            let note = if frontmatter_unparsed {
-                ", frontmatter unparsed"
-            } else {
-                ""
-            };
-            wdiag!("watcher: reindexed {rel} ({chunks} chunks{note})");
+            let counts = indexer::ChunkVectorCounts::of_updated(chunks, texts_before, &embedder);
+            wdiag!("{}", reindexed_message(rel, counts, frontmatter_unparsed));
         }
         // (#251) `MetadataRefreshed` cannot come back here: the one-time check
         // is off on this path. Named so a new variant stays a compile error.
@@ -3160,5 +3175,23 @@ mod tests {
             got.contains(&(both, vec![from, to])),
             "the filtered debouncer must stitch the directory rename; got {got:?}"
         );
+    }
+
+    /// (feature-69) The reindex line names the chunks whose stored vector was kept, beside
+    /// the total, and stays ASCII for a CP932 console.
+    #[test]
+    fn test_reindexed_message_names_the_reused_chunks() {
+        let counts = indexer::ChunkVectorCounts {
+            embedded: 2,
+            reused: 3,
+        };
+        let plain = reindexed_message("a.md", counts, false);
+        assert_eq!(plain, "watcher: reindexed a.md (5 chunks, 3 reused)");
+        let unparsed = reindexed_message("a.md", counts, true);
+        assert_eq!(
+            unparsed,
+            "watcher: reindexed a.md (5 chunks, 3 reused, frontmatter unparsed)"
+        );
+        assert!(plain.is_ascii() && unparsed.is_ascii());
     }
 }
