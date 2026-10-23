@@ -28,6 +28,9 @@ pub use storage::CodeMeta;
 // (feature-69) The indexer reads a document's stored vectors to reuse the ones whose chunk
 // did not change, and writes each chunk with either a computed or a carried-over vector.
 pub(crate) use storage::ChunkVector;
+// (local Codex on PR #388) What a rename's bytes say about the topic, handed in by both callers
+// of `rename_document` (the full run's rename detection and the watcher).
+pub use meta::FrontmatterTopic;
 pub use storage::StoredChunkVector;
 // `server::compute_match_spans` が citation の offset を求めるのに同じ分割規則を使う。
 pub(crate) use fts_query::query_phrases;
@@ -2090,7 +2093,8 @@ mod tests {
         assert_eq!(db.chunk_count().unwrap(), 1);
 
         // rename
-        db.rename_document("old/path.md", "new/path.md").unwrap();
+        db.rename_document("old/path.md", "new/path.md", FrontmatterTopic::Read(None))
+            .unwrap();
 
         // chunk 数は不変 (embedding 再計算されない)
         assert_eq!(db.chunk_count().unwrap(), 1);
@@ -2110,7 +2114,7 @@ mod tests {
     fn test_rename_document_missing_source_errors() {
         let db = db_with_384();
         let err = db
-            .rename_document("nope.md", "else.md")
+            .rename_document("nope.md", "else.md", FrontmatterTopic::Read(None))
             .expect_err("must error");
         assert!(err.to_string().contains("no document"));
     }
@@ -2131,7 +2135,7 @@ mod tests {
             ("nope.md".to_string(), "x.md".to_string()),
         ];
         let err = db
-            .rename_documents_atomic(&pairs)
+            .rename_documents_atomic(&pairs, &HashMap::new())
             .expect_err("second pair must fail");
         assert!(err.to_string().contains("no document"));
 
@@ -2152,7 +2156,7 @@ mod tests {
             ("a.md".to_string(), "a2.md".to_string()),
             ("b.md".to_string(), "b2.md".to_string()),
         ];
-        db.rename_documents_atomic(&pairs).unwrap();
+        db.rename_documents_atomic(&pairs, &HashMap::new()).unwrap();
         let map = db.all_path_hashes().unwrap();
         assert_eq!(map.get("a2.md"), Some(&"h_a".to_string()));
         assert_eq!(map.get("b2.md"), Some(&"h_b".to_string()));
@@ -2162,7 +2166,186 @@ mod tests {
     #[test]
     fn test_rename_documents_atomic_empty_pairs_is_noop() {
         let db = db_with_384();
-        db.rename_documents_atomic(&[]).unwrap();
+        db.rename_documents_atomic(&[], &HashMap::new()).unwrap();
+    }
+
+    /// The category and the topic stored for the row under the given path.
+    fn category_topic_of(db: &Database, path: &str) -> (Option<String>, Option<String>) {
+        db.conn
+            .query_row(
+                "SELECT category, topic FROM documents WHERE path = ?1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// (AX-01) A rename moves the path-derived columns with the path: the category always comes
+    /// from the path, and a topic that was the old path's is replaced by the new path's.
+    #[test]
+    fn rename_document_rederives_the_path_category_and_topic() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.upsert_document("a/e.md", None, None, Some("a"), None, &[], None, "h2", 0)
+            .unwrap();
+
+        db.rename_document("a/x/d.md", "b/y/d.md", FrontmatterTopic::Read(None))
+            .unwrap();
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("y".to_string()))
+        );
+
+        // A topic the old path did not have is gained from the new one, and one the new path
+        // does not have is dropped.
+        db.rename_document("a/e.md", "c/z/e.md", FrontmatterTopic::Read(None))
+            .unwrap();
+        assert_eq!(
+            category_topic_of(&db, "c/z/e.md"),
+            (Some("c".to_string()), Some("z".to_string()))
+        );
+        db.rename_document("c/z/e.md", "root.md", FrontmatterTopic::Read(None))
+            .unwrap();
+        assert_eq!(category_topic_of(&db, "root.md"), (None, None));
+    }
+
+    /// (AX-01) A topic that is not the old path's came from the frontmatter, which a rename does
+    /// not touch, so it stays; the category still follows the path.
+    #[test]
+    fn rename_document_keeps_a_frontmatter_topic() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("pinned"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.upsert_document(
+            "a/e.md",
+            None,
+            Some("pinned"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h2",
+            0,
+        )
+        .unwrap();
+        db.rename_documents_atomic(
+            &[
+                ("a/x/d.md".to_string(), "b/y/d.md".to_string()),
+                ("a/e.md".to_string(), "b/e.md".to_string()),
+            ],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("pinned".to_string()))
+        );
+        assert_eq!(
+            category_topic_of(&db, "b/e.md"),
+            (Some("b".to_string()), Some("pinned".to_string()))
+        );
+    }
+
+    /// (local Codex on PR #388) The topic is rebuilt from what the rename's bytes declare, not
+    /// from a comparison with the stored value: a frontmatter `topic: x` under `a/x/` stays `x`
+    /// at `b/y/`, and bytes that declare none take the new path's topic even when the stored
+    /// value was not the old path's.
+    #[test]
+    fn rename_document_rebuilds_the_topic_from_the_bytes() {
+        let db = db_with_384();
+        for (path, hash) in [("a/x/d.md", "h1"), ("a/x/e.md", "h2")] {
+            db.upsert_document(path, None, Some("x"), Some("a"), None, &[], None, hash, 0)
+                .unwrap();
+        }
+        db.upsert_document(
+            "a/f.md",
+            None,
+            Some("stale"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h3",
+            0,
+        )
+        .unwrap();
+        let topics: HashMap<String, Option<String>> = [
+            ("b/y/d.md".to_string(), Some("x".to_string())),
+            ("b/y/e.md".to_string(), None),
+            ("c/z/f.md".to_string(), None),
+        ]
+        .into_iter()
+        .collect();
+        db.rename_documents_atomic(
+            &[
+                ("a/x/d.md".to_string(), "b/y/d.md".to_string()),
+                ("a/x/e.md".to_string(), "b/y/e.md".to_string()),
+                ("a/f.md".to_string(), "c/z/f.md".to_string()),
+            ],
+            &topics,
+        )
+        .unwrap();
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("x".to_string())),
+            "a frontmatter topic equal to the old directory stays"
+        );
+        assert_eq!(
+            category_topic_of(&db, "b/y/e.md"),
+            (Some("b".to_string()), Some("y".to_string())),
+            "a path topic follows the path"
+        );
+        assert_eq!(
+            category_topic_of(&db, "c/z/f.md"),
+            (Some("c".to_string()), Some("z".to_string())),
+            "bytes with no topic take the new path's, whatever was stored"
+        );
+    }
+
+    /// (local Codex on PR #388) With no bytes read, the stored topic stays and the category still
+    /// follows the path.
+    #[test]
+    fn rename_document_unread_keeps_the_stored_topic() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.rename_document("a/x/d.md", "b/y/d.md", FrontmatterTopic::Unread)
+            .unwrap();
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("x".to_string()))
+        );
     }
 
     /// F-32 regression: dropping a `begin_transaction()` handle without

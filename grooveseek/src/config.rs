@@ -648,6 +648,48 @@ impl Default for ContextualConfig {
     }
 }
 
+/// (AX-34) The most of a `groove.toml` that is read. The schema's megabyte
+/// ([`crate::schema::MAX_SCHEMA_FILE_BYTES`]) for the same reason: a person writes it, and
+/// nothing a person writes for this file comes near it, while an unbounded read of whatever
+/// lands on the name (a device, a multi-gigabyte file) takes the whole process with it.
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// (AX-34) How a config file is read. Chosen from [`classify_trust_located`], which decides
+/// from where the file is and never from what it says, so it is known before the file is
+/// opened.
+#[derive(Clone, Copy)]
+enum ConfigRead {
+    /// A trusted location (`--config`, the file beside the binary, or a found file under a
+    /// [`TrustRoots`] root): links are followed, the size is bounded and what they lead to
+    /// must be a regular file ([`crate::links::read_required_following`]). A config kept in a
+    /// dotfiles tree is commonly reached through a symlink or a hard link, and refusing it
+    /// would break a setup that only its owner could have made; a named pipe would hang
+    /// startup whoever put it there.
+    Following,
+    /// An untrusted location (found in the cwd or at the git root, outside every root): the
+    /// checked read the schema and the golden file use ([`crate::links::read_required`]).
+    Checked,
+}
+
+impl ConfigRead {
+    fn for_trust(trust: ConfigTrust) -> Self {
+        match trust {
+            ConfigTrust::Trusted => Self::Following,
+            ConfigTrust::Untrusted => Self::Checked,
+        }
+    }
+}
+
+/// The bytes of the config file, or `None` when there is no file at that name.
+fn read_config_bytes(path: &Path, read: ConfigRead) -> Result<Option<Vec<u8>>> {
+    match read {
+        ConfigRead::Following => {
+            crate::links::read_required_following(path, MAX_CONFIG_FILE_BYTES, "config")
+        }
+        ConfigRead::Checked => crate::links::read_required(path, MAX_CONFIG_FILE_BYTES, "config"),
+    }
+}
+
 impl Config {
     /// 後方互換シム。`discover(None)` に委譲し `ConfigSource` を捨てる。
     /// 実際の探索順は CWD → `.git` 祖先 → バイナリ隣 (legacy) で、
@@ -697,39 +739,65 @@ impl Config {
         alongside: Option<&Path>,
         roots: &TrustRoots,
     ) -> Result<Discovered> {
-        let (mut config, source, path) = Self::discover_located(explicit, cwd, alongside)?;
-        let trust = classify_trust(source, path.as_deref(), roots);
-        if trust == ConfigTrust::Untrusted {
-            // path は Cwd / GitRoot でのみ Untrusted になり、その 2 つは必ず
-            // ファイル由来なので `Some`。防御的に unwrap は避ける。
-            let dir = path.as_deref().and_then(Path::parent);
-            config.restrict_untrusted(path.as_deref(), dir, roots)?;
+        // (codex P1, round 2 on PR #388) The trust comes back from the read: it was decided
+        // once, before the file was opened, and the same value chooses the restriction and is
+        // reported. Deciding it again here would resolve the location after the read, and a
+        // parent directory swapped in between would turn a file read as untrusted into one
+        // treated as trusted.
+        let Located {
+            mut config,
+            source,
+            path,
+            decision,
+        } = Self::discover_located(explicit, cwd, alongside, roots)?;
+        if decision.trust == ConfigTrust::Untrusted {
+            // The directory the decision resolved, not the path's parent resolved anew.
+            config.restrict_untrusted(path.as_deref(), decision.canonical_dir.as_deref(), roots)?;
         }
         Ok(Discovered {
             config,
             source,
-            trust,
+            trust: decision.trust,
             path,
         })
     }
 
     /// `discover` のフル注入版 (テスト専用)。バイナリ隣のパスも override する。
+    ///
+    /// 信頼の根は空で渡す: 見つけたファイルは checked read で読まれる (AX-34)。
     #[cfg(test)]
     pub(crate) fn discover_with_alongside(
         explicit: Option<&Path>,
         cwd: &Path,
         alongside: Option<&Path>,
     ) -> Result<(Self, ConfigSource)> {
-        let (cfg, source, _) = Self::discover_located(explicit, cwd, alongside)?;
-        Ok((cfg, source))
+        let no_roots = TrustRoots::new(Vec::new(), None);
+        let located = Self::discover_located(explicit, cwd, alongside, &no_roots)?;
+        Ok((located.config, located.source))
     }
 
-    /// 探索本体。読んだファイルのパスも返す (信頼判定に要る)。
+    /// 探索本体。読んだファイルのパスと、読む前に決めた信頼判定も返す。
+    ///
+    /// (AX-34) [`classify_trust_located`] は置き場所だけで決まるので、ファイルを開く前に
+    /// 呼べる。その判定で読み方を選び、見つけた config は判定が解決したパス
+    /// ([`TrustDecision::open`]) で開く。制限 ([`Self::restrict_untrusted`]) を掛けるのは
+    /// 呼び出し側 ([`Self::discover_in`]) のままで、同じ判定 ([`Located::decision`]) を使う
+    /// (codex P1, round 2 on PR #388: 判定は 1 回、読んだ後に解き直さない)。
     fn discover_located(
         explicit: Option<&Path>,
         cwd: &Path,
         alongside: Option<&Path>,
-    ) -> Result<(Self, ConfigSource, Option<PathBuf>)> {
+        roots: &TrustRoots,
+    ) -> Result<Located> {
+        let found = |source: ConfigSource, path: &Path| Self::load_found(source, path, roots);
+        // Sources whose trust does not depend on where the file is: deciding it touches no
+        // file, and it is still the one decision that is carried out.
+        let fixed = |config: Self, source: ConfigSource, path: Option<PathBuf>| Located {
+            decision: classify_trust_located(source, path.as_deref(), roots),
+            config,
+            source,
+            path,
+        };
         // 1. 明示 (--config)
         if let Some(p) = explicit {
             // `~` 展開を噛ませる。OsStr → String の変換は lossy で十分 (パスが
@@ -751,26 +819,37 @@ impl Config {
             let cfg = Self::load_from(&resolved).with_context(|| {
                 format!("failed to load config from --config {}", resolved.display())
             })?;
-            return Ok((cfg, ConfigSource::Explicit, Some(resolved)));
+            return Ok(fixed(cfg, ConfigSource::Explicit, Some(resolved)));
         }
 
         // 2. CWD 直下
         let cwd_toml = cwd.join("groove.toml");
         if cwd_toml.exists() {
-            let cfg = Self::load_from(&cwd_toml).with_context(|| {
+            let (cfg, decision) = found(ConfigSource::Cwd, &cwd_toml).with_context(|| {
                 format!("failed to load config from cwd {}", cwd_toml.display())
             })?;
-            return Ok((cfg, ConfigSource::Cwd, Some(cwd_toml)));
+            return Ok(Located {
+                config: cfg,
+                source: ConfigSource::Cwd,
+                path: Some(cwd_toml),
+                decision,
+            });
         }
 
         // 3. .git 祖先
         if let Some(root) = find_git_root(cwd) {
             let git_toml = root.join("groove.toml");
             if git_toml.exists() {
-                let cfg = Self::load_from(&git_toml).with_context(|| {
-                    format!("failed to load config from git root {}", git_toml.display())
-                })?;
-                return Ok((cfg, ConfigSource::GitRoot, Some(git_toml)));
+                let (cfg, decision) =
+                    found(ConfigSource::GitRoot, &git_toml).with_context(|| {
+                        format!("failed to load config from git root {}", git_toml.display())
+                    })?;
+                return Ok(Located {
+                    config: cfg,
+                    source: ConfigSource::GitRoot,
+                    path: Some(git_toml),
+                    decision,
+                });
             }
         }
 
@@ -781,11 +860,51 @@ impl Config {
             let cfg = Self::load_from(side).with_context(|| {
                 format!("failed to load config alongside binary {}", side.display())
             })?;
-            return Ok((cfg, ConfigSource::AlongsideBinary, Some(side.to_path_buf())));
+            return Ok(fixed(
+                cfg,
+                ConfigSource::AlongsideBinary,
+                Some(side.to_path_buf()),
+            ));
         }
 
         // 5. 未発見 → Default
-        Ok((Self::default(), ConfigSource::NotFound, None))
+        Ok(fixed(Self::default(), ConfigSource::NotFound, None))
+    }
+
+    /// Reads a config discovery found (`Cwd` / `GitRoot`), deciding its trust first.
+    ///
+    /// (codex P1, round 3 on PR #388) After the decision nothing is resolved from the path as
+    /// found: the file opened ([`TrustDecision::open`]) and the base its relative fields
+    /// resolve against ([`relative_base`] of [`TrustDecision::canonical_dir`]) both come from
+    /// the directory the decision resolved. The path as found -- which may run through a link
+    /// that can be repointed after the decision -- only names the file in messages.
+    ///
+    /// A directory the decision could not resolve is refused rather than read as written:
+    /// without a resolved directory every later use of a relative field would resolve the
+    /// path as found again, which is the resolution after the decision this rule exists to
+    /// rule out. `--config` still reads such a file.
+    fn load_found(
+        source: ConfigSource,
+        path: &Path,
+        roots: &TrustRoots,
+    ) -> Result<(Self, TrustDecision)> {
+        let decision = classify_trust_located(source, Some(path), roots);
+        if let Some(why) = &decision.unresolved {
+            anyhow::bail!(
+                "the directory holding the config {} could not be resolved ({why}); \
+                 pass --config to read it",
+                path.display()
+            );
+        }
+        let open = decision.open.as_deref().unwrap_or(path);
+        let base = decision.canonical_dir.as_deref().map(relative_base);
+        let cfg = Self::load_opening(
+            path,
+            open,
+            base.as_deref(),
+            ConfigRead::for_trust(decision.trust),
+        )?;
+        Ok((cfg, decision))
     }
 
     /// 信頼できない場所で見つかった config に制限を掛ける (BU-07)。
@@ -804,6 +923,11 @@ impl Config {
     /// (または落とすだけ) で続行する。ここで起動を止めると、Windows daemon が **何の出力も残さずに
     /// 死ぬ** (`groove-svc` が stdio を `Stdio::null()` にするため、利用者には
     /// 「動かない」以上の情報が出ない)。
+    ///
+    /// `config_dir` is the directory holding the config **as the trust decision resolved it**
+    /// ([`TrustDecision::canonical_dir`]), and it is compared as handed: resolving it again
+    /// after the read would look at whatever its links point to by then (codex P1, round 2 on
+    /// PR #388).
     fn restrict_untrusted(
         &mut self,
         config_path: Option<&Path>,
@@ -952,7 +1076,7 @@ impl Config {
         // 「--kb-path is required」で止める — 危険な値が使われないことは
         // 変わらず、正当な上書きだけが通るようになる。
         if let Some(kb) = self.kb_path.as_deref()
-            && let Some(reason) = forbidden_kb_path(kb, config_dir, roots)
+            && let Some(reason) = forbidden_kb_path_resolved(kb, config_dir, roots)
         {
             tracing::warn!(
                 config = %shown.display(),
@@ -1152,18 +1276,43 @@ impl Config {
     /// 指定パスから読み込む。ファイルが存在しない場合は空の `Config`。
     /// 相対パスで書かれたフィールドは**設定ファイルのあるディレクトリ**を
     /// 基点に解決する (cwd ではない)。
+    ///
+    /// (AX-34) The file is read the way an explicit `--config` is: links are followed, and
+    /// only [`MAX_CONFIG_FILE_BYTES`] bounds the read. A config discovery found in the cwd or
+    /// at the git root is read by [`Self::discover_located`] instead, the way its location's
+    /// trust says: an untrusted one goes through the checked read the schema and the golden
+    /// file use ([`crate::links::read_required`]), which refuses a hard link, anything that is
+    /// not a regular file (a named pipe would otherwise hang startup) and, on Unix, a symlink.
+    /// The read can be chosen before the file is opened because [`classify_trust_located`]
+    /// decides from the location alone.
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        Self::load_opening(path, path, path.parent(), ConfigRead::Following)
+    }
+
+    /// Reads a config, given the path to name, the path to open and the base its relative
+    /// fields resolve against. For a config named by `--config` or found beside the binary all
+    /// three come from the path given ([`Self::load_from`]): its trust follows from the source
+    /// alone, so there is no location decision for a repointed link to get past. For a config
+    /// discovery found, the file opened and the base come from the directory its trust
+    /// decision resolved ([`Self::load_found`]), and the path as found only names the file in
+    /// messages (codex P1, rounds 2 and 3 on PR #388).
+    fn load_opening(
+        path: &Path,
+        open: &Path,
+        base: Option<&Path>,
+        read: ConfigRead,
+    ) -> Result<Self> {
+        let Some(bytes) = read_config_bytes(open, read)? else {
             return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config: {}", path.display()))?;
+        };
+        let text = String::from_utf8(bytes)
+            .with_context(|| format!("failed to read the config: {}", path.display()))?;
         let mut cfg: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
 
         // 相対パスを設定ファイルのディレクトリ基準に resolve する。
         // cwd は MCP 起動時に呼び出し側プロジェクトに依存するため当てにならない。
-        if let Some(base) = path.parent() {
+        if let Some(base) = base {
             cfg.kb_path = cfg.kb_path.map(|p| resolve_relative(base, p));
             cfg.fastembed_cache_dir = cfg.fastembed_cache_dir.map(|p| resolve_relative(base, p));
             // (feature-56) `kb_path` と同じ扱い: config ファイルのある場所を基準にする。
@@ -1549,6 +1698,43 @@ pub struct Discovered {
     pub path: Option<PathBuf>,
 }
 
+/// What [`Config::discover_located`] found, together with the trust decision the read was
+/// chosen by. [`Config::discover_in`] takes the restriction and [`Discovered::trust`] from
+/// that decision instead of deciding again (codex P1, round 2 on PR #388).
+struct Located {
+    config: Config,
+    source: ConfigSource,
+    /// The file as found (`None` for [`ConfigSource::NotFound`]).
+    path: Option<PathBuf>,
+    decision: TrustDecision,
+}
+
+/// The trust of a config's location, decided once before the file is opened
+/// ([`classify_trust_located`]), with what the decision resolved on the way.
+///
+/// Everything that depends on where a found config is reads it from here: how the file is
+/// read, which file is opened, whether [`Config::restrict_untrusted`] applies and what its
+/// `kb_path` check compares with, and what is reported. Resolving the location a second
+/// time is the window in which a swapped parent directory changes the answer.
+#[derive(Debug, Clone)]
+struct TrustDecision {
+    trust: ConfigTrust,
+    /// For a found config (`Cwd` / `GitRoot`), the directory holding it as the decision
+    /// resolved it: canonical, or as written when it could not be canonicalized (then
+    /// [`Self::unresolved`] says why). `None` for the sources whose trust does not depend on
+    /// the location.
+    canonical_dir: Option<PathBuf>,
+    /// The path to open: for a found config, its file name under
+    /// [`Self::canonical_dir`], so the file read is the one in the directory that was judged
+    /// even if a link on the way is repointed after the decision. Otherwise the path as given.
+    open: Option<PathBuf>,
+    /// For a found config whose directory could not be canonicalized, why. Discovery refuses
+    /// such a config ([`Config::load_found`]): [`Self::canonical_dir`] is then the path as
+    /// written, and resolving relative fields against it would resolve its links again after
+    /// the decision (codex P1, round 3 on PR #388). `None` otherwise.
+    unresolved: Option<String>,
+}
+
 /// 発見した `groove.toml` を**運用者が書いたもの**として扱ってよいか。
 ///
 /// 判定材料は**置き場所だけ**で、ファイルの中身は一切見ない (git が
@@ -1699,12 +1885,31 @@ impl TrustRoots {
         }
     }
 
-    fn contains(&self, dir: &Path) -> bool {
-        let dir = canonical_or_as_is(dir);
+    /// Whether `dir` -- already resolved by the caller, [`classify_trust_located`] -- is under
+    /// a root. Only the roots are canonicalized here: they come from the environment, not from
+    /// the directory being judged, and resolving `dir` again would be a second resolution of
+    /// the found config's location.
+    fn contains_resolved(&self, dir: &Path) -> bool {
+        #[cfg(test)]
+        TRUST_ROOT_CHECKS.with(|c| c.set(c.get() + 1));
         self.roots
             .iter()
             .any(|r| dir.starts_with(canonical_or_as_is(r)))
     }
+}
+
+// (codex P1, round 2 on PR #388) How many times the current thread asked the trust roots
+// whether a found config's directory is under one of them -- that is, how many times a
+// found config's location was resolved for its trust. Discovery must resolve it once,
+// before the read, and carry the answer; a second resolution after the read is the
+// window in which a swapped parent directory changes the answer.
+//
+// Thread-local and reset-before-use for the same reasons as `db::FTS_CANDIDATE_CALLS`.
+// (A doc comment cannot be used here -- `thread_local!` is a macro.)
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TRUST_ROOT_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// `canonicalize` できればそれを、できなければ入力をそのまま返す。
@@ -1717,25 +1922,74 @@ fn canonical_or_as_is(p: &Path) -> PathBuf {
 }
 
 /// 置き場所だけから信頼を決める (BU-07)。ファイル内容は見ない。
+///
+/// (codex P1, round 2 on PR #388) 見つけた config (`Cwd` / `GitRoot`) の置き場所を解決するのは
+/// **ここで 1 回だけ**。親ディレクトリを `canonicalize` で解き、その値で root の内外を
+/// 決め、同じ値の下のファイル名を開く path にして [`TrustDecision`] に入れて返す。呼び出し側は
+/// それを読み方・開く file・[`Config::restrict_untrusted`]・報告のすべてに使い、読んだ後に
+/// 解き直さない。
+///
+/// 親ディレクトリを `canonicalize` できない時 (権限で辿れない等) は字面のまま判定し、字面の
+/// path を [`TrustDecision::open`] に入れ、解けなかった理由を [`TrustDecision::unresolved`] に残す。字面が root の
+/// 下にあれば Trusted、そうでなければ Untrusted。discovery はこの判定の config を読まずに拒否する
+/// ([`Config::load_found`]。codex P1, round 3 on PR #388: 相対 field の base にできる解決済みの
+/// dir が無い)。
+fn classify_trust_located(
+    source: ConfigSource,
+    path: Option<&Path>,
+    roots: &TrustRoots,
+) -> TrustDecision {
+    let fixed = |trust| TrustDecision {
+        trust,
+        canonical_dir: None,
+        open: path.map(Path::to_path_buf),
+        unresolved: None,
+    };
+    match source {
+        // argv は信頼する入力。argv が敵性なら `command` 自体が敵性なので、
+        // この層で守れるものは無い。
+        ConfigSource::Explicit => fixed(ConfigTrust::Trusted),
+        // 書き込むにはインストール先への書き込み権限が要る。それがあるなら
+        // バイナリ自体を差し替える方が早い。
+        ConfigSource::AlongsideBinary => fixed(ConfigTrust::Trusted),
+        // ファイルが無い = 組み込み既定値。
+        ConfigSource::NotFound => fixed(ConfigTrust::Trusted),
+        ConfigSource::Cwd | ConfigSource::GitRoot => {
+            let (Some(path), Some(dir)) = (path, path.and_then(Path::parent)) else {
+                return fixed(ConfigTrust::Untrusted);
+            };
+            let (canonical_dir, unresolved) = match std::fs::canonicalize(dir) {
+                Ok(c) => (c, None),
+                Err(e) => (dir.to_path_buf(), Some(e.to_string())),
+            };
+            let trust = if roots.contains_resolved(&canonical_dir) {
+                ConfigTrust::Trusted
+            } else {
+                ConfigTrust::Untrusted
+            };
+            let open = match path.file_name() {
+                Some(name) => canonical_dir.join(name),
+                None => path.to_path_buf(),
+            };
+            TrustDecision {
+                trust,
+                canonical_dir: Some(canonical_dir),
+                open: Some(open),
+                unresolved,
+            }
+        }
+    }
+}
+
+/// [`classify_trust_located`] の trust だけ。production は判定を運ぶために
+/// [`classify_trust_located`] を直接呼ぶ。置き場所の規則そのものを確かめる test の入口。
+#[cfg(test)]
 pub(crate) fn classify_trust(
     source: ConfigSource,
     path: Option<&Path>,
     roots: &TrustRoots,
 ) -> ConfigTrust {
-    match source {
-        // argv は信頼する入力。argv が敵性なら `command` 自体が敵性なので、
-        // この層で守れるものは無い。
-        ConfigSource::Explicit => ConfigTrust::Trusted,
-        // 書き込むにはインストール先への書き込み権限が要る。それがあるなら
-        // バイナリ自体を差し替える方が早い。
-        ConfigSource::AlongsideBinary => ConfigTrust::Trusted,
-        // ファイルが無い = 組み込み既定値。
-        ConfigSource::NotFound => ConfigTrust::Trusted,
-        ConfigSource::Cwd | ConfigSource::GitRoot => match path.and_then(Path::parent) {
-            Some(dir) if roots.contains(dir) => ConfigTrust::Trusted,
-            _ => ConfigTrust::Untrusted,
-        },
-    }
+    classify_trust_located(source, path, roots).trust
 }
 
 /// `SocketAddr` の IP が loopback でないか。
@@ -1853,6 +2107,19 @@ pub(crate) fn env_cache_dir_is_usable() -> bool {
     env_dir("FASTEMBED_CACHE_DIR").is_some()
 }
 
+/// [`forbidden_kb_path_resolved`] の test の入口。`config_dir` を `canonicalize` してから渡す。
+/// production ([`Config::restrict_untrusted`]) は信頼判定が解決した dir
+/// ([`TrustDecision::canonical_dir`]) をそのまま渡し、読んだ後に解き直さない。
+#[cfg(test)]
+pub(crate) fn forbidden_kb_path(
+    kb_path: &Path,
+    config_dir: Option<&Path>,
+    roots: &TrustRoots,
+) -> Option<&'static str> {
+    let config_dir = config_dir.map(canonical_or_as_is);
+    forbidden_kb_path_resolved(kb_path, config_dir.as_deref(), roots)
+}
+
 /// 信頼できない config が `kb_path` に指定してはいけない場所か。
 /// 該当すれば理由 (エラーメッセージ用) を返す。
 ///
@@ -1861,7 +2128,12 @@ pub(crate) fn env_cache_dir_is_usable() -> bool {
 /// (「project root に置いて絶対パスの `kb_path` を書く」と明記されている) が
 /// 壊れるため。塞ぐのは**ユーザ名を知らなくても書ける昇格**:
 /// `../..` / `/` / `C:\Users` / `/home` と、それらを指す symlink。
-pub(crate) fn forbidden_kb_path(
+///
+/// `config_dir` is compared **as handed**: it is the directory the trust decision resolved
+/// before the read ([`TrustDecision::canonical_dir`]), and resolving it again here would look
+/// at whatever its links point to after the read (codex P1, round 2 on PR #388). `kb_path`
+/// itself is still resolved here -- it is a value the config names, not the config's location.
+fn forbidden_kb_path_resolved(
     kb_path: &Path,
     config_dir: Option<&Path>,
     roots: &TrustRoots,
@@ -1896,7 +2168,6 @@ pub(crate) fn forbidden_kb_path(
         }
     }
     if let Some(dir) = config_dir {
-        let dir = canonical_or_as_is(dir);
         // 等しい場合は許す = 「このリポジトリ自身を索引する」通常の使い方。
         if dir.starts_with(&canon) && dir != canon {
             return Some("it is an ancestor of the directory holding the config file");
@@ -1946,14 +2217,14 @@ fn canonical_with_unresolved_tail(p: &Path) -> PathBuf {
 /// ない**」と宣言している。2 つが交わる — 置き場が KB の内側にある — と、「このフォルダを
 /// index して」が「このコードを実行して」に化ける。
 ///
-/// **[`forbidden_kb_path`] と違い trust では分岐しない。** あちらは「信頼できない config が
+/// **[`forbidden_kb_path_resolved`] と違い trust では分岐しない。** あちらは「信頼できない config が
 /// 書いてよい値か」を問うが、こちらの危険は config がどこで見つかったかと無関係に成り立つ。
 /// ADR-0013 が「有効化された言語が解決できなければ実行を止める。これは設定が trusted か
 /// どうかに関わらず成り立つ」と書いたのと同じ理由 — **同じ物理的状況が「どこで見つかったか」で
 /// 2 通りの意味を持ってはならない**。
 ///
 /// **存在しないパスは拒否しない。** plugin をまだ置いていない KB は正常な状態で、置き場が
-/// 無いことは R4 (iii) の文言が受ける。[`forbidden_kb_path`] が「解決できない symlink」を
+/// 無いことは R4 (iii) の文言が受ける。[`forbidden_kb_path_resolved`] が「解決できない symlink」を
 /// 拒否するのは、あちらが*索引される場所*を決めていて判定不能を素通しにできないからで、
 /// ここで同じ扱いをすると Markdown だけの利用者まで止まる。
 ///
@@ -2095,6 +2366,95 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
         cur = cur.parent()?;
     }
     None
+}
+
+/// The base a found config's relative fields resolve against, made from the directory its
+/// trust decision resolved ([`TrustDecision::canonical_dir`]) -- never from the path as found
+/// (codex P1, round 3 on PR #388).
+///
+/// On Unix that directory is used as is. On Windows `canonicalize` returns it under the
+/// verbatim prefix (`\\?\C:\...`). Joining a relative field to it still works (`PathBuf::push`
+/// folds `.`, `..` and `/` under a verbatim prefix), but the fields would then carry that
+/// prefix into every path made from them -- the database next to `kb_path`, the paths
+/// printed, and the comparisons with paths the operator spelled without it. So the prefix is
+/// dropped when doing so names the same directory: every component is a plain name that
+/// Win32 parsing leaves alone (no trailing dot or space, no reserved device name) and the
+/// whole fits in `MAX_PATH`. The result is still the resolved directory -- the same
+/// components, none of them a link. Otherwise the verbatim form is kept.
+fn relative_base(canonical_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(plain) = without_verbatim_prefix(canonical_dir) {
+            return plain;
+        }
+    }
+    canonical_dir.to_path_buf()
+}
+
+/// `\\?\C:\a\b` -> `C:\a\b`, `\\?\UNC\server\share\a` -> `\\server\share\a`, when the plain
+/// spelling names the same path ([`relative_base`]). `None` when it might not, or when the
+/// path has no verbatim prefix to drop.
+#[cfg(windows)]
+fn without_verbatim_prefix(p: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut components = p.components();
+    let plain_prefix = match components.next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => format!("{}:", char::from(drive)),
+            Prefix::VerbatimUNC(server, share) => {
+                format!(r"\\{}\{}", server.to_str()?, share.to_str()?)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut out = PathBuf::from(format!(r"{plain_prefix}\"));
+    for c in components {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                if !plain_component(name) {
+                    return None;
+                }
+                out.push(name);
+            }
+            _ => return None,
+        }
+    }
+    // MAX_PATH (260) counts the terminating NUL.
+    if out.as_os_str().len() >= 260 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Whether Win32 path parsing leaves `name` as it is: not empty, no trailing dot or space
+/// (both are stripped), no character it treats specially, and not a reserved device name
+/// (`CON`, `NUL`, `COM1` ..., also with an extension -- `nul.txt` is the null device).
+#[cfg(windows)]
+fn plain_component(name: &str) -> bool {
+    if name.is_empty() || name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c < ' ')
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.chars().count() == 4
+        && upper
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')));
+    !reserved
 }
 
 /// `path` が絶対なら何もしない、相対なら `base.join(path)` を返す。
@@ -6050,5 +6410,674 @@ lambda = 0.5
             refused.is_err(),
             "deny_unknown_fields must catch a misspelt key"
         );
+    }
+
+    // =======================================================================
+    // AX-34: how much of a config file is read, and which files are read at all
+    // =======================================================================
+
+    /// A valid `groove.toml` one byte over [`MAX_CONFIG_FILE_BYTES`]: a comment, so that
+    /// without the cap it parses and loads.
+    fn oversized_toml() -> String {
+        let pad = usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap() - 1;
+        format!("#{}\n", "x".repeat(pad))
+    }
+
+    /// The error chain of discovering from the given directory with no `--config`, which must
+    /// fail.
+    fn discover_err(cwd: &Path) -> String {
+        let err = Config::discover_in(None, cwd, None, &roots_for(None, None))
+            .expect_err("the found config must be refused");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn a_found_config_over_the_cap_is_refused() {
+        let dir = TempDir::new("groove-ax34-found-big");
+        std::fs::write(dir.path().join("groove.toml"), oversized_toml()).unwrap();
+        let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(
+            err.contains(&format!("over the {MAX_CONFIG_FILE_BYTES} byte limit")),
+            "{err}"
+        );
+    }
+
+    /// The cap is not about trust: an explicit `--config` is bounded the same way.
+    #[test]
+    fn an_explicit_config_over_the_cap_is_refused() {
+        let dir = TempDir::new("groove-ax34-explicit-big");
+        let toml = dir.path().join("big.toml");
+        std::fs::write(&toml, oversized_toml()).unwrap();
+        let err = format!(
+            "{:#}",
+            Config::load_from(&toml).expect_err("over the cap must be refused")
+        );
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(
+            err.contains(&format!("over the {MAX_CONFIG_FILE_BYTES} byte limit")),
+            "{err}"
+        );
+    }
+
+    /// A config at the cap still loads: the limit is "over", not "at".
+    #[test]
+    fn a_config_at_the_cap_still_loads() {
+        let dir = TempDir::new("groove-ax34-at-cap");
+        let toml = dir.path().join("groove.toml");
+        let mut body = oversized_toml();
+        body.remove(1);
+        assert_eq!(body.len() as u64, MAX_CONFIG_FILE_BYTES);
+        std::fs::write(&toml, body).unwrap();
+        Config::load_from(&toml).expect("at the cap loads");
+        let d = Config::discover_in(None, dir.path(), None, &roots_for(None, None))
+            .expect("at the cap loads when found too");
+        assert_eq!(d.source, ConfigSource::Cwd);
+    }
+
+    /// A found config outside every trust root is a name whoever writes the directory controls,
+    /// so it goes through the same checked read as the schema and the golden file: a hard link
+    /// (which needs no privilege anywhere) is refused.
+    #[test]
+    fn a_found_config_that_is_a_hard_link_is_refused() {
+        let dir = TempDir::new("groove-ax34-found-hardlink");
+        let elsewhere = TempDir::new("groove-ax34-found-hardlink-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        std::fs::hard_link(&original, dir.path().join("groove.toml"))
+            .expect("hard links need no privilege");
+        let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("hard link"), "{err}");
+    }
+
+    /// The read follows the location's trust, not the fact that the file was found: the same
+    /// hard-linked `groove.toml` loads when its directory is under a trust root (the config
+    /// home `groove service install` writes to, for one) and is refused when it is not.
+    #[test]
+    fn a_found_hard_link_loads_under_a_trust_root_and_is_refused_outside_one() {
+        let home = TempDir::new("groove-ax34-root-home");
+        let outside = TempDir::new("groove-ax34-root-outside");
+        let elsewhere = TempDir::new("groove-ax34-root-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        for dir in [home.path(), outside.path()] {
+            std::fs::hard_link(&original, dir.join("groove.toml"))
+                .expect("hard links need no privilege");
+        }
+        let roots = roots_for(Some(home.path()), None);
+
+        let d = Config::discover_in(None, home.path(), None, &roots)
+            .expect("a found hard link under a trust root loads");
+        assert_eq!(d.source, ConfigSource::Cwd);
+        assert_eq!(d.trust, ConfigTrust::Trusted);
+        assert_eq!(d.config.model, Some(ModelChoice::BgeM3));
+
+        let err = format!(
+            "{:#}",
+            Config::discover_in(None, outside.path(), None, &roots)
+                .expect_err("the same link outside every root is refused")
+        );
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("hard link"), "{err}");
+    }
+
+    /// `--config` is the operator's own word (it is what [`classify_trust`] calls trusted), and
+    /// a config kept in a dotfiles tree is often reached through a link. Only the cap and the
+    /// file type apply.
+    #[test]
+    fn an_explicit_config_that_is_a_hard_link_still_loads() {
+        let dir = TempDir::new("groove-ax34-explicit-hardlink");
+        let original = dir.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        let link = dir.path().join("groove.toml");
+        std::fs::hard_link(&original, &link).expect("hard links need no privilege");
+        let cfg = Config::load_from(&link).expect("an explicit hard link loads");
+        assert_eq!(cfg.model, Some(ModelChoice::BgeM3));
+        let d = Config::discover_in(Some(&link), dir.path(), None, &roots_for(None, None))
+            .expect("--config through a hard link loads");
+        assert_eq!(d.source, ConfigSource::Explicit);
+    }
+
+    /// The Unix half of the checked read: a found config that is a symlink is refused, while
+    /// the same link named by `--config` is followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_found_config_symlink_is_refused_but_an_explicit_one_is_followed() {
+        let dir = TempDir::new("groove-ax34-symlink");
+        let elsewhere = TempDir::new("groove-ax34-symlink-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        let link = dir.path().join("groove.toml");
+        std::os::unix::fs::symlink(&original, &link).expect("symlinks need no privilege on unix");
+
+        let err = discover_err(dir.path());
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let d = Config::discover_in(Some(&link), dir.path(), None, &roots_for(None, None))
+            .expect("--config through a symlink loads");
+        assert_eq!(d.config.model, Some(ModelChoice::BgeM3));
+    }
+
+    /// Discover with `--config <explicit>` on its own thread and give up after a while, so
+    /// that a read that waits on a named pipe fails the test instead of hanging the suite.
+    #[cfg(unix)]
+    fn discover_explicit_within(explicit: &Path, cwd: &Path) -> Result<Discovered, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let explicit = explicit.to_path_buf();
+        let cwd = cwd.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                Config::discover_in(Some(&explicit), &cwd, None, &roots_for(None, None))
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("loading a named pipe as --config did not return")
+    }
+
+    /// A named pipe at the given path, for the two tests below.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode; the call touches nothing else.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo to test against");
+    }
+
+    /// (local codex on PR #388) A trusted read follows links, but it still must not wait on a
+    /// named pipe: with no writer, a plain open of a FIFO blocks until one appears, so startup
+    /// would never return. `--config` is the trusted read, so it is the case to pin.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_config_that_is_a_fifo_without_a_writer_is_refused_promptly() {
+        let dir = TempDir::new("groove-ax34-explicit-fifo");
+        let fifo = dir.path().join("groove.toml");
+        make_fifo(&fifo);
+
+        let err = discover_explicit_within(&fifo, dir.path())
+            .expect_err("a named pipe is not a config file");
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// The other half of the same wait: a writer that stays open after a short write. The open
+    /// returns at once then, and it is the read that waits for an EOF that never comes; the
+    /// byte cap bounds memory, not time. The refusal has to come before anything is read.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_config_that_is_a_fifo_with_an_open_writer_is_refused_promptly() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new("groove-ax34-explicit-fifo-writer");
+        let fifo = dir.path().join("groove.toml");
+        make_fifo(&fifo);
+        // Read-write, so that this open does not itself wait for a reader (Linux and macOS
+        // both allow it on a FIFO). It holds the write end open for the rest of the test.
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("open the fifo's write end");
+        writer
+            .write_all(b"model = \"bge-m3\"\n")
+            .expect("a short write fits the pipe buffer");
+
+        let err = discover_explicit_within(&fifo, dir.path())
+            .expect_err("a named pipe is not a config file, even with bytes in it");
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+        drop(writer);
+    }
+
+    /// The trusted read asks what kind of object it opened, as the checked read does: a
+    /// directory named by `--config` is not loaded. Windows refuses to open a directory as a
+    /// file at all, so there the failure is the open's; on Unix the open succeeds and the
+    /// file-type check is what refuses it.
+    #[test]
+    fn an_explicit_config_that_is_a_directory_is_not_loaded() {
+        let dir = TempDir::new("groove-ax34-explicit-dir");
+        let sub = dir.path().join("groove.toml");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let err = format!(
+            "{:#}",
+            Config::discover_in(Some(&sub), dir.path(), None, &roots_for(None, None))
+                .expect_err("a directory is not a config file")
+        );
+        assert!(err.contains("the config"), "{err}");
+        #[cfg(unix)]
+        assert!(
+            err.contains("refusing to read the config") && err.contains("not a regular file"),
+            "{err}"
+        );
+    }
+
+    // =======================================================================
+    // codex P1, round 2 on PR #388: a found config's trust is decided once, before it is
+    // read, and that one answer chooses the read, decides the restriction and is reported
+    // =======================================================================
+
+    /// A directory link `link` -> `target`: a junction on Windows (`mklink /J` needs no
+    /// elevation, while a symlink does), a symlink on Unix. Asserted rather than skipped, as
+    /// the AX-35 / AV-11 junction tests do.
+    fn dir_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlinks need no privilege on unix");
+    }
+
+    /// How many times discovering from `cwd` asks the trust roots about a found config.
+    fn trust_root_checks_for(cwd: &Path, roots: &TrustRoots) -> (usize, Discovered) {
+        TRUST_ROOT_CHECKS.with(|c| c.set(0));
+        let d = Config::discover_in(None, cwd, None, roots).expect("discover ok");
+        (TRUST_ROOT_CHECKS.with(std::cell::Cell::get), d)
+    }
+
+    /// The location of a found config is resolved for its trust exactly once. A second
+    /// resolution after the read is what let a swapped parent directory turn a file read as
+    /// untrusted into one restricted -- and reported -- as trusted.
+    #[test]
+    fn a_found_config_has_its_location_resolved_for_trust_once() {
+        // Cwd, outside every root (untrusted) and under one (trusted).
+        let untrusted = TempDir::new("groove-pr388-once-cwd");
+        std::fs::write(untrusted.path().join("groove.toml"), "model = \"bge-m3\"\n").unwrap();
+        let (checks, d) = trust_root_checks_for(untrusted.path(), &roots_for(None, None));
+        assert_eq!(d.source, ConfigSource::Cwd);
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(checks, 1, "the cwd config's location is resolved once");
+
+        let home = TempDir::new("groove-pr388-once-root");
+        std::fs::write(home.path().join("groove.toml"), "model = \"bge-m3\"\n").unwrap();
+        let (checks, d) = trust_root_checks_for(home.path(), &roots_for(Some(home.path()), None));
+        assert_eq!(d.trust, ConfigTrust::Trusted);
+        assert_eq!(
+            checks, 1,
+            "a trusted cwd config's location is resolved once"
+        );
+
+        // GitRoot.
+        let repo = TempDir::new("groove-pr388-once-git");
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join("groove.toml"), "model = \"bge-m3\"\n").unwrap();
+        let nested = repo.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (checks, d) = trust_root_checks_for(&nested, &roots_for(None, None));
+        assert_eq!(d.source, ConfigSource::GitRoot);
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(checks, 1, "the git root config's location is resolved once");
+    }
+
+    /// [`Config::restrict_untrusted`] compares `kb_path` with the directory it is handed, as
+    /// handed: that directory is the one the trust decision resolved before the read, and
+    /// resolving it again here would look at whatever the link points to now. The directory
+    /// handed in below is a link into a child of `kb_path`; compared as written it is not
+    /// under `kb_path`, so `kb_path` stays. Resolving it again would drop it.
+    #[test]
+    fn restrict_untrusted_compares_with_the_directory_it_is_handed_without_resolving_it() {
+        let tmp = TempDir::new("groove-pr388-restrict-dir");
+        let top = tmp.path().join("top");
+        let deep = top.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &deep);
+
+        let mut cfg = Config {
+            kb_path: Some(top.clone()),
+            ..Config::default()
+        };
+        let shown = link.join("groove.toml");
+        cfg.restrict_untrusted(Some(&shown), Some(&link), &roots_for(None, None))
+            .expect("restrict ok");
+        assert_eq!(
+            cfg.kb_path.as_deref(),
+            Some(top.as_path()),
+            "the directory handed in is compared as written, not resolved again"
+        );
+    }
+
+    /// A found config is opened under the directory its trust was decided for: the decision
+    /// carries the canonical directory and the file name under it, so repointing a link on
+    /// the way after the decision cannot make the read land on another directory's file.
+    #[test]
+    fn a_found_config_is_opened_under_the_directory_its_trust_was_decided_for() {
+        let tmp = TempDir::new("groove-pr388-open");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &real);
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+
+        for source in [ConfigSource::Cwd, ConfigSource::GitRoot] {
+            let decision = classify_trust_located(
+                source,
+                Some(&link.join("groove.toml")),
+                &roots_for(None, None),
+            );
+            assert_eq!(decision.trust, ConfigTrust::Untrusted);
+            assert_eq!(
+                decision.canonical_dir.as_deref(),
+                Some(canonical_real.as_path())
+            );
+            assert_eq!(
+                decision.open,
+                Some(canonical_real.join("groove.toml")),
+                "{source:?}: the path opened is the one the trust was decided for"
+            );
+        }
+
+        // The same holds when the link leads under a trust root: the trusted (link-following)
+        // read opens the file in the root, not whatever the link points to later.
+        let decision = classify_trust_located(
+            ConfigSource::Cwd,
+            Some(&link.join("groove.toml")),
+            &roots_for(Some(&real), None),
+        );
+        assert_eq!(decision.trust, ConfigTrust::Trusted);
+        assert_eq!(decision.open, Some(canonical_real.join("groove.toml")));
+    }
+
+    /// Discovery opens [`TrustDecision::open`], not the path as found: the refusal of a
+    /// hard-linked config in a linked cwd names the file under the canonical directory,
+    /// which is the path the read was given (the outer context still names the file as
+    /// found).
+    #[test]
+    fn discovery_opens_the_path_the_trust_decision_resolved() {
+        let tmp = TempDir::new("groove-pr388-opened");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let elsewhere = TempDir::new("groove-pr388-opened-src");
+        let original = elsewhere.path().join("real.toml");
+        std::fs::write(&original, "model = \"bge-m3\"\n").unwrap();
+        std::fs::hard_link(&original, real.join("groove.toml"))
+            .expect("hard links need no privilege");
+        let link = tmp.path().join("link");
+        dir_link(&link, &real);
+        let opened = std::fs::canonicalize(&real).unwrap().join("groove.toml");
+
+        let err = discover_err(&link);
+        assert!(err.contains("hard link"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "refusing to read the config: {}",
+                opened.display()
+            )),
+            "the read was given the canonical path: {err}"
+        );
+        assert!(
+            err.contains(&link.join("groove.toml").display().to_string()),
+            "the file as found is still named: {err}"
+        );
+    }
+
+    /// When the directory cannot be canonicalized, the decision keeps the path as written
+    /// (the behaviour before the fix): it opens that path, and judges it as written -- under
+    /// a root's spelling it is trusted, elsewhere untrusted.
+    #[test]
+    fn a_found_config_whose_directory_cannot_be_resolved_is_judged_and_opened_as_written() {
+        let tmp = TempDir::new("groove-pr388-unresolved");
+        let missing = tmp.path().join("missing").join("groove.toml");
+        let decision =
+            classify_trust_located(ConfigSource::Cwd, Some(&missing), &roots_for(None, None));
+        assert_eq!(decision.trust, ConfigTrust::Untrusted);
+        assert_eq!(
+            decision.canonical_dir,
+            missing.parent().map(Path::to_path_buf)
+        );
+        assert_eq!(decision.open.as_deref(), Some(missing.as_path()));
+
+        // A root that does not exist either is compared as written too.
+        let root = tmp.path().join("missing");
+        let decision = classify_trust_located(
+            ConfigSource::Cwd,
+            Some(&missing),
+            &roots_for(Some(&root), None),
+        );
+        assert_eq!(decision.trust, ConfigTrust::Trusted);
+        assert_eq!(decision.open.as_deref(), Some(missing.as_path()));
+    }
+
+    /// The end-to-end half: a cwd reached through a link still has `kb_path` checked
+    /// against the real directory holding the config, because discovery resolved it (once)
+    /// when it decided the trust.
+    #[test]
+    fn a_found_config_through_a_linked_cwd_is_checked_against_the_real_directory() {
+        let tmp = TempDir::new("groove-pr388-linked-cwd");
+        let top = tmp.path().join("top");
+        let deep = top.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(
+            deep.join("groove.toml"),
+            format!("kb_path = '{}'\n", top.display()),
+        )
+        .unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &deep);
+
+        let d =
+            Config::discover_in(None, &link, None, &roots_for(None, None)).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert_eq!(
+            d.config.kb_path, None,
+            "an ancestor of the real directory holding the config is refused"
+        );
+    }
+
+    // =======================================================================
+    // codex P1, round 3 on PR #388: after the trust decision nothing is resolved from the
+    // path as found -- the relative fields of a found config resolve against the directory
+    // the decision resolved, and the path as found only names the file in messages
+    // =======================================================================
+
+    /// The four relative fields of a found config, each written as `../<name>`.
+    const RELATIVE_FIELDS_TOML: &str = concat!(
+        "kb_path = '../kb'\n",
+        "fastembed_cache_dir = '../cache'\n",
+        "grammar_dir = '../grammars'\n",
+        "[eval]\n",
+        "golden = '../golden.yml'\n",
+    );
+
+    /// `tmp/a/real` holds the config and is reached through `tmp/link`. Each `../<name>` is
+    /// made twice: `tmp/a/<name>` (next to the real directory) and `tmp/<name>` (next to the
+    /// link). Resolved against the real directory a field lands in `tmp/a`; resolved against
+    /// the path as found it is `tmp/link/../<name>`, which Windows folds to `tmp/<name>` -- the
+    /// other directory of the same name.
+    struct LinkedConfigDir {
+        _tmp: TempDir,
+        real: PathBuf,
+        link: PathBuf,
+        beside_real: PathBuf,
+    }
+
+    fn linked_config_dir(prefix: &str, git: bool) -> LinkedConfigDir {
+        let tmp = TempDir::new(prefix);
+        let a = tmp.path().join("a");
+        let real = a.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        if git {
+            std::fs::create_dir_all(real.join(".git")).unwrap();
+            std::fs::create_dir_all(real.join("nested")).unwrap();
+        }
+        std::fs::write(real.join("groove.toml"), RELATIVE_FIELDS_TOML).unwrap();
+        for parent in [&a, &tmp.path().to_path_buf()] {
+            for d in ["kb", "cache", "grammars"] {
+                std::fs::create_dir_all(parent.join(d)).unwrap();
+            }
+            std::fs::write(parent.join("golden.yml"), "queries: []\n").unwrap();
+        }
+        let link = tmp.path().join("link");
+        dir_link(&link, &real);
+        LinkedConfigDir {
+            beside_real: std::fs::canonicalize(&a).unwrap(),
+            _tmp: tmp,
+            real,
+            link,
+        }
+    }
+
+    /// The four resolved fields of `cfg`, by name.
+    fn relative_fields(cfg: &Config) -> Vec<(&'static str, Option<PathBuf>)> {
+        vec![
+            ("kb_path", cfg.kb_path.clone()),
+            ("fastembed_cache_dir", cfg.fastembed_cache_dir.clone()),
+            ("grammar_dir", cfg.grammar_dir.clone()),
+            ("golden", cfg.eval.as_ref().and_then(|e| e.golden.clone())),
+        ]
+    }
+
+    /// A trusted config found through a linked cwd (and through a linked git root) resolves
+    /// every relative field against the directory its trust was decided for. Resolved against
+    /// the link instead, a repointed link after the decision would hand a trusted config's
+    /// `grammar_dir` -- a native library that is `dlopen`ed -- to the link's new target.
+    #[test]
+    fn a_trusted_found_config_resolves_relative_fields_against_the_judged_directory() {
+        for (git, source) in [(false, ConfigSource::Cwd), (true, ConfigSource::GitRoot)] {
+            let fx = linked_config_dir("groove-pr388-r3-trusted", git);
+            let cwd = if git {
+                fx.link.join("nested")
+            } else {
+                fx.link.clone()
+            };
+            let d = Config::discover_in(None, &cwd, None, &roots_for(Some(&fx.real), None))
+                .expect("discover ok");
+            assert_eq!(d.source, source);
+            assert_eq!(d.trust, ConfigTrust::Trusted, "{source:?}");
+            for (name, value) in relative_fields(&d.config) {
+                let value = value.unwrap_or_else(|| panic!("{source:?}: {name} is kept"));
+                assert!(
+                    !value.starts_with(&fx.link),
+                    "{source:?}: {name} is not resolved against the path as found: {}",
+                    value.display()
+                );
+                let leaf = value.file_name().unwrap().to_owned();
+                assert_eq!(
+                    std::fs::canonicalize(&value).unwrap(),
+                    fx.beside_real.join(&leaf),
+                    "{source:?}: {name} lands next to the judged directory, not next to the link"
+                );
+            }
+        }
+    }
+
+    /// The untrusted half: R3 keeps a `kb_path` that is not a forbidden place, and the value it
+    /// keeps is resolved against the judged directory -- the one R3 compared it with.
+    #[test]
+    fn an_untrusted_found_config_keeps_a_kb_path_resolved_against_the_judged_directory() {
+        let fx = linked_config_dir("groove-pr388-r3-untrusted", false);
+        let d =
+            Config::discover_in(None, &fx.link, None, &roots_for(None, None)).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let kb = d.config.kb_path.expect("an allowed kb_path is kept");
+        assert!(!kb.starts_with(&fx.link), "{}", kb.display());
+        assert_eq!(
+            std::fs::canonicalize(&kb).unwrap(),
+            fx.beside_real.join("kb")
+        );
+    }
+
+    /// The path as found is still what messages name: a parse error in a config reached
+    /// through a linked cwd names the file under the link, as the operator spelled the cwd.
+    #[test]
+    fn a_found_config_error_names_the_file_as_found() {
+        let tmp = TempDir::new("groove-pr388-r3-named");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("groove.toml"), "kb_path = [\n").unwrap();
+        let link = tmp.path().join("link");
+        dir_link(&link, &real);
+        let err = discover_err(&link);
+        let as_found = link.join("groove.toml");
+        assert!(
+            err.contains(&format!("failed to parse config: {}", as_found.display())),
+            "{err}"
+        );
+    }
+
+    /// On Windows the base drops the verbatim prefix `canonicalize` adds, when the plain
+    /// spelling names the same directory, so a found config's fields do not carry `\\?\`
+    /// into the database path and the paths printed. Where it might not, the prefix stays.
+    #[cfg(windows)]
+    #[test]
+    fn the_relative_base_drops_the_verbatim_prefix_only_where_it_names_the_same_directory() {
+        let plain = |s: &str| without_verbatim_prefix(Path::new(s));
+        assert_eq!(plain(r"\\?\C:\a\b"), Some(PathBuf::from(r"C:\a\b")));
+        assert_eq!(plain(r"\\?\C:\"), Some(PathBuf::from(r"C:\")));
+        assert_eq!(
+            plain(r"\\?\UNC\server\share\a"),
+            Some(PathBuf::from(r"\\server\share\a"))
+        );
+        for kept in [
+            r"\\?\C:\a\trailing.",
+            r"\\?\C:\a\trailing ",
+            r"\\?\C:\a\CON",
+            r"\\?\C:\a\nul.txt",
+            r"\\?\C:\a\com1",
+            r"\\?\C:\a\LPT9.log",
+            r"\\?\C:\a\COM¹",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\a",
+        ] {
+            assert_eq!(plain(kept), None, "{kept}");
+        }
+        assert_eq!(plain(r"C:\a\b"), None, "nothing to drop");
+        let long = format!(r"\\?\C:\{}", "x".repeat(300));
+        assert_eq!(plain(&long), None, "longer than MAX_PATH");
+        assert_eq!(
+            relative_base(Path::new(r"\\?\C:\a\CON")),
+            PathBuf::from(r"\\?\C:\a\CON")
+        );
+
+        // End to end: a found config's relative field carries no verbatim prefix.
+        let fx = linked_config_dir("groove-pr388-r3-plain", false);
+        let d = Config::discover_in(None, &fx.link, None, &roots_for(Some(&fx.real), None))
+            .expect("discover ok");
+        for (name, value) in relative_fields(&d.config) {
+            let value = value.unwrap();
+            assert!(
+                !value.to_string_lossy().starts_with(r"\\?\"),
+                "{name}: {}",
+                value.display()
+            );
+        }
+    }
+
+    /// A found config whose directory cannot be resolved is refused rather than read: there is
+    /// no resolved directory to resolve its relative fields against, and the path as found
+    /// would be resolved again at every later use. The refusal names the file as found.
+    #[test]
+    fn a_found_config_whose_directory_cannot_be_resolved_is_refused() {
+        let tmp = TempDir::new("groove-pr388-r3-unresolved");
+        let missing = tmp.path().join("missing").join("groove.toml");
+        for source in [ConfigSource::Cwd, ConfigSource::GitRoot] {
+            for roots in [
+                roots_for(None, None),
+                roots_for(Some(&tmp.path().join("missing")), None),
+            ] {
+                let err = Config::load_found(source, &missing, &roots)
+                    .expect_err("an unresolved directory is refused");
+                let err = format!("{err:#}");
+                assert!(err.contains("could not be resolved"), "{source:?}: {err}");
+                assert!(
+                    err.contains(&missing.display().to_string()),
+                    "{source:?}: {err}"
+                );
+                assert!(err.contains("--config"), "{source:?}: {err}");
+            }
+        }
     }
 }

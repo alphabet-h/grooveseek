@@ -320,6 +320,25 @@ and stops at the first hit:
 `~` in `--config` is expanded to the home directory on all platforms
 (including Windows `cmd.exe` where the shell does not expand it).
 
+Whichever file is chosen, groove reads at most 1 MiB of it and refuses a
+larger one (`refusing to read the config: <path>: it is N bytes, over the
+1048576 byte limit`). A file in an untrusted location (see
+[Trusted and untrusted config locations](#trusted-and-untrusted-config-locations):
+found at priority 2 or 3 outside every trusted root) is also read the way the
+frontmatter schema and the golden file are: a hard link, anything that is not
+a regular file (a named pipe, a device) and, on Linux and macOS, a symlink are
+refused rather than followed, because whoever writes that directory chose what
+is at that name. A file in a trusted location — named with `--config`, beside
+the binary, or found under a trusted root such as the config home
+`groove service install` writes to — may be a symlink or a hard link, as a config kept
+in a dotfiles tree usually is. To use a linked `groove.toml` from a project
+root, name it with `--config`. Wherever the file is, what is read must be a
+regular file: a named pipe, a device or a directory is refused before
+anything is read (`refusing to read the config: <path>: it is not a regular
+file ...`), so a pipe cannot hang startup. This includes `--config` given a
+pipe from the shell, such as `--config <(...)`; write the config to a file
+instead.
+
 The chosen file is logged to stderr at startup as
 `grooveseek::config: loaded config source=... path=... trust=...`, so you can see
 which file is in effect and how far it was trusted.
@@ -336,6 +355,24 @@ it as yours:
   install-directory access), a config home used by `groove service install`,
   and "no file at all".
 - **Untrusted**: anything else found under the cwd or a `.git` ancestor.
+
+The directory holding a found file is resolved (its links followed) once, before
+the file is opened, and the file is then opened in that resolved directory. The
+same answer decides whether the restrictions below apply and is the `trust=` the
+startup log reports, so repointing a link on the way while groove starts cannot
+change it.
+
+Relative paths in a found file — `kb_path`, `fastembed_cache_dir`,
+`grammar_dir` and `[eval] golden` — are resolved against that same resolved
+directory, not against the path groove found the file at, and so is everything
+derived from `kb_path` (the database beside it, `groove-schema.toml`,
+`.grooveignore`). If you `cd` through a link into a project, `kb_path = "../kb"`
+names the `kb` next to the project's real directory. The path as found is used
+only to name the file in messages and in the startup log. If the directory
+cannot be resolved at all, the file is refused with an error that names it;
+pass it with `--config` to use it. A file named with `--config` or found beside
+the binary resolves its relative paths against the directory as you gave it,
+since its trust does not depend on where it is.
 
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,

@@ -24,6 +24,58 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   every other changed document was served from stored vectors now exits 1 (MCP: an `error`), since
   the endpoint accepted nothing.
 
+### Fixed
+
+- **Moving a document without changing its bytes now moves its `category` and `topic` with it.**
+  Under the default `context_mode = "off"` such a move — a file or a whole directory, seen by
+  `groove index` or by the live watcher — rewrote only the path, so a search filtered on the new
+  directory missed the document and one filtered on the old directory still found it, until
+  `--force` or an edit. The category is now taken from the new path, and so is the topic unless the
+  document's frontmatter sets one, which is kept. The frontmatter is read again from the bytes the
+  move was recognised by, so a frontmatter topic that happens to equal the old directory's name is
+  kept as well; nothing is re-embedded. When the watcher cannot read the moved file — it is over
+  the size limit, the read fails, or the read is refused — only the category follows the new path:
+  without the bytes a frontmatter topic cannot be told from the old directory's, so the topic is
+  left as it was. Once the file can be read again, `--force` or an edit to it sets the topic from
+  the new path; a plain `groove index` does not, since the bytes, and so the hash, are unchanged.
+  A move to a different parser (`.md` to `.pdf`) is the exception when the file is over the size
+  limit or the read is refused: the old chunks are not valid for the new parser, so the document is
+  removed from the index instead (a failed read keeps it either way).
+  When the watcher sees a move that also changed the file, the topic likewise stays as it was until
+  the reindex that follows writes the new content. For a move within one parser (`.md` to `.md`),
+  if that reindex writes nothing (the new content has nothing to index, or it cannot be read or
+  parsed), the document keeps its previous content and the topic that went with it. A move to a
+  different parser (`.md` to `.pdf`) cannot keep it, since the old chunks are not valid for the new
+  parser: unless the reindex succeeds, the document is removed from the index.
+
+### Security
+
+- **The live watcher no longer walks into a directory that was replaced by a link.** When a new
+  directory appears the watcher scans it once, and that scan followed the directory itself if it
+  had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time
+  the scan started, indexing files outside the knowledge base under in-KB names. Links below it
+  were already skipped.
+- **The `groove.toml` that commands load is read through a size limit, and an untrusted one
+  through the checked read.** The config `groove` loads at startup (`--config`, the working
+  directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole,
+  and refused when it is not a regular file (a named pipe would hang startup, `--config <(...)`
+  included), wherever it is; `groove service` and the tray, which read their own configs, are
+  unchanged. A `groove.toml` found in the working directory or at the git root outside every
+  trusted config location is also refused when it is a hard link or, on Linux and macOS, a
+  symlink, as the frontmatter schema and the golden file already were. Name a linked config with
+  `--config` to use it. Whether a found config is trusted is decided once, before it
+  is opened, and that one answer chooses how it is read, which file is opened (the one in the
+  directory that was judged), whether the restrictions apply and what the startup log reports, so
+  repointing a parent directory while the file is read can no longer make it count as trusted.
+  Its relative paths (`kb_path`, `fastembed_cache_dir`, `grammar_dir`, `[eval] golden`) are
+  resolved against that judged directory too, not against the path the file was found at, so a
+  link repointed after the decision cannot move a trusted config's grammar plugins, model cache or
+  knowledge base; the path as found only names the file in messages. A found config whose
+  directory cannot be resolved is refused (name it with `--config` to use it). See
+  [Config file discovery](docs/configuration.md#config-file-discovery).
+- **CI runs with a read-only `GITHUB_TOKEN`.** `ci.yml` now declares `permissions: contents: read`
+  at the top level instead of inheriting the repository default.
+
 ### Documentation
 
 - **Pages and doc comments that had fallen behind the code are corrected.** The 1.20.4 heading

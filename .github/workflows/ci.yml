@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# (AX-38) Every job here only checks out and runs cargo; none writes to the
+# repository, an issue or a pull request, and the caches (`Swatinem/rust-cache`,
+# `actions/cache`) use the runtime cache token rather than `GITHUB_TOKEN`. So the
+# token gets read access to the contents and nothing else, whatever the
+# repository's default happens to be.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

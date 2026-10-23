@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-use crate::db::{ChunkVector, Database};
+use crate::db::{ChunkVector, Database, FrontmatterTopic};
 use crate::embedder::Embedder;
 use crate::parser::{ParserExt, Registry};
 use crate::quality;
@@ -136,6 +136,14 @@ struct DiskScan {
     /// ここで測った値を持ち帰って上書きする (codex P2 round 4)。**索引後に
     /// 消えたファイル等と違い、これは知り得る** — たった今 stat したのだから。
     oversize: Vec<(String, u64)>,
+    /// (local Codex on PR #388) The frontmatter topic of each entry the scan's caller called a
+    /// rename candidate, keyed by its rel path, read from **the bytes the entry's hash was
+    /// taken from** ([`crate::parser::Parser::frontmatter_topic_inner`]). Rename detection pairs
+    /// paths by that hash, so these are the bytes the rename is decided on, and the rename
+    /// rebuilds the topic from them without a second read
+    /// ([`Database::rename_documents_atomic`]). Only candidates, because [`DiskEntry`] keeps no
+    /// content and the rest of the run reads each file again.
+    frontmatter_topics: std::collections::HashMap<String, Option<String>>,
 }
 
 /// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
@@ -369,6 +377,7 @@ fn scan_disk_entries(
         registry,
         max_binary_bytes,
         max_text_bytes,
+        &|_, _| false,
         &mut || std::ops::ControlFlow::Continue(()),
     )
     .0
@@ -382,12 +391,16 @@ fn scan_disk_entries(
 /// observer that reports the file and looks at the cancel token, and the test-only wrapper
 /// next to it in this module (not linked: it is `#[cfg(test)]`, which rustdoc does not see)
 /// passes one that never stops it.
+///
+/// `rename_candidate(rel, hash)` says which entries get their frontmatter topic read from the
+/// scan's own bytes into [`DiskScan::frontmatter_topics`] (local Codex on PR #388).
 fn scan_disk_entries_observed(
     source_files: &[std::path::PathBuf],
     kb_path: &Path,
     registry: &Registry,
     max_binary_bytes: u64,
     max_text_bytes: u64,
+    rename_candidate: &dyn Fn(&str, &str) -> bool,
     on_file: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
 ) -> (DiskScan, std::ops::ControlFlow<()>) {
     let binary_exts = registry.binary_extensions();
@@ -395,14 +408,17 @@ fn scan_disk_entries_observed(
         entries: Vec::with_capacity(source_files.len()),
         skipped: Vec::new(),
         oversize: Vec::new(),
+        frontmatter_topics: std::collections::HashMap::new(),
     };
     for p in source_files {
         scan_one_file(
             p,
             kb_path,
+            registry,
             &binary_exts,
             max_binary_bytes,
             max_text_bytes,
+            rename_candidate,
             &mut scan,
         );
         if on_file().is_break() {
@@ -417,12 +433,15 @@ fn scan_disk_entries_observed(
 /// [`DiskScan::oversize`]) why it was declined.
 /// Split out of the loop so the observer runs after every outcome, including the ones that
 /// end early here.
+#[allow(clippy::too_many_arguments)]
 fn scan_one_file(
     p: &std::path::Path,
     kb_path: &Path,
+    registry: &Registry,
     binary_exts: &[&str],
     max_binary_bytes: u64,
     max_text_bytes: u64,
+    rename_candidate: &dyn Fn(&str, &str) -> bool,
     scan: &mut DiskScan,
 ) {
     let rel = index_rel_path_or_whole(kb_path, p);
@@ -458,6 +477,10 @@ fn scan_one_file(
     match read_for_index_under(p, &rel, cap, size_cap_key(is_binary)) {
         Ok((Some(bytes), _)) => {
             let hash = sha256_hex_bytes(&bytes);
+            if rename_candidate(&rel, &hash) {
+                scan.frontmatter_topics
+                    .insert(rel.clone(), frontmatter_topic_of(registry, &rel, &bytes));
+            }
             scan.entries.push(DiskEntry {
                 rel,
                 hash,
@@ -569,6 +592,23 @@ fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) ->
         registry.by_extension(ext).map(|p| p.extension())
     };
     parser_of(old_rel) != parser_of(new_rel)
+}
+
+/// The frontmatter topic `bytes` give the document at `rel`, read by the parser the index would
+/// pick for `rel` ([`Registry::by_extension`], the lookup [`rename_crosses_a_parser`] uses) --
+/// what the index would merge as `frontmatter.topic.or(path-derived)` (local Codex on PR #388).
+///
+/// Both rename paths ask this one question of the bytes they decided the rename on: the full
+/// run's scan for each rename candidate, and [`rename_single_file`] for the bytes it hashed.
+/// `None` for an extension with no parser, as for a parser whose format carries no topic.
+fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<String> {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    registry
+        .by_extension(ext)
+        .and_then(|parser| parser.frontmatter_topic(bytes, rel))
 }
 
 /// After a rename [`rename_crosses_a_parser`] said crosses parsers, the caller reparses the
@@ -1136,12 +1176,26 @@ pub fn rebuild_index(
     //
     // (feature-60) Every file the scan visits is reported, declined or not, and is check point
     // C1: a set token stops the scan right after the file it just reported.
+    //
+    // (local Codex on PR #388) The rows' (path, hash) are read before the scan, not after it,
+    // so the scan can tell which files rename detection may pair -- a path the index does not
+    // hold whose hash a row does -- and read their frontmatter topic from the bytes it hashes.
+    // Nothing writes between here and the renames below. `force` detects no renames.
+    let db_path_hashes = if force {
+        std::collections::HashMap::new()
+    } else {
+        db.all_path_hashes()?
+    };
+    let db_hashes: HashSet<&str> = db_path_hashes.values().map(String::as_str).collect();
+    let rename_candidate =
+        |rel: &str, hash: &str| !db_path_hashes.contains_key(rel) && db_hashes.contains(hash);
     let (scan, scan_flow) = scan_disk_entries_observed(
         &source_files,
         &kb_path,
         registry,
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
+        &rename_candidate,
         &mut || {
             progress.report_scanned();
             if progress.is_cancelled() {
@@ -1153,6 +1207,7 @@ pub fn rebuild_index(
     );
     let disk_entries = scan.entries;
     let scan_oversize = scan.oversize;
+    let frontmatter_topics = scan.frontmatter_topics;
 
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
@@ -1195,11 +1250,12 @@ pub fn rebuild_index(
     tally.renamed = if force {
         0
     } else {
-        let db_path_hashes = db.all_path_hashes()?;
         let pairs = detect_renames(&disk_entries, &db_path_hashes, &skipped_paths);
         // evaluator 指摘 High #2: rename フェーズ全体を単一 transaction に
         // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
-        db.rename_documents_atomic(&pairs)?;
+        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
+        // its topic comes from the bytes the pair was matched on.
+        db.rename_documents_atomic(&pairs, &frontmatter_topics)?;
         for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
             let crossed = rename_crosses_a_parser(registry, old_path, new_path);
@@ -3161,6 +3217,26 @@ pub enum RenameOutcome {
 /// - **size cap**: 新 path が registry の上限 ([`Registry::limits`]) を超えていれば hash
 ///   再計算のための `fs::read` をスキップする ([`size_cap_exceeded`]、codex P2 round 3。
 ///   これで scan / reindex / rename の 3 read 経路すべてが同じ size-cap guard を通る)
+/// - **path 由来の列** (AX-01、[`Database::rename_document`]): 行の topic は、その行の chunk を
+///   作った bytes (か同じ hash の bytes) から作る。新 path の bytes を読めて hash が行と一致した
+///   移動は、`category` を新 path から、topic をその bytes の frontmatter の topic か、無ければ
+///   新 path から作る。読めなかった移動 (上限超え・読み込みの失敗・読み込みの拒否) は `category`
+///   だけを新 path から作り、topic は保存値のまま残す (frontmatter を読めないので、path 由来の
+///   topic と frontmatter の topic を区別できない)。旧 path 由来の topic は、file が再び読める
+///   ようになった後の `--force` か内容の編集 (= 再 parse) で直る。bytes が同じままの通常の
+///   full run は hash が一致して行に触らないので直さない。ただし parser をまたぐ移動
+///   ([`rename_crosses_a_parser`]) で上限超えか読み込みの拒否なら、旧 chunk が新 parser にとって
+///   無効なので行ごと消える ([`settle_cross_parser_rename`]。結果は
+///   [`RenameOutcome::RenamedSizeCappedAndDropped`] か
+///   [`RenameOutcome::RenamedButRefusedAndDropped`])。読み込みの失敗 (`Err`) は parser を
+///   またいでも行を消さない
+/// - 中身も変わった移動 (hash が行と違う) も、移す時点では `category` だけを新 path から作り、
+///   topic は保存値のまま残す (codex P2 round 4 on PR #388)。続く reindex が行を書き換えれば、
+///   topic は index 時の規則で新しい bytes から書かれる。書き換えなければ (chunk が 0・2 度目の
+///   読み込みの拒否・parse の失敗)、同じ parser の間の移動なら行は旧 hash・旧 chunk・それと対の
+///   topic のまま残る。parser をまたぐ移動 ([`rename_crosses_a_parser`]) は旧 chunk が新 parser に
+///   とって無効なので残せず、reindex が [`SingleResult::Updated`] で終わらなければ行ごと消える
+///   ([`settle_cross_parser_rename`])
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -3193,26 +3269,33 @@ pub fn rename_single_file(
         );
     };
 
-    db.rename_document(old_rel, new_rel)?;
+    // (local Codex on PR #388) The row moves once the new path's bytes have been read, so a
+    // same-hash move rebuilds its topic from the bytes this function hashes below -- the same
+    // bytes the same-hash decision is made on, not a second read. The exits that read nothing
+    // (size cap, failed read, refused read, missing file) move it with `FrontmatterTopic::Unread`
+    // first: the category follows the new path, the stored topic stays beside the stored chunks,
+    // since without the bytes a frontmatter topic cannot be told from the old path's (local Codex
+    // r3). A move whose bytes changed moves with `Unread` too (codex P2 round 4): see below.
 
-    // (codex P2 round 11 on PR #291) Decided here, right after the row moved and before any
-    // of the early returns below: a rename that crosses a parser leaves the *old* parser's
-    // row under the new path until something rewrites it, and the size-cap and read-refusal
-    // exits below rewrite nothing. Each of them settles the crossing the same way the reparse
-    // arms further down do (`settle_cross_parser_rename`'s doc), so the row is dropped rather
-    // than kept as a stale hit a later full index would preserve as an oversized skip.
+    // (codex P2 round 11 on PR #291) Decided here, before any of the early returns below: a
+    // rename that crosses a parser leaves the *old* parser's row under the new path until
+    // something rewrites it, and the size-cap and read-refusal exits below rewrite nothing.
+    // Each of them settles the crossing the same way the reparse arms further down do
+    // (`settle_cross_parser_rename`'s doc), so the row is dropped rather than kept as a stale
+    // hit a later full index would preserve as an oversized skip.
     let crosses_a_parser = rename_crosses_a_parser(registry, old_rel, new_rel);
 
     // 新 path の実体 hash を読み直し、DB 側 (= old_hash) と比較
     let full = kb_path.join(new_rel);
     if !full.exists() {
         // 新 path のファイルも無い。通常起こらないが起きたら DB も掃除
+        db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         db.delete_document(new_rel)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
     }
 
-    // size-cap ガード: fs::read する前に判定する。DB の path 自体は既に
-    // rename_document で UPDATE 済なのでここでは触らない (= 旧 hash のまま
+    // size-cap ガード: fs::read する前に判定する。超過なら DB の path だけ
+    // rename_document (topic は Unread) で UPDATE し、内容には触らない (= 旧 hash のまま
     // 新 path に残る)。hash 再計算 / reindex は次回 full rebuild に委ねる。
     let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
     let is_binary_ext = registry
@@ -3229,6 +3312,7 @@ pub fn rename_single_file(
         eprintln!(
             "Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
         );
+        db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         // (codex P2 round 11 on PR #291) Crossed a parser: the row is the old parser's
         // and nothing below will rewrite it. Settle before recording a size for it.
         if crosses_a_parser {
@@ -3251,10 +3335,18 @@ pub fn rename_single_file(
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
     );
-    let (maybe_bytes, measured) =
-        read_for_index_under(&full, new_rel, cap, size_cap_key(is_binary_ext))
-            .with_context(|| format!("failed to read {}", full.display()))?;
+    let read = read_for_index_under(&full, new_rel, cap, size_cap_key(is_binary_ext));
+    let (maybe_bytes, measured) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            // Before the move waited for the bytes, a failed read found the row already moved.
+            // It moves here too, so a failed read leaves the state it always left.
+            db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
+            return Err(e).with_context(|| format!("failed to read {}", full.display()));
+        }
+    };
     let Some(new_bytes) = maybe_bytes else {
+        db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         // (codex P2 round 6) The rename target has the same stat-then-read
         // window as every other reader, and this was the last caller still
         // dropping the length the refusal measured.
@@ -3272,6 +3364,23 @@ pub fn rename_single_file(
         return Ok(RenameOutcome::RenamedButRefused);
     };
     let new_hash = sha256_hex_bytes(&new_bytes);
+    let same_hash = new_hash == old_hash;
+    // (local Codex on PR #388) The row's topic is built from the bytes its chunks came from, or
+    // bytes of the same hash. When the bytes just hashed match the row's hash they are such
+    // bytes, and their frontmatter topic is the row's (the fast path below keeps it). (codex P2
+    // round 4 on PR #388) When they do not, they are not committed yet: the row moves with
+    // `FrontmatterTopic::Unread`, and the reindex below writes their topic only if it rewrites
+    // the row. If it writes nothing (no chunks, a second-read refusal, a failed parse), the row
+    // keeps its old hash, its old chunks and the topic those chunks were built with.
+    let read_topic = same_hash
+        .then(|| frontmatter_topic_of(registry, new_rel, &new_bytes))
+        .flatten();
+    let topic = if same_hash {
+        FrontmatterTopic::Read(read_topic.as_deref())
+    } else {
+        FrontmatterTopic::Unread
+    };
+    db.rename_document(old_rel, new_rel, topic)?;
     // 測った側が記録する (上の reindex と同じ理由)。
     if let Err(e) = db.record_document_sizes(&[(new_rel, new_bytes.len() as u64)]) {
         tracing::warn!("failed to record the size of {new_rel}: {e}");
@@ -3291,7 +3400,6 @@ pub fn rename_single_file(
     // 旧 parser が書いた `document_fields` / title / tags が新 parser の読みへ
     // 更新されないまま残ってしまうため。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
-    let same_hash = new_hash == old_hash;
     if same_hash && context_mode != ContextMode::Static && !crosses_a_parser {
         return Ok(RenameOutcome::Renamed);
     }
@@ -3482,8 +3590,14 @@ pub(crate) fn collect_source_files_counted(
         unspellable.set(unspellable.get() + 1);
     };
 
+    // (AX-35) `follow_links(false)` leaves the root alone: walkdir follows a root that is a
+    // link unless `follow_root_links(false)` says otherwise. The watcher's `start` is a name
+    // inside the KB that a writer can swap for a link (or, on Windows, a junction) to a
+    // directory outside it. The full index hands in the canonicalized KB root, which is never
+    // a link, so this changes nothing there.
     for entry in WalkDir::new(start)
         .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_entry(|e| {
             // `kb_path` itself relativizes to the empty string, which is never
@@ -3547,7 +3661,11 @@ pub(crate) fn collect_source_files_counted(
 /// "ai-news/2026-04-16.md"         → (Some("ai-news"), None)
 /// "index.md"                       → (None, None)
 /// ```
-fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
+///
+/// (AX-01) Also read by [`Database::rename_document`], which re-derives both from the new path
+/// when a rename moves a row without re-embedding it -- the topic only when the rename's bytes
+/// declare none, the way the index merges the two.
+pub(crate) fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
     let parts: Vec<&str> = rel_path.split('/').collect();
     match parts.len() {
         // "index.md" — no category, no topic
@@ -4632,6 +4750,62 @@ mod tests {
         );
     }
 
+    /// (AX-35) The directory the walk starts at is not followed when it is a symlink. The
+    /// watcher hands in the directory an event named, and a KB writer can swap it for a link to
+    /// a directory outside the KB between the event and the walk. walkdir follows the **root**
+    /// regardless of `follow_links(false)` unless told otherwise (`follow_root_links` defaults
+    /// to `true`), so without that the walk would collect the outside files under KB-relative
+    /// names.
+    ///
+    /// On Windows the link is a directory junction: a symlink there needs Developer Mode or an
+    /// elevated token, while `mklink /J` needs neither, so the junction is the form a KB writer
+    /// can actually make (the same reasoning as the `grammar_dir` junction test in
+    /// [`crate::config`]). std reports a junction as a symlink, and so does walkdir. No std API
+    /// creates one, hence `mklink /J` through the shell; it is asserted rather than skipped.
+    #[test]
+    fn collect_source_files_under_does_not_follow_a_symlinked_start() {
+        let kb = mk_tmp("under-symlinked-start-kb");
+        let outside = mk_tmp("under-symlinked-start-out");
+        write_file(&outside.0, "pay.md", "# outside the knowledge base");
+        write_file(&kb.0, "real.md", "# real");
+        let link = kb.0.join("fresh");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside.0, &link).expect("symlinks need no privilege on unix");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &outside.0.display().to_string(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("mklink must be runnable");
+            assert!(
+                made.success(),
+                "mklink /J needs no elevation and must succeed"
+            );
+        }
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "premise: the start is a link"
+        );
+
+        let reg = Registry::defaults();
+        let files = collect_source_files_under(&kb.0, &link, &reg, &excl(&kb.0, &[])).unwrap();
+        assert!(
+            files.is_empty(),
+            "a symlinked start must not be walked into, got {files:?}"
+        );
+    }
+
     /// The full walk is the subtree walk started at the root. Pinning the
     /// delegation keeps a future edit from growing a second walk body — the
     /// whole reason `collect_source_files_under` exists rather than a copy.
@@ -5230,6 +5404,41 @@ mod tests {
         assert_eq!(scan.skipped, vec!["notes.md".to_string()]);
     }
 
+    /// (local Codex on PR #388) The scan reads a frontmatter topic for the rename candidates
+    /// only, from the bytes it hashed, and records none for a candidate that declares none.
+    #[test]
+    fn scan_reads_the_frontmatter_topic_of_rename_candidates_only() {
+        let tmp = mk_tmp("scantopics");
+        write_file(&tmp.0, "a.md", "---\ntopic: x\n---\n\n# a\n");
+        write_file(&tmp.0, "b.md", "---\ntopic: y\n---\n\n# b\n");
+        write_file(&tmp.0, "c.txt", "plain text");
+        let reg = Registry::defaults();
+        let source = vec![tmp.0.join("a.md"), tmp.0.join("b.md"), tmp.0.join("c.txt")];
+        let candidates = ["a.md", "c.txt"];
+        let (scan, _) = scan_disk_entries_observed(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+            &|rel, hash| {
+                let entry_hash = sha256_hex_bytes(
+                    &std::fs::read(tmp.0.join(rel)).expect("read the fixture back"),
+                );
+                assert_eq!(hash, entry_hash, "the candidate check sees the scan's hash");
+                candidates.contains(&rel)
+            },
+            &mut || std::ops::ControlFlow::Continue(()),
+        );
+        let mut topics: Vec<(&str, Option<&str>)> = scan
+            .frontmatter_topics
+            .iter()
+            .map(|(rel, topic)| (rel.as_str(), topic.as_deref()))
+            .collect();
+        topics.sort();
+        assert_eq!(topics, [("a.md", Some("x")), ("c.txt", None)]);
+    }
+
     /// (feature-60) The observer runs once per visited file, declined files included, and a
     /// `Break` ends the scan right there with what it had so far -- so a stopped run can still
     /// count the files it declined. [`scan_disk_entries`] is the same scan with an observer that
@@ -5256,6 +5465,7 @@ mod tests {
             &reg,
             crate::parser::MAX_RAW_BINARY_BYTES,
             crate::parser::MAX_RAW_TEXT_BYTES,
+            &|_, _| false,
             &mut || {
                 calls += 1;
                 if calls == 2 {

@@ -1377,12 +1377,55 @@ impl Database {
     /// `chunks` / `vec_chunks` / `fts_chunks` は `document_id` 経由で紐付いて
     /// いるため、`documents.path` のみを UPDATE すれば embedding の再計算は
     /// 不要。移動先 path が既に使われている場合は UNIQUE 制約違反でエラー。
-    pub fn rename_document(&self, old_path: &str, new_path: &str) -> Result<()> {
+    ///
+    /// (AX-01) path から導出する列も同じ UPDATE で書き換える。同じ bytes の rename は
+    /// content hash が一致するので、ここで直さないと次の incremental run も fast path を
+    /// 通って旧 directory の値が `--force` か内容の編集まで残る。規則は
+    /// [`crate::indexer::extract_category_topic`] の書き手 (index 時の merge) と同じ:
+    /// - `category` は frontmatter に対応する key が無く常に path 由来なので、新 path から
+    ///   無条件に導出し直す
+    /// - `topic` は index 時と同じ `frontmatter.topic.or(新 path 由来)` で作り直す。
+    ///   frontmatter の topic は呼び出し側が **rename の判定 (hash の一致) に使った bytes** から
+    ///   読んで [`FrontmatterTopic::Read`] で渡す (local Codex on PR #388)。保存値だけでは
+    ///   frontmatter の `topic: x` と旧 path 由来の `x` を区別できないため、保存値との比較はしない
+    /// - [`FrontmatterTopic::Unread`] (bytes を読めなかった watcher の枝 = 上限超え・読み込みの
+    ///   失敗・読み込みの拒否) は `category` だけを新 path から作り、topic は保存値のまま置く。
+    ///   frontmatter を読めないので保存値が frontmatter 由来か旧 path 由来かを区別できず、新 path
+    ///   由来で上書きすると frontmatter の topic を壊す側に倒れるため。chunk も旧 bytes のままの
+    ///   行で、topic だけを推測で書き換えない。旧 path 由来の topic は、file が再び読めるように
+    ///   なった後の `--force` か内容の編集 (= 再 parse) で新 path から作り直される。bytes が同じ
+    ///   ままの通常の full run は hash が一致して行に触らないので直さない。ただし parser をまたぐ
+    ///   移動で上限超えか読み込みの拒否なら、呼び出し側 ([`crate::indexer::rename_single_file`]) が
+    ///   行ごと消すので保存値は残らない。読み込みの失敗は parser をまたいでも行を消さない
+    /// - 中身も変わった watcher の移動 (読めた bytes の hash が行と違う) も
+    ///   [`FrontmatterTopic::Unread`] で渡す (codex P2 round 4 on PR #388)。行の topic は、その行の
+    ///   chunk を作った bytes (か同じ hash の bytes) から作る。まだ index されていない bytes の
+    ///   topic は、続く reindex が行を書き換えた時にだけ書かれ、書き換えなければ (同じ parser の間の
+    ///   移動なら) 保存値が旧 chunk と対のまま残る。parser をまたぐ移動は、reindex が成功しなければ
+    ///   呼び出し側が行ごと消すので、保存値は残らない
+    ///
+    /// watcher の [`crate::indexer::rename_single_file`] と full run の
+    /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
+    pub fn rename_document(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        frontmatter_topic: FrontmatterTopic<'_>,
+    ) -> Result<()> {
+        let (new_category, path_topic) = crate::indexer::extract_category_topic(new_path);
+        let (rebuild_topic, topic) = match frontmatter_topic {
+            FrontmatterTopic::Read(fm) => (true, fm.map(str::to_string).or(path_topic)),
+            FrontmatterTopic::Unread => (false, None),
+        };
         let updated = self
             .conn
             .execute(
-                "UPDATE documents SET path = ?1 WHERE path = ?2",
-                params![new_path, old_path],
+                "UPDATE documents
+                 SET path = ?1,
+                     category = ?2,
+                     topic = CASE WHEN ?3 THEN ?4 ELSE topic END
+                 WHERE path = ?5",
+                params![new_path, new_category, rebuild_topic, topic, old_path],
             )
             .with_context(|| {
                 format!(
@@ -1403,18 +1446,48 @@ impl Database {
     /// `Connection::unchecked_transaction()` を使用 (F-32)。Drop guard で
     /// rollback が担保されるので、`?` early-return パスでも DB が中途半端な
     /// state に置かれない。
-    pub fn rename_documents_atomic(&self, pairs: &[(String, String)]) -> Result<()> {
+    ///
+    /// `frontmatter_topics` は **新 path** をキーに、rename の判定に使った bytes の
+    /// frontmatter topic を持つ (local Codex on PR #388)。キーの無い pair は
+    /// [`FrontmatterTopic::Unread`] として渡す。
+    pub fn rename_documents_atomic(
+        &self,
+        pairs: &[(String, String)],
+        frontmatter_topics: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
         let tx = self.conn.unchecked_transaction()?;
         for (old, new) in pairs {
-            self.rename_document(old, new)?; // Drop on tx rolls back on error
+            let topic = match frontmatter_topics.get(new) {
+                Some(fm) => FrontmatterTopic::Read(fm.as_deref()),
+                None => FrontmatterTopic::Unread,
+            };
+            self.rename_document(old, new, topic)?; // Drop on tx rolls back on error
         }
         tx.commit()
             .context("rename_documents_atomic: COMMIT failed")?;
         Ok(())
     }
+}
+
+/// What the bytes behind a rename say about the document's topic, for
+/// [`Database::rename_document`] (local Codex on PR #388).
+///
+/// The stored `topic` is the merged value (`frontmatter.topic.or(path-derived)`), so it cannot
+/// tell a frontmatter `topic: x` from the old directory's `x`. Only the bytes can, and the
+/// caller hands over what they said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontmatterTopic<'a> {
+    /// The bytes the rename was decided on were read: the topic their frontmatter declares, or
+    /// `None` when it declares none (every format but Markdown). The stored topic is rebuilt as
+    /// the index builds it, this one first and the new path's second.
+    Read(Option<&'a str>),
+    /// No bytes were read (the watcher's size-cap, refusal and missing-file exits), or the bytes
+    /// read are not the ones the row was built from (a watcher move whose hash changed, codex P2
+    /// round 4 on PR #388): the stored topic stays as it is, like the chunks beside it.
+    Unread,
 }
 
 /// How many leading segments a `(category, topic)` group already accounts for.
