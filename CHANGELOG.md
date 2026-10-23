@@ -33,7 +33,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `--force` or an edit. The category is now taken from the new path, and so is the topic unless the
   document's frontmatter sets one, which is kept. The frontmatter is read again from the bytes the
   move was recognised by, so a frontmatter topic that happens to equal the old directory's name is
-  kept as well; nothing is re-embedded.
+  kept as well; nothing is re-embedded. When the watcher cannot read the moved file — it is over
+  the size limit, the read fails, or the read is refused — only the category follows the new path:
+  without the bytes a frontmatter topic cannot be told from the old directory's, so the topic is
+  left as it was. Once the file can be read again, `--force` or an edit to it sets the topic from
+  the new path; a plain `groove index` does not, since the bytes, and so the hash, are unchanged.
 
 ### Security
 

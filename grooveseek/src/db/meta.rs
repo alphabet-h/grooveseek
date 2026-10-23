@@ -1388,8 +1388,13 @@ impl Database {
     ///   frontmatter の topic は呼び出し側が **rename の判定 (hash の一致) に使った bytes** から
     ///   読んで [`FrontmatterTopic::Read`] で渡す (local Codex on PR #388)。保存値だけでは
     ///   frontmatter の `topic: x` と旧 path 由来の `x` を区別できないため、保存値との比較はしない
-    /// - [`FrontmatterTopic::Unread`] (bytes を読めなかった watcher の枝) は topic を保存値のまま
-    ///   置く。chunk も旧 bytes のままの行で、topic だけを推測で書き換えない
+    /// - [`FrontmatterTopic::Unread`] (bytes を読めなかった watcher の枝 = 上限超え・読み込みの
+    ///   失敗・読み込みの拒否) は `category` だけを新 path から作り、topic は保存値のまま置く。
+    ///   frontmatter を読めないので保存値が frontmatter 由来か旧 path 由来かを区別できず、新 path
+    ///   由来で上書きすると frontmatter の topic を壊す側に倒れるため。chunk も旧 bytes のままの
+    ///   行で、topic だけを推測で書き換えない。旧 path 由来の topic は、file が再び読めるように
+    ///   なった後の `--force` か内容の編集 (= 再 parse) で新 path から作り直される。bytes が同じ
+    ///   ままの通常の full run は hash が一致して行に触らないので直さない
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
     /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。

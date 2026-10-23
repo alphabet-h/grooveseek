@@ -257,3 +257,100 @@ fn a_watcher_rename_keeps_a_frontmatter_topic_equal_to_the_old_directory() {
     assert_the_frontmatter_topic_stays(&fx);
     assert_dir_empty(&fx.cache);
 }
+
+/// A text cap below [`PLAIN`]'s size, appended to the fixture's `groove.toml` as its `[index]`.
+const LOWERED_TEXT_CAP: &str = "\n[index]\nmax_text_file_size = 16\n";
+
+/// (local Codex r3 on PR #388) A watcher rename the watcher cannot read -- the moved file is
+/// over the size limit -- moves the category but keeps the stored topic: without the bytes, a
+/// path-derived `x` cannot be told from a frontmatter `topic: x`, and overwriting it with the new
+/// path's would break the latter. A full run under the same limit skips the file and keeps the
+/// row as it is. Once the limit is raised again, `groove index --force` parses the file and the
+/// topic follows the new path.
+#[test]
+fn a_watcher_rename_over_the_size_cap_keeps_the_stored_topic_until_the_file_is_indexed() {
+    if run_in_hermetic_child(
+        "a_watcher_rename_over_the_size_cap_keeps_the_stored_topic_until_the_file_is_indexed",
+    ) {
+        return;
+    }
+    let fx = fixture("ax01-capped", &[("a/x/n.md", PLAIN)], "");
+    fx.index();
+
+    // Lower the cap below the note's size, then move it.
+    let original = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    std::fs::write(&fx.config, format!("{original}{LOWERED_TEXT_CAP}"))
+        .expect("lower the text cap");
+    std::fs::create_dir_all(fx.kb().join("b/y")).expect("create b/y");
+    std::fs::rename(fx.kb().join("a/x/n.md"), fx.kb().join("b/y/n.md")).expect("move the note");
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let before = fx.mock.requests().len();
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "a/x/n.md",
+        "b/y/n.md",
+        None,
+        &registry,
+    )
+    .expect("rename the note");
+    // The premise: the size-cap exit, which reads no bytes.
+    assert_eq!(outcome, RenameOutcome::RenamedSizeCapped);
+    drop(db);
+
+    // A full run under the lowered cap skips the over-cap file and keeps its row.
+    fx.index();
+    assert!(
+        fx.requests_since(before)
+            .iter()
+            .all(|r| r.model() != Some(common::embed_mock::DOC_MODEL)),
+        "an over-cap rename must not re-embed"
+    );
+    let moved = vec!["b/y/n.md".to_string()];
+    assert_eq!(fx.documents(), 1, "the row is kept");
+    assert_eq!(
+        hits(&fx, &["--category", "b"]),
+        moved,
+        "the category follows the path"
+    );
+    assert!(
+        hits(&fx, &["--category", "a"]).is_empty(),
+        "category a must hold nothing after the move"
+    );
+    assert_eq!(
+        hits(&fx, &["--topic", "x"]),
+        moved,
+        "the stored topic is kept while the bytes cannot be read"
+    );
+    assert!(
+        hits(&fx, &["--topic", "y"]).is_empty(),
+        "the new path's topic is not guessed without the bytes"
+    );
+
+    // The recovery: raise the cap back and rebuild. The bytes are the ones the row was built
+    // from, so a plain full run finds the hash unchanged and leaves the row alone; `--force` (or
+    // an edit to the file) parses it again, and the topic is rebuilt from the new path.
+    std::fs::write(&fx.config, &original).expect("restore the text cap");
+    let out = fx.index_force();
+    assert!(
+        out.status.success(),
+        "groove index --force failed:\n{}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        hits(&fx, &["--topic", "y"]),
+        moved,
+        "the topic follows the path once the file is indexed"
+    );
+    assert!(
+        hits(&fx, &["--topic", "x"]).is_empty(),
+        "topic x must hold nothing once the file is indexed"
+    );
+    assert_eq!(hits(&fx, &["--category", "b"]), moved, "category b");
+    assert_dir_empty(&fx.cache);
+}

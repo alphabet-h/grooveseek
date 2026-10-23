@@ -3217,6 +3217,13 @@ pub enum RenameOutcome {
 /// - **size cap**: 新 path が registry の上限 ([`Registry::limits`]) を超えていれば hash
 ///   再計算のための `fs::read` をスキップする ([`size_cap_exceeded`]、codex P2 round 3。
 ///   これで scan / reindex / rename の 3 read 経路すべてが同じ size-cap guard を通る)
+/// - **path 由来の列** (AX-01、[`Database::rename_document`]): 新 path の bytes を読めた移動は、
+///   `category` を新 path から、topic をその bytes の frontmatter の topic か、無ければ新 path から
+///   作る。読めなかった移動 (上限超え・読み込みの失敗・読み込みの拒否) は `category` だけを新 path
+///   から作り、topic は保存値のまま残す (frontmatter を読めないので、path 由来の topic と
+///   frontmatter の topic を区別できない)。旧 path 由来の topic は、file が再び読めるようになった
+///   後の `--force` か内容の編集 (= 再 parse) で直る。bytes が同じままの通常の full run は hash が
+///   一致して行に触らないので直さない
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -3251,9 +3258,10 @@ pub fn rename_single_file(
 
     // (local Codex on PR #388) The row moves once the new path's bytes have been read, so its
     // topic is rebuilt from the bytes this function hashes below -- the same bytes the
-    // same-hash decision is made on, not a second read. The exits that read nothing move it
-    // with `FrontmatterTopic::Unread` first, which keeps the stored topic beside the stored
-    // chunks.
+    // same-hash decision is made on, not a second read. The exits that read nothing (size cap,
+    // failed read, refused read, missing file) move it with `FrontmatterTopic::Unread` first:
+    // the category follows the new path, the stored topic stays beside the stored chunks, since
+    // without the bytes a frontmatter topic cannot be told from the old path's (local Codex r3).
 
     // (codex P2 round 11 on PR #291) Decided here, before any of the early returns below: a
     // rename that crosses a parser leaves the *old* parser's row under the new path until
