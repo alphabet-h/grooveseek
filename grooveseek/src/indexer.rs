@@ -242,7 +242,7 @@ fn read_for_index_under(
 /// event can name a file through a directory link inside the KB -- on Linux
 /// notify followed such links when it set up its watches until AX-02, and a
 /// directory can be swapped for a link at any time. The walk never goes through
-/// one (`follow_links(false)`), and `get_document` refuses one, so the
+/// one (`follow_links(false)`), and `get_document` ([`crate::server`]) refuses one, so the
 /// single-file paths must not be the place that does. `kb_path` is canonicalized
 /// here rather than trusted to be: the comparison needs both sides spelled the
 /// same, and a caller that passed a non-canonical root would otherwise have every

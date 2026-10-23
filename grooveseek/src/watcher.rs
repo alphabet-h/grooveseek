@@ -534,9 +534,9 @@ fn reload_rules(state: &mut WatcherState) {
 /// (audit AX-02) The notify configuration the watcher is built with: the default, with
 /// `follow_symlinks` off.
 ///
-/// notify 8.2.0 defaults it to `true` (`Config::default`, `src/config.rs`), and the inotify
-/// backend hands it to the `WalkDir` that sets up a recursive watch (`add_watch` in
-/// `src/inotify.rs`), both for the root and for a directory moved in later. With it on, a
+/// notify 8.2.0 defaults it to `true` (the `Default` of notify's own configuration type), and
+/// notify's inotify backend hands it to the `WalkDir` that sets up a recursive watch, both
+/// for the root and for a directory moved in later. With it on, a
 /// directory symlink inside the KB gets watches on its target, so on Linux the target's
 /// files arrive as events under in-KB names -- the walk never follows such a link, and
 /// `max_user_watches` runs out on `-> /`. The kqueue and poll backends read the same flag;

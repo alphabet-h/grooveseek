@@ -469,15 +469,15 @@ fn is_symlink_open_error(_e: &std::io::Error) -> bool {
     false
 }
 
-/// Where `path` resolves to with every link on the way followed, when that is
-/// under `root`; `Ok(None)` when it resolves outside. `root` must itself be
-/// canonical (`std::fs::canonicalize`), so both sides carry the same spelling --
+/// Where the given path resolves to with every link on the way followed, when
+/// that is under the given root; `Ok(None)` when it resolves outside. The root
+/// must itself be canonical (`std::fs::canonicalize`), so both sides carry the same spelling --
 /// on Windows, the same verbatim prefix.
 ///
 /// (audit AX-02) This is the check for an **intermediate** directory that is a
 /// link: `symlink_metadata` and the `O_NOFOLLOW` open in [`read_checked`] look at
 /// the final component only, so `kb/notes/a.md` with `kb/notes -> /elsewhere`
-/// passes both. `get_document` asks it before serving a path, and the watcher's
+/// passes both. `get_document` ([`crate::server`]) asks it before serving a path, and the watcher's
 /// single-file reindex and rename ask it before reading one. Like the rest of
 /// this module it decides about a path at one moment: a directory swapped for a
 /// link between this answer and the open is not closed here (module docs).

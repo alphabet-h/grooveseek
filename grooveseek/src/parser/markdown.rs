@@ -538,7 +538,7 @@ fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> 
     merge_and_build(raw_chunks, title)
 }
 
-/// The sections of `body` at its `##` / `###` headings, each with the ancestry it had when it
+/// The sections of the body at its `##` / `###` headings, each with the ancestry it had when it
 /// opened (ancestors cut by [`super::context_ancestor`]), before the 50-char merge.
 fn split_at_headings(body: &str, excludes: &[&str]) -> Vec<RawChunk> {
     // raw_chunks: (heading, 祖先見出しスナップショット, content)
@@ -1188,7 +1188,8 @@ larger body enough enough enough enough enough enough enough.";
         }
     }
 
-    /// (audit AX-04) Cutting the ancestors leaves every context as `build_context` makes it
+    /// (audit AX-04) Cutting the ancestors leaves every context as
+    /// [`crate::parser::build_context`] makes it
     /// over the uncut headings, byte for byte: a cut that ends in whitespace, a CJK heading,
     /// a child equal to the cut parent and a child equal to the whole parent.
     #[test]

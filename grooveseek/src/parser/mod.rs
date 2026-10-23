@@ -546,7 +546,7 @@ pub(crate) fn context_ancestor(heading: &str) -> String {
 
 /// The breadcrumb `[title, ...ancestry, heading]` of a heading-chunked document (Markdown,
 /// docx). `ancestry` holds [`context_ancestor`] values; the title and the heading are
-/// trimmed here as [`build_context`] does. Same output as `build_context` over the uncut
+/// trimmed here as [`build_context`] does. Same output as [`build_context`] over the uncut
 /// ancestors.
 pub(crate) fn heading_context(
     title: Option<&str>,
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(context_ancestor(&"a".repeat(200)), "a".repeat(200));
     }
 
-    /// (audit AX-04) `heading_context` over cut ancestors equals `build_context` over the
+    /// (audit AX-04) [`heading_context`] over cut ancestors equals [`build_context`] over the
     /// whole ones, and does not trim a cut that ends in whitespace.
     #[test]
     fn heading_context_over_cut_ancestors_is_build_context_over_whole_ones() {

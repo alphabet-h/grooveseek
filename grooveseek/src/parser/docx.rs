@@ -1690,7 +1690,8 @@ mod tests {
     }
 
     /// (audit AX-04) A long ancestor heading is held cut to the context cap; the contexts stay
-    /// those of `build_context` over the uncut headings, a cut ending in whitespace included.
+    /// those of [`crate::parser::build_context`] over the uncut headings, a cut ending in
+    /// whitespace included.
     #[test]
     fn a_long_ancestor_heading_gives_the_context_of_the_uncut_one() {
         // ideographic spaces over the cut, after the 196 chars the title "a > " leaves room
