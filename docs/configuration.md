@@ -332,7 +332,12 @@ is at that name. A file in a trusted location — named with `--config`, beside
 the binary, or found under a trusted root such as the config home
 `groove service install` writes to — may be a symlink or a hard link, as a config kept
 in a dotfiles tree usually is. To use a linked `groove.toml` from a project
-root, name it with `--config`.
+root, name it with `--config`. Wherever the file is, what is read must be a
+regular file: a named pipe, a device or a directory is refused before
+anything is read (`refusing to read the config: <path>: it is not a regular
+file ...`), so a pipe cannot hang startup. This includes `--config` given a
+pipe from the shell, such as `--config <(...)`; write the config to a file
+instead.
 
 The chosen file is logged to stderr at startup as
 `grooveseek::config: loaded config source=... path=... trust=...`, so you can see

@@ -316,6 +316,10 @@ bind = "127.0.0.1:3100"
 `groove service install` が書く config home のような信頼する根の下で見つけたもの — は、
 シンボリックリンクでもハードリンクでもよい (dotfiles の管理下に置いた config はたいていそうなる)。
 プロジェクトルートの `groove.toml` がリンクなら、`--config` で名指しすること。
+どの置き場所でも、読む対象は通常ファイルでなければならない: 名前付きパイプ、デバイス、
+ディレクトリは何も読む前に拒否する (`refusing to read the config: <path>: it is not a
+regular file ...`)。なのでパイプで起動が止まることはない。シェルが渡すパイプ
+(`--config <(...)` など) も同じく拒否されるので、config はファイルに書き出して渡すこと。
 
 起動時に stderr へ `grooveseek::config: loaded config source=... path=... trust=...`
 が出るので、**どの toml が効いているか**と**どこまで信用したか**をログで確認できる。

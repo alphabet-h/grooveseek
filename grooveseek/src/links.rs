@@ -53,7 +53,10 @@
 //! `symlink(2)` needs no privilege. It also carries `O_NONBLOCK`, because a FIFO
 //! left in place of a note would otherwise block the open until a writer
 //! appeared and hang the whole index run; for regular files both flags are
-//! no-ops.
+//! no-ops. The trusted read behind [`crate::links::read_required_following`]
+//! makes the same open without `O_NOFOLLOW` -- it follows links, but it must
+//! not wait on a FIFO any more than the index run may -- and refuses anything
+//! that is not a regular file from the same `fstat`.
 //!
 //! On Windows the open adds nothing, deliberately. Creating a symlink there
 //! requires `SeCreateSymbolicLinkPrivilege` or Developer Mode — measured on
@@ -296,9 +299,7 @@ pub(crate) enum Content {
 /// read is bounded a second time as it runs, so a file that grows under us
 /// cannot outrun the check either.
 pub(crate) fn read_checked(path: &Path, cap: u64) -> std::io::Result<Content> {
-    use std::io::Read;
-
-    let file = match open_for_read(path) {
+    let file = match open_for_read(path, FinalLink::Refuse) {
         Ok(f) => f,
         // O_NOFOLLOW reports a symlink as ELOOP. That is a refusal, not a
         // failure: the file we were told about is not the file that is there.
@@ -316,7 +317,16 @@ pub(crate) fn read_checked(path: &Path, cap: u64) -> std::io::Result<Content> {
     if handle_link_count(&meta, &file).is_some_and(|count| count > 1) {
         return Ok(Content::Refused(Refused::MultiplyLinked));
     }
-    let len = meta.len();
+    read_bounded(file, meta.len(), cap)
+}
+
+/// The two size checks every read here makes, and the read itself, for a
+/// handle already known to be a regular file: its length against `cap`, then
+/// what was actually read, so a file that grows under us cannot outrun the
+/// check either.
+fn read_bounded(file: File, len: u64, cap: u64) -> std::io::Result<Content> {
+    use std::io::Read;
+
     if len > cap {
         return Ok(Content::Refused(Refused::TooLarge { len, cap }));
     }
@@ -354,8 +364,10 @@ pub(crate) fn read_required(path: &Path, cap: u64, what: &str) -> anyhow::Result
 /// is bounded by `cap` the same way, but links are followed and the link count
 /// is not asked. Whoever could put a file there is the operator, and a file
 /// kept in a dotfiles tree is commonly a symlink or a hard link to one
-/// elsewhere. Absence and failures are worded as in [`read_required`], through
-/// the same conversion.
+/// elsewhere. What the links lead to must still be a regular file: a named
+/// pipe, a device or a directory is refused before anything is read, as in
+/// [`read_required`] and with the same reason. Absence and failures are worded
+/// as in [`read_required`], through the same conversion.
 pub(crate) fn read_required_following(
     path: &Path,
     cap: u64,
@@ -364,25 +376,23 @@ pub(crate) fn read_required_following(
     required(read_following(path, cap), path, what)
 }
 
-/// The bounded read behind [`read_required_following`]: plain `File::open`,
-/// then the same two size checks [`read_checked`] makes -- the handle's length,
-/// and what was actually read, so a device or a pipe with no length is bounded
-/// too.
+/// The bounded read behind [`read_required_following`]: the open
+/// [`read_checked`] makes without its refusal of a final symlink, then the same
+/// file-type check on the handle and the same two size checks.
+///
+/// The file-type check is what keeps a named pipe from hanging startup (local
+/// Codex on PR #388). The byte cap bounds memory, not time: a FIFO whose writer
+/// stays open after a short write never reaches EOF, so it has to be refused
+/// before it is read, and on Unix the open itself must not wait for a writer
+/// either -- which is why the open is shared with [`read_checked`] rather than
+/// being a plain `File::open`.
 fn read_following(path: &Path, cap: u64) -> std::io::Result<Content> {
-    use std::io::Read;
-
-    let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > cap {
-        return Ok(Content::Refused(Refused::TooLarge { len, cap }));
+    let file = open_for_read(path, FinalLink::Follow)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Ok(Content::Refused(Refused::NotAPlainFile));
     }
-    let mut bytes = Vec::new();
-    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
-    let read = bytes.len() as u64;
-    if read > cap {
-        return Ok(Content::Refused(Refused::TooLarge { len: read, cap }));
-    }
-    Ok(Content::Bytes(bytes))
+    read_bounded(file, meta.len(), cap)
 }
 
 /// The one conversion from a read's outcome to what a caller that cannot go on
@@ -407,15 +417,32 @@ fn required(
     }
 }
 
-/// Open a path for reading, refusing to follow a symlink in its final component
-/// and refusing to block on a FIFO. See the module docs for why the two
-/// platforms differ.
+/// Whether [`open_for_read`] refuses a symlink in the final component.
+#[derive(Clone, Copy)]
+enum FinalLink {
+    /// [`read_checked`]: a symlink in place of the file fails the open (Unix).
+    Refuse,
+    /// [`read_following`]: the trusted read follows it.
+    Follow,
+}
+
+/// Open a path for reading, refusing to block on a FIFO and, with
+/// [`FinalLink::Refuse`], refusing to follow a symlink in its final component.
+/// See the module docs for why the two platforms differ.
+///
+/// `O_NONBLOCK` stays on the descriptor afterwards. That is harmless here: the
+/// callers read only after the handle is known to be a regular file, and a
+/// regular file ignores the flag.
 #[cfg(unix)]
-fn open_for_read(path: &Path) -> std::io::Result<File> {
+fn open_for_read(path: &Path, final_link: FinalLink) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
+    let flags = match final_link {
+        FinalLink::Refuse => libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        FinalLink::Follow => libc::O_NONBLOCK,
+    };
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(flags)
         .open(path)
 }
 
@@ -424,9 +451,11 @@ fn open_for_read(path: &Path) -> std::io::Result<File> {
 /// Plain `File::open`, which is exactly what `std::fs::read` did here before —
 /// the same access mode (`GENERIC_READ`) and the same default sharing
 /// (read | write | delete). So no file that could be indexed before stops being
-/// readable now; only where the count comes from has changed.
+/// readable now; only where the count comes from has changed. `final_link`
+/// changes nothing here: the open follows a symlink either way (see the module
+/// docs), and there is no FIFO on the filesystem to block on.
 #[cfg(not(unix))]
-fn open_for_read(path: &Path) -> std::io::Result<File> {
+fn open_for_read(path: &Path, _final_link: FinalLink) -> std::io::Result<File> {
     File::open(path)
 }
 

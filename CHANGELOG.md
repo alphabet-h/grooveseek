@@ -45,12 +45,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   were already skipped.
 - **The `groove.toml` that commands load is read through a size limit, and an untrusted one
   through the checked read.** The config `groove` loads at startup (`--config`, the working
-  directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole;
-  `groove service` and the tray, which read their own configs, are unchanged. A `groove.toml` found
-  in the working directory or at the git root outside every trusted config location is also
-  refused when it is a hard link, not a regular file (a named pipe would hang startup) or, on Linux
-  and macOS, a symlink, as the frontmatter schema and the golden file already were. Name a linked
-  config with `--config` to use it. Whether a found config is trusted is decided once, before it
+  directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole,
+  and refused when it is not a regular file (a named pipe would hang startup, `--config <(...)`
+  included), wherever it is; `groove service` and the tray, which read their own configs, are
+  unchanged. A `groove.toml` found in the working directory or at the git root outside every
+  trusted config location is also refused when it is a hard link or, on Linux and macOS, a
+  symlink, as the frontmatter schema and the golden file already were. Name a linked config with
+  `--config` to use it. Whether a found config is trusted is decided once, before it
   is opened, and that one answer chooses how it is read, which file is opened (the one in the
   directory that was judged), whether the restrictions apply and what the startup log reports, so
   repointing a parent directory while the file is read can no longer make it count as trusted.

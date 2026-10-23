@@ -660,10 +660,11 @@ pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Copy)]
 enum ConfigRead {
     /// A trusted location (`--config`, the file beside the binary, or a found file under a
-    /// [`TrustRoots`] root): links are followed and only the size is bounded
-    /// ([`crate::links::read_required_following`]). A config kept in a dotfiles tree is
-    /// commonly reached through a symlink or a hard link, and refusing it would break a setup
-    /// that only its owner could have made.
+    /// [`TrustRoots`] root): links are followed, the size is bounded and what they lead to
+    /// must be a regular file ([`crate::links::read_required_following`]). A config kept in a
+    /// dotfiles tree is commonly reached through a symlink or a hard link, and refusing it
+    /// would break a setup that only its owner could have made; a named pipe would hang
+    /// startup whoever put it there.
     Following,
     /// An untrusted location (found in the cwd or at the git root, outside every root): the
     /// checked read the schema and the golden file use ([`crate::links::read_required`]).
@@ -6522,7 +6523,8 @@ lambda = 0.5
     }
 
     /// `--config` is the operator's own word (it is what [`classify_trust`] calls trusted), and
-    /// a config kept in a dotfiles tree is often reached through a link. Only the cap applies.
+    /// a config kept in a dotfiles tree is often reached through a link. Only the cap and the
+    /// file type apply.
     #[test]
     fn an_explicit_config_that_is_a_hard_link_still_loads() {
         let dir = TempDir::new("groove-ax34-explicit-hardlink");
@@ -6556,6 +6558,101 @@ lambda = 0.5
         let d = Config::discover_in(Some(&link), dir.path(), None, &roots_for(None, None))
             .expect("--config through a symlink loads");
         assert_eq!(d.config.model, Some(ModelChoice::BgeM3));
+    }
+
+    /// Discover with `--config <explicit>` on its own thread and give up after a while, so
+    /// that a read that waits on a named pipe fails the test instead of hanging the suite.
+    #[cfg(unix)]
+    fn discover_explicit_within(explicit: &Path, cwd: &Path) -> Result<Discovered, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let explicit = explicit.to_path_buf();
+        let cwd = cwd.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                Config::discover_in(Some(&explicit), &cwd, None, &roots_for(None, None))
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("loading a named pipe as --config did not return")
+    }
+
+    /// A named pipe at `path`, for the two tests below.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode; the call touches nothing else.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo to test against");
+    }
+
+    /// (local codex on PR #388) A trusted read follows links, but it still must not wait on a
+    /// named pipe: with no writer, a plain open of a FIFO blocks until one appears, so startup
+    /// would never return. `--config` is the trusted read, so it is the case to pin.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_config_that_is_a_fifo_without_a_writer_is_refused_promptly() {
+        let dir = TempDir::new("groove-ax34-explicit-fifo");
+        let fifo = dir.path().join("groove.toml");
+        make_fifo(&fifo);
+
+        let err = discover_explicit_within(&fifo, dir.path())
+            .expect_err("a named pipe is not a config file");
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// The other half of the same wait: a writer that stays open after a short write. The open
+    /// returns at once then, and it is the read that waits for an EOF that never comes; the
+    /// byte cap bounds memory, not time. The refusal has to come before anything is read.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_config_that_is_a_fifo_with_an_open_writer_is_refused_promptly() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new("groove-ax34-explicit-fifo-writer");
+        let fifo = dir.path().join("groove.toml");
+        make_fifo(&fifo);
+        // Read-write, so that this open does not itself wait for a reader (Linux and macOS
+        // both allow it on a FIFO). It holds the write end open for the rest of the test.
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("open the fifo's write end");
+        writer
+            .write_all(b"model = \"bge-m3\"\n")
+            .expect("a short write fits the pipe buffer");
+
+        let err = discover_explicit_within(&fifo, dir.path())
+            .expect_err("a named pipe is not a config file, even with bytes in it");
+        assert!(err.contains("refusing to read the config"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+        drop(writer);
+    }
+
+    /// The trusted read asks what kind of object it opened, as the checked read does: a
+    /// directory named by `--config` is not loaded. Windows refuses to open a directory as a
+    /// file at all, so there the failure is the open's; on Unix the open succeeds and the
+    /// file-type check is what refuses it.
+    #[test]
+    fn an_explicit_config_that_is_a_directory_is_not_loaded() {
+        let dir = TempDir::new("groove-ax34-explicit-dir");
+        let sub = dir.path().join("groove.toml");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let err = format!(
+            "{:#}",
+            Config::discover_in(Some(&sub), dir.path(), None, &roots_for(None, None))
+                .expect_err("a directory is not a config file")
+        );
+        assert!(err.contains("the config"), "{err}");
+        #[cfg(unix)]
+        assert!(
+            err.contains("refusing to read the config") && err.contains("not a regular file"),
+            "{err}"
+        );
     }
 
     // =======================================================================
