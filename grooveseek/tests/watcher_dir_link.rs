@@ -245,6 +245,56 @@ fn a_rename_into_a_directory_link_drops_the_destination_row_too() {
     assert_dir_empty(&fx.cache);
 }
 
+/// (local Codex r3 on AX-02) The same as above with a link whose target is gone: the file does
+/// not exist through it, so the reindex used to stop at "file no longer exists" and keep the row,
+/// while the full index (which does not follow the link) drops it.
+#[test]
+fn a_document_whose_directory_became_a_dangling_link_leaves_the_index() {
+    if run_in_hermetic_child("a_document_whose_directory_became_a_dangling_link_leaves_the_index") {
+        return;
+    }
+    let fx = fixture(
+        "ax02-dangling",
+        &[("in.md", NOTE), ("sub/note.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+    let moved = fx.layout.root().join("moved-out");
+    std::fs::rename(kb.join("sub"), &moved).expect("move sub/ out");
+    dir_link(&kb.join("sub"), &moved);
+    std::fs::remove_dir_all(&moved).expect("remove the link's target");
+    assert!(!kb.join("sub/note.md").exists(), "the link must dangle");
+
+    let outcome = reindex_single_file(&db, &mut embedder, &kb, "sub/note.md", None, &registry)
+        .expect("reindex");
+    assert_eq!(outcome, SingleResult::OutsideKnowledgeBaseDeindexed);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string()]
+    );
+
+    // Control: a file that is simply gone, with no link on the way, keeps the "no longer
+    // exists" skip; its row is the removal path's to drop, not this one's.
+    std::fs::remove_file(kb.join("in.md")).expect("remove in.md");
+    let outcome =
+        reindex_single_file(&db, &mut embedder, &kb, "in.md", None, &registry).expect("reindex");
+    assert!(
+        matches!(outcome, SingleResult::Skipped { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string()]
+    );
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
 #[test]
 fn a_rename_into_a_directory_link_takes_the_document_out_of_the_index() {
     if run_in_hermetic_child("a_rename_into_a_directory_link_takes_the_document_out_of_the_index") {

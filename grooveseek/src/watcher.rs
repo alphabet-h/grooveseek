@@ -608,6 +608,33 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     let Some(rel) = to_rel(&state.kb_path, p) else {
                         continue;
                     };
+                    // (local Codex r3 on AX-02) A path that is now a link: if it was a
+                    // directory, whatever the index holds under it is reached through the
+                    // link now, and the full index (which does not follow links) drops it.
+                    // The removal that should have done so can be folded away by the
+                    // debouncer when the link is made in the same window. Nothing else to do
+                    // for a link: `should_process` refuses it below. The db is locked only for
+                    // a link, so an ordinary event costs one `symlink_metadata` and no lock.
+                    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                        let db = recover_db(state.db.lock());
+                        if let Some((under, outcome)) =
+                            deindex_under_a_link_parts(&db, &state.kb_path, p)
+                        {
+                            match outcome {
+                                Ok(deleted) if deleted.is_empty() => {}
+                                Ok(deleted) => wdiag!(
+                                    "watcher: {under} is now a link; deindexed {} documents under it",
+                                    deleted.len()
+                                ),
+                                Err(e) => {
+                                    wdiag!(
+                                        "watcher: deindexing under the link {under}/ failed: {e}"
+                                    )
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     // A directory that just appeared brings its contents with
                     // it, and on Linux those files produce no event of their
                     // own. Look inside once. `symlink_metadata` rather than
@@ -1089,6 +1116,22 @@ fn deindex_subtree_parts(
     }
     let outcome = indexer::deindex_subtree(db, &rel);
     Some((rel, outcome))
+}
+
+/// (local Codex r3 on AX-02) [`deindex_subtree_parts`] for an event path that is now a link (a
+/// symlink, or on Windows a junction, by `symlink_metadata`); `None`, touching nothing, for
+/// anything else, including a path that cannot be stat'ed. Split out so a test can run it with
+/// no [`crate::embedder::Embedder`].
+fn deindex_under_a_link_parts(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+) -> Option<(String, Result<Vec<String>>)> {
+    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return None;
+    }
+    deindex_subtree_parts(db, kb_path, p)
 }
 
 /// (feature-67, kuriya issue #479) Delete what the store holds under a removed
@@ -2576,6 +2619,67 @@ mod tests {
             Classified::Deindex(paths) => assert_eq!(paths, [PathBuf::from("/tmp/sub")]),
             other => panic!("expected Deindex, got {other:?}"),
         }
+    }
+
+    /// (local Codex r3 on AX-02) An event path that is now a link -- a directory replaced by
+    /// a link, the removal folded away -- drops the rows under it; a real directory, or a
+    /// path that is not there, touches nothing. A junction on Windows (`mklink /J`, no
+    /// privilege), a symlink on Unix; the link dangles, as the target is never created.
+    #[test]
+    fn deindex_under_a_link_parts_drops_the_rows_under_a_path_that_is_now_a_link() {
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Dir(crate::test_support::unique_temp_path(
+            "groove-watcher-link-subtree",
+        ));
+        let kb = root.0.join("kb");
+        std::fs::create_dir_all(kb.join("real")).unwrap();
+        let target = root.0.join("gone");
+        std::fs::create_dir_all(&target).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &kb.join("sub").display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, kb.join("sub")).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        for path in ["sub/a.md", "sub/deep/b.md", "real/c.md", "missing/d.md"] {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        }
+
+        assert!(deindex_under_a_link_parts(&db, &kb, &kb.join("real")).is_none());
+        assert!(deindex_under_a_link_parts(&db, &kb, &kb.join("missing")).is_none());
+        assert_eq!(db.all_document_paths().unwrap().len(), 4);
+
+        let (rel, outcome) = deindex_under_a_link_parts(&db, &kb, &kb.join("sub"))
+            .expect("a link under the KB is handled");
+        assert_eq!(rel, "sub");
+        assert_eq!(
+            outcome.unwrap(),
+            vec!["sub/a.md".to_string(), "sub/deep/b.md".to_string()]
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["missing/d.md".to_string(), "real/c.md".to_string()]
+        );
     }
 
     /// feature-67: the subtree delete decides from the store alone. The KB is

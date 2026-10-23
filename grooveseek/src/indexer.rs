@@ -252,6 +252,25 @@ fn resolves_inside_kb(kb_path: &Path, full: &Path) -> std::io::Result<bool> {
     Ok(crate::links::canonical_within(&root, full)?.is_some())
 }
 
+/// (audit AX-02, local Codex r3) Whether a component of `rel` below `kb_path` -- an ancestor
+/// directory or the leaf -- is itself a link (a symlink, or on Windows a junction), found by
+/// descending one component at a time with `symlink_metadata`. `kb_path` itself is not asked:
+/// a knowledge base reached through a link is still the one the operator chose. A component
+/// that is missing, or that cannot be examined, ends the descent with `false`, so a file that
+/// is simply gone keeps the ordinary "no longer exists" answer.
+fn a_link_is_on_the_way(kb_path: &Path, rel: &str) -> bool {
+    let mut at = kb_path.to_path_buf();
+    for segment in rel.split('/') {
+        at.push(segment);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) | Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// (audit AX-02, local Codex r2) Drop what the index holds for `rel`, a path that now resolves
 /// outside the knowledge base: the row under `rel` and the row an older version stored under its
 /// [`legacy_folded_spelling`], as a removal does ([`sweep_legacy_folded_row`] with
@@ -2967,6 +2986,18 @@ pub fn reindex_single_file(
 ) -> Result<SingleResult> {
     let full = kb_path.join(rel);
     if !full.exists() {
+        // (local Codex r3) `exists` follows links, so a path through a link whose target is
+        // gone -- a directory replaced by a dangling link -- reads as missing. The full index
+        // does not follow the link and drops the row, so this does too. Asked only here, on
+        // the missing-file path, so an ordinary event pays no extra stat.
+        if a_link_is_on_the_way(kb_path, rel) {
+            eprintln!("{}", outside_kb_line(rel));
+            return Ok(if deindex_outside_kb(db, kb_path, rel)? {
+                SingleResult::OutsideKnowledgeBaseDeindexed
+            } else {
+                SingleResult::Refused
+            });
+        }
         return Ok(SingleResult::Skipped {
             reason: "file no longer exists",
             frontmatter_unparsed: false,
