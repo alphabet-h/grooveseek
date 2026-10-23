@@ -234,6 +234,32 @@ fn read_for_index_under(
     }
 }
 
+/// (audit AX-02) Whether the file the watcher was told about at `full` resolves
+/// inside the knowledge base, every link on the way followed
+/// ([`crate::links::canonical_within`]).
+///
+/// The watcher builds `full` as `kb_path.join(rel)` from an event path, and an
+/// event can name a file through a directory link inside the KB -- on Linux
+/// notify followed such links when it set up its watches until AX-02, and a
+/// directory can be swapped for a link at any time. The walk never goes through
+/// one (`follow_links(false)`), and `get_document` refuses one, so the
+/// single-file paths must not be the place that does. `kb_path` is canonicalized
+/// here rather than trusted to be: the comparison needs both sides spelled the
+/// same, and a caller that passed a non-canonical root would otherwise have every
+/// file refused.
+fn resolves_inside_kb(kb_path: &Path, full: &Path) -> std::io::Result<bool> {
+    let root = kb_path.canonicalize()?;
+    Ok(crate::links::canonical_within(&root, full)?.is_some())
+}
+
+/// The stderr line for a file [`resolves_inside_kb`] turned away. ASCII.
+fn outside_kb_line(rel: &str) -> String {
+    format!(
+        "Skipping {rel}: it resolves outside the knowledge base through a directory \
+         link, and links are not followed"
+    )
+}
+
 /// [`read_for_index_under`] under the text cap's key, for the tests that read
 /// a Markdown file through it.
 #[cfg(test)]
@@ -2886,6 +2912,14 @@ pub fn reindex_single_file(
             frontmatter_unparsed: false,
         });
     }
+    // (audit AX-02) Before the size stat and the read, both of which follow every link on
+    // the way. No row is written, so this is a refusal, like the read's own.
+    if !resolves_inside_kb(kb_path, &full)
+        .with_context(|| format!("failed to resolve {}", full.display()))?
+    {
+        eprintln!("{}", outside_kb_line(rel));
+        return Ok(SingleResult::Refused);
+    }
 
     // scan_disk_entries (フル rebuild) と同じ size-cap ガードを read 前に適用する。
     // metadata 自体の失敗はここでは無視し、直後の fs::read の既存エラー処理
@@ -3209,6 +3243,10 @@ pub enum RenameOutcome {
     /// が、[`RenameOutcome::Renamed`] (= 内容同一で path だけ更新) と区別して watcher が「古い内容のまま」と言える
     /// ようにする。
     RenamedButNotReindexed,
+    /// (audit AX-02) The new path resolves outside the knowledge base through a directory
+    /// link. The old row was **deleted** and nothing at the new path was read: the
+    /// document is no longer in the knowledge base.
+    MovedOutOfTheKnowledgeBase,
 }
 
 /// 単一ファイルの rename を処理する。
@@ -3292,6 +3330,16 @@ pub fn rename_single_file(
         db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         db.delete_document(new_rel)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
+    }
+    // (audit AX-02) A destination reached through a directory link is not in the knowledge
+    // base, so the document has left it: the row is dropped, as for a move into an excluded
+    // directory, and nothing at the new path is read.
+    if !resolves_inside_kb(kb_path, &full)
+        .with_context(|| format!("failed to resolve {}", full.display()))?
+    {
+        eprintln!("{}", outside_kb_line(new_rel));
+        db.delete_document(old_rel)?;
+        return Ok(RenameOutcome::MovedOutOfTheKnowledgeBase);
     }
 
     // size-cap ガード: fs::read する前に判定する。超過なら DB の path だけ

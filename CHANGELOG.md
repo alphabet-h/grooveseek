@@ -56,6 +56,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   megabytes over a thousand sub-headings took gigabytes to parse (a 2 MB heading over 1,000
   children peaked at 2,094 MB). Markdown is enabled by default. Headings above a chunk are now kept
   cut to the 200 characters the `context` can hold; chunks, headings and `context` are unchanged.
+- **The live watcher no longer indexes files reached through a directory link inside the
+  knowledge base.** On Linux the watcher asked notify to follow symlinks (notify's default), so a
+  directory symlink in the knowledge base got watches on its target, and a file written there was
+  indexed under the link's in-KB name and served back by `search`; a link to `/` could also use up
+  `max_user_watches`. The full index never followed such links. The watcher now sets up its watches
+  without following them, and before it reads a file for a create, a change or a rename it checks
+  that the file resolves inside the knowledge base, on every platform (on Windows a directory
+  junction, which needs no privilege, reached the same read). A file that resolves outside is
+  skipped with a line on stderr; a document moved into such a link is removed from the index.
 - **The live watcher no longer walks into a directory that was replaced by a link.** When a new
   directory appears the watcher scans it once, and that scan followed the directory itself if it
   had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time

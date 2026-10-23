@@ -213,7 +213,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                         }
                     },
                     RecommendedCache::new(),
-                    notify::Config::default(),
+                    notify_config(),
                 );
                 let mut debouncer = match debouncer_result {
                     Ok(d) => d,
@@ -529,6 +529,22 @@ fn reload_rules(state: &mut WatcherState) {
             wdiag!("watcher: {name} is gone or could not be read; only exclude_dirs applies now.")
         }
     }
+}
+
+/// (audit AX-02) The notify configuration the watcher is built with: the default, with
+/// `follow_symlinks` off.
+///
+/// notify 8.2.0 defaults it to `true` (`Config::default`, `src/config.rs`), and the inotify
+/// backend hands it to the `WalkDir` that sets up a recursive watch (`add_watch` in
+/// `src/inotify.rs`), both for the root and for a directory moved in later. With it on, a
+/// directory symlink inside the KB gets watches on its target, so on Linux the target's
+/// files arrive as events under in-KB names -- the walk never follows such a link, and
+/// `max_user_watches` runs out on `-> /`. The kqueue and poll backends read the same flag;
+/// the FSEvents (macOS) and ReadDirectoryChangesW (Windows) backends do not read it, so it
+/// changes nothing there. The single-file paths check where a file resolves as well
+/// ([`indexer::reindex_single_file`]), which covers an event that reaches them anyway.
+fn notify_config() -> notify::Config {
+    notify::Config::default().with_follow_symlinks(false)
 }
 
 /// debounced event batch を分類して indexer に流す。
@@ -1151,6 +1167,10 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
+        // (audit AX-02) The reason is on stderr from the indexer; this says the row went.
+        Ok(indexer::RenameOutcome::MovedOutOfTheKnowledgeBase) => {
+            wdiag!("watcher: {new_rel} resolves outside the knowledge base; deindexed {old_rel}");
+        }
         // (AW-16) The helper the reindex arm uses, which the integration tests cover; a
         // rename is not driven there, since macOS (FSEvents) does not pair renames.
         Err(e) => wdiag!(
@@ -1499,6 +1519,71 @@ fn dispatch_directory_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (audit AX-02) The watcher is built with notify's `follow_symlinks` off. Runs on every
+    /// platform, so turning it back on is red in every PR leg, not only on Linux where it bites.
+    #[test]
+    fn the_watcher_does_not_ask_notify_to_follow_symlinks() {
+        assert!(!notify_config().follow_symlinks());
+        // and nothing else of the default changed
+        assert_eq!(
+            notify_config().with_follow_symlinks(true),
+            notify::Config::default()
+        );
+    }
+
+    /// (audit AX-02) On Linux, a recursive inotify watch built from [`notify_config`] puts no
+    /// watch on a directory symlink's target: a file written there produces no event under the
+    /// link's in-KB name, while a file written in the KB itself does. With notify's default
+    /// (`follow_symlinks: true`) the target's write arrives as `kb/notes/secret.md`, before the
+    /// in-KB one (one inotify descriptor, events in order).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_inotify_watch_does_not_reach_through_a_directory_symlink() {
+        use notify::Watcher as _;
+        use std::time::Instant;
+
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Dir(crate::test_support::unique_temp_path("groove-ax02-inotify"));
+        let kb = root.0.join("kb");
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, kb.join("notes")).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::RecommendedWatcher::new(tx, notify_config()).unwrap();
+        watcher.watch(&kb, RecursiveMode::Recursive).unwrap();
+
+        std::fs::write(outside.join("secret.md"), "outside the knowledge base").unwrap();
+        std::fs::write(kb.join("in.md"), "inside the knowledge base").unwrap();
+
+        let in_kb = kb.join("in.md");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        while !seen.contains(&in_kb) && Instant::now() < deadline {
+            if let Ok(Ok(event)) = rx.recv_timeout(Duration::from_millis(200)) {
+                seen.extend(event.paths);
+            }
+        }
+        assert!(
+            seen.contains(&in_kb),
+            "the in-KB write was not seen: {seen:?}"
+        );
+        let through_link: Vec<&PathBuf> = seen
+            .iter()
+            .filter(|p| p.starts_with(kb.join("notes")))
+            .collect();
+        assert!(
+            through_link.is_empty(),
+            "a write outside the KB arrived under the link: {through_link:?}"
+        );
+    }
 
     #[test]
     fn test_watch_config_default() {
