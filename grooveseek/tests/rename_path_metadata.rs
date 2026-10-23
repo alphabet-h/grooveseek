@@ -354,3 +354,100 @@ fn a_watcher_rename_over_the_size_cap_keeps_the_stored_topic_until_the_file_is_i
     assert_eq!(hits(&fx, &["--category", "b"]), moved, "category b");
     assert_dir_empty(&fx.cache);
 }
+
+/// The moved file's new bytes: a frontmatter `topic: z` and no body, so nothing to chunk.
+const FRONTMATTER_ONLY_Z: &str = "---\ntitle: Emptied\ntopic: z\n---\n";
+/// The moved file's new bytes: a frontmatter `topic: z` and a body the reindex can chunk.
+const PINNED_Z: &str = concat!(
+    "---\ntitle: Pinned elsewhere\ntopic: z\n---\n\n## Pinned\n\n",
+    "The lighthouse keeper logs every passing ship in the harbour ledger at midnight.\n",
+);
+
+/// Index `a/x/n.md` (frontmatter `topic: x`), move it to `b/y/n.md` and replace its bytes with
+/// `new_body`, then hand the move to the watcher's [`rename_single_file`]. Returns the fixture and
+/// the outcome.
+fn watcher_rename_with_new_bytes(prefix: &str, new_body: &str) -> (Fixture, RenameOutcome) {
+    let fx = fixture(prefix, &[("a/x/n.md", PINNED_AS_DIR)], "");
+    fx.index();
+    std::fs::create_dir_all(fx.kb().join("b/y")).expect("create b/y");
+    std::fs::rename(fx.kb().join("a/x/n.md"), fx.kb().join("b/y/n.md")).expect("move the note");
+    std::fs::write(fx.kb().join("b/y/n.md"), new_body).expect("rewrite the moved note");
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "a/x/n.md",
+        "b/y/n.md",
+        None,
+        &registry,
+    )
+    .expect("rename the note");
+    drop(db);
+    (fx, outcome)
+}
+
+/// (codex P2 round 4 on PR #388) A watcher rename whose bytes also changed, where the reindex
+/// then writes nothing -- the new bytes are frontmatter only, so there is nothing to chunk. The
+/// row keeps its old hash and its old chunks, so its topic must stay the one those chunks were
+/// built with (`x`), not the `z` of bytes that were never committed.
+#[test]
+fn a_watcher_rename_with_changed_bytes_that_index_nothing_keeps_the_stored_topic() {
+    if run_in_hermetic_child(
+        "a_watcher_rename_with_changed_bytes_that_index_nothing_keeps_the_stored_topic",
+    ) {
+        return;
+    }
+    let (fx, outcome) = watcher_rename_with_new_bytes("ax01-r4-empty", FRONTMATTER_ONLY_Z);
+    // The premise: the reindex the changed bytes went through wrote nothing.
+    assert_eq!(outcome, RenameOutcome::RenamedButNotReindexed);
+
+    let moved = vec!["b/y/n.md".to_string()];
+    // The old chunks are still under the new path, so the query still finds them.
+    assert_eq!(
+        hits(&fx, &["--category", "b"]),
+        moved,
+        "the category follows the path"
+    );
+    assert!(
+        hits(&fx, &["--topic", "z"]).is_empty(),
+        "a topic from bytes that were never indexed must not be written"
+    );
+    assert_eq!(
+        hits(&fx, &["--topic", "x"]),
+        moved,
+        "the topic stays the one the stored chunks were built with"
+    );
+    assert_dir_empty(&fx.cache);
+}
+
+/// (codex P2 round 4 on PR #388) The counterpart: a watcher rename whose bytes changed and whose
+/// reindex succeeds takes its topic from those bytes, as the index writes it.
+#[test]
+fn a_watcher_rename_with_changed_bytes_that_reindex_takes_their_topic() {
+    if run_in_hermetic_child("a_watcher_rename_with_changed_bytes_that_reindex_takes_their_topic") {
+        return;
+    }
+    let (fx, outcome) = watcher_rename_with_new_bytes("ax01-r4-body", PINNED_Z);
+    assert!(
+        matches!(outcome, RenameOutcome::RenamedAndReindexed { .. }),
+        "the changed bytes were reindexed: {outcome:?}"
+    );
+
+    let moved = vec!["b/y/n.md".to_string()];
+    assert_eq!(
+        hits(&fx, &["--topic", "z"]),
+        moved,
+        "the reindex writes the frontmatter topic of the new bytes"
+    );
+    assert!(
+        hits(&fx, &["--topic", "x"]).is_empty(),
+        "topic x must hold nothing once the new bytes are indexed"
+    );
+    assert_eq!(hits(&fx, &["--category", "b"]), moved, "category b");
+    assert_dir_empty(&fx.cache);
+}

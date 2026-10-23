@@ -3217,13 +3217,26 @@ pub enum RenameOutcome {
 /// - **size cap**: 新 path が registry の上限 ([`Registry::limits`]) を超えていれば hash
 ///   再計算のための `fs::read` をスキップする ([`size_cap_exceeded`]、codex P2 round 3。
 ///   これで scan / reindex / rename の 3 read 経路すべてが同じ size-cap guard を通る)
-/// - **path 由来の列** (AX-01、[`Database::rename_document`]): 新 path の bytes を読めた移動は、
-///   `category` を新 path から、topic をその bytes の frontmatter の topic か、無ければ新 path から
-///   作る。読めなかった移動 (上限超え・読み込みの失敗・読み込みの拒否) は `category` だけを新 path
-///   から作り、topic は保存値のまま残す (frontmatter を読めないので、path 由来の topic と
-///   frontmatter の topic を区別できない)。旧 path 由来の topic は、file が再び読めるようになった
-///   後の `--force` か内容の編集 (= 再 parse) で直る。bytes が同じままの通常の full run は hash が
-///   一致して行に触らないので直さない
+/// - **path 由来の列** (AX-01、[`Database::rename_document`]): 行の topic は、その行の chunk を
+///   作った bytes (か同じ hash の bytes) から作る。新 path の bytes を読めて hash が行と一致した
+///   移動は、`category` を新 path から、topic をその bytes の frontmatter の topic か、無ければ
+///   新 path から作る。読めなかった移動 (上限超え・読み込みの失敗・読み込みの拒否) は `category`
+///   だけを新 path から作り、topic は保存値のまま残す (frontmatter を読めないので、path 由来の
+///   topic と frontmatter の topic を区別できない)。旧 path 由来の topic は、file が再び読める
+///   ようになった後の `--force` か内容の編集 (= 再 parse) で直る。bytes が同じままの通常の
+///   full run は hash が一致して行に触らないので直さない。ただし parser をまたぐ移動
+///   ([`rename_crosses_a_parser`]) で上限超えか読み込みの拒否なら、旧 chunk が新 parser にとって
+///   無効なので行ごと消える ([`settle_cross_parser_rename`]。結果は
+///   [`RenameOutcome::RenamedSizeCappedAndDropped`] か
+///   [`RenameOutcome::RenamedButRefusedAndDropped`])。読み込みの失敗 (`Err`) は parser を
+///   またいでも行を消さない
+/// - 中身も変わった移動 (hash が行と違う) も、移す時点では `category` だけを新 path から作り、
+///   topic は保存値のまま残す (codex P2 round 4 on PR #388)。続く reindex が行を書き換えれば、
+///   topic は index 時の規則で新しい bytes から書かれる。書き換えなければ (chunk が 0・2 度目の
+///   読み込みの拒否・parse の失敗)、同じ parser の間の移動なら行は旧 hash・旧 chunk・それと対の
+///   topic のまま残る。parser をまたぐ移動 ([`rename_crosses_a_parser`]) は旧 chunk が新 parser に
+///   とって無効なので残せず、reindex が [`SingleResult::Updated`] で終わらなければ行ごと消える
+///   ([`settle_cross_parser_rename`])
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -3256,12 +3269,13 @@ pub fn rename_single_file(
         );
     };
 
-    // (local Codex on PR #388) The row moves once the new path's bytes have been read, so its
-    // topic is rebuilt from the bytes this function hashes below -- the same bytes the
-    // same-hash decision is made on, not a second read. The exits that read nothing (size cap,
-    // failed read, refused read, missing file) move it with `FrontmatterTopic::Unread` first:
-    // the category follows the new path, the stored topic stays beside the stored chunks, since
-    // without the bytes a frontmatter topic cannot be told from the old path's (local Codex r3).
+    // (local Codex on PR #388) The row moves once the new path's bytes have been read, so a
+    // same-hash move rebuilds its topic from the bytes this function hashes below -- the same
+    // bytes the same-hash decision is made on, not a second read. The exits that read nothing
+    // (size cap, failed read, refused read, missing file) move it with `FrontmatterTopic::Unread`
+    // first: the category follows the new path, the stored topic stays beside the stored chunks,
+    // since without the bytes a frontmatter topic cannot be told from the old path's (local Codex
+    // r3). A move whose bytes changed moves with `Unread` too (codex P2 round 4): see below.
 
     // (codex P2 round 11 on PR #291) Decided here, before any of the early returns below: a
     // rename that crosses a parser leaves the *old* parser's row under the new path until
@@ -3350,16 +3364,23 @@ pub fn rename_single_file(
         return Ok(RenameOutcome::RenamedButRefused);
     };
     let new_hash = sha256_hex_bytes(&new_bytes);
-    // (local Codex on PR #388) The topic from the bytes just hashed. When they match the row's
-    // hash they are the bytes the row was built from, and the fast path below keeps this as
-    // the row's topic. When they do not, the reindex below rewrites the row from a parse of
-    // its own; if that reindex writes nothing, the row keeps its old hash and the next run
-    // reparses it.
-    db.rename_document(
-        old_rel,
-        new_rel,
-        FrontmatterTopic::Read(frontmatter_topic_of(registry, new_rel, &new_bytes).as_deref()),
-    )?;
+    let same_hash = new_hash == old_hash;
+    // (local Codex on PR #388) The row's topic is built from the bytes its chunks came from, or
+    // bytes of the same hash. When the bytes just hashed match the row's hash they are such
+    // bytes, and their frontmatter topic is the row's (the fast path below keeps it). (codex P2
+    // round 4 on PR #388) When they do not, they are not committed yet: the row moves with
+    // `FrontmatterTopic::Unread`, and the reindex below writes their topic only if it rewrites
+    // the row. If it writes nothing (no chunks, a second-read refusal, a failed parse), the row
+    // keeps its old hash, its old chunks and the topic those chunks were built with.
+    let read_topic = same_hash
+        .then(|| frontmatter_topic_of(registry, new_rel, &new_bytes))
+        .flatten();
+    let topic = if same_hash {
+        FrontmatterTopic::Read(read_topic.as_deref())
+    } else {
+        FrontmatterTopic::Unread
+    };
+    db.rename_document(old_rel, new_rel, topic)?;
     // 測った側が記録する (上の reindex と同じ理由)。
     if let Err(e) = db.record_document_sizes(&[(new_rel, new_bytes.len() as u64)]) {
         tracing::warn!("failed to record the size of {new_rel}: {e}");
@@ -3379,7 +3400,6 @@ pub fn rename_single_file(
     // 旧 parser が書いた `document_fields` / title / tags が新 parser の読みへ
     // 更新されないまま残ってしまうため。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
-    let same_hash = new_hash == old_hash;
     if same_hash && context_mode != ContextMode::Static && !crosses_a_parser {
         return Ok(RenameOutcome::Renamed);
     }

@@ -38,6 +38,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   without the bytes a frontmatter topic cannot be told from the old directory's, so the topic is
   left as it was. Once the file can be read again, `--force` or an edit to it sets the topic from
   the new path; a plain `groove index` does not, since the bytes, and so the hash, are unchanged.
+  A move to a different parser (`.md` to `.pdf`) is the exception when the file is over the size
+  limit or the read is refused: the old chunks are not valid for the new parser, so the document is
+  removed from the index instead (a failed read keeps it either way).
+  When the watcher sees a move that also changed the file, the topic likewise stays as it was until
+  the reindex that follows writes the new content. For a move within one parser (`.md` to `.md`),
+  if that reindex writes nothing (the new content has nothing to index, or it cannot be read or
+  parsed), the document keeps its previous content and the topic that went with it. A move to a
+  different parser (`.md` to `.pdf`) cannot keep it, since the old chunks are not valid for the new
+  parser: unless the reindex succeeds, the document is removed from the index.
 
 ### Security
 

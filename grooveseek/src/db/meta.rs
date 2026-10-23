@@ -1394,7 +1394,15 @@ impl Database {
     ///   由来で上書きすると frontmatter の topic を壊す側に倒れるため。chunk も旧 bytes のままの
     ///   行で、topic だけを推測で書き換えない。旧 path 由来の topic は、file が再び読めるように
     ///   なった後の `--force` か内容の編集 (= 再 parse) で新 path から作り直される。bytes が同じ
-    ///   ままの通常の full run は hash が一致して行に触らないので直さない
+    ///   ままの通常の full run は hash が一致して行に触らないので直さない。ただし parser をまたぐ
+    ///   移動で上限超えか読み込みの拒否なら、呼び出し側 ([`crate::indexer::rename_single_file`]) が
+    ///   行ごと消すので保存値は残らない。読み込みの失敗は parser をまたいでも行を消さない
+    /// - 中身も変わった watcher の移動 (読めた bytes の hash が行と違う) も
+    ///   [`FrontmatterTopic::Unread`] で渡す (codex P2 round 4 on PR #388)。行の topic は、その行の
+    ///   chunk を作った bytes (か同じ hash の bytes) から作る。まだ index されていない bytes の
+    ///   topic は、続く reindex が行を書き換えた時にだけ書かれ、書き換えなければ (同じ parser の間の
+    ///   移動なら) 保存値が旧 chunk と対のまま残る。parser をまたぐ移動は、reindex が成功しなければ
+    ///   呼び出し側が行ごと消すので、保存値は残らない
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
     /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
@@ -1476,8 +1484,9 @@ pub enum FrontmatterTopic<'a> {
     /// `None` when it declares none (every format but Markdown). The stored topic is rebuilt as
     /// the index builds it, this one first and the new path's second.
     Read(Option<&'a str>),
-    /// No bytes were read (the watcher's size-cap, refusal and missing-file exits): the stored
-    /// topic stays as it is, like the chunks beside it.
+    /// No bytes were read (the watcher's size-cap, refusal and missing-file exits), or the bytes
+    /// read are not the ones the row was built from (a watcher move whose hash changed, codex P2
+    /// round 4 on PR #388): the stored topic stays as it is, like the chunks beside it.
     Unread,
 }
 
