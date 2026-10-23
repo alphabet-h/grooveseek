@@ -1384,27 +1384,35 @@ impl Database {
     /// [`crate::indexer::extract_category_topic`] の書き手 (index 時の merge) と同じ:
     /// - `category` は frontmatter に対応する key が無く常に path 由来なので、新 path から
     ///   無条件に導出し直す
-    /// - `topic` は index 時に `frontmatter.topic.or(path 由来)` で決まる。保存値が旧 path の
-    ///   導出値と等しい時だけ新 path の導出値に置き換え、それ以外 (frontmatter 由来) は保つ。
-    ///   比較は `IS` で、旧 path が topic を持たない (NULL) 場合も等しいと数える
-    /// - 残る穴: frontmatter の topic が旧 path の directory 名とたまたま等しいと、path 由来と
-    ///   区別できずに置き換わる。content hash は一致したままなので次の incremental run でも
-    ///   戻らず、`--force` か文書の編集まで新 path の値のまま
+    /// - `topic` は index 時と同じ `frontmatter.topic.or(新 path 由来)` で作り直す。
+    ///   frontmatter の topic は呼び出し側が **rename の判定 (hash の一致) に使った bytes** から
+    ///   読んで [`FrontmatterTopic::Read`] で渡す (local Codex on PR #388)。保存値だけでは
+    ///   frontmatter の `topic: x` と旧 path 由来の `x` を区別できないため、保存値との比較はしない
+    /// - [`FrontmatterTopic::Unread`] (bytes を読めなかった watcher の枝) は topic を保存値のまま
+    ///   置く。chunk も旧 bytes のままの行で、topic だけを推測で書き換えない
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
     /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
-    pub fn rename_document(&self, old_path: &str, new_path: &str) -> Result<()> {
-        let (_, old_topic) = crate::indexer::extract_category_topic(old_path);
-        let (new_category, new_topic) = crate::indexer::extract_category_topic(new_path);
+    pub fn rename_document(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        frontmatter_topic: FrontmatterTopic<'_>,
+    ) -> Result<()> {
+        let (new_category, path_topic) = crate::indexer::extract_category_topic(new_path);
+        let (rebuild_topic, topic) = match frontmatter_topic {
+            FrontmatterTopic::Read(fm) => (true, fm.map(str::to_string).or(path_topic)),
+            FrontmatterTopic::Unread => (false, None),
+        };
         let updated = self
             .conn
             .execute(
                 "UPDATE documents
                  SET path = ?1,
                      category = ?2,
-                     topic = CASE WHEN topic IS ?3 THEN ?4 ELSE topic END
+                     topic = CASE WHEN ?3 THEN ?4 ELSE topic END
                  WHERE path = ?5",
-                params![new_path, new_category, old_topic, new_topic, old_path],
+                params![new_path, new_category, rebuild_topic, topic, old_path],
             )
             .with_context(|| {
                 format!(
@@ -1425,18 +1433,47 @@ impl Database {
     /// `Connection::unchecked_transaction()` を使用 (F-32)。Drop guard で
     /// rollback が担保されるので、`?` early-return パスでも DB が中途半端な
     /// state に置かれない。
-    pub fn rename_documents_atomic(&self, pairs: &[(String, String)]) -> Result<()> {
+    ///
+    /// `frontmatter_topics` は **新 path** をキーに、rename の判定に使った bytes の
+    /// frontmatter topic を持つ (local Codex on PR #388)。キーの無い pair は
+    /// [`FrontmatterTopic::Unread`] として渡す。
+    pub fn rename_documents_atomic(
+        &self,
+        pairs: &[(String, String)],
+        frontmatter_topics: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
         let tx = self.conn.unchecked_transaction()?;
         for (old, new) in pairs {
-            self.rename_document(old, new)?; // Drop on tx rolls back on error
+            let topic = match frontmatter_topics.get(new) {
+                Some(fm) => FrontmatterTopic::Read(fm.as_deref()),
+                None => FrontmatterTopic::Unread,
+            };
+            self.rename_document(old, new, topic)?; // Drop on tx rolls back on error
         }
         tx.commit()
             .context("rename_documents_atomic: COMMIT failed")?;
         Ok(())
     }
+}
+
+/// What the bytes behind a rename say about the document's topic, for
+/// [`Database::rename_document`] (local Codex on PR #388).
+///
+/// The stored `topic` is the merged value (`frontmatter.topic.or(path-derived)`), so it cannot
+/// tell a frontmatter `topic: x` from the old directory's `x`. Only the bytes can, and the
+/// caller hands over what they said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontmatterTopic<'a> {
+    /// The bytes the rename was decided on were read: the topic their frontmatter declares, or
+    /// `None` when it declares none (every format but Markdown). The stored topic is rebuilt as
+    /// the index builds it, this one first and the new path's second.
+    Read(Option<&'a str>),
+    /// No bytes were read (the watcher's size-cap, refusal and missing-file exits): the stored
+    /// topic stays as it is, like the chunks beside it.
+    Unread,
 }
 
 /// How many leading segments a `(category, topic)` group already accounts for.

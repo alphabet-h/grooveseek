@@ -168,3 +168,92 @@ fn a_watcher_rename_moves_the_category_and_the_path_topic() {
     assert_filters_follow_the_move(&fx);
     assert_dir_empty(&fx.cache);
 }
+
+/// A frontmatter topic that happens to equal the old directory's name. Only the bytes can tell it
+/// from a path-derived `x`, so a rename that compares the stored value with the old path's turns
+/// it into `y` (local Codex on PR #388).
+const PINNED_AS_DIR: &str = concat!(
+    "---\ntitle: Pinned as the directory\ntopic: x\n---\n\n## Pinned\n\n",
+    "The lighthouse keeper logs every passing ship in the harbour ledger at noon.\n",
+);
+
+/// The knowledge base before the move: `a/x/note.md` with `topic: x` in its frontmatter.
+fn indexed_pinned_as_dir(prefix: &str) -> Fixture {
+    let fx = fixture(prefix, &[("a/x/note.md", PINNED_AS_DIR)], "");
+    fx.index();
+    fx
+}
+
+/// Move `a/x/note.md` to `b/y/note.md` on disk.
+fn move_pinned_as_dir(fx: &Fixture) {
+    std::fs::create_dir_all(fx.kb().join("b/y")).expect("create b/y");
+    std::fs::rename(fx.kb().join("a/x/note.md"), fx.kb().join("b/y/note.md"))
+        .expect("move the note");
+}
+
+/// What both tests check once the note has moved: the frontmatter's `x` stayed, the new
+/// directory's `y` was not taken, and the category still follows the path.
+fn assert_the_frontmatter_topic_stays(fx: &Fixture) {
+    let moved = vec!["b/y/note.md".to_string()];
+    assert_eq!(
+        hits(fx, &["--topic", "x"]),
+        moved,
+        "a frontmatter topic equal to the old directory is kept"
+    );
+    assert!(
+        hits(fx, &["--topic", "y"]).is_empty(),
+        "the new directory's topic must not replace a frontmatter topic"
+    );
+    assert_eq!(hits(fx, &["--category", "b"]), moved, "category b");
+}
+
+#[test]
+fn a_full_run_rename_keeps_a_frontmatter_topic_equal_to_the_old_directory() {
+    let fx = indexed_pinned_as_dir("ax01-pin-full");
+    move_pinned_as_dir(&fx);
+
+    let before = fx.mock.requests().len();
+    fx.index();
+    assert!(
+        fx.requests_since(before)
+            .iter()
+            .all(|r| r.model() != Some(common::embed_mock::DOC_MODEL)),
+        "a same-bytes rename must not re-embed under context_mode off"
+    );
+
+    assert_the_frontmatter_topic_stays(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+#[test]
+fn a_watcher_rename_keeps_a_frontmatter_topic_equal_to_the_old_directory() {
+    if run_in_hermetic_child(
+        "a_watcher_rename_keeps_a_frontmatter_topic_equal_to_the_old_directory",
+    ) {
+        return;
+    }
+    let fx = indexed_pinned_as_dir("ax01-pin-watch");
+    move_pinned_as_dir(&fx);
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let before = fx.mock.requests().len();
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "a/x/note.md",
+        "b/y/note.md",
+        None,
+        &registry,
+    )
+    .expect("rename the note");
+    assert_eq!(outcome, RenameOutcome::Renamed);
+    assert_eq!(fx.mock.requests().len(), before, "nothing was embedded");
+    drop(db);
+
+    assert_the_frontmatter_topic_stays(&fx);
+    assert_dir_empty(&fx.cache);
+}

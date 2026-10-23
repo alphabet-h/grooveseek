@@ -674,6 +674,20 @@ pub trait Parser: Send + Sync {
     fn is_binary(&self) -> bool {
         false
     }
+
+    /// The [`Frontmatter::topic`] that [`Parser::parse_bytes_inner`] would give `bytes`, without
+    /// chunking them: what a same-bytes rename needs to rebuild the stored topic as the index
+    /// does (`frontmatter.topic.or(path-derived)`, local Codex on PR #388).
+    ///
+    /// The default is `None`, which is what every format but Markdown puts there: `.txt`, the
+    /// binary formats and code fill `title` at most, never `topic`. A parser that starts reading
+    /// a topic from its own metadata overrides this from the same function its parse uses.
+    ///
+    /// **Callers go through [`ParserExt::frontmatter_topic`]**, for the same panic isolation as
+    /// [`ParserExt::parse_bytes`] (the `_inner` suffix is load-bearing for the same reason).
+    fn frontmatter_topic_inner(&self, _bytes: &[u8]) -> Option<String> {
+        None
+    }
 }
 
 /// 全 call site (indexer / server) が使う parse 入口。**`Parser` の実装側から
@@ -711,6 +725,11 @@ pub trait ParserExt {
         path_hint: &str,
         exclude_headings: &[&str],
     ) -> Result<ParsedDocument>;
+
+    /// [`Parser::frontmatter_topic_inner`] behind the panic guard. A panic reads as no topic:
+    /// the bytes behind a rename are bytes the index already parsed without one, so the guard
+    /// is a backstop, not an expected path.
+    fn frontmatter_topic(&self, bytes: &[u8], path_hint: &str) -> Option<String>;
 }
 
 impl<T: Parser + ?Sized> ParserExt for T {
@@ -734,6 +753,14 @@ impl<T: Parser + ?Sized> ParserExt for T {
         panic_guard::catch_parser_panic(path_hint, self.id(), || {
             self.parse_bytes_for_read_inner(bytes, path_hint, exclude_headings)
         })
+    }
+
+    fn frontmatter_topic(&self, bytes: &[u8], path_hint: &str) -> Option<String> {
+        panic_guard::catch_parser_panic(path_hint, self.id(), || {
+            Ok(self.frontmatter_topic_inner(bytes))
+        })
+        .ok()
+        .flatten()
     }
 }
 

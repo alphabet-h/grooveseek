@@ -31,10 +31,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `groove index` or by the live watcher — rewrote only the path, so a search filtered on the new
   directory missed the document and one filtered on the old directory still found it, until
   `--force` or an edit. The category is now taken from the new path, and so is the topic unless the
-  document's frontmatter sets one, which is kept. A frontmatter topic that happens to equal the old
-  path's directory name is indistinguishable from a path-derived one and is replaced too; since the
-  content hash still matches, the next incremental run does not restore it either, and it stays
-  replaced until `--force` or an edit to the document.
+  document's frontmatter sets one, which is kept. The frontmatter is read again from the bytes the
+  move was recognised by, so a frontmatter topic that happens to equal the old directory's name is
+  kept as well; nothing is re-embedded.
 
 ### Security
 

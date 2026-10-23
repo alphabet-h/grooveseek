@@ -37,6 +37,14 @@ impl Parser for MarkdownParser {
             frontmatter_error,
         }
     }
+
+    /// The topic [`Self::parse`] reads, through the same UTF-8 check the default
+    /// [`Parser::parse_bytes_inner`] runs before it and the same [`extract_frontmatter`]. Bytes
+    /// that are not UTF-8 are bytes the index refuses, so they have no topic here either.
+    fn frontmatter_topic_inner(&self, bytes: &[u8]) -> Option<String> {
+        let raw = std::str::from_utf8(bytes).ok()?;
+        extract_frontmatter(raw).0.topic
+    }
 }
 
 /// Tag on a Markdown document whose YAML frontmatter could not be parsed (#251).
@@ -649,6 +657,35 @@ fn strip_heading(line: &str) -> Option<(u8, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (local Codex on PR #388) The topic a rename reads from the bytes is the one the parse
+    /// puts in the frontmatter, including none for no block, a refused block and non-UTF-8.
+    #[test]
+    fn frontmatter_topic_is_the_parse_topic() {
+        use crate::parser::ParserExt;
+        for md in [
+            "---\ntopic: x\n---\n\n## H\n\nbody\n",
+            "---\r\ntitle: T\r\ntopic: x\r\n---\r\n\r\nbody\r\n",
+            "---\ntitle: T\n---\n\nbody\n",
+            "no frontmatter\n",
+            "---\ntopic: [a]\n---\n\nbody\n",
+        ] {
+            assert_eq!(
+                MarkdownParser.frontmatter_topic(md.as_bytes(), "a/x/n.md"),
+                parse(md).frontmatter.topic,
+                "{md:?}"
+            );
+        }
+        assert_eq!(
+            MarkdownParser.frontmatter_topic(&[0xff, 0xfe, b'-'], "a/x/n.md"),
+            None
+        );
+        assert_eq!(
+            crate::parser::txt::TxtParser.frontmatter_topic(b"---\ntopic: x\n---\n", "a/x/n.txt"),
+            None,
+            "a format that carries no topic answers none"
+        );
+    }
 
     fn parse(md: &str) -> ParsedDocument {
         MarkdownParser.parse(md, "test.md", &[])

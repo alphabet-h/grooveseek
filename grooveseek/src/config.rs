@@ -6577,7 +6577,7 @@ lambda = 0.5
             .expect("loading a named pipe as --config did not return")
     }
 
-    /// A named pipe at `path`, for the two tests below.
+    /// A named pipe at the given path, for the two tests below.
     #[cfg(unix)]
     fn make_fifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt;
