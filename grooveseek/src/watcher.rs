@@ -1568,11 +1568,33 @@ mod tests {
         std::fs::write(kb.join("in.md"), "inside the knowledge base").unwrap();
 
         let in_kb = kb.join("in.md");
+        // Receive until the in-KB write has been seen and then nothing has come for `QUIET`,
+        // under one overall cap. The secret is written first, and one inotify descriptor
+        // delivers in order, so a watch through the link would report it before `in.md`; the
+        // quiet drain after `in.md` also takes anything that comes later, so the assertion
+        // below never passes for having stopped listening early. A notify error fails the test.
+        const QUIET: Duration = Duration::from_millis(500);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen: Vec<PathBuf> = Vec::new();
-        while !seen.contains(&in_kb) && Instant::now() < deadline {
-            if let Ok(Ok(event)) = rx.recv_timeout(Duration::from_millis(200)) {
-                seen.extend(event.paths);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let step = if seen.contains(&in_kb) {
+                QUIET
+            } else {
+                Duration::from_millis(200)
+            };
+            let wait = step.min(deadline - now);
+            match rx.recv_timeout(wait) {
+                Ok(Ok(event)) => seen.extend(event.paths),
+                Ok(Err(e)) => panic!("notify reported an error: {e:?}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if seen.contains(&in_kb) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the watcher's channel closed: {seen:?}")
+                }
             }
         }
         assert!(
