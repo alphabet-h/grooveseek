@@ -53,7 +53,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   config with `--config` to use it. Whether a found config is trusted is decided once, before it
   is opened, and that one answer chooses how it is read, which file is opened (the one in the
   directory that was judged), whether the restrictions apply and what the startup log reports, so
-  repointing a parent directory while the file is read can no longer make it count as trusted. See
+  repointing a parent directory while the file is read can no longer make it count as trusted.
+  Its relative paths (`kb_path`, `fastembed_cache_dir`, `grammar_dir`, `[eval] golden`) are
+  resolved against that judged directory too, not against the path the file was found at, so a
+  link repointed after the decision cannot move a trusted config's grammar plugins, model cache or
+  knowledge base; the path as found only names the file in messages. A found config whose
+  directory cannot be resolved is refused (name it with `--config` to use it). See
   [Config file discovery](docs/configuration.md#config-file-discovery).
 - **CI runs with a read-only `GITHUB_TOKEN`.** `ci.yml` now declares `permissions: contents: read`
   at the top level instead of inheriting the repository default.

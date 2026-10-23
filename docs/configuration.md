@@ -357,6 +357,18 @@ same answer decides whether the restrictions below apply and is the `trust=` the
 startup log reports, so repointing a link on the way while groove starts cannot
 change it.
 
+Relative paths in a found file — `kb_path`, `fastembed_cache_dir`,
+`grammar_dir` and `[eval] golden` — are resolved against that same resolved
+directory, not against the path groove found the file at, and so is everything
+derived from `kb_path` (the database beside it, `groove-schema.toml`,
+`.grooveignore`). If you `cd` through a link into a project, `kb_path = "../kb"`
+names the `kb` next to the project's real directory. The path as found is used
+only to name the file in messages and in the startup log. If the directory
+cannot be resolved at all, the file is refused with an error that names it;
+pass it with `--config` to use it. A file named with `--config` or found beside
+the binary resolves its relative paths against the directory as you gave it,
+since its trust does not depend on where it is.
+
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
 `[watch]`, `[contextual]`, `[index].fail_on_frontmatter_error` — is honoured
