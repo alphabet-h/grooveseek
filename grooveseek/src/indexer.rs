@@ -252,6 +252,18 @@ fn resolves_inside_kb(kb_path: &Path, full: &Path) -> std::io::Result<bool> {
     Ok(crate::links::canonical_within(&root, full)?.is_some())
 }
 
+/// (audit AX-02, local Codex r2) Drop what the index holds for `rel`, a path that now resolves
+/// outside the knowledge base: the row under `rel` and the row an older version stored under its
+/// [`legacy_folded_spelling`], as a removal does ([`sweep_legacy_folded_row`] with
+/// `require_real_key = false`, so a folded row goes even when no row is under `rel`; its guard
+/// against a real document at the folded path stays). The full index's walk does not follow the
+/// link, so it drops both. `Ok(true)` when either was there.
+fn deindex_outside_kb(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
+    let exact = deindex_single_file(db, rel)?;
+    let folded = sweep_legacy_folded_row(db, kb_path, rel, false)?;
+    Ok(exact || folded)
+}
+
 /// (audit AX-02) What [`rename_single_file`] does with [`resolves_inside_kb`]'s answer for the
 /// destination `full`: `Ok(None)` to go on and read it.
 ///
@@ -2968,7 +2980,7 @@ pub fn reindex_single_file(
         .with_context(|| format!("failed to resolve {}", full.display()))?
     {
         eprintln!("{}", outside_kb_line(rel));
-        return Ok(if deindex_single_file(db, rel)? {
+        return Ok(if deindex_outside_kb(db, kb_path, rel)? {
             SingleResult::OutsideKnowledgeBaseDeindexed
         } else {
             SingleResult::Refused
@@ -3397,6 +3409,13 @@ pub fn rename_single_file(
         &full,
         resolves_inside_kb(kb_path, &full),
     )? {
+        // (local Codex r2) Whatever the index already held for the destination -- a row from
+        // before its directory became a link, or an older version's folded row -- describes a
+        // path outside the knowledge base too, and the full index drops it. The old path's
+        // folded row is the watcher's sweep of `old_rel`, as for any removal.
+        if outcome == RenameOutcome::MovedOutOfTheKnowledgeBase {
+            deindex_outside_kb(db, kb_path, new_rel)?;
+        }
         return Ok(outcome);
     }
 

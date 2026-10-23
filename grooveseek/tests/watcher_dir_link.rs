@@ -146,6 +146,105 @@ fn a_document_whose_directory_became_a_link_leaves_the_index() {
     assert_dir_empty(&fx.cache);
 }
 
+/// (local Codex r2 on AX-02) A row a version up to 1.12.0 stored under the folded spelling
+/// (`notes/secret/pay.md` for a file named `secret\pay.md`) goes too when the file now resolves
+/// outside the knowledge base, even with no row under the current spelling: the full index
+/// does not follow the link and drops it. Unix only, where `\` is a filename character.
+#[cfg(unix)]
+#[test]
+fn a_folded_legacy_row_under_a_directory_link_leaves_the_index() {
+    if run_in_hermetic_child("a_folded_legacy_row_under_a_directory_link_leaves_the_index") {
+        return;
+    }
+    let fx = linked("ax02-legacy");
+    std::fs::write(
+        fx.layout.root().join("outside").join("secret\\pay.md"),
+        SECRET,
+    )
+    .expect("write the backslash-named file");
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    db.upsert_document(
+        "notes/secret/pay.md",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        "legacy",
+        0,
+    )
+    .expect("seed the folded row");
+
+    let outcome = reindex_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "notes/secret\\pay.md",
+        None,
+        &registry,
+    )
+    .expect("reindex");
+    assert_eq!(outcome, SingleResult::OutsideKnowledgeBaseDeindexed);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string()],
+        "the folded legacy row must go with the file"
+    );
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
+/// (local Codex r2 on AX-02) A rename onto a path that resolves outside the knowledge base drops
+/// the row the index already held for that destination (indexed before its directory became a
+/// link) as well as the moved document's, as the full index would.
+#[test]
+fn a_rename_into_a_directory_link_drops_the_destination_row_too() {
+    if run_in_hermetic_child("a_rename_into_a_directory_link_drops_the_destination_row_too") {
+        return;
+    }
+    let fx = fixture(
+        "ax02-rename-dest",
+        &[("in.md", NOTE), ("sub/in.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string(), "sub/in.md".to_string()]
+    );
+
+    let moved = fx.layout.root().join("moved-out");
+    std::fs::rename(kb.join("sub"), &moved).expect("move sub/ out");
+    dir_link(&kb.join("sub"), &moved);
+    std::fs::rename(kb.join("in.md"), kb.join("sub").join("in.md")).expect("move the note");
+
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "in.md",
+        "sub/in.md",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert_eq!(outcome, RenameOutcome::MovedOutOfTheKnowledgeBase);
+    assert!(
+        db.all_document_paths().expect("paths").is_empty(),
+        "neither the moved row nor the destination's old row may stay"
+    );
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
 #[test]
 fn a_rename_into_a_directory_link_takes_the_document_out_of_the_index() {
     if run_in_hermetic_child("a_rename_into_a_directory_link_takes_the_document_out_of_the_index") {
