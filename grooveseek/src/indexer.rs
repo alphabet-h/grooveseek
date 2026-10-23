@@ -3450,9 +3450,23 @@ pub fn rename_single_file(
     // 新 path の実体 hash を読み直し、DB 側 (= old_hash) と比較
     let full = kb_path.join(new_rel);
     if !full.exists() {
+        // (local Codex after PR #391 r1) `exists` follows links: a destination through a link
+        // whose target is gone is settled as one reached through a link -- the old row and
+        // whatever the index holds for the destination (its row and its folded legacy row)
+        // go, as the full index drops them.
+        if a_link_is_on_the_way(kb_path, new_rel) {
+            eprintln!("{}", outside_kb_line(new_rel));
+            db.delete_document(old_rel)?;
+            deindex_outside_kb(db, kb_path, new_rel)?;
+            return Ok(RenameOutcome::MovedOutOfTheKnowledgeBase);
+        }
         // 新 path のファイルも無い。通常起こらないが起きたら DB も掃除
         db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         db.delete_document(new_rel)?;
+        // The file is gone under every spelling, so an older version's folded row for the
+        // destination goes too (a removal's sweep); the watcher's sweep after a rename asks for
+        // the real key, which was just deleted, and would keep it.
+        sweep_legacy_folded_row(db, kb_path, new_rel, false)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
     }
     // (audit AX-02) A destination reached through a directory link is not in the knowledge

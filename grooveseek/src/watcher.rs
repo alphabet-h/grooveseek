@@ -616,22 +616,26 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // for a link: `should_process` refuses it below. The db is locked only for
                     // a link, so an ordinary event costs one `symlink_metadata` and no lock.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
-                        let db = recover_db(state.db.lock());
-                        if let Some((under, outcome)) =
-                            deindex_under_a_link_parts(&db, &state.kb_path, p)
-                        {
-                            match outcome {
-                                Ok(deleted) if deleted.is_empty() => {}
-                                Ok(deleted) => wdiag!(
-                                    "watcher: {under} is now a link; deindexed {} documents under it",
-                                    deleted.len()
-                                ),
-                                Err(e) => {
-                                    wdiag!(
-                                        "watcher: deindexing under the link {under}/ failed: {e}"
-                                    )
+                        let handled = {
+                            let db = recover_db(state.db.lock());
+                            match deindex_under_a_link_parts(&db, &state.kb_path, p) {
+                                Some((under, outcome)) => {
+                                    match outcome {
+                                        Ok(deleted) if deleted.is_empty() => {}
+                                        Ok(deleted) => wdiag!(
+                                            "watcher: {under} is now a link; deindexed {} documents at or under it",
+                                            deleted.len()
+                                        ),
+                                        Err(e) => wdiag!(
+                                            "watcher: deindexing under the link {under}/ failed: {e}"
+                                        ),
+                                    }
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if handled {
                             continue;
                         }
                     }
@@ -1122,6 +1126,11 @@ fn deindex_subtree_parts(
 /// symlink, or on Windows a junction, by `symlink_metadata`); `None`, touching nothing, for
 /// anything else, including a path that cannot be stat'ed. Split out so a test can run it with
 /// no [`crate::embedder::Embedder`].
+///
+/// (local Codex after PR #391 r1) The row at the link's own name goes too -- a file replaced
+/// by a link -- with its folded legacy row ([`indexer::sweep_legacy_folded_row`] as a removal,
+/// `require_real_key = false`): the full walk takes no link as a document. Its name is added to
+/// the deleted list when it was there.
 fn deindex_under_a_link_parts(
     db: &Database,
     kb_path: &Path,
@@ -1131,7 +1140,16 @@ fn deindex_under_a_link_parts(
     if !is_link {
         return None;
     }
-    deindex_subtree_parts(db, kb_path, p)
+    let (rel, under) = deindex_subtree_parts(db, kb_path, p)?;
+    let outcome = under.and_then(|mut deleted| {
+        let exact = indexer::deindex_single_file(db, &rel)?;
+        let folded = indexer::sweep_legacy_folded_row(db, kb_path, &rel, false)?;
+        if exact || folded {
+            deleted.push(rel.clone());
+        }
+        Ok(deleted)
+    });
+    Some((rel, outcome))
 }
 
 /// (feature-67, kuriya issue #479) Delete what the store holds under a removed
@@ -2679,6 +2697,59 @@ mod tests {
         assert_eq!(
             db.all_document_paths().unwrap(),
             vec!["missing/d.md".to_string(), "real/c.md".to_string()]
+        );
+    }
+
+    /// (local Codex after PR #391 r1) A file replaced by a link: the row at the link's own
+    /// name goes too, not only the rows under it. A junction on Windows, a symlink on Unix,
+    /// both dangling.
+    #[test]
+    fn deindex_under_a_link_parts_drops_the_row_at_the_links_own_name() {
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Dir(crate::test_support::unique_temp_path(
+            "groove-watcher-link-leaf",
+        ));
+        let kb = root.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let target = root.0.join("gone");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = kb.join("note.md");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        for path in ["note.md", "other.md"] {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        }
+        let (rel, outcome) =
+            deindex_under_a_link_parts(&db, &kb, &link).expect("a link under the KB");
+        assert_eq!(rel, "note.md");
+        assert_eq!(outcome.unwrap(), vec!["note.md".to_string()]);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
         );
     }
 

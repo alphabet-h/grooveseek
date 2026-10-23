@@ -347,6 +347,111 @@ fn a_file_reached_through_a_link_to_a_directory_inside_the_kb_is_not_indexed_twi
     assert_dir_empty(&fx.cache);
 }
 
+/// (local Codex after PR #391 r1) A rename whose destination is missing because it is reached
+/// through a dangling link: settled as one reached through a link -- the old row and the row
+/// the index held for the destination both go, rather than the old row being moved onto it.
+#[test]
+fn a_rename_onto_a_path_through_a_dangling_link_drops_both_rows() {
+    if run_in_hermetic_child("a_rename_onto_a_path_through_a_dangling_link_drops_both_rows") {
+        return;
+    }
+    let fx = fixture("ax02-rename-dangling", &[("in.md", NOTE)], "");
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+    let gone = fx.layout.root().join("gone");
+    std::fs::create_dir_all(&gone).expect("create the link's target");
+    dir_link(&kb.join("sub"), &gone);
+    std::fs::remove_dir_all(&gone).expect("remove the link's target");
+    db.upsert_document("sub/in.md", None, None, None, None, &[], None, "h", 0)
+        .expect("seed the destination row");
+    std::fs::remove_file(kb.join("in.md")).expect("the note left its old name");
+
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "in.md",
+        "sub/in.md",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert_eq!(outcome, RenameOutcome::MovedOutOfTheKnowledgeBase);
+    assert!(db.all_document_paths().expect("paths").is_empty());
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
+/// (local Codex after PR #391 r1) The folded legacy row of a missing rename destination goes,
+/// both through a dangling link and with no link at all (the file is gone under every
+/// spelling). Unix only, where `\` is a filename character.
+#[cfg(unix)]
+#[test]
+fn a_missing_rename_destination_drops_its_folded_legacy_row() {
+    if run_in_hermetic_child("a_missing_rename_destination_drops_its_folded_legacy_row") {
+        return;
+    }
+    let fx = fixture(
+        "ax02-rename-folded",
+        &[("in.md", NOTE), ("two.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let seed = |p: &str| {
+        db.upsert_document(p, None, None, None, None, &[], None, "legacy", 0)
+            .expect("seed a folded row");
+    };
+
+    // Through a dangling link.
+    let gone = fx.layout.root().join("gone");
+    std::fs::create_dir_all(&gone).expect("create the link's target");
+    dir_link(&kb.join("sub"), &gone);
+    std::fs::remove_dir_all(&gone).expect("remove the link's target");
+    seed("sub/secret/pay.md");
+    std::fs::remove_file(kb.join("in.md")).expect("remove in.md");
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "in.md",
+        "sub/secret\\pay.md",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert_eq!(outcome, RenameOutcome::MovedOutOfTheKnowledgeBase);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["two.md".to_string()]
+    );
+
+    // With no link: the destination is simply gone.
+    seed("secret/pay.md");
+    std::fs::remove_file(kb.join("two.md")).expect("remove two.md");
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "two.md",
+        "secret\\pay.md",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert_eq!(outcome, RenameOutcome::Renamed);
+    assert!(db.all_document_paths().expect("paths").is_empty());
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
 #[test]
 fn a_rename_into_a_directory_link_takes_the_document_out_of_the_index() {
     if run_in_hermetic_child("a_rename_into_a_directory_link_takes_the_document_out_of_the_index") {
