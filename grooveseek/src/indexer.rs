@@ -258,6 +258,10 @@ fn resolves_inside_kb(kb_path: &Path, full: &Path) -> std::io::Result<bool> {
 /// a knowledge base reached through a link is still the one the operator chose. A component
 /// that is missing, or that cannot be examined, ends the descent with `false`, so a file that
 /// is simply gone keeps the ordinary "no longer exists" answer.
+///
+/// Only a name-surrogate reparse point counts as a link on Windows (`FileType::is_symlink`):
+/// a symlink or a junction, not an OneDrive / Dropbox placeholder, whose cloud tag is not one,
+/// so such a file or directory is not refused (see [`crate::links`] for why it must not be).
 fn a_link_is_on_the_way(kb_path: &Path, rel: &str) -> bool {
     let mut at = kb_path.to_path_buf();
     for segment in rel.split('/') {
@@ -269,6 +273,23 @@ fn a_link_is_on_the_way(kb_path: &Path, rel: &str) -> bool {
         }
     }
     false
+}
+
+/// (audit AX-02, GitHub codex r1 on PR #391) Whether the watcher may read `rel` (at `full`) and
+/// write or keep its row: the invariant is the full walk's, **no component below `kb_path` is a
+/// link** ([`a_link_is_on_the_way`]), so a link to another directory inside the knowledge base
+/// does not make a second name for its files either. [`resolves_inside_kb`] is asked as well;
+/// with no link on the way it holds, so it is a second guard, not a second rule. `false` is
+/// handled as a path outside the knowledge base: refused, and its rows dropped
+/// ([`deindex_outside_kb`]).
+///
+/// Cost: one `symlink_metadata` per component of `rel` on every reindex and rename destination,
+/// existing files included, plus the canonicalization of the root and of `full`.
+fn readable_as_the_walk_reads(kb_path: &Path, rel: &str, full: &Path) -> std::io::Result<bool> {
+    if a_link_is_on_the_way(kb_path, rel) {
+        return Ok(false);
+    }
+    resolves_inside_kb(kb_path, full)
 }
 
 /// (audit AX-02, local Codex r2) Drop what the index holds for `rel`, a path that now resolves
@@ -319,8 +340,8 @@ fn settle_rename_destination(
 /// the check does not know.
 fn outside_kb_line(rel: &str) -> String {
     format!(
-        "Skipping {rel}: it resolves outside the knowledge base through a link, and \
-         links are not followed"
+        "Skipping {rel}: it is reached through a link (to elsewhere in or outside the \
+         knowledge base), and links are not followed"
     )
 }
 
@@ -1014,8 +1035,9 @@ pub enum SingleResult {
     /// content が新 path のまま残るのに watcher は「rename 成功」と報告する**。
     /// 型で分けておけば、その分岐を書き忘れることができない。
     Refused,
-    /// (audit AX-02, review P2-1) The file resolves outside the knowledge base through a link,
-    /// and the row that was under its path has been **deleted**. Only
+    /// (audit AX-02, review P2-1) The file is reached through a link -- to outside the
+    /// knowledge base, or (GitHub codex r1 on PR #391) to elsewhere inside it -- and the row
+    /// that was under its path has been **deleted**. Only
     /// [`reindex_single_file`] returns it (when no row was there it returns
     /// [`SingleResult::Refused`]); [`rebuild_index`]'s walk does not follow links, so a file
     /// like this never reaches it.
@@ -2988,8 +3010,8 @@ pub fn reindex_single_file(
     if !full.exists() {
         // (local Codex r3) `exists` follows links, so a path through a link whose target is
         // gone -- a directory replaced by a dangling link -- reads as missing. The full index
-        // does not follow the link and drops the row, so this does too. Asked only here, on
-        // the missing-file path, so an ordinary event pays no extra stat.
+        // does not follow the link and drops the row, so this does too. The same component
+        // check as for an existing file below ([`readable_as_the_walk_reads`]).
         if a_link_is_on_the_way(kb_path, rel) {
             eprintln!("{}", outside_kb_line(rel));
             return Ok(if deindex_outside_kb(db, kb_path, rel)? {
@@ -3007,7 +3029,9 @@ pub fn reindex_single_file(
     // the way. Nothing is read or written for the file. (review P2-1) A row already under
     // `rel` -- its directory was indexed, then replaced by a link -- is dropped, as the full
     // index drops it (its walk does not follow the link, so the file is not collected).
-    if !resolves_inside_kb(kb_path, &full)
+    // (GitHub codex r1 on PR #391) A link to elsewhere *inside* the KB is refused the same way:
+    // the walk does not follow it either, so its files would be indexed under a second name.
+    if !readable_as_the_walk_reads(kb_path, rel, &full)
         .with_context(|| format!("failed to resolve {}", full.display()))?
     {
         eprintln!("{}", outside_kb_line(rel));
@@ -3340,9 +3364,10 @@ pub enum RenameOutcome {
     /// が、[`RenameOutcome::Renamed`] (= 内容同一で path だけ更新) と区別して watcher が「古い内容のまま」と言える
     /// ようにする。
     RenamedButNotReindexed,
-    /// (audit AX-02) The new path resolves outside the knowledge base through a directory
-    /// link. The old row was **deleted** and nothing at the new path was read: the
-    /// document is no longer in the knowledge base.
+    /// (audit AX-02) The new path is reached through a link, to outside the knowledge base or
+    /// (GitHub codex r1 on PR #391) to elsewhere inside it. The old row was **deleted** and
+    /// nothing at the new path was read: the document is no longer in the knowledge base under
+    /// any name the full index would give it.
     MovedOutOfTheKnowledgeBase,
 }
 
@@ -3438,7 +3463,7 @@ pub fn rename_single_file(
         old_rel,
         new_rel,
         &full,
-        resolves_inside_kb(kb_path, &full),
+        readable_as_the_walk_reads(kb_path, new_rel, &full),
     )? {
         // (local Codex r2) Whatever the index already held for the destination -- a row from
         // before its directory became a link, or an older version's folded row -- describes a

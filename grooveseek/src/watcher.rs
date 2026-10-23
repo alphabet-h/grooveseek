@@ -1064,7 +1064,7 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         }
         // (AX-02, review P2-1) The reason is on stderr from the indexer; this says the row went.
         Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed) => {
-            wdiag!("watcher: {rel} resolves outside the knowledge base; deindexed it");
+            wdiag!("watcher: {rel} is reached through a link; deindexed it");
         }
         Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
@@ -1216,7 +1216,7 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         }
         // (audit AX-02) The reason is on stderr from the indexer; this says the row went.
         Ok(indexer::RenameOutcome::MovedOutOfTheKnowledgeBase) => {
-            wdiag!("watcher: {new_rel} resolves outside the knowledge base; deindexed {old_rel}");
+            wdiag!("watcher: {new_rel} is reached through a link; deindexed {old_rel}");
         }
         // (AW-16) The helper the reindex arm uses, which the integration tests cover; a
         // rename is not driven there, since macOS (FSEvents) does not pair renames.

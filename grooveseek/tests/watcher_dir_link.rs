@@ -295,6 +295,58 @@ fn a_document_whose_directory_became_a_dangling_link_leaves_the_index() {
     assert_dir_empty(&fx.cache);
 }
 
+/// (GitHub codex r1 on PR #391) A link to another directory *inside* the knowledge base: the
+/// file resolves inside, but the full walk does not follow the link, so the watcher must not
+/// index it under the link's name either, and drops a row it holds under that name. The index
+/// the watcher leaves is the one the full run built.
+#[test]
+fn a_file_reached_through_a_link_to_a_directory_inside_the_kb_is_not_indexed_twice() {
+    if run_in_hermetic_child(
+        "a_file_reached_through_a_link_to_a_directory_inside_the_kb_is_not_indexed_twice",
+    ) {
+        return;
+    }
+    let fx = fixture(
+        "ax02-alias",
+        &[("in.md", NOTE), ("real/note.md", SECRET)],
+        "",
+    );
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    dir_link(&kb.join("alias"), &kb.join("real"));
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let walked = db.all_document_paths().expect("paths");
+    assert_eq!(
+        walked,
+        vec!["in.md".to_string(), "real/note.md".to_string()],
+        "the full run does not follow the link"
+    );
+
+    let before = fx.mock.requests().len();
+    let outcome = reindex_single_file(&db, &mut embedder, &kb, "alias/note.md", None, &registry)
+        .expect("reindex");
+    assert_eq!(outcome, SingleResult::Refused);
+    assert_eq!(fx.mock.requests().len(), before, "nothing was embedded");
+    assert_eq!(db.all_document_paths().expect("paths"), walked);
+
+    // A row the watcher stored under the link's name before this fix goes.
+    db.upsert_document("alias/note.md", None, None, None, None, &[], None, "h", 0)
+        .expect("seed the alias row");
+    let outcome = reindex_single_file(&db, &mut embedder, &kb, "alias/note.md", None, &registry)
+        .expect("reindex");
+    assert_eq!(outcome, SingleResult::OutsideKnowledgeBaseDeindexed);
+    assert_eq!(db.all_document_paths().expect("paths"), walked);
+
+    // The real name is untouched by any of it and still reindexes as an ordinary file.
+    let outcome = reindex_single_file(&db, &mut embedder, &kb, "real/note.md", None, &registry)
+        .expect("reindex");
+    assert_eq!(outcome, SingleResult::Unchanged);
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
 #[test]
 fn a_rename_into_a_directory_link_takes_the_document_out_of_the_index() {
     if run_in_hermetic_child("a_rename_into_a_directory_link_takes_the_document_out_of_the_index") {
