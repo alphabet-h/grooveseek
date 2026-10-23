@@ -523,12 +523,52 @@ pub(crate) fn sheet_chunk(index: usize, title: &str, name: &str, text: &str) -> 
 /// 例: `build_context(&["設計ノート", "検索パイプライン", "RRF の実装"])`
 ///     → `Some("設計ノート > 検索パイプライン > RRF の実装")`
 pub(crate) fn build_context(parts: &[&str]) -> Option<String> {
-    // BGE-small の 512 token 制限保護 + 異常に長い見出しへの防御 (spec D-11)。
-    const MAX_CONTEXT_CHARS: usize = 200;
+    let trimmed: Vec<&str> = parts.iter().map(|p| p.trim()).collect();
+    join_context(&trimmed)
+}
 
+/// BGE-small の 512 token 制限保護 + 異常に長い見出しへの防御 (spec D-11)。
+const MAX_CONTEXT_CHARS: usize = 200;
+
+/// (audit AX-04) A heading as it is kept on an ancestry stack: trimmed and cut to the
+/// context cap, on a char boundary.
+///
+/// The stack is cloned into every chunk below the heading, so keeping the full text made a
+/// long heading cost its length once per child (a 2 MB heading over 1000 children peaked at
+/// 2,094 MB in the audit). The cut cannot change a context: an element that is longer than
+/// the cap fills the rest of the breadcrumb by itself, so nothing past its first
+/// [`MAX_CONTEXT_CHARS`] chars, nor any element after it, reaches the output. Pass the
+/// result to [`heading_context`], never to [`build_context`] -- that one trims each part
+/// again, and a cut that ends in whitespace would come out shorter than the uncut heading.
+pub(crate) fn context_ancestor(heading: &str) -> String {
+    heading.trim().chars().take(MAX_CONTEXT_CHARS).collect()
+}
+
+/// The breadcrumb `[title, ...ancestry, heading]` of a heading-chunked document (Markdown,
+/// docx). `ancestry` holds [`context_ancestor`] values; the title and the heading are
+/// trimmed here as [`build_context`] does. Same output as `build_context` over the uncut
+/// ancestors.
+pub(crate) fn heading_context(
+    title: Option<&str>,
+    ancestry: &[String],
+    heading: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::with_capacity(ancestry.len() + 2);
+    if let Some(t) = title {
+        parts.push(t.trim());
+    }
+    parts.extend(ancestry.iter().map(String::as_str));
+    if let Some(h) = heading {
+        parts.push(h.trim());
+    }
+    join_context(&parts)
+}
+
+/// [`build_context`] after the trim: skips empty and consecutive duplicate parts, joins with
+/// `" > "` and caps at [`MAX_CONTEXT_CHARS`].
+fn join_context(parts: &[&str]) -> Option<String> {
     let mut out: Vec<&str> = Vec::with_capacity(parts.len());
-    for p in parts {
-        let t = p.trim();
+    for &t in parts {
         if t.is_empty() {
             continue; // 空/whitespace-only は skip
         }
@@ -1009,6 +1049,30 @@ mod tests {
         let long = "a".repeat(300);
         let ctx = build_context(&[&long]).unwrap();
         assert_eq!(ctx.chars().count(), 200);
+    }
+
+    /// (audit AX-04) The stacked form of a heading is trimmed and at most the cap, cut on a
+    /// char boundary; a short heading is kept whole.
+    #[test]
+    fn context_ancestor_is_trimmed_and_cut_to_the_cap() {
+        assert_eq!(context_ancestor("  short  "), "short");
+        let cjk = context_ancestor(&"日本".repeat(1000));
+        assert_eq!(cjk.chars().count(), 200);
+        assert_eq!(cjk.len(), 600);
+        assert_eq!(context_ancestor(&"a".repeat(200)), "a".repeat(200));
+    }
+
+    /// (audit AX-04) `heading_context` over cut ancestors equals `build_context` over the
+    /// whole ones, and does not trim a cut that ends in whitespace.
+    #[test]
+    fn heading_context_over_cut_ancestors_is_build_context_over_whole_ones() {
+        let long = format!(" {}\u{3000}\u{3000}{} ", "a".repeat(199), "b".repeat(10));
+        let cut = vec![context_ancestor(&long)];
+        assert_eq!(
+            heading_context(Some(" T "), &cut, Some(" leaf ")),
+            build_context(&[" T ", &long, " leaf "])
+        );
+        assert_eq!(heading_context(None, &cut, None), build_context(&[&long]));
     }
 
     #[test]

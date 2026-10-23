@@ -50,6 +50,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **A long heading over many sub-headings no longer multiplies the memory a Markdown or `.docx`
+  parse takes.** Every chunk kept its own copy of each heading above it, at full length, and the
+  breadcrumb `context` was cut to 200 characters only after that, so a single heading of a few
+  megabytes over a thousand sub-headings took gigabytes to parse (a 2 MB heading over 1,000
+  children peaked at 2,094 MB). Markdown is enabled by default. Headings above a chunk are now kept
+  cut to the 200 characters the `context` can hold; chunks, headings and `context` are unchanged.
 - **The live watcher no longer walks into a directory that was replaced by a link.** When a new
   directory appears the watcher scans it once, and that scan followed the directory itself if it
   had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time

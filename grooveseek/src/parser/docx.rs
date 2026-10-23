@@ -840,7 +840,8 @@ fn parse_document_xml(
                             }
                         }
                         let ancestry: Vec<String> = stack.iter().map(|(_, h)| h.clone()).collect();
-                        stack.push((level, text.clone()));
+                        // 積む時点で context の上限に切る (audit AX-04)
+                        stack.push((level, super::context_ancestor(&text)));
 
                         // 見出し段落。exclude 対象なら新規 section を作らず
                         // `excluded = true` にするだけ (= 次の非除外見出しまで
@@ -906,17 +907,7 @@ fn parse_document_xml(
         .enumerate()
         .map(|(i, s)| {
             // context parts: [title, ...ancestry, heading]
-            let mut parts: Vec<&str> = Vec::with_capacity(s.ancestry.len() + 2);
-            if let Some(t) = title {
-                parts.push(t);
-            }
-            for a in &s.ancestry {
-                parts.push(a);
-            }
-            if let Some(h) = &s.heading {
-                parts.push(h);
-            }
-            let context = super::build_context(&parts);
+            let context = super::heading_context(title, &s.ancestry, s.heading.as_deref());
             // (feature-66) `body` is the chunk's content as it is, so the spans need no other
             // adjustment than the fold's.
             let table_rows = chunk_table_rows(&s.spans);
@@ -1645,6 +1636,46 @@ mod tests {
             .unwrap();
         assert_eq!(doc.chunks[0].context.as_deref(), Some("a > 章1"));
         assert_eq!(doc.chunks[1].context.as_deref(), Some("a > 章1 > 節1.1"));
+    }
+
+    /// (audit AX-04) A long ancestor heading is held cut to the context cap; the contexts stay
+    /// those of `build_context` over the uncut headings, a cut ending in whitespace included.
+    #[test]
+    fn a_long_ancestor_heading_gives_the_context_of_the_uncut_one() {
+        // ideographic spaces over the cut, after the 196 chars the title "a > " leaves room
+        // for: a re-trimmed cut would end at the a's and let " > 節" in (' ' would hide it,
+        // as " > " starts with one)
+        let ws_at_cut = format!(
+            "{}{}{}",
+            "a".repeat(195),
+            "\u{3000}".repeat(10),
+            "b".repeat(50)
+        );
+        let cjk = "章".repeat(300);
+        for (parent, child) in [
+            (ws_at_cut.as_str(), "節"),
+            (cjk.as_str(), "節"),
+            (cjk.as_str(), cjk.as_str()),
+        ] {
+            let bytes = make_minimal_docx(&[
+                (Some("Heading1"), parent),
+                (None, "本文A これは十分な長さの本文です十分な長さの本文です"),
+                (Some("Heading2"), child),
+                (None, "本文B これは十分な長さの本文です十分な長さの本文です"),
+            ]);
+            let doc = DocxParser::default()
+                .parse_bytes(&bytes, "docs/a.docx", &[])
+                .unwrap();
+            assert_eq!(doc.chunks.len(), 2);
+            assert_eq!(
+                doc.chunks[0].context,
+                super::super::build_context(&["a", parent])
+            );
+            assert_eq!(
+                doc.chunks[1].context,
+                super::super::build_context(&["a", parent, child])
+            );
+        }
     }
 
     #[test]
