@@ -1035,6 +1035,10 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         Ok(indexer::SingleResult::Refused) => {
             wdiag!("watcher: {rel} refused, index left as it was");
         }
+        // (AX-02, review P2-1) The reason is on stderr from the indexer; this says the row went.
+        Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed) => {
+            wdiag!("watcher: {rel} resolves outside the knowledge base; deindexed it");
+        }
         Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
         }

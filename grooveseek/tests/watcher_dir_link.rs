@@ -103,6 +103,49 @@ fn a_file_reached_through_a_directory_link_is_not_indexed() {
     assert_dir_empty(&fx.cache);
 }
 
+/// (review P2-1 on AX-02) A directory that was indexed and is then replaced by a link to
+/// elsewhere: the full walk (`follow_links(false)`) no longer collects its files and drops their
+/// rows, so the watcher's reindex of one of them must drop the row too rather than keep it.
+#[test]
+fn a_document_whose_directory_became_a_link_leaves_the_index() {
+    if run_in_hermetic_child("a_document_whose_directory_became_a_link_leaves_the_index") {
+        return;
+    }
+    let fx = fixture(
+        "ax02-swapped",
+        &[("in.md", NOTE), ("sub/note.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string(), "sub/note.md".to_string()]
+    );
+
+    // `sub/` moves out of the knowledge base and a link to it takes its place.
+    let moved = fx.layout.root().join("moved-out");
+    std::fs::rename(kb.join("sub"), &moved).expect("move sub/ out");
+    dir_link(&kb.join("sub"), &moved);
+
+    let before = fx.mock.requests().len();
+    let outcome = reindex_single_file(&db, &mut embedder, &kb, "sub/note.md", None, &registry)
+        .expect("reindex");
+    assert_eq!(outcome, SingleResult::OutsideKnowledgeBaseDeindexed);
+    assert_eq!(fx.mock.requests().len(), before, "nothing was embedded");
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string()],
+        "the row of a file that now resolves outside the knowledge base must go, as the \
+         full index drops it"
+    );
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
 #[test]
 fn a_rename_into_a_directory_link_takes_the_document_out_of_the_index() {
     if run_in_hermetic_child("a_rename_into_a_directory_link_takes_the_document_out_of_the_index") {

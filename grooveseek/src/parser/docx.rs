@@ -709,6 +709,13 @@ fn parse_document_xml(
     title: Option<&str>,
     styles: Option<&StyleTable>,
 ) -> Vec<Chunk> {
+    chunks_of_sections(read_sections(xml, excludes, styles), title)
+}
+
+/// The raw sections of `word/document.xml`, before [`fold_empty_heading_sections`]: what
+/// [`parse_document_xml`] reads, each with the ancestry it had when its heading was read
+/// (ancestors cut by [`super::context_ancestor`], audit AX-04).
+fn read_sections(xml: &[u8], excludes: &[&str], styles: Option<&StyleTable>) -> Vec<DocxSection> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -901,7 +908,12 @@ fn parse_document_xml(
         let so_far = row.take_so_far();
         push_table_line(&mut sections, excluded, row.table, &so_far);
     }
+    sections
+}
 
+/// [`read_sections`]' sections folded ([`fold_empty_heading_sections`]) and made chunks, each
+/// with its breadcrumb.
+fn chunks_of_sections(sections: Vec<DocxSection>, title: Option<&str>) -> Vec<Chunk> {
     fold_empty_heading_sections(sections)
         .into_iter()
         .enumerate()
@@ -1636,6 +1648,45 @@ mod tests {
             .unwrap();
         assert_eq!(doc.chunks[0].context.as_deref(), Some("a > 章1"));
         assert_eq!(doc.chunks[1].context.as_deref(), Some("a > 章1 > 節1.1"));
+    }
+
+    /// (audit AX-04, review P2-2) The sections keep a long ancestor heading cut to the context
+    /// cap, so what they hold of it does not grow with its length times the number of children.
+    /// The section of the long heading itself keeps its heading whole.
+    #[test]
+    fn docx_ancestors_are_kept_cut_to_the_context_cap() {
+        for (unit, len) in [("x", 100_000), ("章", 50_000)] {
+            let parent = unit.repeat(len);
+            let mut body = format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{parent}</w:t></w:r></w:p>"#
+            );
+            for i in 0..200 {
+                body.push_str(&format!(
+                    r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>child {i}</w:t></w:r></w:p><w:p><w:r><w:t>body {i}</w:t></w:r></w:p>"#
+                ));
+            }
+            let xml = format!(
+                r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+            );
+            let sections = read_sections(xml.as_bytes(), &[], None);
+            // the leading untitled section, the parent, then the 200 children
+            assert_eq!(sections.len(), 202);
+            assert_eq!(sections[1].heading.as_deref(), Some(parent.as_str()));
+            for s in &sections[2..] {
+                assert_eq!(s.ancestry.len(), 1);
+                assert_eq!(s.ancestry[0].chars().count(), 200);
+                assert!(parent.starts_with(s.ancestry[0].as_str()));
+            }
+            let held: usize = sections
+                .iter()
+                .flat_map(|s| &s.ancestry)
+                .map(String::len)
+                .sum();
+            assert!(
+                held <= 200 * 200 * unit.len(),
+                "ancestry held {held} bytes for 200 children"
+            );
+        }
     }
 
     /// (audit AX-04) A long ancestor heading is held cut to the context cap; the contexts stay

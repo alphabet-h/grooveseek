@@ -64,7 +64,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   without following them, and before it reads a file for a create, a change or a rename it checks
   that the file resolves inside the knowledge base, on every platform (on Windows a directory
   junction, which needs no privilege, reached the same read). A file that resolves outside is
-  skipped with a line on stderr; a document moved into such a link is removed from the index.
+  skipped with a line on stderr. A document moved into such a link, or one whose directory was
+  replaced by a link after it was indexed, is removed from the index, as the next full index
+  would remove it.
 - **The live watcher no longer walks into a directory that was replaced by a link.** When a new
   directory appears the watcher scans it once, and that scan followed the directory itself if it
   had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time

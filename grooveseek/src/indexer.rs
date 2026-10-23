@@ -252,11 +252,44 @@ fn resolves_inside_kb(kb_path: &Path, full: &Path) -> std::io::Result<bool> {
     Ok(crate::links::canonical_within(&root, full)?.is_some())
 }
 
-/// The stderr line for a file [`resolves_inside_kb`] turned away. ASCII.
+/// (audit AX-02) What [`rename_single_file`] does with [`resolves_inside_kb`]'s answer for the
+/// destination `full`: `Ok(None)` to go on and read it.
+///
+/// - outside: the old row is deleted and nothing is read
+///   ([`RenameOutcome::MovedOutOfTheKnowledgeBase`])
+/// - (review Low-3) the look failed: the row moves to `new_rel` first and the error is
+///   returned, the state a failed read of the destination leaves
+///
+/// Split out so a test can hand it a failed look, which a real file system rarely produces
+/// after `exists()` has just succeeded.
+fn settle_rename_destination(
+    db: &Database,
+    old_rel: &str,
+    new_rel: &str,
+    full: &Path,
+    inside: std::io::Result<bool>,
+) -> Result<Option<RenameOutcome>> {
+    match inside {
+        Ok(true) => Ok(None),
+        Ok(false) => {
+            eprintln!("{}", outside_kb_line(new_rel));
+            db.delete_document(old_rel)?;
+            Ok(Some(RenameOutcome::MovedOutOfTheKnowledgeBase))
+        }
+        Err(e) => {
+            db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
+            Err(e).with_context(|| format!("failed to resolve {}", full.display()))
+        }
+    }
+}
+
+/// The stderr line for a file [`resolves_inside_kb`] turned away. ASCII. It does not say
+/// which kind of link took the path out (a directory on the way, or the file itself), since
+/// the check does not know.
 fn outside_kb_line(rel: &str) -> String {
     format!(
-        "Skipping {rel}: it resolves outside the knowledge base through a directory \
-         link, and links are not followed"
+        "Skipping {rel}: it resolves outside the knowledge base through a link, and \
+         links are not followed"
     )
 }
 
@@ -950,6 +983,12 @@ pub enum SingleResult {
     /// content が新 path のまま残るのに watcher は「rename 成功」と報告する**。
     /// 型で分けておけば、その分岐を書き忘れることができない。
     Refused,
+    /// (audit AX-02, review P2-1) The file resolves outside the knowledge base through a link,
+    /// and the row that was under its path has been **deleted**. Only
+    /// [`reindex_single_file`] returns it (when no row was there it returns
+    /// [`SingleResult::Refused`]); [`rebuild_index`]'s walk does not follow links, so a file
+    /// like this never reaches it.
+    OutsideKnowledgeBaseDeindexed,
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,7 +1519,9 @@ pub fn rebuild_index(
                 SingleResult::Skipped { reason, .. } => {
                     mode == Reindex::Reparse && *reason == SKIPPED_NO_CHUNKS
                 }
-                SingleResult::MetadataRefreshed { .. } | SingleResult::Refused => false,
+                SingleResult::MetadataRefreshed { .. }
+                | SingleResult::Refused
+                | SingleResult::OutsideKnowledgeBaseDeindexed => false,
             };
             if !settled && stale_row(&passes, db, registry, &entry.rel)? {
                 unsettled.insert(entry.rel.clone());
@@ -1539,7 +1580,9 @@ pub fn rebuild_index(
             }
             // A refusal counts as a skip here for the same reason a size cap
             // does: the file is not indexed and the reason is already on stderr.
-            SingleResult::Refused => {
+            // `OutsideKnowledgeBaseDeindexed` comes only from `reindex_single_file`, never from
+            // the shared entry this loop calls; named so a new variant stays a compile error.
+            SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed => {
                 tally.skipped += 1;
                 if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
                     refresh_pending = true;
@@ -2887,8 +2930,13 @@ pub(crate) fn write_parsed_document_with_vectors(
 
 /// 1 つの source file を index / 再 index する。
 ///
-/// - `kb_path` は canonicalized (`rebuild_index` と同じ前提)
+/// - `kb_path` は watcher からは canonical (`groove serve` が canonicalize して渡す)。
+///   canonical でなくても動く: KB の内外の判定 ([`resolves_inside_kb`]) は root を
+///   canonicalize し直してから比べる (audit AX-02)
 /// - `rel` は forward-slash、`kb_path` からの相対パス (e.g. `"notes/a.md"`)
+/// - (audit AX-02) KB の外に解ける file は読まない。`rel` の行があれば消して
+///   [`SingleResult::OutsideKnowledgeBaseDeindexed`]、無ければ [`SingleResult::Refused`]
+///   (full index の walk も link を辿らず、その行を落とすのと揃える)
 /// - 拡張子が `registry` に登録されていなければ `Skipped` を返す
 /// - hash が DB と一致なら `Unchanged`、違えば upsert + embedding 再計算
 /// - **size cap**: registry の上限 ([`Registry::limits`]、`[index]` で変えられる。既定は
@@ -2913,12 +2961,18 @@ pub fn reindex_single_file(
         });
     }
     // (audit AX-02) Before the size stat and the read, both of which follow every link on
-    // the way. No row is written, so this is a refusal, like the read's own.
+    // the way. Nothing is read or written for the file. (review P2-1) A row already under
+    // `rel` -- its directory was indexed, then replaced by a link -- is dropped, as the full
+    // index drops it (its walk does not follow the link, so the file is not collected).
     if !resolves_inside_kb(kb_path, &full)
         .with_context(|| format!("failed to resolve {}", full.display()))?
     {
         eprintln!("{}", outside_kb_line(rel));
-        return Ok(SingleResult::Refused);
+        return Ok(if deindex_single_file(db, rel)? {
+            SingleResult::OutsideKnowledgeBaseDeindexed
+        } else {
+            SingleResult::Refused
+        });
     }
 
     // scan_disk_entries (フル rebuild) と同じ size-cap ガードを read 前に適用する。
@@ -3294,7 +3348,9 @@ pub fn rename_single_file(
         return Ok(
             match reindex_single_file(db, embedder, kb_path, new_rel, exclude_headings, registry)? {
                 // (AW-04) An endpoint rejection writes no row either, so it is not "indexed".
+                // (AX-02) A path outside the knowledge base creates no row either.
                 SingleResult::Refused
+                | SingleResult::OutsideKnowledgeBaseDeindexed
                 | SingleResult::Skipped {
                     reason: SKIPPED_EMBED_REJECTED,
                     ..
@@ -3334,12 +3390,14 @@ pub fn rename_single_file(
     // (audit AX-02) A destination reached through a directory link is not in the knowledge
     // base, so the document has left it: the row is dropped, as for a move into an excluded
     // directory, and nothing at the new path is read.
-    if !resolves_inside_kb(kb_path, &full)
-        .with_context(|| format!("failed to resolve {}", full.display()))?
-    {
-        eprintln!("{}", outside_kb_line(new_rel));
-        db.delete_document(old_rel)?;
-        return Ok(RenameOutcome::MovedOutOfTheKnowledgeBase);
+    if let Some(outcome) = settle_rename_destination(
+        db,
+        old_rel,
+        new_rel,
+        &full,
+        resolves_inside_kb(kb_path, &full),
+    )? {
+        return Ok(outcome);
     }
 
     // size-cap ガード: fs::read する前に判定する。超過なら DB の path だけ
@@ -3515,6 +3573,9 @@ pub fn rename_single_file(
         // catch-all below would report a successful rename while the database
         // kept the old content under the new path.
         SingleResult::Refused => Ok(RenameOutcome::RenamedButRefused),
+        // Only `reindex_single_file` returns it, never the shared entry called above; mapped
+        // with the refusal it is a case of, and named so a new variant stays a compile error.
+        SingleResult::OutsideKnowledgeBaseDeindexed => Ok(RenameOutcome::RenamedButRefused),
         // Spelled out rather than `_`: a catch-all is what swallowed the
         // refusal in the first place, and it would swallow the next variant too.
         // `MetadataRefreshed` cannot come back here (the check is off on this
@@ -4457,6 +4518,54 @@ mod tests {
     /// `tests/index_declared_fields.rs` for the subprocess-level coverage of the bug this
     /// closes: a cross-parser rename whose destination parser refuses the bytes used to leave
     /// the old parser's row behind).
+    /// (audit AX-02, review Low-3) The rename's destination check: inside goes on, outside drops
+    /// the old row, and a failed look moves the row before returning the error -- the state a
+    /// failed read of the destination leaves.
+    #[test]
+    fn settle_rename_destination_ends_a_failed_look_as_a_failed_read() {
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let upsert = |p: &str| {
+            db.upsert_document(p, None, None, None, None, &[], None, "h1", 10)
+                .unwrap();
+        };
+        let full = Path::new("kb/new.md");
+
+        upsert("old.md");
+        let go_on = settle_rename_destination(&db, "old.md", "new.md", full, Ok(true)).unwrap();
+        assert_eq!(go_on, None);
+        assert_eq!(db.all_document_paths().unwrap(), vec!["old.md".to_string()]);
+
+        let err = settle_rename_destination(
+            &db,
+            "old.md",
+            "new.md",
+            full,
+            Err(std::io::Error::other("probe")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to resolve"), "{err:#}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["new.md".to_string()],
+            "the row moved, as it does before a failed read"
+        );
+
+        let out = settle_rename_destination(&db, "new.md", "far.md", full, Ok(false)).unwrap();
+        assert_eq!(out, Some(RenameOutcome::MovedOutOfTheKnowledgeBase));
+        assert!(db.all_document_paths().unwrap().is_empty());
+    }
+
+    /// (review Low-4) The refusal line does not claim which kind of link it was, and stays
+    /// ASCII for stderr.
+    #[test]
+    fn the_outside_kb_line_names_no_kind_of_link() {
+        let line = outside_kb_line("notes/a.md");
+        assert!(line.contains("notes/a.md") && line.contains("outside the knowledge base"));
+        assert!(!line.contains("directory"), "{line}");
+        assert!(line.is_ascii(), "{line}");
+    }
+
     #[test]
     fn settle_cross_parser_rename_deletes_the_row_unless_the_reparse_updated_it() {
         let db = Database::open_in_memory().unwrap();
