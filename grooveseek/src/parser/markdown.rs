@@ -534,6 +534,13 @@ fn extract_frontmatter(raw: &str) -> (Frontmatter, String, Option<String>) {
 type RawChunk = (Option<(u8, String)>, Vec<String>, String);
 
 fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> {
+    let raw_chunks = split_at_headings(body, excludes);
+    merge_and_build(raw_chunks, title)
+}
+
+/// The sections of the body at its `##` / `###` headings, each with the ancestry it had when it
+/// opened (ancestors cut by [`super::context_ancestor`]), before the 50-char merge.
+fn split_at_headings(body: &str, excludes: &[&str]) -> Vec<RawChunk> {
     // raw_chunks: (heading, 祖先見出しスナップショット, content)
     let mut raw_chunks: Vec<RawChunk> = Vec::new();
     let mut current_heading: Option<(u8, String)> = None;
@@ -563,8 +570,9 @@ fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> 
                 }
             }
             let ancestry: Vec<String> = stack.iter().map(|(_, h)| h.clone()).collect();
-            // 3) この見出しを stack へ (exclude されても積む = E-6)
-            stack.push((level, heading_text.clone()));
+            // 3) この見出しを stack へ (exclude されても積む = E-6)。積む時点で context の
+            //    上限に切る (audit AX-04: 全長を子 chunk の数だけ clone していた)
+            stack.push((level, super::context_ancestor(&heading_text)));
 
             // 4) 次 chunk の state を確定
             if excludes.iter().any(|ex| heading_text.contains(ex)) {
@@ -586,7 +594,11 @@ fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> 
             raw_chunks.push((current_heading, current_ancestry, content));
         }
     }
+    raw_chunks
+}
 
+/// [`split_at_headings`]'s sections after the 50-char merge, as chunks with their context.
+fn merge_and_build(raw_chunks: Vec<RawChunk>, title: Option<&str>) -> Vec<Chunk> {
     // 50-char 未満 chunk は直前 chunk に merge。heading / level / **ancestry** は
     // 最初に出現した heading のものを維持 (legacy 挙動 + E-9 の ancestry 引継ぎ)。
     let mut merged: Vec<RawChunk> = Vec::new();
@@ -614,17 +626,7 @@ fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> 
                 None => (None, None),
             };
             // context parts: [title, ...ancestry, heading]
-            let mut parts: Vec<&str> = Vec::with_capacity(ancestry.len() + 2);
-            if let Some(t) = title {
-                parts.push(t);
-            }
-            for a in &ancestry {
-                parts.push(a);
-            }
-            if let Some(h) = &heading {
-                parts.push(h);
-            }
-            let context = super::build_context(&parts);
+            let context = super::heading_context(title, &ancestry, heading.as_deref());
             Chunk {
                 index: i,
                 heading,
@@ -1152,5 +1154,77 @@ larger body enough enough enough enough enough enough enough.";
         let diff = changed(&old, &short);
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].heading.as_deref(), Some("Install"));
+    }
+
+    const LONG_BODY: &str = "a body paragraph long enough to stay a chunk of its own here";
+
+    /// (audit AX-04) A long heading is held on the stack cut to the context cap, so what the
+    /// sections keep of it does not grow with its length times the number of children.
+    #[test]
+    fn ancestors_are_kept_cut_to_the_context_cap() {
+        for (unit, len) in [("x", 100_000), ("あ", 50_000)] {
+            let parent = unit.repeat(len);
+            let mut body = format!("## {parent}\n\n{LONG_BODY}\n\n");
+            for i in 0..200 {
+                body.push_str(&format!("### child {i}\n\n{LONG_BODY}\n\n"));
+            }
+            let raw = split_at_headings(&body, &[]);
+            assert_eq!(raw.len(), 201);
+            // the section of the long heading itself keeps its heading whole
+            assert_eq!(
+                raw[0].0.as_ref().map(|(_, h)| h.as_str()),
+                Some(parent.as_str())
+            );
+            for (_, ancestry, _) in &raw[1..] {
+                assert_eq!(ancestry.len(), 1);
+                assert_eq!(ancestry[0].chars().count(), 200);
+                assert!(parent.starts_with(ancestry[0].as_str()));
+            }
+            let held: usize = raw.iter().flat_map(|r| &r.1).map(String::len).sum();
+            assert!(
+                held <= 200 * 200 * unit.len(),
+                "ancestry held {held} bytes for 200 children"
+            );
+        }
+    }
+
+    /// (audit AX-04) Cutting the ancestors leaves every context as
+    /// [`crate::parser::build_context`] makes it
+    /// over the uncut headings, byte for byte: a cut that ends in whitespace, a CJK heading,
+    /// a child equal to the cut parent and a child equal to the whole parent.
+    #[test]
+    fn the_cut_ancestry_gives_the_context_of_the_uncut_one() {
+        // an ideographic space, not ' ': the separator " > " starts with ' ', so a re-trimmed
+        // cut ending in ' ' would come out the same and hide the bug
+        let ws_at_cut = format!("{}\u{3000}\u{3000}{}", "a".repeat(199), "b".repeat(50));
+        let cases: Vec<(String, String)> = vec![
+            (ws_at_cut.clone(), "Child".to_string()),
+            ("あ".repeat(300), "子".to_string()),
+            ("z".repeat(300), "z".repeat(200)),
+            ("z".repeat(300), "z".repeat(300)),
+            ("y".repeat(200), "y".repeat(200)),
+            ("Parent".to_string(), "w".repeat(250)),
+        ];
+        for title in [None, Some("T"), Some("  ")] {
+            for (parent, child) in &cases {
+                let body = format!("## {parent}\n\n{LONG_BODY}\n\n### {child}\n\n{LONG_BODY}\n");
+                let chunks = chunk_body(&body, &[], title);
+                assert_eq!(chunks.len(), 2, "{parent:.20} / {child:.20}");
+                let t = title.unwrap_or("");
+                let want_parent = super::super::build_context(&[t, parent]);
+                let want_child = super::super::build_context(&[t, parent, child]);
+                assert_eq!(chunks[0].context, want_parent, "{parent:.20}");
+                assert_eq!(chunks[1].context, want_child, "{parent:.20} / {child:.20}");
+            }
+        }
+        // the whitespace case is the one a re-trim of the cut would break
+        let chunks = chunk_body(
+            &format!("## {ws_at_cut}\n\n{LONG_BODY}\n\n### Child\n\n{LONG_BODY}\n"),
+            &[],
+            None,
+        );
+        let ctx = chunks[1].context.as_deref().unwrap();
+        assert_eq!(ctx.chars().count(), 200);
+        assert!(ctx.ends_with('\u{3000}'));
     }
 }

@@ -709,6 +709,13 @@ fn parse_document_xml(
     title: Option<&str>,
     styles: Option<&StyleTable>,
 ) -> Vec<Chunk> {
+    chunks_of_sections(read_sections(xml, excludes, styles), title)
+}
+
+/// The raw sections of `word/document.xml`, before [`fold_empty_heading_sections`]: what
+/// [`parse_document_xml`] reads, each with the ancestry it had when its heading was read
+/// (ancestors cut by [`super::context_ancestor`], audit AX-04).
+fn read_sections(xml: &[u8], excludes: &[&str], styles: Option<&StyleTable>) -> Vec<DocxSection> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -840,7 +847,8 @@ fn parse_document_xml(
                             }
                         }
                         let ancestry: Vec<String> = stack.iter().map(|(_, h)| h.clone()).collect();
-                        stack.push((level, text.clone()));
+                        // 積む時点で context の上限に切る (audit AX-04)
+                        stack.push((level, super::context_ancestor(&text)));
 
                         // 見出し段落。exclude 対象なら新規 section を作らず
                         // `excluded = true` にするだけ (= 次の非除外見出しまで
@@ -900,23 +908,18 @@ fn parse_document_xml(
         let so_far = row.take_so_far();
         push_table_line(&mut sections, excluded, row.table, &so_far);
     }
+    sections
+}
 
+/// [`read_sections`]' sections folded ([`fold_empty_heading_sections`]) and made chunks, each
+/// with its breadcrumb.
+fn chunks_of_sections(sections: Vec<DocxSection>, title: Option<&str>) -> Vec<Chunk> {
     fold_empty_heading_sections(sections)
         .into_iter()
         .enumerate()
         .map(|(i, s)| {
             // context parts: [title, ...ancestry, heading]
-            let mut parts: Vec<&str> = Vec::with_capacity(s.ancestry.len() + 2);
-            if let Some(t) = title {
-                parts.push(t);
-            }
-            for a in &s.ancestry {
-                parts.push(a);
-            }
-            if let Some(h) = &s.heading {
-                parts.push(h);
-            }
-            let context = super::build_context(&parts);
+            let context = super::heading_context(title, &s.ancestry, s.heading.as_deref());
             // (feature-66) `body` is the chunk's content as it is, so the spans need no other
             // adjustment than the fold's.
             let table_rows = chunk_table_rows(&s.spans);
@@ -1645,6 +1648,86 @@ mod tests {
             .unwrap();
         assert_eq!(doc.chunks[0].context.as_deref(), Some("a > 章1"));
         assert_eq!(doc.chunks[1].context.as_deref(), Some("a > 章1 > 節1.1"));
+    }
+
+    /// (audit AX-04, review P2-2) The sections keep a long ancestor heading cut to the context
+    /// cap, so what they hold of it does not grow with its length times the number of children.
+    /// The section of the long heading itself keeps its heading whole.
+    #[test]
+    fn docx_ancestors_are_kept_cut_to_the_context_cap() {
+        for (unit, len) in [("x", 100_000), ("章", 50_000)] {
+            let parent = unit.repeat(len);
+            let mut body = format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{parent}</w:t></w:r></w:p>"#
+            );
+            for i in 0..200 {
+                body.push_str(&format!(
+                    r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>child {i}</w:t></w:r></w:p><w:p><w:r><w:t>body {i}</w:t></w:r></w:p>"#
+                ));
+            }
+            let xml = format!(
+                r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+            );
+            let sections = read_sections(xml.as_bytes(), &[], None);
+            // the leading untitled section, the parent, then the 200 children
+            assert_eq!(sections.len(), 202);
+            assert_eq!(sections[1].heading.as_deref(), Some(parent.as_str()));
+            for s in &sections[2..] {
+                assert_eq!(s.ancestry.len(), 1);
+                assert_eq!(s.ancestry[0].chars().count(), 200);
+                assert!(parent.starts_with(s.ancestry[0].as_str()));
+            }
+            let held: usize = sections
+                .iter()
+                .flat_map(|s| &s.ancestry)
+                .map(String::len)
+                .sum();
+            assert!(
+                held <= 200 * 200 * unit.len(),
+                "ancestry held {held} bytes for 200 children"
+            );
+        }
+    }
+
+    /// (audit AX-04) A long ancestor heading is held cut to the context cap; the contexts stay
+    /// those of [`crate::parser::build_context`] over the uncut headings, a cut ending in
+    /// whitespace included.
+    #[test]
+    fn a_long_ancestor_heading_gives_the_context_of_the_uncut_one() {
+        // ideographic spaces over the cut, after the 196 chars the title "a > " leaves room
+        // for: a re-trimmed cut would end at the a's and let " > 節" in (' ' would hide it,
+        // as " > " starts with one)
+        let ws_at_cut = format!(
+            "{}{}{}",
+            "a".repeat(195),
+            "\u{3000}".repeat(10),
+            "b".repeat(50)
+        );
+        let cjk = "章".repeat(300);
+        for (parent, child) in [
+            (ws_at_cut.as_str(), "節"),
+            (cjk.as_str(), "節"),
+            (cjk.as_str(), cjk.as_str()),
+        ] {
+            let bytes = make_minimal_docx(&[
+                (Some("Heading1"), parent),
+                (None, "本文A これは十分な長さの本文です十分な長さの本文です"),
+                (Some("Heading2"), child),
+                (None, "本文B これは十分な長さの本文です十分な長さの本文です"),
+            ]);
+            let doc = DocxParser::default()
+                .parse_bytes(&bytes, "docs/a.docx", &[])
+                .unwrap();
+            assert_eq!(doc.chunks.len(), 2);
+            assert_eq!(
+                doc.chunks[0].context,
+                super::super::build_context(&["a", parent])
+            );
+            assert_eq!(
+                doc.chunks[1].context,
+                super::super::build_context(&["a", parent, child])
+            );
+        }
     }
 
     #[test]

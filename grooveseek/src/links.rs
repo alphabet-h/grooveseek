@@ -58,19 +58,35 @@
 //! not wait on a FIFO any more than the index run may -- and refuses anything
 //! that is not a regular file from the same `fstat`.
 //!
-//! On Windows the open adds nothing, deliberately. Creating a symlink there
+//! On Windows the open adds nothing, deliberately. Creating a file symlink there
 //! requires `SeCreateSymbolicLinkPrivilege` or Developer Mode — measured on
 //! Windows 11: a non-elevated `New-Item -ItemType SymbolicLink` is refused with
 //! "Administrator privilege required" while the hard link in the same script
-//! succeeds — so the attacker in this threat model cannot make one. And the
-//! obvious symmetric guard is actively wrong: refusing reparse points would
-//! refuse **every OneDrive / Dropbox placeholder**, since Files On-Demand
-//! implements them as reparse points. This asymmetry is the mirror image of the
-//! one BU-20 rejected, and for the same reason — each platform is guarded where
-//! the primitive is actually free.
+//! succeeds — so the attacker in this threat model cannot put a symlink in place
+//! of a note. A **directory junction** is another matter: `mklink /J` needs no
+//! privilege (the junction tests in this module and in the watcher's directory
+//! link integration tests make one unelevated and assert it), so on Windows too
+//! a directory *on the way*
+//! to a file can lead out of the knowledge base. That is handled by the path
+//! check below, not by the open. And the obvious symmetric guard on the open is
+//! actively wrong: refusing reparse points would refuse **every OneDrive /
+//! Dropbox placeholder**, since Files On-Demand implements them as reparse
+//! points. This asymmetry is the mirror image of the one BU-20 rejected, and for
+//! the same reason — each platform is guarded where the primitive is actually
+//! free.
 //!
-//! Neither platform closes an **intermediate directory** swapped for a symlink;
-//! that needs `openat2(RESOLVE_NO_SYMLINKS)`, which is Linux-only.
+//! ## Intermediate directories (audit AX-02)
+//!
+//! The open's checks see the final component only. An **intermediate
+//! directory** that is a symlink, or on Windows a junction, is caught by
+//! [`crate::links::canonical_within`]: `get_document` ([`crate::server`]) and
+//! the watcher's single-file reindex and rename ([`crate::indexer`]) resolve the
+//! path and refuse it when it lands outside the canonical knowledge base root,
+//! and the full index's walk never follows such a link. What stays open on both
+//! platforms is a directory swapped for a link **between** that check and the
+//! open. Closing it needs a traversal whose every step is taken from a handle:
+//! `openat2(RESOLVE_NO_SYMLINKS)` (or a component-by-component `O_NOFOLLOW`
+//! walk) on Linux, and a handle-relative open on Windows.
 //!
 //! ## What this still does not do (codex P1 round 2 on PR #155)
 //!
@@ -469,6 +485,29 @@ fn is_symlink_open_error(_e: &std::io::Error) -> bool {
     false
 }
 
+/// Where the given path resolves to with every link on the way followed, when
+/// that is under the given root; `Ok(None)` when it resolves outside. The root
+/// must itself be canonical (`std::fs::canonicalize`), so both sides carry the same spelling --
+/// on Windows, the same verbatim prefix.
+///
+/// (audit AX-02) This is the check for an **intermediate** directory that is a
+/// link: `symlink_metadata` and the `O_NOFOLLOW` open in [`read_checked`] look at
+/// the final component only, so `kb/notes/a.md` with `kb/notes -> /elsewhere`
+/// passes both. `get_document` ([`crate::server`]) asks it before serving a path, and the watcher's
+/// single-file reindex and rename ask it before reading one. Like the rest of
+/// this module it decides about a path at one moment: a directory swapped for a
+/// link between this answer and the open is not closed here (module docs).
+///
+/// `Err` is `canonicalize`'s, for the caller to split as it already did (a path
+/// that is not there versus a look that failed).
+pub(crate) fn canonical_within(
+    root: &Path,
+    path: &Path,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let canonical = path.canonicalize()?;
+    Ok(canonical.starts_with(root).then_some(canonical))
+}
+
 /// The message every hard-link call site logs, so they stay in step and a
 /// skipped file is never a mystery.
 pub(crate) fn refusal_reason(path: &Path) -> String {
@@ -789,6 +828,66 @@ mod tests {
             Refused::NotAPlainFile,
             "a named pipe is not a note, and waiting on one would hang the run"
         );
+    }
+
+    /// A directory link `link` -> `target`: a junction on Windows (`mklink /J` needs no
+    /// elevation), a symlink on Unix. Asserted rather than skipped.
+    fn dir_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlinks need no privilege on unix");
+    }
+
+    /// (audit AX-02) A file under the root resolves inside it; one reached through a
+    /// directory link to elsewhere, or by `..` out of it, resolves outside; a missing one is
+    /// `canonicalize`'s error. Windows runs it through a junction, which needs no privilege.
+    #[test]
+    fn canonical_within_answers_where_a_path_resolves() {
+        let tree = TempTree::new("groove-links-within");
+        let kb = tree.join("kb");
+        let outside = tree.join("outside");
+        std::fs::create_dir_all(kb.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(kb.join("sub/note.md"), b"in").unwrap();
+        std::fs::write(outside.join("secret.md"), b"out").unwrap();
+        dir_link(&kb.join("notes"), &outside);
+        let root = kb.canonicalize().unwrap();
+
+        let inside = canonical_within(&root, &kb.join("sub/note.md")).unwrap();
+        assert_eq!(inside, Some(kb.join("sub/note.md").canonicalize().unwrap()));
+        assert_eq!(
+            canonical_within(&root, &kb.join("notes/secret.md")).unwrap(),
+            None,
+            "a file through a directory link to outside the root"
+        );
+        assert_eq!(
+            canonical_within(&root, &kb.join("sub/../../outside/secret.md")).unwrap(),
+            None,
+            "a file reached by `..` out of the root"
+        );
+        // the root itself is under itself, and a non-canonical spelling of an inside file is
+        // answered by where it resolves
+        assert!(canonical_within(&root, &kb).unwrap().is_some());
+        assert!(
+            canonical_within(&root, &kb.join("sub/../sub/note.md"))
+                .unwrap()
+                .is_some()
+        );
+        let missing = canonical_within(&root, &kb.join("gone.md")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// The reason alone is for a caller that stops rather than skips: it must

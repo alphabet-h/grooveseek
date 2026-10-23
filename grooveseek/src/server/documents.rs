@@ -480,8 +480,13 @@ pub(crate) fn validate_get_document_path(
     // absolute form, so what resolves outside `kb_path` here got there through
     // a link inside the knowledge base -- a directory symlink, or on Windows a
     // junction, which needs no privilege to make.
-    let canonical = match file_path.canonicalize() {
-        Ok(p) => p,
+    let canonical = match crate::links::canonical_within(kb_path, &file_path) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return ValidatePathOutcome::NotFound(ErrorResponse {
+                error: "Access denied: path is outside the knowledge base.".to_string(),
+            });
+        }
         Err(e) if path_probe_failed(&e) => {
             return ValidatePathOutcome::Unavailable(ErrorResponse {
                 error: format!("Failed to resolve {rel_path}: {e}"),
@@ -495,11 +500,6 @@ pub(crate) fn validate_get_document_path(
             });
         }
     };
-    if !canonical.starts_with(kb_path) {
-        return ValidatePathOutcome::NotFound(ErrorResponse {
-            error: "Access denied: path is outside the knowledge base.".to_string(),
-        });
-    }
 
     // 2b. One spelling per document. Rebuild the path the way the index writes
     // it (relative to the KB, `/`-separated) and require the request to be

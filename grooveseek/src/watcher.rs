@@ -213,7 +213,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                         }
                     },
                     RecommendedCache::new(),
-                    notify::Config::default(),
+                    notify_config(),
                 );
                 let mut debouncer = match debouncer_result {
                     Ok(d) => d,
@@ -531,6 +531,22 @@ fn reload_rules(state: &mut WatcherState) {
     }
 }
 
+/// (audit AX-02) The notify configuration the watcher is built with: the default, with
+/// `follow_symlinks` off.
+///
+/// notify 8.2.0 defaults it to `true` (the `Default` of notify's own configuration type), and
+/// notify's inotify backend hands it to the `WalkDir` that sets up a recursive watch, both
+/// for the root and for a directory moved in later. With it on, a
+/// directory symlink inside the KB gets watches on its target, so on Linux the target's
+/// files arrive as events under in-KB names -- the walk never follows such a link, and
+/// `max_user_watches` runs out on `-> /`. The kqueue and poll backends read the same flag;
+/// the FSEvents (macOS) and ReadDirectoryChangesW (Windows) backends do not read it, so it
+/// changes nothing there. The single-file paths check where a file resolves as well
+/// ([`indexer::reindex_single_file`]), which covers an event that reaches them anyway.
+fn notify_config() -> notify::Config {
+    notify::Config::default().with_follow_symlinks(false)
+}
+
 /// debounced event batch を分類して indexer に流す。
 fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
     // (feature-49) ignore ファイルの変更を分類より **先** に処理する。
@@ -592,6 +608,37 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     let Some(rel) = to_rel(&state.kb_path, p) else {
                         continue;
                     };
+                    // (local Codex r3 on AX-02) A path that is now a link: if it was a
+                    // directory, whatever the index holds under it is reached through the
+                    // link now, and the full index (which does not follow links) drops it.
+                    // The removal that should have done so can be folded away by the
+                    // debouncer when the link is made in the same window. Nothing else to do
+                    // for a link: `should_process` refuses it below. The db is locked only for
+                    // a link, so an ordinary event costs one `symlink_metadata` and no lock.
+                    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                        let handled = {
+                            let db = recover_db(state.db.lock());
+                            match deindex_under_a_link_parts(&db, &state.kb_path, p) {
+                                Some((under, outcome)) => {
+                                    match outcome {
+                                        Ok(deleted) if deleted.is_empty() => {}
+                                        Ok(deleted) => wdiag!(
+                                            "watcher: {under} is now a link; deindexed {} documents at or under it",
+                                            deleted.len()
+                                        ),
+                                        Err(e) => wdiag!(
+                                            "watcher: deindexing under the link {under}/ failed: {e}"
+                                        ),
+                                    }
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if handled {
+                            continue;
+                        }
+                    }
                     // A directory that just appeared brings its contents with
                     // it, and on Linux those files produce no event of their
                     // own. Look inside once. `symlink_metadata` rather than
@@ -1019,6 +1066,10 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         Ok(indexer::SingleResult::Refused) => {
             wdiag!("watcher: {rel} refused, index left as it was");
         }
+        // (AX-02, review P2-1) The reason is on stderr from the indexer; this says the row went.
+        Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed) => {
+            wdiag!("watcher: {rel} is reached through a link; deindexed it");
+        }
         Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
         }
@@ -1068,6 +1119,36 @@ fn deindex_subtree_parts(
         return None;
     }
     let outcome = indexer::deindex_subtree(db, &rel);
+    Some((rel, outcome))
+}
+
+/// (local Codex r3 on AX-02) [`deindex_subtree_parts`] for an event path that is now a link (a
+/// symlink, or on Windows a junction, by `symlink_metadata`); `None`, touching nothing, for
+/// anything else, including a path that cannot be stat'ed. Split out so a test can run it with
+/// no [`crate::embedder::Embedder`].
+///
+/// (local Codex after PR #391 r1) The row at the link's own name goes too -- a file replaced
+/// by a link -- with its folded legacy row ([`indexer::sweep_legacy_folded_row`] as a removal,
+/// `require_real_key = false`): the full walk takes no link as a document. Its name is added to
+/// the deleted list when it was there.
+fn deindex_under_a_link_parts(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+) -> Option<(String, Result<Vec<String>>)> {
+    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return None;
+    }
+    let (rel, under) = deindex_subtree_parts(db, kb_path, p)?;
+    let outcome = under.and_then(|mut deleted| {
+        let exact = indexer::deindex_single_file(db, &rel)?;
+        let folded = indexer::sweep_legacy_folded_row(db, kb_path, &rel, false)?;
+        if exact || folded {
+            deleted.push(rel.clone());
+        }
+        Ok(deleted)
+    });
     Some((rel, outcome))
 }
 
@@ -1150,6 +1231,10 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
             wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
+        }
+        // (audit AX-02) The reason is on stderr from the indexer; this says the row went.
+        Ok(indexer::RenameOutcome::MovedOutOfTheKnowledgeBase) => {
+            wdiag!("watcher: {new_rel} is reached through a link; deindexed {old_rel}");
         }
         // (AW-16) The helper the reindex arm uses, which the integration tests cover; a
         // rename is not driven there, since macOS (FSEvents) does not pair renames.
@@ -1499,6 +1584,93 @@ fn dispatch_directory_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (audit AX-02) The watcher is built with notify's `follow_symlinks` off. Runs on every
+    /// platform, so turning it back on is red in every PR leg, not only on Linux where it bites.
+    #[test]
+    fn the_watcher_does_not_ask_notify_to_follow_symlinks() {
+        assert!(!notify_config().follow_symlinks());
+        // and nothing else of the default changed
+        assert_eq!(
+            notify_config().with_follow_symlinks(true),
+            notify::Config::default()
+        );
+    }
+
+    /// (audit AX-02) On Linux, a recursive inotify watch built from [`notify_config`] puts no
+    /// watch on a directory symlink's target: a file written there produces no event under the
+    /// link's in-KB name, while a file written in the KB itself does. With notify's default
+    /// (`follow_symlinks: true`) the target's write arrives as `kb/notes/secret.md`, before the
+    /// in-KB one (one inotify descriptor, events in order).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_inotify_watch_does_not_reach_through_a_directory_symlink() {
+        use notify::Watcher as _;
+        use std::time::Instant;
+
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Dir(crate::test_support::unique_temp_path("groove-ax02-inotify"));
+        let kb = root.0.join("kb");
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, kb.join("notes")).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::RecommendedWatcher::new(tx, notify_config()).unwrap();
+        watcher.watch(&kb, RecursiveMode::Recursive).unwrap();
+
+        std::fs::write(outside.join("secret.md"), "outside the knowledge base").unwrap();
+        std::fs::write(kb.join("in.md"), "inside the knowledge base").unwrap();
+
+        let in_kb = kb.join("in.md");
+        // Receive until the in-KB write has been seen and then nothing has come for `QUIET`,
+        // under one overall cap. The secret is written first, and one inotify descriptor
+        // delivers in order, so a watch through the link would report it before `in.md`; the
+        // quiet drain after `in.md` also takes anything that comes later, so the assertion
+        // below never passes for having stopped listening early. A notify error fails the test.
+        const QUIET: Duration = Duration::from_millis(500);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let step = if seen.contains(&in_kb) {
+                QUIET
+            } else {
+                Duration::from_millis(200)
+            };
+            let wait = step.min(deadline - now);
+            match rx.recv_timeout(wait) {
+                Ok(Ok(event)) => seen.extend(event.paths),
+                Ok(Err(e)) => panic!("notify reported an error: {e:?}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if seen.contains(&in_kb) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the watcher's channel closed: {seen:?}")
+                }
+            }
+        }
+        assert!(
+            seen.contains(&in_kb),
+            "the in-KB write was not seen: {seen:?}"
+        );
+        let through_link: Vec<&PathBuf> = seen
+            .iter()
+            .filter(|p| p.starts_with(kb.join("notes")))
+            .collect();
+        assert!(
+            through_link.is_empty(),
+            "a write outside the KB arrived under the link: {through_link:?}"
+        );
+    }
 
     #[test]
     fn test_watch_config_default() {
@@ -2465,6 +2637,120 @@ mod tests {
             Classified::Deindex(paths) => assert_eq!(paths, [PathBuf::from("/tmp/sub")]),
             other => panic!("expected Deindex, got {other:?}"),
         }
+    }
+
+    /// (local Codex r3 on AX-02) An event path that is now a link -- a directory replaced by
+    /// a link, the removal folded away -- drops the rows under it; a real directory, or a
+    /// path that is not there, touches nothing. A junction on Windows (`mklink /J`, no
+    /// privilege), a symlink on Unix; the link dangles, as the target is never created.
+    #[test]
+    fn deindex_under_a_link_parts_drops_the_rows_under_a_path_that_is_now_a_link() {
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Dir(crate::test_support::unique_temp_path(
+            "groove-watcher-link-subtree",
+        ));
+        let kb = root.0.join("kb");
+        std::fs::create_dir_all(kb.join("real")).unwrap();
+        let target = root.0.join("gone");
+        std::fs::create_dir_all(&target).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &kb.join("sub").display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, kb.join("sub")).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        for path in ["sub/a.md", "sub/deep/b.md", "real/c.md", "missing/d.md"] {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        }
+
+        assert!(deindex_under_a_link_parts(&db, &kb, &kb.join("real")).is_none());
+        assert!(deindex_under_a_link_parts(&db, &kb, &kb.join("missing")).is_none());
+        assert_eq!(db.all_document_paths().unwrap().len(), 4);
+
+        let (rel, outcome) = deindex_under_a_link_parts(&db, &kb, &kb.join("sub"))
+            .expect("a link under the KB is handled");
+        assert_eq!(rel, "sub");
+        assert_eq!(
+            outcome.unwrap(),
+            vec!["sub/a.md".to_string(), "sub/deep/b.md".to_string()]
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["missing/d.md".to_string(), "real/c.md".to_string()]
+        );
+    }
+
+    /// (local Codex after PR #391 r1) A file replaced by a link: the row at the link's own
+    /// name goes too, not only the rows under it. A junction on Windows, a symlink on Unix,
+    /// both dangling.
+    #[test]
+    fn deindex_under_a_link_parts_drops_the_row_at_the_links_own_name() {
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Dir(crate::test_support::unique_temp_path(
+            "groove-watcher-link-leaf",
+        ));
+        let kb = root.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let target = root.0.join("gone");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = kb.join("note.md");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        for path in ["note.md", "other.md"] {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        }
+        let (rel, outcome) =
+            deindex_under_a_link_parts(&db, &kb, &link).expect("a link under the KB");
+        assert_eq!(rel, "note.md");
+        assert_eq!(outcome.unwrap(), vec!["note.md".to_string()]);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// feature-67: the subtree delete decides from the store alone. The KB is

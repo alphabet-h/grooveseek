@@ -50,6 +50,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **A long heading over many sub-headings no longer multiplies the memory a Markdown or `.docx`
+  parse takes.** Every chunk kept its own copy of each heading above it, at full length, and the
+  breadcrumb `context` was cut to 200 characters only after that, so a single heading of a few
+  megabytes over a thousand sub-headings took gigabytes to parse (a 2 MB heading over 1,000
+  children peaked at 2,094 MB). Markdown is enabled by default. Headings above a chunk are now kept
+  cut to the 200 characters the `context` can hold; chunks, headings and `context` are unchanged.
+- **The live watcher no longer indexes files reached through a directory link inside the
+  knowledge base.** On Linux the watcher asked notify to follow symlinks (notify's default), so a
+  directory symlink in the knowledge base got watches on its target, and a file written there was
+  indexed under the link's in-KB name and served back by `search`; a link to `/` could also use up
+  `max_user_watches`. The full index never followed such links. The watcher now sets up its watches
+  without following them, and before it reads a file for a create, a change or a rename it checks
+  that no directory on the way to the file is a link, as the full index does, and that the file
+  resolves inside the knowledge base, on every platform (on Windows a directory junction, which
+  needs no privilege, reached the same read). A link to another directory inside the knowledge
+  base is refused too, so a file is not indexed a second time under the link's name. A file
+  reached through a link is skipped with a line on stderr. A document moved into such a link, or one whose directory was
+  replaced by a link after it was indexed, is removed from the index, as the next full index
+  would remove it.
 - **The live watcher no longer walks into a directory that was replaced by a link.** When a new
   directory appears the watcher scans it once, and that scan followed the directory itself if it
   had become a symlink (or, on Windows, a directory junction, which needs no privilege) by the time
