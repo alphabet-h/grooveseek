@@ -58,19 +58,35 @@
 //! not wait on a FIFO any more than the index run may -- and refuses anything
 //! that is not a regular file from the same `fstat`.
 //!
-//! On Windows the open adds nothing, deliberately. Creating a symlink there
+//! On Windows the open adds nothing, deliberately. Creating a file symlink there
 //! requires `SeCreateSymbolicLinkPrivilege` or Developer Mode — measured on
 //! Windows 11: a non-elevated `New-Item -ItemType SymbolicLink` is refused with
 //! "Administrator privilege required" while the hard link in the same script
-//! succeeds — so the attacker in this threat model cannot make one. And the
-//! obvious symmetric guard is actively wrong: refusing reparse points would
-//! refuse **every OneDrive / Dropbox placeholder**, since Files On-Demand
-//! implements them as reparse points. This asymmetry is the mirror image of the
-//! one BU-20 rejected, and for the same reason — each platform is guarded where
-//! the primitive is actually free.
+//! succeeds — so the attacker in this threat model cannot put a symlink in place
+//! of a note. A **directory junction** is another matter: `mklink /J` needs no
+//! privilege (the junction tests in this module and in the watcher's directory
+//! link integration tests make one unelevated and assert it), so on Windows too
+//! a directory *on the way*
+//! to a file can lead out of the knowledge base. That is handled by the path
+//! check below, not by the open. And the obvious symmetric guard on the open is
+//! actively wrong: refusing reparse points would refuse **every OneDrive /
+//! Dropbox placeholder**, since Files On-Demand implements them as reparse
+//! points. This asymmetry is the mirror image of the one BU-20 rejected, and for
+//! the same reason — each platform is guarded where the primitive is actually
+//! free.
 //!
-//! Neither platform closes an **intermediate directory** swapped for a symlink;
-//! that needs `openat2(RESOLVE_NO_SYMLINKS)`, which is Linux-only.
+//! ## Intermediate directories (audit AX-02)
+//!
+//! The open's checks see the final component only. An **intermediate
+//! directory** that is a symlink, or on Windows a junction, is caught by
+//! [`crate::links::canonical_within`]: `get_document` ([`crate::server`]) and
+//! the watcher's single-file reindex and rename ([`crate::indexer`]) resolve the
+//! path and refuse it when it lands outside the canonical knowledge base root,
+//! and the full index's walk never follows such a link. What stays open on both
+//! platforms is a directory swapped for a link **between** that check and the
+//! open. Closing it needs a traversal whose every step is taken from a handle:
+//! `openat2(RESOLVE_NO_SYMLINKS)` (or a component-by-component `O_NOFOLLOW`
+//! walk) on Linux, and a handle-relative open on Windows.
 //!
 //! ## What this still does not do (codex P1 round 2 on PR #155)
 //!
