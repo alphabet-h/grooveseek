@@ -803,8 +803,8 @@ fn removal_decision(
     }
 }
 
-/// (#543, local Codex r1 [high]) Whether `parent` holds an entry named exactly `leaf`, given
-/// that `parent.join(leaf)` was just found. On a case-insensitive volume that lookup also
+/// (#543, local Codex r1 [high]) Whether the directory given holds an entry named exactly
+/// `leaf`, given that `leaf` under it was just found. On a case-insensitive volume that lookup also
 /// succeeds for an entry spelled in another case, which is not the name the row is keyed by.
 ///
 /// No directory listing where the answer is plain: a `leaf` with no cased letter cannot be
