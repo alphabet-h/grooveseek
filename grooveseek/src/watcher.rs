@@ -661,10 +661,18 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
             }
             Classified::Deindex(paths) => {
                 for p in paths {
-                    if let Some(rel) = to_rel(&state.kb_path, p)
-                        && deindex_passes(&rel, p, &state.registry, &state.rules)
-                    {
-                        dispatch_deindex(state, &rel);
+                    if let Some(rel) = to_rel(&state.kb_path, p) {
+                        // (#543) What is at the path now decides, not the event kind alone.
+                        match removal_outcome(&rel, p, &state.registry, &state.rules) {
+                            (RemovalAction::Reindex, _) => {
+                                dispatch_reindex_after_removal(state, &rel)
+                            }
+                            (RemovalAction::Deindex, Some(kind)) => {
+                                dispatch_deindex_unknown(state, &rel, kind)
+                            }
+                            (RemovalAction::Deindex, None) => dispatch_deindex(state, &rel),
+                            (RemovalAction::Skip, _) => {}
+                        }
                     }
                     // (feature-67) Always, whatever the gate above said: a
                     // removed directory carries no extension, and its files'
@@ -737,6 +745,326 @@ fn deindex_passes(
     rules: &crate::exclusion::ExclusionRules,
 ) -> bool {
     gate_parts(rel, full, registry, rules, Gate::Removal)
+}
+
+/// What a remove event (`Remove`, or a `Modify(Name(From))` that arrived unpaired) does to
+/// its path. See [`removal_outcome`].
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalAction {
+    /// An indexable file is at the path again: reindex it in place.
+    Reindex,
+    /// Drop the row.
+    Deindex,
+    /// Neither: the path is not one the index tracks.
+    Skip,
+}
+
+/// (#543) A remove event whose path holds an indexable regular file again by the time the
+/// event is handled is a reindex, not a deindex.
+///
+/// An editor that saves by removing the file and writing a new one (Claude Code's Edit tool
+/// arrives as a `Remove` and a `Create` of the same path) used to have its row deleted first,
+/// so the reindex that followed had no stored vector to reuse (feature-69) and embedded every
+/// chunk again. Reindexing in place keeps the row, so the unchanged chunks keep their vectors;
+/// the `Create` that follows then finds the hash unchanged and does nothing. The disk is read
+/// when the event is handled rather than trusting the batch to also carry the `Create`, so it
+/// holds when the debouncer emits the removal on its own (the write landed after the removal
+/// queued, but before it was handled).
+///
+/// The write is judged by the same gate as any reindex ([`should_process_parts`]), on a regular
+/// file only: a symlink, a hard link, an excluded path or a directory is not reindexed here. A
+/// path with a link on the way passes this gate as it does for any reindex, and the single-file
+/// read refuses it and drops its row (AX-02). Only a key the index can hold is
+/// considered for it, so a key written by an older version under a name this one refuses
+/// ([`Gate::Removal`], ADR-0023) still goes, without a refusal warning on every delete.
+/// Anything not reindexed takes the removal gate exactly as before ([`deindex_passes`]).
+///
+/// (local Codex r1, high) The file must be there under the very spelling of `rel`
+/// ([`path_on_disk`]): on a case-insensitive volume a case-only rename leaves the
+/// old name opening the new file, and reindexing it would keep a row under the old spelling
+/// beside the one the new spelling's event writes. (local Codex r6, medium) That holds for
+/// every directory of `rel` on the way as well as for the leaf: a case-only directory rename
+/// leaves the old directory name opening the new directory. This is a first look, outside the locks;
+/// [`dispatch_reindex_after_removal`] looks again inside them.
+///
+/// (#543, local Codex r3, medium) Only a file found under the exact spelling
+/// ([`OnDisk::Present`]) is reindexed. A look that cannot tell ([`OnDisk::Unknown`]: the stat
+/// or the listing failed with anything but "not there") takes the removal gate, as every
+/// remove event did before: keeping the row on an unknown would leave it for good when the
+/// file is in fact gone, since no later event comes to drop it.
+///
+/// (local Codex r7, medium) The look is taken once ([`removal_look`]) and its answer decides
+/// both the action and, for an unknown that ends in a deindex, the kind the line names
+/// ([`removal_outcome_for`]).
+fn removal_outcome(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> (RemovalAction, Option<std::io::ErrorKind>) {
+    removal_outcome_for(rel, full, registry, rules, removal_look(rel, full))
+}
+
+/// The action alone of [`removal_outcome`], which is how the tests written before the kind
+/// was kept ask for it.
+#[cfg(test)]
+fn removal_decision(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> RemovalAction {
+    removal_outcome(rel, full, registry, rules).0
+}
+
+/// The look [`removal_outcome`] takes, outside the locks: [`path_on_disk`] from the directory
+/// that holds `full`, or [`OnDisk::Gone`] when there is none.
+fn removal_look(rel: &str, full: &Path) -> OnDisk {
+    match full.parent() {
+        Some(dir) => path_on_disk(dir, rel),
+        None => OnDisk::Gone,
+    }
+}
+
+/// (#543, local Codex r7, medium) [`removal_decision_for`], plus the kind of the failed look
+/// when an [`OnDisk::Unknown`] ends in [`RemovalAction::Deindex`]. The event loop hands that
+/// kind to [`dispatch_deindex_unknown`], so the line says the row went because the look failed
+/// ([`log_removed_path_unknown`], the line the look inside the locks prints too), not as a
+/// plain removal. `None` for every other answer.
+fn removal_outcome_for(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> (RemovalAction, Option<std::io::ErrorKind>) {
+    let action = removal_decision_for(rel, full, registry, rules, on_disk);
+    let kind = match (&action, on_disk) {
+        (RemovalAction::Deindex, OnDisk::Unknown(kind)) => Some(kind),
+        _ => None,
+    };
+    (action, kind)
+}
+
+/// The action of [`removal_outcome`] once the disk has been looked at, split out so a test can hand it an
+/// [`OnDisk::Unknown`] that no file system makes on demand.
+fn removal_decision_for(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> RemovalAction {
+    if on_disk == OnDisk::Present
+        && !rel.is_empty()
+        && crate::resources::doc_is_addressable(rel)
+        && should_process_parts(rel, full, registry, rules)
+    {
+        return RemovalAction::Reindex;
+    }
+    if deindex_passes(rel, full, registry, rules) {
+        RemovalAction::Deindex
+    } else {
+        RemovalAction::Skip
+    }
+}
+
+/// (#543, local Codex r2, medium) What a look at the disk found for a path a remove event
+/// named: three answers, because a failed look is not a missing file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDisk {
+    /// A regular file under the exact spelling asked for, every directory on the way included.
+    Present,
+    /// Nothing there, something other than a regular file there, or the file there only
+    /// under another case of its name or of a directory on the way.
+    Gone,
+    /// The look failed in a way that does not say the file is gone (access denied, an I/O
+    /// error). (local Codex r3, medium) Treated as a removal all the same, as before the
+    /// look existed; the kind is kept for the line that says why.
+    Unknown(std::io::ErrorKind),
+}
+
+/// (#543, local Codex r2, medium) What a failed stat or listing says about the path: only
+/// "not found" and "not a directory" (a file where a directory on the way was) say it is gone.
+/// Anything else, permission denied or an I/O error among them, says nothing about whether
+/// the file is still there.
+fn probe_error_on_disk(kind: std::io::ErrorKind) -> OnDisk {
+    match kind {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => OnDisk::Gone,
+        other => OnDisk::Unknown(other),
+    }
+}
+
+/// Whether `leaf` under the directory given is a regular file under exactly that spelling
+/// ([`spelled_on_disk`]), with a failed stat read through [`probe_error_on_disk`].
+fn file_on_disk(dir: &Path, leaf: &str) -> OnDisk {
+    match std::fs::symlink_metadata(dir.join(leaf)) {
+        Ok(meta) if meta.file_type().is_file() => spelled_on_disk(dir, leaf),
+        Ok(_) => OnDisk::Gone,
+        Err(e) => probe_error_on_disk(e.kind()),
+    }
+}
+
+/// (#543, local Codex r6, medium) What is at `rel`, given the directory its leaf sits in:
+/// [`file_on_disk`] for the leaf, then, only when that found the file under its exact name,
+/// [`spelled_on_disk`] for each directory segment of `rel` from the innermost out, each
+/// against the directory above it (reached by `Path::parent`, so a verbatim path keeps its
+/// prefix). The first answer other than [`OnDisk::Present`] is the answer: a directory held on
+/// disk only under another case is [`OnDisk::Gone`], a listing that failed is
+/// [`OnDisk::Unknown`]. The directory `rel` is relative to is not checked: it is configured,
+/// and no row key holds it.
+fn path_on_disk(leaf_dir: &Path, rel: &str) -> OnDisk {
+    let mut segments = rel.rsplit('/');
+    let leaf = segments.next().unwrap_or(rel);
+    let found = file_on_disk(leaf_dir, leaf);
+    if found != OnDisk::Present {
+        return found;
+    }
+    let mut dir = leaf_dir;
+    for segment in segments {
+        // `dir` ends in `segment`, so it has a parent; none would mean the path cannot hold
+        // `rel` at all.
+        let Some(parent) = dir.parent() else {
+            return OnDisk::Gone;
+        };
+        let spelled = spelled_on_disk(parent, segment);
+        if spelled != OnDisk::Present {
+            return spelled;
+        }
+        dir = parent;
+    }
+    OnDisk::Present
+}
+
+/// (#543, local Codex r1, high) Whether the directory given holds an entry named exactly
+/// `name`, given that `name` under it was just found (a file, or for [`path_on_disk`] a
+/// directory on the way to one). On a case-insensitive volume that lookup also succeeds for an
+/// entry spelled in another case, which is not the name the row is keyed by.
+///
+/// No directory listing where the answer is plain: a `name` with no cased letter cannot be
+/// matched by another case, and when the case-swapped spelling is not found the directory
+/// tells the two apart (a case-sensitive file system: Linux, as a rule), so the exact name is
+/// the one that was found. Otherwise the parent is listed and its names compared byte for
+/// byte: [`OnDisk::Present`] when the exact name is listed, [`OnDisk::Gone`] when the listing
+/// went through without it. (local Codex r2, medium) [`OnDisk::Unknown`] when the listing,
+/// or an entry of it, failed and the exact name was not among what was read.
+fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
+    let lower = name.to_lowercase();
+    let swapped = if lower != name {
+        lower
+    } else {
+        name.to_uppercase()
+    };
+    if swapped == name {
+        return OnDisk::Present;
+    }
+    if std::fs::symlink_metadata(dir.join(&swapped))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return OnDisk::Present;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => return OnDisk::Unknown(e.kind()),
+    };
+    let mut failed = None;
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name() == std::ffi::OsStr::new(name) => {
+                return OnDisk::Present;
+            }
+            Ok(_) => {}
+            Err(e) => failed = Some(e.kind()),
+        }
+    }
+    failed.map_or(OnDisk::Gone, OnDisk::Unknown)
+}
+
+/// [`spelled_on_disk`] as a yes or no, for the tests written before it had three answers:
+/// only [`OnDisk::Present`] is a yes.
+#[cfg(test)]
+fn leaf_is_spelled_on_disk(dir: &Path, leaf: &str) -> bool {
+    spelled_on_disk(dir, leaf) == OnDisk::Present
+}
+
+/// (#543, local Codex r1) What is at the path a remove event was about to reindex
+/// ([`path_on_disk`], every segment of `rel` under its exact spelling). Built from `kb_path`
+/// one segment of `rel` at a time, so the directory and the leaf split the way `rel` does
+/// whatever `kb_path` looks like.
+fn removed_path_on_disk(kb_path: &Path, rel: &str) -> OnDisk {
+    let mut dir = kb_path.to_path_buf();
+    let mut segments = rel.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_some() {
+            dir.push(segment);
+        }
+    }
+    path_on_disk(&dir, rel)
+}
+
+/// What [`check_removed_path`] did.
+#[derive(Debug)]
+enum RemovedPathCheck {
+    /// The path is gone: the rows were deleted, and the result says whether either was there.
+    Deindexed(Result<bool>),
+    /// The file is still at `rel`: nothing touched, the reindex goes ahead.
+    StillThere,
+    /// The look could not tell: the rows were deleted as for a path that is gone, no reindex
+    /// runs, and the kind says why the look failed.
+    Unknown(std::io::ErrorKind, Result<bool>),
+}
+
+/// (#543, local Codex r1) The removal [`dispatch_reindex_after_removal`] falls back to, for a
+/// caller already holding the database lock: unless the file is still there
+/// ([`OnDisk::Present`], [`removed_path_on_disk`]), the row under `rel` and its folded legacy
+/// row ([`indexer::sweep_legacy_folded_row`] as a removal) are deleted. Split out so a test
+/// can run it with no [`crate::embedder::Embedder`].
+fn check_removed_path(db: &Database, kb_path: &Path, rel: &str) -> RemovedPathCheck {
+    act_on_removed_path(db, kb_path, rel, removed_path_on_disk(kb_path, rel))
+}
+
+/// [`check_removed_path`] once the disk has been looked at, split out so a test can hand it an
+/// [`OnDisk::Unknown`]. (local Codex r3, medium) Anything but [`OnDisk::Present`] deletes the
+/// rows, an unknown look included: the remove event is the only signal the file is going, and
+/// the removal it carried before this look existed is what it falls back to.
+fn act_on_removed_path(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    on_disk: OnDisk,
+) -> RemovedPathCheck {
+    match on_disk {
+        OnDisk::Present => RemovedPathCheck::StillThere,
+        OnDisk::Unknown(kind) => {
+            RemovedPathCheck::Unknown(kind, deindex_removed_path(db, kb_path, rel))
+        }
+        OnDisk::Gone => RemovedPathCheck::Deindexed(deindex_removed_path(db, kb_path, rel)),
+    }
+}
+
+/// The deletion [`act_on_removed_path`] runs for a path not found there: the row under `rel`
+/// and its folded legacy row. `Ok(true)` when either was there.
+fn deindex_removed_path(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
+    indexer::deindex_single_file(db, rel).and_then(|exact| {
+        let folded = indexer::sweep_legacy_folded_row(db, kb_path, rel, false)?;
+        Ok(exact || folded)
+    })
+}
+
+/// [`check_removed_path`] in the shape the tests written before it had three answers use:
+/// `Some` when the rows were deleted, `None` when nothing was touched.
+#[cfg(test)]
+fn deindex_if_removed_path_is_gone(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+) -> Option<Result<bool>> {
+    match check_removed_path(db, kb_path, rel) {
+        RemovedPathCheck::Deindexed(outcome) | RemovedPathCheck::Unknown(_, outcome) => {
+            Some(outcome)
+        }
+        RemovedPathCheck::StillThere => None,
+    }
 }
 
 /// What a path is being judged for, which decides whether the name check
@@ -1008,13 +1336,10 @@ fn new_directory_rels(
 /// duplicate row, which the next event for the file or the next full index
 /// removes.
 fn sweep_legacy_row(db: &Database, kb_path: &Path, rel: &str, require_real_key: bool) {
-    match indexer::sweep_legacy_folded_row(db, kb_path, rel, require_real_key) {
-        Ok(true) => wdiag!(
-            "watcher: removed the row an older version stored for {rel} under a folded spelling"
-        ),
-        Ok(false) => {}
-        Err(e) => wdiag!("watcher: removing the folded-spelling row for {rel} failed: {e}"),
-    }
+    log_folded_sweep(
+        rel,
+        indexer::sweep_legacy_folded_row(db, kb_path, rel, require_real_key),
+    );
 }
 
 /// (feature-69) The line [`dispatch_reindex`] prints for a reindexed document. Takes the
@@ -1041,19 +1366,226 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
     let texts_before = embedder.texts_embedded();
-    match indexer::reindex_single_file(
+    let result = indexer::reindex_single_file(
         &db,
         &mut embedder,
         &state.kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
-    ) {
+    );
+    let require_real_key = sweep_requires_real_key(&result);
+    log_reindex_result(rel, result, texts_before, &embedder);
+    sweep_legacy_row(&db, &state.kb_path, rel, require_real_key);
+}
+
+/// (#543, local Codex, medium) The `require_real_key` that [`dispatch_reindex`] passes to
+/// [`sweep_legacy_row`] after a reindex. A file left with nothing to embed
+/// ([`indexer::SingleResult::NothingToIndex`]) is gone from the index like a removal, so its
+/// folded legacy row goes too, whether or not the real key held a row; the write form (`true`)
+/// would keep a folded row whose real key holds none. Every other result keeps the write form.
+fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
+    !matches!(result, Ok(indexer::SingleResult::NothingToIndex { .. }))
+}
+
+/// (#543, local Codex r1) [`dispatch_reindex`] for a path a remove event found holding a file
+/// again ([`RemovalAction::Reindex`]). The look that decided it ran outside the locks, and the
+/// remove event is the only signal that the file is going: if it is gone by the time the locks
+/// are held, no later event will drop the row. So the path is looked at again inside the same
+/// embedder + database region as the write, before the reindex, and the row goes in that
+/// region when the file is no longer there under the exact spelling of `rel`, directories on
+/// the way included ([`check_removed_path`]).
+///
+/// (local Codex r3, medium) A look that cannot tell ([`RemovedPathCheck::Unknown`]) is
+/// handled as one that found the path gone: the rows go, no reindex runs, and one line names
+/// why the look failed.
+///
+/// (#543, GitHub codex r1 P2) This path keeps the rows, where a plain removal drops them, only
+/// when the file is there under the exact spelling ([`OnDisk::Present`]) **and** the reindex
+/// says the rows now hold it ([`settle_removal_reindex`]). Every other answer of the reindex
+/// -- a skip whatever its reason, a refusal, an error -- drops the rows as a removal does,
+/// whatever the disk shows afterwards.
+///
+/// Only the remove path calls this: what a create, modify or rename does with a file gone
+/// before its read is unchanged.
+fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
+    let mut embedder = recover(state.embedder.lock(), "embedder");
+    let db = recover_db(state.db.lock());
+    match check_removed_path(&db, &state.kb_path, rel) {
+        RemovedPathCheck::Deindexed(outcome) => {
+            log_removed_path_deindexed(rel, outcome);
+            return;
+        }
+        RemovedPathCheck::Unknown(kind, outcome) => {
+            log_removed_path_unknown(rel, kind, outcome);
+            return;
+        }
+        RemovedPathCheck::StillThere => {}
+    }
+    let texts_before = embedder.texts_embedded();
+    let result = indexer::reindex_single_file(
+        &db,
+        &mut embedder,
+        &state.kb_path,
+        rel,
+        state.exclude_headings.as_deref(),
+        &state.registry,
+    );
+    match settle_removal_reindex(&db, &state.kb_path, rel, &result) {
+        RemovalReindexSettled::Kept => {
+            log_reindex_result(rel, result, texts_before, &embedder);
+            sweep_legacy_row(&db, &state.kb_path, rel, true);
+        }
+        RemovalReindexSettled::IndexerDeindexed(folded) => {
+            log_reindex_result(rel, result, texts_before, &embedder);
+            log_folded_sweep(rel, folded);
+        }
+        RemovalReindexSettled::Deindexed { reason, outcome } => {
+            log_replacement_not_indexed(rel, &reason, outcome);
+        }
+    }
+}
+
+/// What [`settle_removal_reindex`] did after the reindex a remove event ran.
+#[derive(Debug)]
+enum RemovalReindexSettled {
+    /// The rows now hold what is on disk: nothing more was done.
+    Kept,
+    /// The indexer already dropped the row under `rel`; only its folded legacy row was swept,
+    /// as a removal (the result is that sweep's).
+    IndexerDeindexed(Result<bool>),
+    /// The replacement was not indexed: the row under `rel` and its folded legacy row were
+    /// deleted, as for a plain removal. `outcome` is `Ok(true)` when either was there;
+    /// The reason field says why the replacement was not indexed, with no document text in it.
+    Deindexed {
+        reason: String,
+        outcome: Result<bool>,
+    },
+}
+
+/// (#543, GitHub codex r1 P2) After [`dispatch_reindex_after_removal`]'s reindex: the rows are
+/// left only when the reindex says they now hold the file on disk (`Updated`, `Unchanged`,
+/// `MetadataRefreshed`). Any other answer -- a skip for whatever reason (an empty file, a
+/// frontmatter-only stub), a refusal, an error -- would leave the old document's rows
+/// standing, since a skipped reindex does not delete them and the `Create` that follows takes
+/// the same skip; so they go here, as the remove event dropped them before #543. A result whose
+/// row the indexer already dropped only has its folded row swept, so no second line names it.
+/// An error's reason goes through [`crate::embedder::body_free_message`], so no document text
+/// reaches the log.
+///
+/// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
+fn settle_removal_reindex(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    result: &Result<indexer::SingleResult>,
+) -> RemovalReindexSettled {
+    match result {
+        Ok(
+            indexer::SingleResult::Updated { .. }
+            | indexer::SingleResult::Unchanged
+            | indexer::SingleResult::MetadataRefreshed { .. },
+        ) => RemovalReindexSettled::Kept,
+        Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed) => {
+            RemovalReindexSettled::IndexerDeindexed(indexer::sweep_legacy_folded_row(
+                db, kb_path, rel, false,
+            ))
+        }
+        // Each named, not a catch-all, so a new variant stays a compile error (#251's way);
+        // the reason is only for the line, never branched on.
+        Ok(indexer::SingleResult::Skipped { reason, .. }) => RemovalReindexSettled::Deindexed {
+            reason: (*reason).to_string(),
+            outcome: deindex_removed_path(db, kb_path, rel),
+        },
+        // (#543) The skip of a file with nothing to embed, whose row the indexer has already
+        // dropped: settled as that skip is, and the line counts that row as one the removal
+        // dropped, so it reads as it did before the indexer took the row itself.
+        Ok(indexer::SingleResult::NothingToIndex { deindexed, .. }) => {
+            RemovalReindexSettled::Deindexed {
+                reason: indexer::SKIPPED_NO_CHUNKS.to_string(),
+                outcome: deindex_removed_path(db, kb_path, rel).map(|swept| swept || *deindexed),
+            }
+        }
+        Ok(indexer::SingleResult::Refused) => RemovalReindexSettled::Deindexed {
+            reason: "refused".to_string(),
+            outcome: deindex_removed_path(db, kb_path, rel),
+        },
+        Err(e) => RemovalReindexSettled::Deindexed {
+            reason: format!("reindex failed: {}", crate::embedder::body_free_message(e)),
+            outcome: deindex_removed_path(db, kb_path, rel),
+        },
+    }
+}
+
+/// The line [`dispatch_reindex_after_removal`] prints when the replacement was not indexed and
+/// the rows went as a removal. When no row was there, only the skip is reported.
+fn log_replacement_not_indexed(rel: &str, reason: &str, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => wdiag!(
+            "watcher: {rel} was removed and its replacement was not indexed ({reason}); deindexed it"
+        ),
+        Ok(false) => wdiag!("watcher: skipped {rel} ({reason})"),
+        Err(e) => wdiag!(
+            "watcher: {rel} was removed and its replacement was not indexed ({reason}); deindex failed: {e}"
+        ),
+    }
+}
+
+/// The lines for a folded-row sweep ([`indexer::sweep_legacy_folded_row`]) already run.
+fn log_folded_sweep(rel: &str, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => wdiag!(
+            "watcher: removed the row an older version stored for {rel} under a folded spelling"
+        ),
+        Ok(false) => {}
+        Err(e) => wdiag!("watcher: removing the folded-spelling row for {rel} failed: {e}"),
+    }
+}
+
+/// What [`dispatch_reindex_after_removal`] says when it could not tell whether the path is
+/// still there and dropped its rows as a removal. Silent, like [`log_removed_path_deindexed`],
+/// when no row was there. [`dispatch_deindex_unknown`] says the same when the look outside the
+/// locks is the one that could not tell.
+fn log_removed_path_unknown(rel: &str, kind: std::io::ErrorKind, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => wdiag!(
+            "watcher: could not tell whether {rel} is still there ({kind}); deindexed it as a removal"
+        ),
+        Ok(false) => { /* no-op: not in DB */ }
+        Err(e) => wdiag!(
+            "watcher: could not tell whether {rel} is still there ({kind}); deindex failed: {e}"
+        ),
+    }
+}
+
+/// What [`dispatch_reindex_after_removal`] says when the path turned out to be gone.
+fn log_removed_path_deindexed(rel: &str, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => wdiag!("watcher: deindexed {rel}"),
+        Ok(false) => { /* no-op: not in DB */ }
+        Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
+    }
+}
+
+/// (#543) The line [`dispatch_reindex`] prints when a file it had indexed now holds nothing to
+/// embed and the indexer dropped its rows ([`indexer::SingleResult::NothingToIndex`]).
+fn emptied_message(rel: &str) -> String {
+    format!("watcher: {rel} has nothing to embed now; deindexed it")
+}
+
+/// The line [`dispatch_reindex`] prints for what [`indexer::reindex_single_file`] returned.
+fn log_reindex_result(
+    rel: &str,
+    result: Result<indexer::SingleResult>,
+    texts_before: u64,
+    embedder: &Embedder,
+) {
+    match result {
         Ok(indexer::SingleResult::Updated {
             chunks,
             frontmatter_unparsed,
         }) => {
-            let counts = indexer::ChunkVectorCounts::of_updated(chunks, texts_before, &embedder);
+            let counts = indexer::ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
             wdiag!("{}", reindexed_message(rel, counts, frontmatter_unparsed));
         }
         // (#251) `MetadataRefreshed` cannot come back here: the one-time check
@@ -1073,6 +1605,18 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
         }
+        // (#543) The indexer dropped the row the file's earlier text left; say so, since the
+        // document no longer answers searches. With no row there it reads as the skip it was.
+        Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: true, ..
+        }) => {
+            wdiag!("{}", emptied_message(rel));
+        }
+        Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: false, ..
+        }) => {
+            wdiag!("watcher: skipped {rel} ({})", indexer::SKIPPED_NO_CHUNKS);
+        }
         Err(e) => {
             wdiag!(
                 "watcher: reindex {rel} failed: {}",
@@ -1080,7 +1624,6 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             );
         }
     }
-    sweep_legacy_row(&db, &state.kb_path, rel, true);
 }
 
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
@@ -1090,6 +1633,16 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
         Ok(false) => { /* no-op: not in DB */ }
         Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
+    sweep_legacy_row(&db, &state.kb_path, rel, false);
+}
+
+/// (#543, local Codex r7, medium) [`dispatch_deindex`] for a remove event whose look outside
+/// the locks could not tell whether the path is still there ([`removal_outcome_for`]). The row
+/// goes all the same; the line is [`log_removed_path_unknown`]'s, so a document dropped on an
+/// access or I/O failure can be told apart from a plain removal in the log.
+fn dispatch_deindex_unknown(state: &WatcherState, rel: &str, kind: std::io::ErrorKind) {
+    let db = recover_db(state.db.lock());
+    log_removed_path_unknown(rel, kind, indexer::deindex_single_file(&db, rel));
     sweep_legacy_row(&db, &state.kb_path, rel, false);
 }
 
@@ -2443,6 +2996,593 @@ mod tests {
                 &rules
             ),
             RenameAction::Reindex
+        );
+    }
+
+    /// (#543) A remove event is a reindex when an indexable regular file is at the path again
+    /// by the time it is handled, and a deindex when nothing is there, as before.
+    #[test]
+    fn a_removal_whose_file_is_back_is_a_reindex_and_one_whose_file_is_gone_a_deindex() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        std::fs::write(kb.join("back.md"), "# Back\n").unwrap();
+        assert_eq!(
+            removal_decision("back.md", &kb.join("back.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+
+        let gone = kb.join("gone.md");
+        assert!(std::fs::symlink_metadata(&gone).is_err());
+        assert_eq!(
+            removal_decision("gone.md", &gone, &reg, &rules),
+            RemovalAction::Deindex
+        );
+
+        // Excluded (`.obsidian` in `default_exclude_dirs`): neither, as before.
+        std::fs::create_dir_all(kb.join(".obsidian")).unwrap();
+        std::fs::write(kb.join(".obsidian").join("x.md"), "# x\n").unwrap();
+        assert_eq!(
+            removal_decision(
+                ".obsidian/x.md",
+                &kb.join(".obsidian").join("x.md"),
+                &reg,
+                &rules
+            ),
+            RemovalAction::Skip
+        );
+
+        // A wrong extension is not reindexed either.
+        std::fs::write(kb.join("back.tmp"), "x").unwrap();
+        assert_ne!(
+            removal_decision("back.tmp", &kb.join("back.tmp"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+    }
+
+    /// (#543) Only a regular file the reindex gate takes is reindexed from a remove event: a
+    /// directory or a hard link put at the path keeps the old decision.
+    #[test]
+    fn a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-nf");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        // A directory with a registered extension in its name.
+        std::fs::create_dir_all(kb.join("dir.md")).unwrap();
+        assert_ne!(
+            removal_decision("dir.md", &kb.join("dir.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+
+        // A hard link (no privilege needed on Windows either).
+        let other = kb.join("other.md");
+        std::fs::write(&other, "# other\n").unwrap();
+        std::fs::hard_link(&other, kb.join("linked.md")).unwrap();
+        assert_eq!(
+            removal_decision("linked.md", &kb.join("linked.md"), &reg, &rules),
+            RemovalAction::Skip,
+            "same as the removal gate decided before #543"
+        );
+    }
+
+    /// (#543, local Codex r1, high) A remove event whose name is held on disk only under
+    /// another case (`Old.md` renamed to `old.md`, the `Name(From)` arriving unpaired) is not
+    /// a reindex: reindexing would rewrite the row under the old spelling, and the new
+    /// spelling's own event adds a second row (`documents.path` compares bytes). On a
+    /// case-insensitive volume (Windows, macOS) the old name still opens the file; on a
+    /// case-sensitive one it is simply gone. Either way, not a reindex.
+    #[test]
+    fn a_removal_whose_name_is_on_disk_only_in_another_case_is_not_a_reindex() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-case");
+        std::fs::create_dir_all(kb.join("sub")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        std::fs::write(kb.join("A.md"), "# A\n").unwrap();
+        assert_eq!(
+            removal_decision("a.md", &kb.join("a.md"), &reg, &rules),
+            RemovalAction::Deindex
+        );
+        std::fs::write(kb.join("sub").join("Old.md"), "# Old\n").unwrap();
+        assert_eq!(
+            removal_decision("sub/old.md", &kb.join("sub").join("old.md"), &reg, &rules),
+            RemovalAction::Deindex
+        );
+        // The exact spelling is still a reindex.
+        assert_eq!(
+            removal_decision("sub/Old.md", &kb.join("sub").join("Old.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+    }
+
+    /// (#543, local Codex r1, medium) The look [`dispatch_reindex_after_removal`] takes inside
+    /// the locks: a file gone after the remove event was judged a reindex, a directory put at
+    /// the path, or the file there only in another case drops the row (and nothing else); the
+    /// file still there under its exact spelling touches nothing, so the reindex goes ahead.
+    #[test]
+    fn a_removed_path_that_is_gone_by_the_time_the_locks_are_held_drops_its_row() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-gone");
+        std::fs::create_dir_all(kb.join("sub")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let db = dir_rename_db(&[
+            "gone.md",
+            "sub/now-a-dir.md",
+            "sub/case.md",
+            "sub/here.md",
+            "other.md",
+        ]);
+        std::fs::create_dir_all(kb.join("sub").join("now-a-dir.md")).unwrap();
+        std::fs::write(kb.join("sub").join("Case.md"), "# Case\n").unwrap();
+        std::fs::write(kb.join("sub").join("here.md"), "# here\n").unwrap();
+
+        assert!(
+            deindex_if_removed_path_is_gone(&db, &kb, "sub/here.md").is_none(),
+            "a file still at its exact spelling is left to the reindex"
+        );
+        for rel in ["gone.md", "sub/now-a-dir.md", "sub/case.md"] {
+            assert!(
+                deindex_if_removed_path_is_gone(&db, &kb, rel)
+                    .expect("gone")
+                    .unwrap(),
+                "{rel} had a row and it went"
+            );
+        }
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string(), "sub/here.md".to_string()]
+        );
+        // Nothing left to drop: still handled as gone, reporting no row.
+        assert!(
+            !deindex_if_removed_path_is_gone(&db, &kb, "gone.md")
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    /// (#543, local Codex r1, high) The spelling check itself: the exact name passes, another
+    /// case of it does not (where the volume finds that other case at all), and a name with no
+    /// cased letter needs no look.
+    #[test]
+    fn leaf_is_spelled_on_disk_takes_only_the_exact_name() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-spell");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        std::fs::write(kb.join("Note.md"), "# n\n").unwrap();
+        std::fs::write(kb.join("123.md"), "# n\n").unwrap();
+        assert!(leaf_is_spelled_on_disk(&kb, "Note.md"));
+        assert!(leaf_is_spelled_on_disk(&kb, "123.md"));
+        // On a case-sensitive file system `note.md` is not found either way; on a
+        // case-insensitive one it is found, and the listing says it is not the name on disk.
+        if std::fs::symlink_metadata(kb.join("note.md")).is_ok() {
+            assert!(!leaf_is_spelled_on_disk(&kb, "note.md"));
+            assert!(!leaf_is_spelled_on_disk(&kb, "NOTE.MD"));
+        }
+    }
+
+    /// (#543, local Codex r6, medium) The spelling check covers the directories on the way,
+    /// not the leaf alone. After an unpaired case-only directory rename (`Dir/note.md` to
+    /// `dir/note.md`) a case-insensitive volume still opens `Dir/note.md`, and the leaf there
+    /// is spelled exactly `note.md`; reindexing it would keep the row under `Dir/` beside the
+    /// one the new spelling's event writes. Neither the first look nor the one inside the
+    /// locks may keep it. On a case-sensitive volume `Dir` is simply not there.
+    #[test]
+    fn a_removal_whose_directory_is_on_disk_only_in_another_case_drops_its_row() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-dircase");
+        std::fs::create_dir_all(kb.join("dir")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        std::fs::write(kb.join("dir").join("note.md"), "# note\n").unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        assert_ne!(
+            removal_decision("Dir/note.md", &kb.join("Dir").join("note.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+        // The exact spelling is still a reindex.
+        assert_eq!(
+            removal_decision("dir/note.md", &kb.join("dir").join("note.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+
+        let db = dir_rename_db(&["Dir/note.md", "other.md"]);
+        assert!(
+            deindex_if_removed_path_is_gone(&db, &kb, "Dir/note.md")
+                .expect("gone under that spelling")
+                .unwrap(),
+            "the row under Dir/ was there and it went"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#543, local Codex r2, medium) Only "not found" and "not a directory" say a path is
+    /// gone. Permission denied, an I/O error or anything else says nothing either way.
+    #[test]
+    fn only_not_found_and_not_a_directory_say_a_removed_path_is_gone() {
+        use std::io::ErrorKind;
+        assert_eq!(probe_error_on_disk(ErrorKind::NotFound), OnDisk::Gone);
+        assert_eq!(probe_error_on_disk(ErrorKind::NotADirectory), OnDisk::Gone);
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::Interrupted,
+            ErrorKind::TimedOut,
+            ErrorKind::ResourceBusy,
+        ] {
+            assert_eq!(probe_error_on_disk(kind), OnDisk::Unknown(kind), "{kind:?}");
+        }
+    }
+
+    /// (#543, local Codex r3, medium) Inside the locks, a look that could not tell drops the
+    /// row as a path found gone does, and leaves every other row where it is.
+    #[test]
+    fn a_removed_path_that_could_not_be_looked_at_is_deindexed() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-unknown");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let db = dir_rename_db(&["locked.md", "other.md"]);
+
+        let kept = act_on_removed_path(
+            &db,
+            &kb,
+            "locked.md",
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(
+            matches!(
+                kept,
+                RemovedPathCheck::Unknown(std::io::ErrorKind::PermissionDenied, Ok(true))
+            ),
+            "{kept:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+
+        let gone = act_on_removed_path(&db, &kb, "locked.md", OnDisk::Gone);
+        assert!(
+            matches!(gone, RemovedPathCheck::Deindexed(Ok(false))),
+            "{gone:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#543, local Codex r3, medium) Outside the locks, a look that could not tell is never a
+    /// reindex: it takes the removal gate's answer, as a path found gone does.
+    #[test]
+    fn a_removal_that_could_not_be_looked_at_takes_the_removal_gate() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-unknown-out");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        let unknown = OnDisk::Unknown(std::io::ErrorKind::PermissionDenied);
+
+        assert_eq!(
+            removal_decision_for("note.md", &kb.join("note.md"), &reg, &rules, unknown),
+            RemovalAction::Deindex
+        );
+        assert_eq!(
+            removal_decision_for("note.md", &kb.join("note.md"), &reg, &rules, OnDisk::Gone),
+            RemovalAction::Deindex
+        );
+        assert_eq!(
+            removal_decision_for(
+                ".obsidian/x.md",
+                &kb.join(".obsidian").join("x.md"),
+                &reg,
+                &rules,
+                unknown
+            ),
+            RemovalAction::Skip
+        );
+    }
+
+    /// (#543, local Codex r7, medium) Outside the locks, a look that could not tell and ends
+    /// in a deindex keeps the kind of the failure, so the line it prints can say why; a path
+    /// found gone, found present, or skipped carries none.
+    #[test]
+    fn a_removal_that_could_not_be_looked_at_keeps_the_kind_for_its_line() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-unknown-kind");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let note = kb.join("note.md");
+
+        assert_eq!(
+            removal_outcome_for("note.md", &note, &reg, &rules, OnDisk::Unknown(denied)),
+            (RemovalAction::Deindex, Some(denied))
+        );
+        assert_eq!(
+            removal_outcome_for(
+                "note.md",
+                &note,
+                &reg,
+                &rules,
+                OnDisk::Unknown(std::io::ErrorKind::Other)
+            ),
+            (RemovalAction::Deindex, Some(std::io::ErrorKind::Other))
+        );
+        assert_eq!(
+            removal_outcome_for("note.md", &note, &reg, &rules, OnDisk::Gone),
+            (RemovalAction::Deindex, None)
+        );
+        assert_eq!(
+            removal_outcome_for(
+                ".obsidian/x.md",
+                &kb.join(".obsidian").join("x.md"),
+                &reg,
+                &rules,
+                OnDisk::Unknown(denied)
+            ),
+            (RemovalAction::Skip, None)
+        );
+        std::fs::write(&note, "# note\n").unwrap();
+        assert_eq!(
+            removal_outcome_for("note.md", &note, &reg, &rules, OnDisk::Present),
+            (RemovalAction::Reindex, None)
+        );
+    }
+
+    /// (#543, GitHub codex r1 P2) After the reindex a remove event ran on a file still there,
+    /// the rows stay only when the reindex says they hold the file now. A skip (whatever its
+    /// reason), a refusal or an error drops the row as a removal does, and leaves every other
+    /// row where it is.
+    #[test]
+    fn a_removal_reindex_that_did_not_index_the_replacement_drops_the_row() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-settle");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        // The file is there, as it is when this runs: the disk is not what decides.
+        std::fs::write(kb.join("doc.md"), "").unwrap();
+
+        let kept: [Result<indexer::SingleResult>; 3] = [
+            Ok(indexer::SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Unchanged),
+            Ok(indexer::SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: false,
+            }),
+        ];
+        for result in &kept {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled = settle_removal_reindex(&db, &kb, "doc.md", result);
+            assert!(
+                matches!(settled, RemovalReindexSettled::Kept),
+                "{result:?}: {settled:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+
+        let dropped: [(Result<indexer::SingleResult>, &str); 4] = [
+            (
+                Ok(indexer::SingleResult::Skipped {
+                    reason: "no embeddable chunks",
+                    frontmatter_unparsed: false,
+                }),
+                "no embeddable chunks",
+            ),
+            (
+                Ok(indexer::SingleResult::Skipped {
+                    reason: "a reason added later",
+                    frontmatter_unparsed: true,
+                }),
+                "a reason added later",
+            ),
+            (Ok(indexer::SingleResult::Refused), "refused"),
+            (Err(anyhow::anyhow!("endpoint down")), "reindex failed"),
+        ];
+        for (result, reason_part) in &dropped {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled = settle_removal_reindex(&db, &kb, "doc.md", result);
+            match &settled {
+                RemovalReindexSettled::Deindexed {
+                    reason,
+                    outcome: Ok(true),
+                } => assert!(reason.contains(reason_part), "{reason}"),
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()],
+                "{result:?}"
+            );
+        }
+
+        // The indexer already dropped the row: nothing else goes, and no deindex is reported.
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex(
+            &db,
+            &kb,
+            "doc.md",
+            &Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed),
+        );
+        assert!(
+            matches!(settled, RemovalReindexSettled::IndexerDeindexed(Ok(false))),
+            "{settled:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#543) A replacement with nothing to embed, whose row the indexer already dropped
+    /// ([`indexer::SingleResult::NothingToIndex`]), is settled as the skip it is: the line
+    /// still says the removal deindexed the document when a row was there, and stays a plain
+    /// skip when none was. Every other row stays.
+    #[test]
+    fn a_removal_reindex_that_found_nothing_to_index_reports_the_row_the_indexer_dropped() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-nothing");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        std::fs::write(kb.join("doc.md"), "").unwrap();
+
+        for had_row in [true, false] {
+            // The indexer took the row already, so only `other.md` is left either way.
+            let db = dir_rename_db(&["other.md"]);
+            let settled = settle_removal_reindex(
+                &db,
+                &kb,
+                "doc.md",
+                &Ok(indexer::SingleResult::NothingToIndex {
+                    deindexed: had_row,
+                    frontmatter_unparsed: false,
+                }),
+            );
+            match &settled {
+                RemovalReindexSettled::Deindexed {
+                    reason,
+                    outcome: Ok(reported),
+                } => {
+                    assert_eq!(reason, indexer::SKIPPED_NO_CHUNKS);
+                    assert_eq!(*reported, had_row, "had_row = {had_row}");
+                }
+                other => panic!("had_row = {had_row}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()]
+            );
+        }
+    }
+
+    /// (#543) The line a create or modify prints when the file it had indexed now holds
+    /// nothing to embed. `tests/watcher_remove_then_write.rs` waits for this text.
+    #[test]
+    fn the_emptied_line_names_the_file_and_the_deindex() {
+        assert_eq!(
+            emptied_message("runbook.md"),
+            "watcher: runbook.md has nothing to embed now; deindexed it"
+        );
+    }
+
+    /// (#543, local Codex, medium) After a reindex that left the file with nothing to embed,
+    /// the folded legacy row is swept as for a removal (`false`), whether or not the real key
+    /// held a row; every other result keeps the write form (`true`).
+    #[test]
+    fn a_file_left_with_nothing_to_embed_sweeps_its_folded_row_as_a_removal() {
+        for deindexed in [true, false] {
+            assert!(!sweep_requires_real_key(&Ok(
+                indexer::SingleResult::NothingToIndex {
+                    deindexed,
+                    frontmatter_unparsed: false,
+                }
+            )));
+        }
+        assert!(sweep_requires_real_key(&Ok(
+            indexer::SingleResult::Unchanged
+        )));
+        assert!(sweep_requires_real_key(&Ok(
+            indexer::SingleResult::Skipped {
+                reason: "file no longer exists",
+                frontmatter_unparsed: false,
+            }
+        )));
+        assert!(sweep_requires_real_key(&Err(anyhow::anyhow!(
+            "endpoint down"
+        ))));
+    }
+
+    /// (#543, ADR-0023) A key the index cannot hold is still dropped on a remove event even
+    /// when a file is back under that name: it is never reindexed from here.
+    #[cfg(windows)]
+    #[test]
+    fn a_removal_of_a_name_win32_cannot_spell_still_deindexes_when_the_file_is_back() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-i543");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("CON.md"), "# back\n").unwrap();
+        assert_eq!(
+            removal_decision("CON.md", &kb.join("CON.md"), &reg, &rules),
+            RemovalAction::Deindex
         );
     }
 

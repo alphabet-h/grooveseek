@@ -14,6 +14,26 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A document an editor saves by deleting and rewriting it keeps its stored vectors in the live
+  watcher.** Some editors (Claude Code's Edit tool among them) replace a file rather than write
+  into it, which reaches the watcher as a removal followed by a creation of the same path. The
+  watcher deindexed the document on the removal, so the reindex that followed had no stored vector
+  to reuse and embedded every chunk again — on a large note, minutes of embedding for a one-section
+  edit. A removal whose path holds an indexable file again by the time the watcher handles it now
+  reindexes the document in place, so only the chunks whose embedding input changed are embedded;
+  a file that is really gone is deindexed as before. The path is looked at again while the
+  watcher holds the index, so a file that disappears in between is still deindexed, and a file
+  that is there only under another case of the name (a case-only rename on Windows or macOS) is
+  not kept under the old spelling. When the watcher cannot tell whether the file is there (the
+  look fails with an access or I/O error), it deindexes the document as before, and likewise when
+  the file written back is not indexed (an empty file or a frontmatter-only stub, a refused read,
+  a failed reindex), so the deleted document's old chunks do not stay searchable. The watcher
+  also drops a document that is written over in place with nothing to embed (an empty file or a
+  frontmatter-only stub), which used to keep its old chunks searchable, and which is also what a
+  delete-and-rewrite looks like on macOS, where the file system reports the two as one change.
+
 ## [1.21.0] - 2026-10-24
 
 **Check these four changes before upgrading.** Each closes a security defect that could not be
