@@ -23,7 +23,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   to reuse and embedded every chunk again — on a large note, minutes of embedding for a one-section
   edit. A removal whose path holds an indexable file again by the time the watcher handles it now
   reindexes the document in place, so only the chunks whose embedding input changed are embedded;
-  a file that is really gone is deindexed as before.
+  a file that is really gone is deindexed as before. The path is looked at again while the
+  watcher holds the index, so a file that disappears in between is still deindexed, and a file
+  that is there only under another case of the name (a case-only rename on Windows or macOS) is
+  not kept under the old spelling.
 
 ## [1.21.0] - 2026-10-24
 
