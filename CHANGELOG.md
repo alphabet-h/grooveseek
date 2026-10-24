@@ -34,7 +34,7 @@ they land in a minor release and are called out here. Details are in the Securit
   `kb_path` next to the project's real directory. On Windows those paths are now also spelled the
   way the filesystem stores them: a short (8.3) name such as `C:\PROGRA~1` appears as the long
   name (`C:\Program Files`), letter case follows the disk, and a directory the plain spelling would not name exactly (longer than
-  `MAX_PATH`, or with a name ending in a dot or a space) keeps a `\\?\` prefix.
+  `MAX_PATH`, or with a name ending in a dot or a space, or a reserved device name) keeps a `\\?\` prefix.
   This shows in the startup log and printed paths; the files themselves are the same. A config
   named with `--config` or placed beside the binary is unchanged.
 - **The live watcher no longer indexes a path with a directory link anywhere below the knowledge
