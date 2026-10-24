@@ -20,10 +20,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 fixed while keeping the old behaviour, so under the [stability policy](docs/stability.md#deprecation)
 they land in a minor release and are called out here. Details are in the Security entries below.
 
-- **A config passed as a pipe is refused.** `groove --config <(...)`, or `--config /dev/stdin`
-  fed from a pipe, now stops with `refusing to read the config: <path>: it is not a regular file`
-  instead of reading it, because a pipe could hang startup. Write the config to a file and pass
-  that path.
+- **A config that is not a regular file, or is over 1 MiB, is refused — wherever it comes from**
+  (`--config`, the working directory, the git root or beside the binary). `groove --config <(...)`,
+  or `--config /dev/stdin` fed from a pipe, now stops with
+  `refusing to read the config: <path>: it is not a regular file` instead of reading it, because a
+  pipe could hang startup. Write the config to a file and pass that path. `groove service` and the
+  tray, which read their own configs, are unchanged.
 - **A `groove.toml` found in the working directory or at the git root is refused when its
   directory cannot be resolved** (for example, a path component that can no longer be followed).
   Name the file with `--config` to use it.
@@ -35,8 +37,9 @@ they land in a minor release and are called out here. Details are in the Securit
   way the filesystem stores them: a short (8.3) name such as `C:\PROGRA~1` appears as the long
   name (`C:\Program Files`), letter case follows the disk, and a directory the plain spelling would not name exactly (longer than
   `MAX_PATH`, or with a name ending in a dot or a space, or a reserved device name) keeps a `\\?\` prefix.
-  This shows in the startup log and printed paths; the files themselves are the same. A config
-  named with `--config` or placed beside the binary is unchanged.
+  This shows in the startup log and printed paths; the files themselves are the same. Relative
+  paths in a config named with `--config` or placed beside the binary resolve as before (the
+  first change above still applies to them).
 - **The live watcher no longer indexes a path with a directory link anywhere below the knowledge
   base, and removes rows it already holds for such a path.** This covers symlinks and, on Windows,
   junctions, and includes a link to another directory inside the knowledge base: a file there is

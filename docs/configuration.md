@@ -372,7 +372,7 @@ directory is spelled the way the filesystem stores it, so those paths show the
 long name where you typed a short (8.3) one (`C:\PROGRA~1` becomes
 `C:\Program Files`) and the letter case found on disk; a directory the plain
 spelling would not name exactly (longer than `MAX_PATH`, or with a name ending in
-a dot or a space) keeps the `\\?\` prefix. The files are the same; only
+a dot or a space, or a reserved device name such as `CON` or `NUL`) keeps the `\\?\` prefix. The files are the same; only
 the spelling in the startup log and printed paths differs. The path as found is used
 only to name the file in messages and in the startup log. If the directory
 cannot be resolved at all, the file is refused with an error that names it;
