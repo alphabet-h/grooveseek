@@ -862,7 +862,7 @@ fn file_on_disk(dir: &Path, leaf: &str) -> OnDisk {
 /// (#543, local Codex r6 [medium]) What is at `rel`, given the directory its leaf sits in:
 /// [`file_on_disk`] for the leaf, then, only when that found the file under its exact name,
 /// [`spelled_on_disk`] for each directory segment of `rel` from the innermost out, each
-/// against the directory above it (reached by [`Path::parent`], so a verbatim path keeps its
+/// against the directory above it (reached by `Path::parent`, so a verbatim path keeps its
 /// prefix). The first answer other than [`OnDisk::Present`] is the answer: a directory held on
 /// disk only under another case is [`OnDisk::Gone`], a listing that failed is
 /// [`OnDisk::Unknown`]. The directory `rel` is relative to is not checked: it is configured,
