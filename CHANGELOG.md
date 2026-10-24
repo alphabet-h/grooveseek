@@ -29,7 +29,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   not kept under the old spelling. When the watcher cannot tell whether the file is there (the
   look fails with an access or I/O error), it deindexes the document as before, and likewise when
   the file written back is not indexed (an empty file or a frontmatter-only stub, a refused read,
-  a failed reindex), so the deleted document's old chunks do not stay searchable.
+  a failed reindex), so the deleted document's old chunks do not stay searchable. The watcher
+  also drops a document that is written over in place with nothing to embed (an empty file or a
+  frontmatter-only stub), which used to keep its old chunks searchable, and which is also what a
+  delete-and-rewrite looks like on macOS, where the file system reports the two as one change.
 
 ## [1.21.0] - 2026-10-24
 

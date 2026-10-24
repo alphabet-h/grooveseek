@@ -1042,6 +1042,17 @@ pub enum SingleResult {
     /// [`SingleResult::Refused`]); [`rebuild_index`]'s walk does not follow links, so a file
     /// like this never reaches it.
     OutsideKnowledgeBaseDeindexed,
+    /// (#543) The file was read and parsed and holds nothing to embed -- an empty file, a
+    /// frontmatter-only stub -- and the row that was under its path, if any, has been
+    /// **deleted**: `--force` leaves no row for such a file, and the row its earlier text left
+    /// would keep answering searches with that text. `deindexed` says whether a row was there;
+    /// `frontmatter_unparsed` is [`SingleResult::Skipped`]'s. Only [`reindex_single_file`]
+    /// returns it ([`Reindex::Event`]); [`rebuild_index`] gets a [`SingleResult::Skipped`] for
+    /// the same file and keeps the row.
+    NothingToIndex {
+        deindexed: bool,
+        frontmatter_unparsed: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,7 +1585,8 @@ pub fn rebuild_index(
                 }
                 SingleResult::MetadataRefreshed { .. }
                 | SingleResult::Refused
-                | SingleResult::OutsideKnowledgeBaseDeindexed => false,
+                | SingleResult::OutsideKnowledgeBaseDeindexed
+                | SingleResult::NothingToIndex { .. } => false,
             };
             if !settled && stale_row(&passes, db, registry, &entry.rel)? {
                 unsettled.insert(entry.rel.clone());
@@ -1635,7 +1647,10 @@ pub fn rebuild_index(
             // does: the file is not indexed and the reason is already on stderr.
             // `OutsideKnowledgeBaseDeindexed` comes only from `reindex_single_file`, never from
             // the shared entry this loop calls; named so a new variant stays a compile error.
-            SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed => {
+            // (#543) So does `NothingToIndex` ([`Reindex::Event`] is not a mode this loop uses).
+            SingleResult::Refused
+            | SingleResult::OutsideKnowledgeBaseDeindexed
+            | SingleResult::NothingToIndex { .. } => {
                 tally.skipped += 1;
                 if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
                     refresh_pending = true;
@@ -2243,7 +2258,10 @@ fn write_matching_chunks_meta(
 /// (feature-62) Under [`Reindex::Reparse`] it also means the row is gone: the document the old
 /// heading rule split has nothing to index under the new one, and [`index_single_disk_entry`]
 /// drops the row, the way `--force` would leave none.
-const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
+///
+/// (#543) The watcher names a [`SingleResult::NothingToIndex`] with it as well, so the line for
+/// a file with nothing to embed reads the same whichever result came back.
+pub(crate) const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
 
 /// The [`SingleResult::Skipped`] reason for a file whose input the embedding endpoint
 /// refused ([`crate::embedder::EmbedInputRejected`], HTTP 400 / 413 / 422, AW-04). The
@@ -2427,6 +2445,12 @@ enum Reindex {
     /// written. Chunks that differ are written the ordinary way, and no chunks at all drop the
     /// row, since `--force` would leave none.
     Reparse,
+    /// (#543) One file a watcher event names ([`reindex_single_file`]): [`Reindex::Incremental`]
+    /// with neither one-time check, except that a file which now yields no chunks loses its row,
+    /// as under [`Reindex::Reparse`], and comes back as [`SingleResult::NothingToIndex`]. Without
+    /// this, a document emptied in place (or, on macOS, removed and written again, which FSEvents
+    /// folds into one change) kept its earlier text's chunks searchable.
+    Event,
 }
 
 /// 単一 [`DiskEntry`] を index する内部関数。
@@ -2469,7 +2493,7 @@ fn index_single_disk_entry(
             check_frontmatter,
             refresh_fields,
         } => (check_frontmatter, refresh_fields),
-        Reindex::Force | Reindex::Reparse => (false, false),
+        Reindex::Force | Reindex::Reparse | Reindex::Event => (false, false),
     };
     // (AV-12) Every path that can put a document into an index arrives here, which is why the
     // chunking policy is resolved here rather than at each caller: the first attempt covered
@@ -2650,6 +2674,14 @@ fn index_single_disk_entry(
         // a row the new parser has nothing for. The caller still counts a skip.
         if reparse {
             db.delete_document(&entry.rel)?;
+        }
+        // (#543) A watcher event leaves what `--force` would leave too: no row. The row the
+        // earlier text wrote goes, and the result says whether there was one.
+        if mode == Reindex::Event {
+            return Ok(SingleResult::NothingToIndex {
+                deindexed: deindex_single_file(db, &entry.rel)?,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            });
         }
         return Ok(SingleResult::Skipped {
             reason: SKIPPED_NO_CHUNKS,
@@ -2992,6 +3024,9 @@ pub(crate) fn write_parsed_document_with_vectors(
 ///   (full index の walk も link を辿らず、その行を落とすのと揃える)
 /// - 拡張子が `registry` に登録されていなければ `Skipped` を返す
 /// - hash が DB と一致なら `Unchanged`、違えば upsert + embedding 再計算
+/// - (#543) 読めて parse できたが embed する chunk が無い (空の file、frontmatter だけの stub) なら、
+///   `rel` の行を消して [`SingleResult::NothingToIndex`] を返す (`--force` もその file の行を作らない)。
+///   [`rebuild_index`] の増分 run は同じ file で行を残す ([`SingleResult::Skipped`])
 /// - **size cap**: registry の上限 ([`Registry::limits`]、`[index]` で変えられる。既定は
 ///   [`crate::parser::MAX_RAW_BINARY_BYTES`] / [`crate::parser::MAX_RAW_TEXT_BYTES`]) を
 ///   超えていれば `fs::read` する前に skip する ([`size_cap_exceeded`]、codex P2 round 2:
@@ -3116,16 +3151,14 @@ pub fn reindex_single_file(
     // `rebuild_index` in another process can clear the generation in that window, and a
     // list read before it would be written over rows the new pass never sees again.
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
+    // (#543) `Event`, not `Incremental`: a file that now yields no chunks loses its row here.
     index_single_disk_entry(
         db,
         embedder,
         &entry,
         exclude_headings,
         registry,
-        Reindex::Incremental {
-            check_frontmatter: false,
-            refresh_fields: false,
-        },
+        Reindex::Event,
         context_mode,
         DeclaredSet::FromIndex,
         false,
@@ -3423,9 +3456,12 @@ pub fn rename_single_file(
                     reason: SKIPPED_EMBED_REJECTED,
                     ..
                 } => RenameOutcome::OldPathMissingAndRefused,
+                // (#543) `NothingToIndex` read the file and dropped any row under it, as a
+                // skip of a new file leaves none.
                 SingleResult::Updated { .. }
                 | SingleResult::Unchanged
                 | SingleResult::Skipped { .. }
+                | SingleResult::NothingToIndex { .. }
                 | SingleResult::MetadataRefreshed { .. } => RenameOutcome::OldPathMissing,
             },
         );
@@ -3665,6 +3701,9 @@ pub fn rename_single_file(
         // Only `reindex_single_file` returns it, never the shared entry called above; mapped
         // with the refusal it is a case of, and named so a new variant stays a compile error.
         SingleResult::OutsideKnowledgeBaseDeindexed => Ok(RenameOutcome::RenamedButRefused),
+        // (#543) Only `reindex_single_file` returns it too (`Event` is not a mode used above);
+        // mapped with the skip it is the watcher's form of, and named for the same reason.
+        SingleResult::NothingToIndex { .. } => Ok(RenameOutcome::RenamedButNotReindexed),
         // Spelled out rather than `_`: a catch-all is what swallowed the
         // refusal in the first place, and it would swallow the next variant too.
         // `MetadataRefreshed` cannot come back here (the check is off on this
@@ -8096,6 +8135,72 @@ mod tests {
             db.get_document_hash("quarry.docx").unwrap().as_deref(),
             Some("hash-the-scan-saw")
         );
+    }
+
+    /// #543: a watcher event on a file written in place down to nothing it can embed -- an
+    /// empty file, a frontmatter-only stub -- drops the row the earlier text left, so the old
+    /// chunks stop answering searches; `--force` leaves no row for such a file either. On macOS
+    /// this is also the path an editor's remove-and-write takes, since FSEvents folds the two
+    /// into one change (kuriya trap #525).
+    #[test]
+    fn a_watcher_reindex_of_a_file_emptied_in_place_drops_its_row() {
+        let registry = docx_registry();
+        let old = [crate::parser::Chunk {
+            heading: Some("Install".to_string()),
+            level: Some(2),
+            content: "Download the archive and unpack it into the tools folder.".to_string(),
+            ..Default::default()
+        }];
+        for (name, emptied) in [("empty", ""), ("stub", "---\ntitle: Runbook\n---\n")] {
+            let dir = mk_tmp(&format!("i543-emptied-{name}"));
+            let db = reparse_db();
+            write_row(&db, "runbook.md", "hash-of-the-earlier-text", &old);
+            std::fs::write(dir.0.join("runbook.md"), emptied).unwrap();
+
+            let mut embedder = unreachable_embedder();
+            let result =
+                reindex_single_file(&db, &mut embedder, &dir.0, "runbook.md", None, &registry)
+                    .unwrap();
+            assert!(
+                !matches!(result, SingleResult::Updated { .. }),
+                "{name}: nothing to embed, yet {result:?}"
+            );
+            assert_eq!(
+                db.get_document_hash("runbook.md").unwrap(),
+                None,
+                "{name}: the earlier text's row is still indexed after {result:?}"
+            );
+            assert_eq!(
+                result,
+                SingleResult::NothingToIndex {
+                    deindexed: true,
+                    frontmatter_unparsed: false
+                },
+                "{name}"
+            );
+        }
+    }
+
+    /// #543: the same event on a file that had no row reports that nothing was deindexed, and
+    /// writes none.
+    #[test]
+    fn a_watcher_reindex_of_a_new_empty_file_writes_no_row() {
+        let registry = docx_registry();
+        let dir = mk_tmp("i543-new-empty");
+        let db = reparse_db();
+        std::fs::write(dir.0.join("blank.md"), "").unwrap();
+
+        let mut embedder = unreachable_embedder();
+        let result =
+            reindex_single_file(&db, &mut embedder, &dir.0, "blank.md", None, &registry).unwrap();
+        assert_eq!(
+            result,
+            SingleResult::NothingToIndex {
+                deindexed: false,
+                frontmatter_unparsed: false
+            }
+        );
+        assert!(db.all_document_paths().unwrap().is_empty());
     }
 
     /// feature-62 (R4.3, Review Focus 2): the pass re-reads a `.docx` by its parser, not its

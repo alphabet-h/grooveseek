@@ -1487,6 +1487,15 @@ fn settle_removal_reindex(
             reason: (*reason).to_string(),
             outcome: deindex_removed_path(db, kb_path, rel),
         },
+        // (#543) The skip of a file with nothing to embed, whose row the indexer has already
+        // dropped: settled as that skip is, and the line counts that row as one the removal
+        // dropped, so it reads as it did before the indexer took the row itself.
+        Ok(indexer::SingleResult::NothingToIndex { deindexed, .. }) => {
+            RemovalReindexSettled::Deindexed {
+                reason: indexer::SKIPPED_NO_CHUNKS.to_string(),
+                outcome: deindex_removed_path(db, kb_path, rel).map(|swept| swept || *deindexed),
+            }
+        }
         Ok(indexer::SingleResult::Refused) => RemovalReindexSettled::Deindexed {
             reason: "refused".to_string(),
             outcome: deindex_removed_path(db, kb_path, rel),
@@ -1548,6 +1557,12 @@ fn log_removed_path_deindexed(rel: &str, outcome: Result<bool>) {
     }
 }
 
+/// (#543) The line [`dispatch_reindex`] prints when a file it had indexed now holds nothing to
+/// embed and the indexer dropped its rows ([`indexer::SingleResult::NothingToIndex`]).
+fn emptied_message(rel: &str) -> String {
+    format!("watcher: {rel} has nothing to embed now; deindexed it")
+}
+
 /// The line [`dispatch_reindex`] prints for what [`indexer::reindex_single_file`] returned.
 fn log_reindex_result(
     rel: &str,
@@ -1579,6 +1594,18 @@ fn log_reindex_result(
         }
         Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
+        }
+        // (#543) The indexer dropped the row the file's earlier text left; say so, since the
+        // document no longer answers searches. With no row there it reads as the skip it was.
+        Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: true, ..
+        }) => {
+            wdiag!("{}", emptied_message(rel));
+        }
+        Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: false, ..
+        }) => {
+            wdiag!("watcher: skipped {rel} ({})", indexer::SKIPPED_NO_CHUNKS);
         }
         Err(e) => {
             wdiag!(
@@ -3448,6 +3475,62 @@ mod tests {
         assert_eq!(
             db.all_document_paths().unwrap(),
             vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#543) A replacement with nothing to embed, whose row the indexer already dropped
+    /// ([`indexer::SingleResult::NothingToIndex`]), is settled as the skip it is: the line
+    /// still says the removal deindexed the document when a row was there, and stays a plain
+    /// skip when none was. Every other row stays.
+    #[test]
+    fn a_removal_reindex_that_found_nothing_to_index_reports_the_row_the_indexer_dropped() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-nothing");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        std::fs::write(kb.join("doc.md"), "").unwrap();
+
+        for had_row in [true, false] {
+            // The indexer took the row already, so only `other.md` is left either way.
+            let db = dir_rename_db(&["other.md"]);
+            let settled = settle_removal_reindex(
+                &db,
+                &kb,
+                "doc.md",
+                &Ok(indexer::SingleResult::NothingToIndex {
+                    deindexed: had_row,
+                    frontmatter_unparsed: false,
+                }),
+            );
+            match &settled {
+                RemovalReindexSettled::Deindexed {
+                    reason,
+                    outcome: Ok(reported),
+                } => {
+                    assert_eq!(reason, indexer::SKIPPED_NO_CHUNKS);
+                    assert_eq!(*reported, had_row, "had_row = {had_row}");
+                }
+                other => panic!("had_row = {had_row}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()]
+            );
+        }
+    }
+
+    /// (#543) The line a create or modify prints when the file it had indexed now holds
+    /// nothing to embed. `tests/watcher_remove_then_write.rs` waits for this text.
+    #[test]
+    fn the_emptied_line_names_the_file_and_the_deindex() {
+        assert_eq!(
+            emptied_message("runbook.md"),
+            "watcher: runbook.md has nothing to embed now; deindexed it"
         );
     }
 

@@ -215,3 +215,60 @@ fn a_file_removed_and_written_again_as_a_frontmatter_stub_is_deindexed() {
         "---\ntitle: Runbook\n---\n",
     );
 }
+
+/// The line the watcher prints when a create, modify or rename finds a file it had indexed
+/// holding nothing to embed, and drops its rows.
+const EMPTIED_LINE: &str = "watcher: runbook.md has nothing to embed now; deindexed it";
+
+/// (#543) Write `replacement` over [`RUNBOOK`] in place -- no removal -- and require the old
+/// document to be gone from the index, as `groove index --force` leaves no row for such a file.
+/// This is also what a remove-and-write becomes on macOS, where FSEvents folds the two into one
+/// change (kuriya trap #525).
+fn an_in_place_write_of_an_unindexable_file_drops_the_row(prefix: &str, replacement: &str) {
+    let (fx, guard) = served_runbook(prefix);
+    assert_eq!(fx.documents(), 1);
+
+    fx.layout.write(RUNBOOK, replacement);
+
+    let handled = wait_until(Duration::from_secs(30), || {
+        stderr_lines(&guard)
+            .iter()
+            .any(|l| l.contains(EMPTIED_LINE) || l.contains("watcher: skipped runbook.md"))
+    });
+    let lines = stderr_lines(&guard);
+    drop(guard);
+    assert!(
+        handled,
+        "the watcher never handled the write:\n{}",
+        lines.join("\n")
+    );
+    assert_eq!(
+        fx.documents(),
+        0,
+        "the earlier text's chunks are still indexed:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines.iter().any(|l| l.contains(EMPTIED_LINE)),
+        "no `{EMPTIED_LINE}` line:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains(NOT_INDEXED_LINE)),
+        "nothing was removed, yet the line says so:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn a_file_emptied_in_place_is_deindexed() {
+    an_in_place_write_of_an_unindexable_file_drops_the_row("i543-inplace-empty", "");
+}
+
+#[test]
+fn a_file_cut_down_to_its_frontmatter_in_place_is_deindexed() {
+    an_in_place_write_of_an_unindexable_file_drops_the_row(
+        "i543-inplace-stub",
+        "---\ntitle: Runbook\n---\n",
+    );
+}
