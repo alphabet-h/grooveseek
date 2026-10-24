@@ -663,10 +663,15 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 for p in paths {
                     if let Some(rel) = to_rel(&state.kb_path, p) {
                         // (#543) What is at the path now decides, not the event kind alone.
-                        match removal_decision(&rel, p, &state.registry, &state.rules) {
-                            RemovalAction::Reindex => dispatch_reindex_after_removal(state, &rel),
-                            RemovalAction::Deindex => dispatch_deindex(state, &rel),
-                            RemovalAction::Skip => {}
+                        match removal_outcome(&rel, p, &state.registry, &state.rules) {
+                            (RemovalAction::Reindex, _) => {
+                                dispatch_reindex_after_removal(state, &rel)
+                            }
+                            (RemovalAction::Deindex, Some(kind)) => {
+                                dispatch_deindex_unknown(state, &rel, kind)
+                            }
+                            (RemovalAction::Deindex, None) => dispatch_deindex(state, &rel),
+                            (RemovalAction::Skip, _) => {}
                         }
                     }
                     // (feature-67) Always, whatever the gate above said: a
@@ -743,7 +748,7 @@ fn deindex_passes(
 }
 
 /// What a remove event (`Remove`, or a `Modify(Name(From))` that arrived unpaired) does to
-/// its path. See [`removal_decision`].
+/// its path. See [`removal_outcome`].
 #[derive(Debug, PartialEq, Eq)]
 enum RemovalAction {
     /// An indexable file is at the path again: reindex it in place.
@@ -787,20 +792,61 @@ enum RemovalAction {
 /// or the listing failed with anything but "not there") takes the removal gate, as every
 /// remove event did before: keeping the row on an unknown would leave it for good when the
 /// file is in fact gone, since no later event comes to drop it.
+///
+/// (local Codex r7, medium) The look is taken once ([`removal_look`]) and its answer decides
+/// both the action and, for an unknown that ends in a deindex, the kind the line names
+/// ([`removal_outcome_for`]).
+fn removal_outcome(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> (RemovalAction, Option<std::io::ErrorKind>) {
+    removal_outcome_for(rel, full, registry, rules, removal_look(rel, full))
+}
+
+/// The action alone of [`removal_outcome`], which is how the tests written before the kind
+/// was kept ask for it.
+#[cfg(test)]
 fn removal_decision(
     rel: &str,
     full: &Path,
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
 ) -> RemovalAction {
-    let on_disk = match full.parent() {
-        Some(parent) => path_on_disk(parent, rel),
-        None => OnDisk::Gone,
-    };
-    removal_decision_for(rel, full, registry, rules, on_disk)
+    removal_outcome(rel, full, registry, rules).0
 }
 
-/// [`removal_decision`] once the disk has been looked at, split out so a test can hand it an
+/// The look [`removal_outcome`] takes, outside the locks: [`path_on_disk`] from the directory
+/// that holds `full`, or [`OnDisk::Gone`] when there is none.
+fn removal_look(rel: &str, full: &Path) -> OnDisk {
+    match full.parent() {
+        Some(dir) => path_on_disk(dir, rel),
+        None => OnDisk::Gone,
+    }
+}
+
+/// (#543, local Codex r7, medium) [`removal_decision_for`], plus the kind of the failed look
+/// when an [`OnDisk::Unknown`] ends in [`RemovalAction::Deindex`]. The event loop hands that
+/// kind to [`dispatch_deindex_unknown`], so the line says the row went because the look failed
+/// ([`log_removed_path_unknown`], the line the look inside the locks prints too), not as a
+/// plain removal. `None` for every other answer.
+fn removal_outcome_for(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> (RemovalAction, Option<std::io::ErrorKind>) {
+    let action = removal_decision_for(rel, full, registry, rules, on_disk);
+    let kind = match (&action, on_disk) {
+        (RemovalAction::Deindex, OnDisk::Unknown(kind)) => Some(kind),
+        _ => None,
+    };
+    (action, kind)
+}
+
+/// The action of [`removal_outcome`] once the disk has been looked at, split out so a test can hand it an
 /// [`OnDisk::Unknown`] that no file system makes on demand.
 fn removal_decision_for(
     rel: &str,
@@ -1479,7 +1525,8 @@ fn log_folded_sweep(rel: &str, outcome: Result<bool>) {
 
 /// What [`dispatch_reindex_after_removal`] says when it could not tell whether the path is
 /// still there and dropped its rows as a removal. Silent, like [`log_removed_path_deindexed`],
-/// when no row was there.
+/// when no row was there. [`dispatch_deindex_unknown`] says the same when the look outside the
+/// locks is the one that could not tell.
 fn log_removed_path_unknown(rel: &str, kind: std::io::ErrorKind, outcome: Result<bool>) {
     match outcome {
         Ok(true) => wdiag!(
@@ -1549,6 +1596,16 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
         Ok(false) => { /* no-op: not in DB */ }
         Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
+    sweep_legacy_row(&db, &state.kb_path, rel, false);
+}
+
+/// (#543, local Codex r7, medium) [`dispatch_deindex`] for a remove event whose look outside
+/// the locks could not tell whether the path is still there ([`removal_outcome_for`]). The row
+/// goes all the same; the line is [`log_removed_path_unknown`]'s, so a document dropped on an
+/// access or I/O failure can be told apart from a plain removal in the log.
+fn dispatch_deindex_unknown(state: &WatcherState, rel: &str, kind: std::io::ErrorKind) {
+    let db = recover_db(state.db.lock());
+    log_removed_path_unknown(rel, kind, indexer::deindex_single_file(&db, rel));
     sweep_legacy_row(&db, &state.kb_path, rel, false);
 }
 
@@ -3242,6 +3299,60 @@ mod tests {
                 unknown
             ),
             RemovalAction::Skip
+        );
+    }
+
+    /// (#543, local Codex r7, medium) Outside the locks, a look that could not tell and ends
+    /// in a deindex keeps the kind of the failure, so the line it prints can say why; a path
+    /// found gone, found present, or skipped carries none.
+    #[test]
+    fn a_removal_that_could_not_be_looked_at_keeps_the_kind_for_its_line() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-unknown-kind");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let note = kb.join("note.md");
+
+        assert_eq!(
+            removal_outcome_for("note.md", &note, &reg, &rules, OnDisk::Unknown(denied)),
+            (RemovalAction::Deindex, Some(denied))
+        );
+        assert_eq!(
+            removal_outcome_for(
+                "note.md",
+                &note,
+                &reg,
+                &rules,
+                OnDisk::Unknown(std::io::ErrorKind::Other)
+            ),
+            (RemovalAction::Deindex, Some(std::io::ErrorKind::Other))
+        );
+        assert_eq!(
+            removal_outcome_for("note.md", &note, &reg, &rules, OnDisk::Gone),
+            (RemovalAction::Deindex, None)
+        );
+        assert_eq!(
+            removal_outcome_for(
+                ".obsidian/x.md",
+                &kb.join(".obsidian").join("x.md"),
+                &reg,
+                &rules,
+                OnDisk::Unknown(denied)
+            ),
+            (RemovalAction::Skip, None)
+        );
+        std::fs::write(&note, "# note\n").unwrap();
+        assert_eq!(
+            removal_outcome_for("note.md", &note, &reg, &rules, OnDisk::Present),
+            (RemovalAction::Reindex, None)
         );
     }
 
