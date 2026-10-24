@@ -163,7 +163,6 @@ fn a_file_that_stays_removed_is_still_deindexed() {
 
 /// The line the watcher prints when a removed path holds a file again that the reindex did
 /// not index, and the rows were dropped as a removal.
-#[cfg(not(target_os = "macos"))]
 const NOT_INDEXED_LINE: &str =
     "watcher: runbook.md was removed and its replacement was not indexed";
 

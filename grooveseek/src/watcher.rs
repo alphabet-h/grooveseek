@@ -1374,8 +1374,18 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         state.exclude_headings.as_deref(),
         &state.registry,
     );
+    let require_real_key = sweep_requires_real_key(&result);
     log_reindex_result(rel, result, texts_before, &embedder);
-    sweep_legacy_row(&db, &state.kb_path, rel, true);
+    sweep_legacy_row(&db, &state.kb_path, rel, require_real_key);
+}
+
+/// (#543, local Codex, medium) The `require_real_key` that [`dispatch_reindex`] passes to
+/// [`sweep_legacy_row`] after a reindex. A file left with nothing to embed
+/// ([`indexer::SingleResult::NothingToIndex`]) is gone from the index like a removal, so its
+/// folded legacy row goes too, whether or not the real key held a row; the write form (`true`)
+/// would keep a folded row whose real key holds none. Every other result keeps the write form.
+fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
+    !matches!(result, Ok(indexer::SingleResult::NothingToIndex { .. }))
 }
 
 /// (#543, local Codex r1) [`dispatch_reindex`] for a path a remove event found holding a file
@@ -3532,6 +3542,33 @@ mod tests {
             emptied_message("runbook.md"),
             "watcher: runbook.md has nothing to embed now; deindexed it"
         );
+    }
+
+    /// (#543, local Codex, medium) After a reindex that left the file with nothing to embed,
+    /// the folded legacy row is swept as for a removal (`false`), whether or not the real key
+    /// held a row; every other result keeps the write form (`true`).
+    #[test]
+    fn a_file_left_with_nothing_to_embed_sweeps_its_folded_row_as_a_removal() {
+        for deindexed in [true, false] {
+            assert!(!sweep_requires_real_key(&Ok(
+                indexer::SingleResult::NothingToIndex {
+                    deindexed,
+                    frontmatter_unparsed: false,
+                }
+            )));
+        }
+        assert!(sweep_requires_real_key(&Ok(
+            indexer::SingleResult::Unchanged
+        )));
+        assert!(sweep_requires_real_key(&Ok(
+            indexer::SingleResult::Skipped {
+                reason: "file no longer exists",
+                frontmatter_unparsed: false,
+            }
+        )));
+        assert!(sweep_requires_real_key(&Err(anyhow::anyhow!(
+            "endpoint down"
+        ))));
     }
 
     /// (#543, ADR-0023) A key the index cannot hold is still dropped on a remove event even
