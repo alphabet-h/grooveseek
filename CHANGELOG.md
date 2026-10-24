@@ -26,7 +26,9 @@ they land in a minor release and are called out here. Details are in the Securit
   `refusing to read the config: <path>: it is not a regular file` instead of reading it, because a
   pipe could hang startup. Write the config to a file and pass that path. A Windows service
   registered with `groove service install` starts `groove serve --config <its groove.toml>`, so
-  that config is checked the same way; only the tray, which reads its own settings, is unchanged.
+  that config is checked the same way when the service starts. The `groove service` subcommands
+  (`install`, `status`, `uninstall`), which read that file themselves, and the tray, which reads
+  its own settings, are unchanged.
 - **A `groove.toml` found in the working directory or at the git root is refused when its
   directory cannot be resolved** (for example, a path component that can no longer be followed).
   Name the file with `--config` to use it.
@@ -113,7 +115,8 @@ they land in a minor release and are called out here. Details are in the Securit
   directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole,
   and refused when it is not a regular file (a named pipe would hang startup, `--config <(...)`
   included), wherever it is — including the config a Windows service passes to `groove serve
-  --config`; only the tray, which reads its own settings, is unchanged. A `groove.toml` found in the working directory or at the git root outside every
+  --config`. The `groove service` subcommands (`install`, `status`, `uninstall`), which read that
+  file themselves, and the tray, which reads its own settings, are unchanged. A `groove.toml` found in the working directory or at the git root outside every
   trusted config location is also refused when it is a hard link or, on Linux and macOS, a
   symlink, as the frontmatter schema and the golden file already were. Name a linked config with
   `--config` to use it. Whether a found config is trusted is decided once, before it
