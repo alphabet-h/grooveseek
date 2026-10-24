@@ -14,6 +14,35 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-10-24
+
+**Check these four changes before upgrading.** Each closes a security defect that could not be
+fixed while keeping the old behaviour, so under the [stability policy](docs/stability.md#deprecation)
+they land in a minor release and are called out here. Details are in the Security entries below.
+
+- **A config passed as a pipe is refused.** `groove --config <(...)`, or `--config /dev/stdin`
+  fed from a pipe, now stops with `refusing to read the config: <path>: it is not a regular file`
+  instead of reading it, because a pipe could hang startup. Write the config to a file and pass
+  that path.
+- **A `groove.toml` found in the working directory or at the git root is refused when its
+  directory cannot be resolved** (for example, a path component that can no longer be followed).
+  Name the file with `--config` to use it.
+- **Relative paths in a found `groove.toml` are resolved from the directory's real location.**
+  `kb_path`, `fastembed_cache_dir`, `grammar_dir` and `[eval] golden` (and the database and files
+  derived from `kb_path`) are taken from the directory with its links followed, not from the path
+  groove found the file at, so `cd` through a symlink or junction into a project now finds the
+  `kb_path` next to the project's real directory. On Windows those paths are now also spelled the
+  way the filesystem stores them: a short (8.3) name such as `C:\PROGRA~1` appears as the long
+  name (`C:\Program Files`), letter case follows the disk, and a directory the plain spelling would not name exactly (longer than
+  `MAX_PATH`, or with a name ending in a dot or a space) keeps a `\\?\` prefix.
+  This shows in the startup log and printed paths; the files themselves are the same. A config
+  named with `--config` or placed beside the binary is unchanged.
+- **The live watcher no longer indexes a path with a directory link anywhere below the knowledge
+  base, and removes rows it already holds for such a path.** This covers symlinks and, on Windows,
+  junctions, and includes a link to another directory inside the knowledge base: a file there is
+  now indexed only under its real path. This is the rule the full `groove index` already followed,
+  so after the upgrade the watcher and a full index agree.
+
 ### Changed
 
 - **Re-indexing a changed document re-embeds only the chunks whose text changed.** Chunks whose
@@ -6317,7 +6346,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.0...HEAD
+[1.21.0]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...v1.21.0
 [1.20.4]: https://github.com/alphabet-h/grooveseek/compare/v1.20.3...v1.20.4
 [1.20.3]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...v1.20.3
 [1.20.2]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...v1.20.2

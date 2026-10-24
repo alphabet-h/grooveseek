@@ -320,7 +320,7 @@ and stops at the first hit:
 `~` in `--config` is expanded to the home directory on all platforms
 (including Windows `cmd.exe` where the shell does not expand it).
 
-Whichever file is chosen, groove reads at most 1 MiB of it and refuses a
+(v1.21.0+) Whichever file is chosen, groove reads at most 1 MiB of it and refuses a
 larger one (`refusing to read the config: <path>: it is N bytes, over the
 1048576 byte limit`). A file in an untrusted location (see
 [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations):
@@ -356,18 +356,24 @@ it as yours:
   and "no file at all".
 - **Untrusted**: anything else found under the cwd or a `.git` ancestor.
 
-The directory holding a found file is resolved (its links followed) once, before
+(v1.21.0+) The directory holding a found file is resolved (its links followed) once, before
 the file is opened, and the file is then opened in that resolved directory. The
 same answer decides whether the restrictions below apply and is the `trust=` the
 startup log reports, so repointing a link on the way while groove starts cannot
 change it.
 
-Relative paths in a found file — `kb_path`, `fastembed_cache_dir`,
+(v1.21.0+) Relative paths in a found file — `kb_path`, `fastembed_cache_dir`,
 `grammar_dir` and `[eval] golden` — are resolved against that same resolved
 directory, not against the path groove found the file at, and so is everything
 derived from `kb_path` (the database beside it, `groove-schema.toml`,
 `.grooveignore`). If you `cd` through a link into a project, `kb_path = "../kb"`
-names the `kb` next to the project's real directory. The path as found is used
+names the `kb` next to the project's real directory. On Windows the resolved
+directory is spelled the way the filesystem stores it, so those paths show the
+long name where you typed a short (8.3) one (`C:\PROGRA~1` becomes
+`C:\Program Files`) and the letter case found on disk; a directory the plain
+spelling would not name exactly (longer than `MAX_PATH`, or with a name ending in
+a dot or a space) keeps the `\\?\` prefix. The files are the same; only
+the spelling in the startup log and printed paths differs. The path as found is used
 only to name the file in messages and in the startup log. If the directory
 cannot be resolved at all, the file is refused with an error that names it;
 pass it with `--config` to use it. A file named with `--config` or found beside
