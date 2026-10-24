@@ -163,12 +163,20 @@ fn a_file_that_stays_removed_is_still_deindexed() {
 
 /// The line the watcher prints when a removed path holds a file again that the reindex did
 /// not index, and the rows were dropped as a removal.
+#[cfg(not(target_os = "macos"))]
 const NOT_INDEXED_LINE: &str =
     "watcher: runbook.md was removed and its replacement was not indexed";
 
 /// (#543, GitHub codex r1 P2) Remove [`RUNBOOK`], write `replacement` under the same name, and
 /// require the old document to be gone from the index: a replacement the reindex skips (an
 /// empty file, a frontmatter-only stub) leaves no row standing for the old text.
+///
+/// Not on macOS: there FSEvents folds the removal and the write into one change (kuriya trap
+/// #525), so the watcher never sees a removal and this path is not taken. PR #393's macOS CI
+/// job showed it: its stderr carried only `watcher: skipped runbook.md (no embeddable chunks)`
+/// lines, no removal line. What a macOS save of this shape does is covered by
+/// [`an_in_place_write_of_an_unindexable_file_drops_the_row`].
+#[cfg(not(target_os = "macos"))]
 fn a_removal_replaced_by_an_unindexable_file_drops_the_row(prefix: &str, replacement: &str) {
     let (fx, guard) = served_runbook(prefix);
     assert_eq!(fx.documents(), 1);
@@ -204,11 +212,13 @@ fn a_removal_replaced_by_an_unindexable_file_drops_the_row(prefix: &str, replace
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn a_file_removed_and_written_again_empty_is_deindexed() {
     a_removal_replaced_by_an_unindexable_file_drops_the_row("i543-empty", "");
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn a_file_removed_and_written_again_as_a_frontmatter_stub_is_deindexed() {
     a_removal_replaced_by_an_unindexable_file_drops_the_row(
         "i543-stub",
