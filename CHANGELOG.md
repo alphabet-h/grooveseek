@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-10-25
+
 ### Fixed
 
 - **A document an editor saves by deleting and rewriting it keeps its stored vectors in the live
@@ -6377,7 +6379,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.1...HEAD
+[1.21.1]: https://github.com/alphabet-h/grooveseek/compare/v1.21.0...v1.21.1
 [1.21.0]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...v1.21.0
 [1.20.4]: https://github.com/alphabet-h/grooveseek/compare/v1.20.3...v1.20.4
 [1.20.3]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...v1.20.3
