@@ -14,6 +14,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A document an editor saves by deleting and rewriting it keeps its stored vectors in the live
+  watcher.** Some editors (Claude Code's Edit tool among them) replace a file rather than write
+  into it, which reaches the watcher as a removal followed by a creation of the same path. The
+  watcher deindexed the document on the removal, so the reindex that followed had no stored vector
+  to reuse and embedded every chunk again — on a large note, minutes of embedding for a one-section
+  edit. A removal whose path holds an indexable file again by the time the watcher handles it now
+  reindexes the document in place, so only the chunks whose embedding input changed are embedded;
+  a file that is really gone is deindexed as before.
+
 ## [1.21.0] - 2026-10-24
 
 **Check these four changes before upgrading.** Each closes a security defect that could not be

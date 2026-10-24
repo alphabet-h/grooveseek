@@ -661,10 +661,13 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
             }
             Classified::Deindex(paths) => {
                 for p in paths {
-                    if let Some(rel) = to_rel(&state.kb_path, p)
-                        && deindex_passes(&rel, p, &state.registry, &state.rules)
-                    {
-                        dispatch_deindex(state, &rel);
+                    if let Some(rel) = to_rel(&state.kb_path, p) {
+                        // (#543) What is at the path now decides, not the event kind alone.
+                        match removal_decision(&rel, p, &state.registry, &state.rules) {
+                            RemovalAction::Reindex => dispatch_reindex(state, &rel),
+                            RemovalAction::Deindex => dispatch_deindex(state, &rel),
+                            RemovalAction::Skip => {}
+                        }
                     }
                     // (feature-67) Always, whatever the gate above said: a
                     // removed directory carries no extension, and its files'
@@ -737,6 +740,58 @@ fn deindex_passes(
     rules: &crate::exclusion::ExclusionRules,
 ) -> bool {
     gate_parts(rel, full, registry, rules, Gate::Removal)
+}
+
+/// What a remove event (`Remove`, or a `Modify(Name(From))` that arrived unpaired) does to
+/// its path. See [`removal_decision`].
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalAction {
+    /// An indexable file is at the path again: reindex it in place.
+    Reindex,
+    /// Drop the row.
+    Deindex,
+    /// Neither: the path is not one the index tracks.
+    Skip,
+}
+
+/// (#543) A remove event whose path holds an indexable regular file again by the time the
+/// event is handled is a reindex, not a deindex.
+///
+/// An editor that saves by removing the file and writing a new one (Claude Code's Edit tool
+/// arrives as a `Remove` and a `Create` of the same path) used to have its row deleted first,
+/// so the reindex that followed had no stored vector to reuse (feature-69) and embedded every
+/// chunk again. Reindexing in place keeps the row, so the unchanged chunks keep their vectors;
+/// the `Create` that follows then finds the hash unchanged and does nothing. The disk is read
+/// when the event is handled rather than trusting the batch to also carry the `Create`, so it
+/// holds when the debouncer emits the removal on its own (the write landed after the removal
+/// queued, but before it was handled).
+///
+/// The write is judged by the same gate as any reindex ([`should_process_parts`]), on a regular
+/// file only: a symlink, a hard link, an excluded path or a directory is not reindexed here. A
+/// path with a link on the way passes this gate as it does for any reindex, and the single-file
+/// read refuses it and drops its row (AX-02). Only a key the index can hold is
+/// considered for it, so a key written by an older version under a name this one refuses
+/// ([`Gate::Removal`], ADR-0023) still goes, without a refusal warning on every delete.
+/// Anything not reindexed takes the removal gate exactly as before ([`deindex_passes`]).
+fn removal_decision(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> RemovalAction {
+    let is_file = std::fs::symlink_metadata(full).is_ok_and(|m| m.file_type().is_file());
+    if is_file
+        && !rel.is_empty()
+        && crate::resources::doc_is_addressable(rel)
+        && should_process_parts(rel, full, registry, rules)
+    {
+        return RemovalAction::Reindex;
+    }
+    if deindex_passes(rel, full, registry, rules) {
+        RemovalAction::Deindex
+    } else {
+        RemovalAction::Skip
+    }
 }
 
 /// What a path is being judged for, which decides whether the name check
@@ -2443,6 +2498,105 @@ mod tests {
                 &rules
             ),
             RenameAction::Reindex
+        );
+    }
+
+    /// (#543) A remove event is a reindex when an indexable regular file is at the path again
+    /// by the time it is handled, and a deindex when nothing is there, as before.
+    #[test]
+    fn a_removal_whose_file_is_back_is_a_reindex_and_one_whose_file_is_gone_a_deindex() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        std::fs::write(kb.join("back.md"), "# Back\n").unwrap();
+        assert_eq!(
+            removal_decision("back.md", &kb.join("back.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+
+        let gone = kb.join("gone.md");
+        assert!(std::fs::symlink_metadata(&gone).is_err());
+        assert_eq!(
+            removal_decision("gone.md", &gone, &reg, &rules),
+            RemovalAction::Deindex
+        );
+
+        // Excluded (`.obsidian` in `default_exclude_dirs`): neither, as before.
+        std::fs::create_dir_all(kb.join(".obsidian")).unwrap();
+        std::fs::write(kb.join(".obsidian").join("x.md"), "# x\n").unwrap();
+        assert_eq!(
+            removal_decision(
+                ".obsidian/x.md",
+                &kb.join(".obsidian").join("x.md"),
+                &reg,
+                &rules
+            ),
+            RemovalAction::Skip
+        );
+
+        // A wrong extension is not reindexed either.
+        std::fs::write(kb.join("back.tmp"), "x").unwrap();
+        assert_ne!(
+            removal_decision("back.tmp", &kb.join("back.tmp"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+    }
+
+    /// (#543) Only a regular file the reindex gate takes is reindexed from a remove event: a
+    /// directory or a hard link put at the path keeps the old decision.
+    #[test]
+    fn a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-nf");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        // A directory with a registered extension in its name.
+        std::fs::create_dir_all(kb.join("dir.md")).unwrap();
+        assert_ne!(
+            removal_decision("dir.md", &kb.join("dir.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+
+        // A hard link (no privilege needed on Windows either).
+        let other = kb.join("other.md");
+        std::fs::write(&other, "# other\n").unwrap();
+        std::fs::hard_link(&other, kb.join("linked.md")).unwrap();
+        assert_eq!(
+            removal_decision("linked.md", &kb.join("linked.md"), &reg, &rules),
+            RemovalAction::Skip,
+            "same as the removal gate decided before #543"
+        );
+    }
+
+    /// (#543, ADR-0023) A key the index cannot hold is still dropped on a remove event even
+    /// when a file is back under that name: it is never reindexed from here.
+    #[cfg(windows)]
+    #[test]
+    fn a_removal_of_a_name_win32_cannot_spell_still_deindexes_when_the_file_is_back() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-i543");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("CON.md"), "# back\n").unwrap();
+        assert_eq!(
+            removal_decision("CON.md", &kb.join("CON.md"), &reg, &rules),
+            RemovalAction::Deindex
         );
     }
 
