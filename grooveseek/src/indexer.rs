@@ -2606,7 +2606,11 @@ fn index_single_disk_entry(
     // (feature-62) The pass re-reads a file because the scan's hash matched its row. Bytes that
     // are not those bytes say nothing about the row -- the reason the frontmatter check below
     // gives (#251, codex P2 round 5) -- so the row is left for the next run.
-    if reparse && sha256_hex_bytes(&bytes) != entry.hash {
+    // (#543, local Codex, medium) A watcher event is held to the same check: its hash came from
+    // [`reindex_single_file`]'s first read, and bytes that only looked empty to this second one
+    // (an editor that truncates before it writes) would otherwise drop the row below. The row is
+    // left for the event that write raises.
+    if (reparse || mode == Reindex::Event) && sha256_hex_bytes(&bytes) != entry.hash {
         return Ok(SingleResult::Skipped {
             reason: SKIPPED_CHANGED_DURING_READ,
             frontmatter_unparsed: parsed.frontmatter_error.is_some(),
@@ -8201,6 +8205,42 @@ mod tests {
             }
         );
         assert!(db.all_document_paths().unwrap().is_empty());
+    }
+
+    /// #543 (local Codex, medium): a watcher event hashes the file on its first read and parses
+    /// a second one. A file that was empty only for that second read -- an editor that truncates
+    /// before it writes -- says nothing about the row, so the row stays and the result is the
+    /// changed-during-read skip; the next event writes it again.
+    #[test]
+    fn a_watcher_reindex_whose_second_read_is_not_the_hashed_bytes_keeps_the_row() {
+        let registry = docx_registry();
+        let old = [crate::parser::Chunk {
+            heading: Some("Install".to_string()),
+            level: Some(2),
+            content: "Download the archive and unpack it into the tools folder.".to_string(),
+            ..Default::default()
+        }];
+        let dir = mk_tmp("i543-reread-emptied");
+        let db = reparse_db();
+        write_row(&db, "runbook.md", "hash-of-the-earlier-text", &old);
+        // On disk for the second read: nothing. Hashed by the first read: text with a chunk.
+        let entry = docx_entry(&dir.0, "runbook.md", b"");
+        let hashed = DiskEntry {
+            hash: sha256_hex_bytes(b"# Install\n\nDownload the archive and unpack it.\n"),
+            ..entry
+        };
+        assert_eq!(
+            reindex(&db, &registry, &hashed, Reindex::Event),
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.get_document_hash("runbook.md").unwrap().as_deref(),
+            Some("hash-of-the-earlier-text"),
+            "the row went on bytes the first read did not hash"
+        );
     }
 
     /// feature-62 (R4.3, Review Focus 2): the pass re-reads a `.docx` by its parser, not its
