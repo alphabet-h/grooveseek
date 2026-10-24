@@ -780,10 +780,11 @@ enum RemovalAction {
 /// beside the one the new spelling's event writes. This is a first look, outside the locks;
 /// [`dispatch_reindex_after_removal`] looks again inside them.
 ///
-/// (#543, local Codex r2 [medium]) A look that cannot tell ([`OnDisk::Unknown`]: the stat or
-/// the listing failed with anything but "not there") does not drop the row. A path the
-/// reindex gate would take is sent to [`dispatch_reindex_after_removal`] as a reindex, whose
-/// look inside the locks keeps the row when it still cannot tell.
+/// (#543, local Codex r3 [medium]) Only a file found under the exact spelling
+/// ([`OnDisk::Present`]) is reindexed. A look that cannot tell ([`OnDisk::Unknown`]: the stat
+/// or the listing failed with anything but "not there") takes the removal gate, as every
+/// remove event did before: keeping the row on an unknown would leave it for good when the
+/// file is in fact gone, since no later event comes to drop it.
 fn removal_decision(
     rel: &str,
     full: &Path,
@@ -806,7 +807,7 @@ fn removal_decision_for(
     rules: &crate::exclusion::ExclusionRules,
     on_disk: OnDisk,
 ) -> RemovalAction {
-    if matches!(on_disk, OnDisk::Present | OnDisk::Unknown(_))
+    if on_disk == OnDisk::Present
         && !rel.is_empty()
         && crate::resources::doc_is_addressable(rel)
         && should_process_parts(rel, full, registry, rules)
@@ -830,7 +831,8 @@ enum OnDisk {
     /// under another case.
     Gone,
     /// The look failed in a way that does not say the file is gone (access denied, an I/O
-    /// error): the row it may still back is left alone.
+    /// error). (local Codex r3 [medium]) Treated as a removal all the same, as before the
+    /// look existed; the kind is kept for the line that says why.
     Unknown(std::io::ErrorKind),
 }
 
@@ -929,21 +931,24 @@ enum RemovedPathCheck {
     Deindexed(Result<bool>),
     /// The file is still at `rel`: nothing touched, the reindex goes ahead.
     StillThere,
-    /// The look could not tell: nothing touched, and no reindex either.
-    Unknown(std::io::ErrorKind),
+    /// The look could not tell: the rows were deleted as for a path that is gone, no reindex
+    /// runs, and the kind says why the look failed.
+    Unknown(std::io::ErrorKind, Result<bool>),
 }
 
 /// (#543, local Codex r1) The removal [`dispatch_reindex_after_removal`] falls back to, for a
-/// caller already holding the database lock: when the path is [`OnDisk::Gone`]
-/// ([`removed_path_on_disk`]), the row under `rel` and its folded legacy row
-/// ([`indexer::sweep_legacy_folded_row`] as a removal) are deleted. Split out so a test can
-/// run it with no [`crate::embedder::Embedder`].
+/// caller already holding the database lock: unless the file is still there
+/// ([`OnDisk::Present`], [`removed_path_on_disk`]), the row under `rel` and its folded legacy
+/// row ([`indexer::sweep_legacy_folded_row`] as a removal) are deleted. Split out so a test
+/// can run it with no [`crate::embedder::Embedder`].
 fn check_removed_path(db: &Database, kb_path: &Path, rel: &str) -> RemovedPathCheck {
     act_on_removed_path(db, kb_path, rel, removed_path_on_disk(kb_path, rel))
 }
 
 /// [`check_removed_path`] once the disk has been looked at, split out so a test can hand it an
-/// [`OnDisk::Unknown`]. (local Codex r2 [medium]) Only [`OnDisk::Gone`] deletes anything.
+/// [`OnDisk::Unknown`]. (local Codex r3 [medium]) Anything but [`OnDisk::Present`] deletes the
+/// rows, an unknown look included: the remove event is the only signal the file is going, and
+/// the removal it carried before this look existed is what it falls back to.
 fn act_on_removed_path(
     db: &Database,
     kb_path: &Path,
@@ -952,14 +957,20 @@ fn act_on_removed_path(
 ) -> RemovedPathCheck {
     match on_disk {
         OnDisk::Present => RemovedPathCheck::StillThere,
-        OnDisk::Unknown(kind) => RemovedPathCheck::Unknown(kind),
-        OnDisk::Gone => {
-            RemovedPathCheck::Deindexed(indexer::deindex_single_file(db, rel).and_then(|exact| {
-                let folded = indexer::sweep_legacy_folded_row(db, kb_path, rel, false)?;
-                Ok(exact || folded)
-            }))
+        OnDisk::Unknown(kind) => {
+            RemovedPathCheck::Unknown(kind, deindex_removed_path(db, kb_path, rel))
         }
+        OnDisk::Gone => RemovedPathCheck::Deindexed(deindex_removed_path(db, kb_path, rel)),
     }
+}
+
+/// The deletion [`act_on_removed_path`] runs for a path not found there: the row under `rel`
+/// and its folded legacy row. `Ok(true)` when either was there.
+fn deindex_removed_path(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
+    indexer::deindex_single_file(db, rel).and_then(|exact| {
+        let folded = indexer::sweep_legacy_folded_row(db, kb_path, rel, false)?;
+        Ok(exact || folded)
+    })
 }
 
 /// [`check_removed_path`] in the shape the tests written before it had three answers use:
@@ -971,8 +982,10 @@ fn deindex_if_removed_path_is_gone(
     rel: &str,
 ) -> Option<Result<bool>> {
     match check_removed_path(db, kb_path, rel) {
-        RemovedPathCheck::Deindexed(outcome) => Some(outcome),
-        RemovedPathCheck::StillThere | RemovedPathCheck::Unknown(_) => None,
+        RemovedPathCheck::Deindexed(outcome) | RemovedPathCheck::Unknown(_, outcome) => {
+            Some(outcome)
+        }
+        RemovedPathCheck::StillThere => None,
     }
 }
 
@@ -1299,12 +1312,10 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
 /// directory, between its stat and its read), and the row goes in that region when the file
 /// is no longer there under the exact spelling of `rel` ([`check_removed_path`]).
 ///
-/// (local Codex r2 [medium]) When a look cannot tell ([`RemovedPathCheck::Unknown`]), the
-/// row stays and one line says so. Before the reindex, the reindex is not run either: the
-/// file may be there but unreadable, or there only in another case behind a listing that
-/// failed, and a reindex would then either fail on the same error or write the row under a
-/// spelling the disk may not hold. After a reindex that wrote nothing, its line is printed and
-/// the folded legacy row is left alone as well.
+/// (local Codex r3 [medium]) A look that cannot tell ([`RemovedPathCheck::Unknown`]) is
+/// handled as one that found the path gone, before the reindex and after it alike: the rows
+/// go, no reindex runs, and one line names why the look failed. Only a file confirmed under
+/// the exact spelling makes this path act differently from a plain removal.
 ///
 /// Only the remove path calls this: what a create, modify or rename does with a file gone
 /// before its read is unchanged.
@@ -1316,8 +1327,8 @@ fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
             log_removed_path_deindexed(rel, outcome);
             return;
         }
-        RemovedPathCheck::Unknown(kind) => {
-            log_removed_path_unknown(rel, kind);
+        RemovedPathCheck::Unknown(kind, outcome) => {
+            log_removed_path_unknown(rel, kind, outcome);
             return;
         }
         RemovedPathCheck::StillThere => {}
@@ -1341,9 +1352,8 @@ fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
                 log_removed_path_deindexed(rel, outcome);
                 return;
             }
-            RemovedPathCheck::Unknown(kind) => {
-                log_reindex_result(rel, result, texts_before, &embedder);
-                log_removed_path_unknown(rel, kind);
+            RemovedPathCheck::Unknown(kind, outcome) => {
+                log_removed_path_unknown(rel, kind, outcome);
                 return;
             }
             RemovedPathCheck::StillThere => {}
@@ -1354,9 +1364,18 @@ fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
 }
 
 /// What [`dispatch_reindex_after_removal`] says when it could not tell whether the path is
-/// still there.
-fn log_removed_path_unknown(rel: &str, kind: std::io::ErrorKind) {
-    wdiag!("watcher: could not tell whether {rel} is still there ({kind}); its row is kept");
+/// still there and dropped its rows as a removal. Silent, like [`log_removed_path_deindexed`],
+/// when no row was there.
+fn log_removed_path_unknown(rel: &str, kind: std::io::ErrorKind, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => wdiag!(
+            "watcher: could not tell whether {rel} is still there ({kind}); deindexed it as a removal"
+        ),
+        Ok(false) => { /* no-op: not in DB */ }
+        Err(e) => wdiag!(
+            "watcher: could not tell whether {rel} is still there ({kind}); deindex failed: {e}"
+        ),
+    }
 }
 
 /// What [`dispatch_reindex_after_removal`] says when the path turned out to be gone.
@@ -2987,10 +3006,10 @@ mod tests {
         }
     }
 
-    /// (#543, local Codex r2 [medium]) Inside the locks, a look that could not tell leaves the
-    /// row (and every other) where it is; only a path found gone drops it.
+    /// (#543, local Codex r3 [medium]) Inside the locks, a look that could not tell drops the
+    /// row as a path found gone does, and leaves every other row where it is.
     #[test]
-    fn a_removed_path_that_could_not_be_looked_at_keeps_its_row() {
+    fn a_removed_path_that_could_not_be_looked_at_is_deindexed() {
         let kb = crate::test_support::unique_temp_path("groove-watcher-i543-unknown");
         std::fs::create_dir_all(&kb).unwrap();
         struct Cleanup(std::path::PathBuf);
@@ -3011,18 +3030,18 @@ mod tests {
         assert!(
             matches!(
                 kept,
-                RemovedPathCheck::Unknown(std::io::ErrorKind::PermissionDenied)
+                RemovedPathCheck::Unknown(std::io::ErrorKind::PermissionDenied, Ok(true))
             ),
             "{kept:?}"
         );
         assert_eq!(
             db.all_document_paths().unwrap(),
-            vec!["locked.md".to_string(), "other.md".to_string()]
+            vec!["other.md".to_string()]
         );
 
         let gone = act_on_removed_path(&db, &kb, "locked.md", OnDisk::Gone);
         assert!(
-            matches!(gone, RemovedPathCheck::Deindexed(Ok(true))),
+            matches!(gone, RemovedPathCheck::Deindexed(Ok(false))),
             "{gone:?}"
         );
         assert_eq!(
@@ -3031,11 +3050,10 @@ mod tests {
         );
     }
 
-    /// (#543, local Codex r2 [medium]) Outside the locks, a look that could not tell is not a
-    /// deindex: a path the reindex gate takes goes to the look inside the locks, and one it
-    /// does not take keeps the removal gate's answer.
+    /// (#543, local Codex r3 [medium]) Outside the locks, a look that could not tell is never a
+    /// reindex: it takes the removal gate's answer, as a path found gone does.
     #[test]
-    fn a_removal_that_could_not_be_looked_at_is_not_a_deindex() {
+    fn a_removal_that_could_not_be_looked_at_takes_the_removal_gate() {
         let kb = crate::test_support::unique_temp_path("groove-watcher-i543-unknown-out");
         std::fs::create_dir_all(&kb).unwrap();
         struct Cleanup(std::path::PathBuf);
@@ -3051,7 +3069,7 @@ mod tests {
 
         assert_eq!(
             removal_decision_for("note.md", &kb.join("note.md"), &reg, &rules, unknown),
-            RemovalAction::Reindex
+            RemovalAction::Deindex
         );
         assert_eq!(
             removal_decision_for("note.md", &kb.join("note.md"), &reg, &rules, OnDisk::Gone),

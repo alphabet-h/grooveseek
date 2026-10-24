@@ -26,7 +26,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   a file that is really gone is deindexed as before. The path is looked at again while the
   watcher holds the index, so a file that disappears in between is still deindexed, and a file
   that is there only under another case of the name (a case-only rename on Windows or macOS) is
-  not kept under the old spelling.
+  not kept under the old spelling. When the watcher cannot tell whether the file is there (the
+  look fails with an access or I/O error), it deindexes the document as before.
 
 ## [1.21.0] - 2026-10-24
 
