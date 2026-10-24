@@ -779,15 +779,15 @@ enum RemovalAction {
 /// ([`Gate::Removal`], ADR-0023) still goes, without a refusal warning on every delete.
 /// Anything not reindexed takes the removal gate exactly as before ([`deindex_passes`]).
 ///
-/// (local Codex r1 [high]) The file must be there under the very spelling of `rel`
+/// (local Codex r1, high) The file must be there under the very spelling of `rel`
 /// ([`path_on_disk`]): on a case-insensitive volume a case-only rename leaves the
 /// old name opening the new file, and reindexing it would keep a row under the old spelling
-/// beside the one the new spelling's event writes. (local Codex r6 [medium]) That holds for
+/// beside the one the new spelling's event writes. (local Codex r6, medium) That holds for
 /// every directory of `rel` on the way as well as for the leaf: a case-only directory rename
 /// leaves the old directory name opening the new directory. This is a first look, outside the locks;
 /// [`dispatch_reindex_after_removal`] looks again inside them.
 ///
-/// (#543, local Codex r3 [medium]) Only a file found under the exact spelling
+/// (#543, local Codex r3, medium) Only a file found under the exact spelling
 /// ([`OnDisk::Present`]) is reindexed. A look that cannot tell ([`OnDisk::Unknown`]: the stat
 /// or the listing failed with anything but "not there") takes the removal gate, as every
 /// remove event did before: keeping the row on an unknown would leave it for good when the
@@ -869,7 +869,7 @@ fn removal_decision_for(
     }
 }
 
-/// (#543, local Codex r2 [medium]) What a look at the disk found for a path a remove event
+/// (#543, local Codex r2, medium) What a look at the disk found for a path a remove event
 /// named: three answers, because a failed look is not a missing file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnDisk {
@@ -879,12 +879,12 @@ enum OnDisk {
     /// under another case of its name or of a directory on the way.
     Gone,
     /// The look failed in a way that does not say the file is gone (access denied, an I/O
-    /// error). (local Codex r3 [medium]) Treated as a removal all the same, as before the
+    /// error). (local Codex r3, medium) Treated as a removal all the same, as before the
     /// look existed; the kind is kept for the line that says why.
     Unknown(std::io::ErrorKind),
 }
 
-/// (#543, local Codex r2 [medium]) What a failed stat or listing says about the path: only
+/// (#543, local Codex r2, medium) What a failed stat or listing says about the path: only
 /// "not found" and "not a directory" (a file where a directory on the way was) say it is gone.
 /// Anything else, permission denied or an I/O error among them, says nothing about whether
 /// the file is still there.
@@ -905,7 +905,7 @@ fn file_on_disk(dir: &Path, leaf: &str) -> OnDisk {
     }
 }
 
-/// (#543, local Codex r6 [medium]) What is at `rel`, given the directory its leaf sits in:
+/// (#543, local Codex r6, medium) What is at `rel`, given the directory its leaf sits in:
 /// [`file_on_disk`] for the leaf, then, only when that found the file under its exact name,
 /// [`spelled_on_disk`] for each directory segment of `rel` from the innermost out, each
 /// against the directory above it (reached by `Path::parent`, so a verbatim path keeps its
@@ -936,7 +936,7 @@ fn path_on_disk(leaf_dir: &Path, rel: &str) -> OnDisk {
     OnDisk::Present
 }
 
-/// (#543, local Codex r1 [high]) Whether the directory given holds an entry named exactly
+/// (#543, local Codex r1, high) Whether the directory given holds an entry named exactly
 /// `name`, given that `name` under it was just found (a file, or for [`path_on_disk`] a
 /// directory on the way to one). On a case-insensitive volume that lookup also succeeds for an
 /// entry spelled in another case, which is not the name the row is keyed by.
@@ -946,7 +946,7 @@ fn path_on_disk(leaf_dir: &Path, rel: &str) -> OnDisk {
 /// tells the two apart (a case-sensitive file system: Linux, as a rule), so the exact name is
 /// the one that was found. Otherwise the parent is listed and its names compared byte for
 /// byte: [`OnDisk::Present`] when the exact name is listed, [`OnDisk::Gone`] when the listing
-/// went through without it. (local Codex r2 [medium]) [`OnDisk::Unknown`] when the listing,
+/// went through without it. (local Codex r2, medium) [`OnDisk::Unknown`] when the listing,
 /// or an entry of it, failed and the exact name was not among what was read.
 fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
     let lower = name.to_lowercase();
@@ -1024,7 +1024,7 @@ fn check_removed_path(db: &Database, kb_path: &Path, rel: &str) -> RemovedPathCh
 }
 
 /// [`check_removed_path`] once the disk has been looked at, split out so a test can hand it an
-/// [`OnDisk::Unknown`]. (local Codex r3 [medium]) Anything but [`OnDisk::Present`] deletes the
+/// [`OnDisk::Unknown`]. (local Codex r3, medium) Anything but [`OnDisk::Present`] deletes the
 /// rows, an unknown look included: the remove event is the only signal the file is going, and
 /// the removal it carried before this look existed is what it falls back to.
 fn act_on_removed_path(
@@ -1386,7 +1386,7 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
 /// region when the file is no longer there under the exact spelling of `rel`, directories on
 /// the way included ([`check_removed_path`]).
 ///
-/// (local Codex r3 [medium]) A look that cannot tell ([`RemovedPathCheck::Unknown`]) is
+/// (local Codex r3, medium) A look that cannot tell ([`RemovedPathCheck::Unknown`]) is
 /// handled as one that found the path gone: the rows go, no reindex runs, and one line names
 /// why the look failed.
 ///
@@ -3046,7 +3046,7 @@ mod tests {
         );
     }
 
-    /// (#543, local Codex r1 [high]) A remove event whose name is held on disk only under
+    /// (#543, local Codex r1, high) A remove event whose name is held on disk only under
     /// another case (`Old.md` renamed to `old.md`, the `Name(From)` arriving unpaired) is not
     /// a reindex: reindexing would rewrite the row under the old spelling, and the new
     /// spelling's own event adds a second row (`documents.path` compares bytes). On a
@@ -3083,7 +3083,7 @@ mod tests {
         );
     }
 
-    /// (#543, local Codex r1 [medium]) The look [`dispatch_reindex_after_removal`] takes inside
+    /// (#543, local Codex r1, medium) The look [`dispatch_reindex_after_removal`] takes inside
     /// the locks: a file gone after the remove event was judged a reindex, a directory put at
     /// the path, or the file there only in another case drops the row (and nothing else); the
     /// file still there under its exact spelling touches nothing, so the reindex goes ahead.
@@ -3133,7 +3133,7 @@ mod tests {
         );
     }
 
-    /// (#543, local Codex r1 [high]) The spelling check itself: the exact name passes, another
+    /// (#543, local Codex r1, high) The spelling check itself: the exact name passes, another
     /// case of it does not (where the volume finds that other case at all), and a name with no
     /// cased letter needs no look.
     #[test]
@@ -3159,7 +3159,7 @@ mod tests {
         }
     }
 
-    /// (#543, local Codex r6 [medium]) The spelling check covers the directories on the way,
+    /// (#543, local Codex r6, medium) The spelling check covers the directories on the way,
     /// not the leaf alone. After an unpaired case-only directory rename (`Dir/note.md` to
     /// `dir/note.md`) a case-insensitive volume still opens `Dir/note.md`, and the leaf there
     /// is spelled exactly `note.md`; reindexing it would keep the row under `Dir/` beside the
@@ -3203,7 +3203,7 @@ mod tests {
         );
     }
 
-    /// (#543, local Codex r2 [medium]) Only "not found" and "not a directory" say a path is
+    /// (#543, local Codex r2, medium) Only "not found" and "not a directory" say a path is
     /// gone. Permission denied, an I/O error or anything else says nothing either way.
     #[test]
     fn only_not_found_and_not_a_directory_say_a_removed_path_is_gone() {
@@ -3221,7 +3221,7 @@ mod tests {
         }
     }
 
-    /// (#543, local Codex r3 [medium]) Inside the locks, a look that could not tell drops the
+    /// (#543, local Codex r3, medium) Inside the locks, a look that could not tell drops the
     /// row as a path found gone does, and leaves every other row where it is.
     #[test]
     fn a_removed_path_that_could_not_be_looked_at_is_deindexed() {
@@ -3265,7 +3265,7 @@ mod tests {
         );
     }
 
-    /// (#543, local Codex r3 [medium]) Outside the locks, a look that could not tell is never a
+    /// (#543, local Codex r3, medium) Outside the locks, a look that could not tell is never a
     /// reindex: it takes the removal gate's answer, as a path found gone does.
     #[test]
     fn a_removal_that_could_not_be_looked_at_takes_the_removal_gate() {
