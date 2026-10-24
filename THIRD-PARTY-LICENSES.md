@@ -491,7 +491,7 @@ Used by:
 
 - cmov 0.5.4 (https://github.com/RustCrypto/utils)
 - codepage 0.1.2 (https://github.com/hsivonen/codepage)
-- ctutils 0.4.2 (https://github.com/RustCrypto/utils)
+- ctutils 0.4.5 (https://github.com/RustCrypto/utils)
 - encode_unicode 1.0.0 (https://github.com/tormol/encode_unicode)
 - encoding_rs 0.8.35 (https://github.com/hsivonen/encoding_rs)
 - iri-string 0.7.12 (https://github.com/lo48576/iri-string)

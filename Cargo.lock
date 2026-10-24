@@ -1018,9 +1018,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -1900,14 +1900,14 @@ dependencies = [
 
 [[package]]
 name = "groove-grammar-abi"
-version = "1.20.4"
+version = "1.21.0"
 dependencies = [
  "tree-sitter-language",
 ]
 
 [[package]]
 name = "groove-grammar-php"
-version = "1.20.4"
+version = "1.21.0"
 dependencies = [
  "groove-grammar-abi",
  "tree-sitter-php",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "groove-grammar-python"
-version = "1.20.4"
+version = "1.21.0"
 dependencies = [
  "groove-grammar-abi",
  "tree-sitter-python",
@@ -1923,11 +1923,11 @@ dependencies = [
 
 [[package]]
 name = "groove-svc"
-version = "1.20.4"
+version = "1.21.0"
 
 [[package]]
 name = "groove-tray"
-version = "1.20.4"
+version = "1.21.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "grooveseek"
-version = "1.20.4"
+version = "1.21.0"
 dependencies = [
  "anyhow",
  "axum",

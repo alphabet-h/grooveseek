@@ -14,6 +14,42 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-10-24
+
+**Check these four changes before upgrading.** Each closes a security defect that could not be
+fixed while keeping the old behaviour, so under the [stability policy](docs/stability.md#deprecation)
+they land in a minor release and are called out here. Details are in the Security entries below.
+
+- **A config that is not a regular file, or is over 1 MiB, is refused — wherever it comes from**
+  (`--config`, the working directory, the git root or beside the binary). `groove --config <(...)`,
+  or `--config /dev/stdin` fed from a pipe, now stops with
+  `refusing to read the config: <path>: it is not a regular file` instead of reading it, because a
+  pipe could hang startup. Write the config to a file and pass that path. A Windows service
+  registered with `groove service install` starts `groove serve --config <its groove.toml>`, so
+  that config is checked the same way when the service starts. The `groove service` subcommands
+  (`install`, `status`, `uninstall`), which read that file themselves, and the tray, which reads
+  its own settings, are unchanged.
+- **A `groove.toml` found in the working directory or at the git root is refused when its
+  directory cannot be resolved** (for example, a path component that can no longer be followed).
+  Name the file with `--config` to use it.
+- **Relative paths in a found `groove.toml` are resolved from the directory's real location.**
+  `kb_path`, `fastembed_cache_dir`, `grammar_dir` and `[eval] golden` (and the database and files
+  derived from `kb_path`) are taken from the directory with its links followed, not from the path
+  groove found the file at, so `cd` through a symlink or junction into a project now finds the
+  `kb_path` next to the project's real directory. On Windows those paths are now also spelled the
+  way the filesystem stores them: a short (8.3) name such as `C:\PROGRA~1` appears as the long
+  name (`C:\Program Files`), letter case follows the disk, and a directory the plain spelling would not name exactly (longer than
+  `MAX_PATH`, or with a name ending in a dot or a space, or a reserved device name) keeps a `\\?\` prefix.
+  This shows in the startup log and printed paths; the files themselves are the same. Relative
+  paths in a config named with `--config` or placed beside the binary resolve as before (the
+  first change above still applies to them).
+- **The live watcher no longer indexes a path with a directory link anywhere below the knowledge
+  base, and removes the rows it holds for such a path when it sees a change there.** This covers
+  symlinks and, on Windows, junctions, and includes a link to another directory inside the
+  knowledge base: a file there is now indexed only under its real path. This is the rule the full
+  `groove index` already followed. The watcher does not sweep the index when it starts, so **run
+  `groove index` once after upgrading** to drop rows an earlier version stored through such a link.
+
 ### Changed
 
 - **Re-indexing a changed document re-embeds only the chunks whose text changed.** Chunks whose
@@ -50,6 +86,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **`ctutils` was updated 0.4.2 → 0.4.5 to clear RUSTSEC-2026-0385** (non-constant-time mask
+  generation and `u128` comparisons). It is transitive, reached through `digest` (via `hmac`,
+  `sha1` and `sha2`) in `zip`, which reads `.docx` / `.xlsx` / `.pptx`. Only `Cargo.lock` changed.
 - **A long heading over many sub-headings no longer multiplies the memory a Markdown or `.docx`
   parse takes.** Every chunk kept its own copy of each heading above it, at full length, and the
   breadcrumb `context` was cut to 200 characters only after that, so a single heading of a few
@@ -78,8 +117,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   through the checked read.** The config `groove` loads at startup (`--config`, the working
   directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole,
   and refused when it is not a regular file (a named pipe would hang startup, `--config <(...)`
-  included), wherever it is; `groove service` and the tray, which read their own configs, are
-  unchanged. A `groove.toml` found in the working directory or at the git root outside every
+  included), wherever it is — including the config a Windows service passes to `groove serve
+  --config`. The `groove service` subcommands (`install`, `status`, `uninstall`), which read that
+  file themselves, and the tray, which reads its own settings, are unchanged. A `groove.toml` found in the working directory or at the git root outside every
   trusted config location is also refused when it is a hard link or, on Linux and macOS, a
   symlink, as the frontmatter schema and the golden file already were. Name a linked config with
   `--config` to use it. Whether a found config is trusted is decided once, before it
@@ -6317,7 +6357,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.0...HEAD
+[1.21.0]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...v1.21.0
 [1.20.4]: https://github.com/alphabet-h/grooveseek/compare/v1.20.3...v1.20.4
 [1.20.3]: https://github.com/alphabet-h/grooveseek/compare/v1.20.2...v1.20.3
 [1.20.2]: https://github.com/alphabet-h/grooveseek/compare/v1.20.1...v1.20.2
