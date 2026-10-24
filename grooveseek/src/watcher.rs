@@ -1368,7 +1368,7 @@ enum RemovalReindexSettled {
     IndexerDeindexed(Result<bool>),
     /// The replacement was not indexed: the row under `rel` and its folded legacy row were
     /// deleted, as for a plain removal. `outcome` is `Ok(true)` when either was there;
-    /// `reason` says why the replacement was not indexed, with no document text in it.
+    /// The reason field says why the replacement was not indexed, with no document text in it.
     Deindexed {
         reason: String,
         outcome: Result<bool>,
