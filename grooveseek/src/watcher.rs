@@ -775,9 +775,11 @@ enum RemovalAction {
 /// Anything not reindexed takes the removal gate exactly as before ([`deindex_passes`]).
 ///
 /// (local Codex r1 [high]) The file must be there under the very spelling of `rel`
-/// ([`spelled_on_disk`]): on a case-insensitive volume a case-only rename leaves the
+/// ([`path_on_disk`]): on a case-insensitive volume a case-only rename leaves the
 /// old name opening the new file, and reindexing it would keep a row under the old spelling
-/// beside the one the new spelling's event writes. This is a first look, outside the locks;
+/// beside the one the new spelling's event writes. (local Codex r6 [medium]) That holds for
+/// every directory of `rel` on the way as well as for the leaf: a case-only directory rename
+/// leaves the old directory name opening the new directory. This is a first look, outside the locks;
 /// [`dispatch_reindex_after_removal`] looks again inside them.
 ///
 /// (#543, local Codex r3 [medium]) Only a file found under the exact spelling
@@ -792,7 +794,7 @@ fn removal_decision(
     rules: &crate::exclusion::ExclusionRules,
 ) -> RemovalAction {
     let on_disk = match full.parent() {
-        Some(parent) => file_on_disk(parent, rel.rsplit('/').next().unwrap_or(rel)),
+        Some(parent) => path_on_disk(parent, rel),
         None => OnDisk::Gone,
     };
     removal_decision_for(rel, full, registry, rules, on_disk)
@@ -825,10 +827,10 @@ fn removal_decision_for(
 /// named: three answers, because a failed look is not a missing file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnDisk {
-    /// A regular file under the exact spelling asked for.
+    /// A regular file under the exact spelling asked for, every directory on the way included.
     Present,
     /// Nothing there, something other than a regular file there, or the file there only
-    /// under another case.
+    /// under another case of its name or of a directory on the way.
     Gone,
     /// The look failed in a way that does not say the file is gone (access denied, an I/O
     /// error). (local Codex r3 [medium]) Treated as a removal all the same, as before the
@@ -857,25 +859,57 @@ fn file_on_disk(dir: &Path, leaf: &str) -> OnDisk {
     }
 }
 
+/// (#543, local Codex r6 [medium]) What is at `rel`, given the directory its leaf sits in:
+/// [`file_on_disk`] for the leaf, then, only when that found the file under its exact name,
+/// [`spelled_on_disk`] for each directory segment of `rel` from the innermost out, each
+/// against the directory above it (reached by [`Path::parent`], so a verbatim path keeps its
+/// prefix). The first answer other than [`OnDisk::Present`] is the answer: a directory held on
+/// disk only under another case is [`OnDisk::Gone`], a listing that failed is
+/// [`OnDisk::Unknown`]. The directory `rel` is relative to is not checked: it is configured,
+/// and no row key holds it.
+fn path_on_disk(leaf_dir: &Path, rel: &str) -> OnDisk {
+    let mut segments = rel.rsplit('/');
+    let leaf = segments.next().unwrap_or(rel);
+    let found = file_on_disk(leaf_dir, leaf);
+    if found != OnDisk::Present {
+        return found;
+    }
+    let mut dir = leaf_dir;
+    for segment in segments {
+        // `dir` ends in `segment`, so it has a parent; none would mean the path cannot hold
+        // `rel` at all.
+        let Some(parent) = dir.parent() else {
+            return OnDisk::Gone;
+        };
+        let spelled = spelled_on_disk(parent, segment);
+        if spelled != OnDisk::Present {
+            return spelled;
+        }
+        dir = parent;
+    }
+    OnDisk::Present
+}
+
 /// (#543, local Codex r1 [high]) Whether the directory given holds an entry named exactly
-/// `leaf`, given that `leaf` under it was just found. On a case-insensitive volume that lookup also
-/// succeeds for an entry spelled in another case, which is not the name the row is keyed by.
+/// `name`, given that `name` under it was just found (a file, or for [`path_on_disk`] a
+/// directory on the way to one). On a case-insensitive volume that lookup also succeeds for an
+/// entry spelled in another case, which is not the name the row is keyed by.
 ///
-/// No directory listing where the answer is plain: a `leaf` with no cased letter cannot be
+/// No directory listing where the answer is plain: a `name` with no cased letter cannot be
 /// matched by another case, and when the case-swapped spelling is not found the directory
 /// tells the two apart (a case-sensitive file system: Linux, as a rule), so the exact name is
 /// the one that was found. Otherwise the parent is listed and its names compared byte for
 /// byte: [`OnDisk::Present`] when the exact name is listed, [`OnDisk::Gone`] when the listing
 /// went through without it. (local Codex r2 [medium]) [`OnDisk::Unknown`] when the listing,
 /// or an entry of it, failed and the exact name was not among what was read.
-fn spelled_on_disk(dir: &Path, leaf: &str) -> OnDisk {
-    let lower = leaf.to_lowercase();
-    let swapped = if lower != leaf {
+fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
+    let lower = name.to_lowercase();
+    let swapped = if lower != name {
         lower
     } else {
-        leaf.to_uppercase()
+        name.to_uppercase()
     };
-    if swapped == leaf {
+    if swapped == name {
         return OnDisk::Present;
     }
     if std::fs::symlink_metadata(dir.join(&swapped))
@@ -890,7 +924,7 @@ fn spelled_on_disk(dir: &Path, leaf: &str) -> OnDisk {
     let mut failed = None;
     for entry in entries {
         match entry {
-            Ok(entry) if entry.file_name() == std::ffi::OsStr::new(leaf) => {
+            Ok(entry) if entry.file_name() == std::ffi::OsStr::new(name) => {
                 return OnDisk::Present;
             }
             Ok(_) => {}
@@ -908,20 +942,18 @@ fn leaf_is_spelled_on_disk(dir: &Path, leaf: &str) -> bool {
 }
 
 /// (#543, local Codex r1) What is at the path a remove event was about to reindex
-/// ([`file_on_disk`]). Built from `kb_path` one segment of `rel` at a time, so the
-/// directory and the leaf split the way `rel` does whatever `kb_path` looks like.
+/// ([`path_on_disk`], every segment of `rel` under its exact spelling). Built from `kb_path`
+/// one segment of `rel` at a time, so the directory and the leaf split the way `rel` does
+/// whatever `kb_path` looks like.
 fn removed_path_on_disk(kb_path: &Path, rel: &str) -> OnDisk {
     let mut dir = kb_path.to_path_buf();
     let mut segments = rel.split('/').peekable();
-    let mut leaf = rel;
     while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            leaf = segment;
-        } else {
+        if segments.peek().is_some() {
             dir.push(segment);
         }
     }
-    file_on_disk(&dir, leaf)
+    path_on_disk(&dir, rel)
 }
 
 /// What [`check_removed_path`] did.
@@ -1305,8 +1337,8 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
 /// remove event is the only signal that the file is going: if it is gone by the time the locks
 /// are held, no later event will drop the row. So the path is looked at again inside the same
 /// embedder + database region as the write, before the reindex, and the row goes in that
-/// region when the file is no longer there under the exact spelling of `rel`
-/// ([`check_removed_path`]).
+/// region when the file is no longer there under the exact spelling of `rel`, directories on
+/// the way included ([`check_removed_path`]).
 ///
 /// (local Codex r3 [medium]) A look that cannot tell ([`RemovedPathCheck::Unknown`]) is
 /// handled as one that found the path gone: the rows go, no reindex runs, and one line names
@@ -3068,6 +3100,50 @@ mod tests {
             assert!(!leaf_is_spelled_on_disk(&kb, "note.md"));
             assert!(!leaf_is_spelled_on_disk(&kb, "NOTE.MD"));
         }
+    }
+
+    /// (#543, local Codex r6 [medium]) The spelling check covers the directories on the way,
+    /// not the leaf alone. After an unpaired case-only directory rename (`Dir/note.md` to
+    /// `dir/note.md`) a case-insensitive volume still opens `Dir/note.md`, and the leaf there
+    /// is spelled exactly `note.md`; reindexing it would keep the row under `Dir/` beside the
+    /// one the new spelling's event writes. Neither the first look nor the one inside the
+    /// locks may keep it. On a case-sensitive volume `Dir` is simply not there.
+    #[test]
+    fn a_removal_whose_directory_is_on_disk_only_in_another_case_drops_its_row() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i543-dircase");
+        std::fs::create_dir_all(kb.join("dir")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        std::fs::write(kb.join("dir").join("note.md"), "# note\n").unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        assert_ne!(
+            removal_decision("Dir/note.md", &kb.join("Dir").join("note.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+        // The exact spelling is still a reindex.
+        assert_eq!(
+            removal_decision("dir/note.md", &kb.join("dir").join("note.md"), &reg, &rules),
+            RemovalAction::Reindex
+        );
+
+        let db = dir_rename_db(&["Dir/note.md", "other.md"]);
+        assert!(
+            deindex_if_removed_path_is_gone(&db, &kb, "Dir/note.md")
+                .expect("gone under that spelling")
+                .unwrap(),
+            "the row under Dir/ was there and it went"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// (#543, local Codex r2 [medium]) Only "not found" and "not a directory" say a path is
