@@ -27,7 +27,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   watcher holds the index, so a file that disappears in between is still deindexed, and a file
   that is there only under another case of the name (a case-only rename on Windows or macOS) is
   not kept under the old spelling. When the watcher cannot tell whether the file is there (the
-  look fails with an access or I/O error), it deindexes the document as before.
+  look fails with an access or I/O error), it deindexes the document as before, and likewise when
+  the file written back is not indexed (an empty file or a frontmatter-only stub, a refused read,
+  a failed reindex), so the deleted document's old chunks do not stay searchable.
 
 ## [1.21.0] - 2026-10-24
 
