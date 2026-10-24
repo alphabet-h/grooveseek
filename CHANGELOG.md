@@ -86,6 +86,9 @@ they land in a minor release and are called out here. Details are in the Securit
 
 ### Security
 
+- **`ctutils` was updated 0.4.2 → 0.4.5 to clear RUSTSEC-2026-0385** (non-constant-time mask
+  generation and `u128` comparisons). It is transitive, reached through `digest` (via `hmac`,
+  `sha1` and `sha2`) in `zip`, which reads `.docx` / `.xlsx` / `.pptx`. Only `Cargo.lock` changed.
 - **A long heading over many sub-headings no longer multiplies the memory a Markdown or `.docx`
   parse takes.** Every chunk kept its own copy of each heading above it, at full length, and the
   breadcrumb `context` was cut to 200 characters only after that, so a single heading of a few
