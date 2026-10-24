@@ -24,8 +24,9 @@ they land in a minor release and are called out here. Details are in the Securit
   (`--config`, the working directory, the git root or beside the binary). `groove --config <(...)`,
   or `--config /dev/stdin` fed from a pipe, now stops with
   `refusing to read the config: <path>: it is not a regular file` instead of reading it, because a
-  pipe could hang startup. Write the config to a file and pass that path. `groove service` and the
-  tray, which read their own configs, are unchanged.
+  pipe could hang startup. Write the config to a file and pass that path. A Windows service
+  registered with `groove service install` starts `groove serve --config <its groove.toml>`, so
+  that config is checked the same way; only the tray, which reads its own settings, is unchanged.
 - **A `groove.toml` found in the working directory or at the git root is refused when its
   directory cannot be resolved** (for example, a path component that can no longer be followed).
   Name the file with `--config` to use it.
@@ -41,10 +42,11 @@ they land in a minor release and are called out here. Details are in the Securit
   paths in a config named with `--config` or placed beside the binary resolve as before (the
   first change above still applies to them).
 - **The live watcher no longer indexes a path with a directory link anywhere below the knowledge
-  base, and removes rows it already holds for such a path.** This covers symlinks and, on Windows,
-  junctions, and includes a link to another directory inside the knowledge base: a file there is
-  now indexed only under its real path. This is the rule the full `groove index` already followed,
-  so after the upgrade the watcher and a full index agree.
+  base, and removes the rows it holds for such a path when it sees a change there.** This covers
+  symlinks and, on Windows, junctions, and includes a link to another directory inside the
+  knowledge base: a file there is now indexed only under its real path. This is the rule the full
+  `groove index` already followed. The watcher does not sweep the index when it starts, so **run
+  `groove index` once after upgrading** to drop rows an earlier version stored through such a link.
 
 ### Changed
 
@@ -110,8 +112,8 @@ they land in a minor release and are called out here. Details are in the Securit
   through the checked read.** The config `groove` loads at startup (`--config`, the working
   directory, the git root or beside the binary) is now refused over 1 MiB instead of read whole,
   and refused when it is not a regular file (a named pipe would hang startup, `--config <(...)`
-  included), wherever it is; `groove service` and the tray, which read their own configs, are
-  unchanged. A `groove.toml` found in the working directory or at the git root outside every
+  included), wherever it is — including the config a Windows service passes to `groove serve
+  --config`; only the tray, which reads its own settings, is unchanged. A `groove.toml` found in the working directory or at the git root outside every
   trusted config location is also refused when it is a hard link or, on Linux and macOS, a
   symlink, as the frontmatter schema and the golden file already were. Name a linked config with
   `--config` to use it. Whether a found config is trusted is decided once, before it
