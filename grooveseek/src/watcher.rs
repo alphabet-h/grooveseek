@@ -1431,8 +1431,8 @@ fn new_directory_entries(
 }
 
 /// The `rel`s alone of [`new_directory_entries`], which is how the tests written before the
-/// paths were kept ask for them.
-#[cfg(test)]
+/// paths were kept ask for them. Only the Windows-only test asks for it.
+#[cfg(all(test, windows))]
 fn new_directory_rels(
     kb_path: &Path,
     dir: &Path,
