@@ -887,11 +887,13 @@ enum OnDisk {
 /// (#543, local Codex r2, medium) What a failed stat or listing says about the path: only
 /// "not found" and "not a directory" (a file where a directory on the way was) say it is gone.
 /// Anything else, permission denied or an I/O error among them, says nothing about whether
-/// the file is still there.
+/// the file is still there. (#544) The question is [`indexer::stat_error_means_gone`]'s, the
+/// one the single-file paths ask too.
 fn probe_error_on_disk(kind: std::io::ErrorKind) -> OnDisk {
-    match kind {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => OnDisk::Gone,
-        other => OnDisk::Unknown(other),
+    if indexer::stat_error_means_gone(kind) {
+        OnDisk::Gone
+    } else {
+        OnDisk::Unknown(kind)
     }
 }
 
