@@ -2538,6 +2538,11 @@ enum Reindex {
 /// unless the result is [`SingleResult::Updated`]. A refusal is worded for that final
 /// state -- not in the index -- rather than for the row it sees now (local Codex before
 /// round 2 on PR #329). Every other caller passes false.
+///
+/// (#544, D5) The hash written with a row is the hash of the bytes this function read and
+/// parsed, not the scan's: the two reads can see different bytes, and a row whose hash names
+/// bytes other than its chunks' would let those bytes, once back on disk, take the unchanged
+/// fast path over chunks they did not produce.
 #[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
     db: &Database,
@@ -2642,6 +2647,14 @@ fn index_single_disk_entry(
     // resource surface would then advertise a URI the filesystem read refuses.
     // The size and the chunks now come from one buffer.
     let size_bytes = bytes.len() as u64;
+    // (#544, D5) Likewise the hash: what is written with a row names these bytes, the ones its
+    // chunks are about to come from. `entry.hash` stays the scan's, for the questions about
+    // the scan (the fast path above, the checks against it below).
+    let read_hash = sha256_hex_bytes(&bytes);
+    let written = DiskEntry {
+        hash: read_hash.clone(),
+        ..entry.clone()
+    };
     let excludes: Vec<&str> = match exclude_headings {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => crate::parser::DEFAULT_EXCLUDED_HEADINGS.to_vec(),
@@ -2676,7 +2689,7 @@ fn index_single_disk_entry(
     // [`reindex_single_file`]'s first read, and bytes that only looked empty to this second one
     // (an editor that truncates before it writes) would otherwise drop the row below. The row is
     // left for the event that write raises.
-    if (reparse || mode == Reindex::Event) && sha256_hex_bytes(&bytes) != entry.hash {
+    if (reparse || mode == Reindex::Event) && read_hash != entry.hash {
         return Ok(SingleResult::Skipped {
             reason: SKIPPED_CHANGED_DURING_READ,
             frontmatter_unparsed: parsed.frontmatter_error.is_some(),
@@ -2695,7 +2708,7 @@ fn index_single_disk_entry(
         // "checked" would let the originals slip past the fast path when they come back.
         // The warning above already named the file if what was read failed to parse,
         // and a named failure is a counted one (codex P2, round 6).
-        if sha256_hex_bytes(&bytes) != entry.hash {
+        if read_hash != entry.hash {
             return Ok(SingleResult::Skipped {
                 reason: SKIPPED_CHANGED_DURING_READ,
                 frontmatter_unparsed: parsed.frontmatter_error.is_some(),
@@ -2721,7 +2734,7 @@ fn index_single_disk_entry(
                 parsed.frontmatter.depth.as_deref(),
                 &parsed.frontmatter.tags,
                 parsed.frontmatter.date.as_deref(),
-                &entry.hash,
+                &written.hash,
                 size_bytes,
             )?;
         }
@@ -2816,7 +2829,7 @@ fn index_single_disk_entry(
         && chunks_unchanged
         && let Some(done) = write_matching_chunks_meta(
             db,
-            entry,
+            &written,
             &parsed,
             table_rows.as_ref(),
             context_mode,
@@ -2936,7 +2949,7 @@ fn index_single_disk_entry(
         parser,
         &vectors,
         context_mode,
-        &entry.hash,
+        &written.hash,
         size_bytes,
         topic.as_deref(),
         category.as_deref(),
