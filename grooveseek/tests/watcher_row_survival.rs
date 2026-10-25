@@ -5,16 +5,18 @@
 //! [`crate::common::embed_cli`], so nothing downloads a model, and read the rows the server left
 //! straight from its index. They were added before the fix, to record what each OS did then.
 //!
-//! | test | spec id | OS |
+//! | test, or the scene it drives | spec id | OS |
 //! |---|---|---|
 //! | [`crate::an_overwriting_rename_moves_the_source_row_onto_the_destination`] | P1-E1 | all |
 //! | [`crate::a_file_replaced_by_a_directory_loses_its_row`] | P1-E5 | all |
-//! | `an_unpaired_rename_drops_the_old_row` | P1-E3 | macOS |
-//! | `a_case_only_rename_leaves_one_row` | P1-E4 | macOS |
-//! | `a_japanese_name_survives_edit_and_rename` | P1-E6 | macOS |
-//! | `a_japanese_directory_that_arrives_keeps_its_file` | P1-E6 (1) | macOS |
-//! | `a_directory_renamed_onto_a_japanese_name_keeps_its_rows` | P1-E6 (2) | macOS |
+//! | a rename that reaches the watcher as two unpaired events | P1-E3 | macOS |
+//! | a rename that changes only the case of a name | P1-E4 | macOS |
+//! | a Japanese file name through an edit and a rename | P1-E6 | macOS |
+//! | a directory with a Japanese name that arrives while the server runs | P1-E6 (1) | macOS |
+//! | a directory renamed onto a Japanese name | P1-E6 (2) | macOS |
 //!
+//! The tests of the macOS rows are compiled on macOS only, so a link to them would not resolve
+//! elsewhere; each row names its scene, and the test's doc comment carries the same spec id.
 //! Every name is written as a Rust literal, which is NFC.
 
 mod common;
