@@ -1649,7 +1649,8 @@ pub fn rebuild_index(
         )?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
         // as: if this was a forced reparse across a parser boundary and it did not end in
-        // `Updated`, the row is stale under the new path and must go. See
+        // `Updated`, the row is stale under the new path and must go -- unless the second read
+        // changed under it, which keeps the row awaiting a reparse (#544). See
         // `settle_cross_parser_rename`'s doc for why.
         if crossed {
             settle_cross_parser_rename(db, &entry.rel, &single_result)?;
@@ -1657,7 +1658,8 @@ pub fn rebuild_index(
         // (feature-62) Settled: written by this parser, re-read and found to match, or dropped
         // by the re-read. Anything else -- a parse failure, a refusal, bytes that changed under
         // the read, a skip on the ordinary path -- leaves a row the old rule wrote, which the end
-        // of the run marks. A row already gone (a cross-parser rename settled above) needs none.
+        // of the run marks. A row already gone (a cross-parser rename settled above) needs none;
+        // one the settlement kept awaiting a reparse (#544) is re-read whatever it is marked.
         if any_stale {
             let settled = match &single_result {
                 SingleResult::Updated { .. } => true,
@@ -3511,6 +3513,10 @@ pub enum RenameOutcome {
     /// them, or found nothing to chunk -- so the old parser's row was **dropped**; "content
     /// left as it was" would be false, hence the separate variant.
     RenamedButRefusedAndDropped,
+    /// (#544) The rename crossed a parser and the destination's second read was not the bytes
+    /// the first read hashed, so nothing was learned: the old parser's row stays under the new
+    /// path with [`HASH_AWAITING_REPARSE`], which the next event or run re-reads.
+    RenamedAcrossParsersAwaitingReparse,
     /// (local Codex on PR #291 after round 13) path は UPDATE 済で、同じ parser の再 parse
     /// (Static モードが同 bytes の rename に強制するもの、または内容が変わった通常の parse) が
     /// [`SingleResult::Skipped`] で終わった: 行は書き換えられず、**以前の内容** (Static なら以前の path 由来の
@@ -3550,7 +3556,9 @@ pub enum RenameOutcome {
 ///   読み込みの拒否・parse の失敗)、同じ parser の間の移動なら行は旧 hash・旧 chunk・それと対の
 ///   topic のまま残る。parser をまたぐ移動 ([`rename_crosses_a_parser`]) は旧 chunk が新 parser に
 ///   とって無効なので残せず、reindex が [`SingleResult::Updated`] で終わらなければ行ごと消える
-///   ([`settle_cross_parser_rename`])
+///   ([`settle_cross_parser_rename`])。ただし 2 度目の読み込みが 1 度目と違う bytes だった時
+///   (#544) は何も分からないので、行は番兵の hash で残る
+///   ([`RenameOutcome::RenamedAcrossParsersAwaitingReparse`])
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -3772,27 +3780,57 @@ pub fn rename_single_file(
         full,
         size: new_bytes.len() as u64,
     };
+    // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
+    // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
+    // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
+    let mode = if same_hash {
+        Reindex::Force
+    } else {
+        Reindex::Incremental {
+            check_frontmatter: false,
+            refresh_fields: false,
+        }
+    };
+    reindex_renamed_entry(
+        db,
+        embedder,
+        &entry,
+        mode,
+        context_mode,
+        exclude_headings,
+        registry,
+        crosses_a_parser,
+    )
+}
+
+/// The reparse [`rename_single_file`] ends with, once the row has moved to `entry.rel` and the
+/// first read's bytes and hash are in `entry`: [`index_single_disk_entry`] in `mode`, the
+/// settlement of a rename that crossed a parser ([`settle_cross_parser_rename`]), and the
+/// outcome that says what became of the row. A function of its own so that a test can hand it
+/// an entry whose hash is not the bytes the second read finds (#544 PR-2, J5).
+#[allow(clippy::too_many_arguments)]
+fn reindex_renamed_entry(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    mode: Reindex,
+    context_mode: ContextMode,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    crosses_a_parser: bool,
+) -> Result<RenameOutcome> {
+    let new_rel = entry.rel.as_str();
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
     // recorded; they do not read the schema themselves -- and (local Codex after round
     // 12) do not read the generation here either: `index_single_disk_entry` resolves
     // `DeclaredSet::FromIndex` inside its write transaction, see `reindex_single_file`.
-    // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
-    // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
-    // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
     let single_result = index_single_disk_entry(
         db,
         embedder,
-        &entry,
+        entry,
         exclude_headings,
         registry,
-        if same_hash {
-            Reindex::Force
-        } else {
-            Reindex::Incremental {
-                check_frontmatter: false,
-                refresh_fields: false,
-            }
-        },
+        mode,
         context_mode,
         DeclaredSet::FromIndex,
         crosses_a_parser,
@@ -3813,9 +3851,24 @@ pub fn rename_single_file(
     // must say so whatever the reparse came back with: the second-read refusal and a parse
     // that failed or found nothing all leave the same state -- no document under the new
     // path -- and `RenamedButRefused` / `Renamed` would both tell the watcher's reader the
-    // content was kept.
-    if crosses_a_parser && !matches!(single_result, SingleResult::Updated { .. }) {
-        return Ok(RenameOutcome::RenamedButRefusedAndDropped);
+    // content was kept. (#544 PR-2) Except the changed-during-read skip, which the settlement
+    // keeps under the awaiting-reparse hash: "dropped" would be false there.
+    if crosses_a_parser {
+        match single_result {
+            SingleResult::Updated { .. } => {}
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                ..
+            } => return Ok(RenameOutcome::RenamedAcrossParsersAwaitingReparse),
+            SingleResult::Skipped { .. }
+            | SingleResult::Unchanged
+            | SingleResult::MetadataRefreshed { .. }
+            | SingleResult::Refused
+            | SingleResult::OutsideKnowledgeBaseDeindexed
+            | SingleResult::NothingToIndex { .. } => {
+                return Ok(RenameOutcome::RenamedButRefusedAndDropped);
+            }
+        }
     }
     match single_result {
         SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
@@ -9519,6 +9572,127 @@ mod tests {
                 reason: SKIPPED_CHANGED_DURING_READ,
                 frontmatter_unparsed: false
             }
+        );
+    }
+
+    /// #544 PR-2 (P2-I5): `note.txt` renamed to `note.md` -- a pair that crosses a parser --
+    /// whose row moved under the first read's hash, then reparsed by [`reindex_renamed_entry`]
+    /// as [`rename_single_file`] does for same-hash bytes, while the file on disk holds
+    /// `disk_bytes`, not the bytes the first read hashed. Returns the scratch directory, the
+    /// index, the registry and the outcome.
+    fn cross_parser_rename_whose_second_read_differs(
+        tag: &str,
+        disk_bytes: &[u8],
+    ) -> (TmpDir, Database, Registry, RenameOutcome) {
+        let dir = mk_tmp(tag);
+        let (db, registry) = (reparse_db(), docx_registry());
+        assert!(
+            rename_crosses_a_parser(&registry, "note.txt", "note.md"),
+            "the pair was meant to cross a parser"
+        );
+        let first_read_hash = sha256_hex_bytes(SCANNED_BYTES);
+        let old = parse_doc(&registry, "md", "note.md", SCANNED_BYTES).chunks;
+        write_row(&db, "note.md", &first_read_hash, &old);
+        let entry = DiskEntry {
+            hash: first_read_hash,
+            ..docx_entry(&dir.0, "note.md", disk_bytes)
+        };
+        let outcome = reindex_renamed_entry(
+            &db,
+            &mut unreachable_embedder(),
+            &entry,
+            Reindex::Force,
+            ContextMode::Off,
+            None,
+            &registry,
+            true,
+        )
+        .unwrap();
+        (dir, db, registry, outcome)
+    }
+
+    /// #544 PR-2 (P2-I5): a cross-parser rename whose second read is not the bytes the first
+    /// read hashed keeps the row, under the awaiting-reparse hash, and says so -- not that the
+    /// document was dropped.
+    #[test]
+    fn a_cross_parser_rename_whose_second_read_differs_says_it_kept_the_row() {
+        let (_dir, db, registry, outcome) =
+            cross_parser_rename_whose_second_read_differs("i544-p2i5-kept", SECOND_READ_BYTES);
+        assert_eq!(
+            outcome,
+            RenameOutcome::RenamedAcrossParsersAwaitingReparse,
+            "the outcome does not say the row was kept"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the row went, or kept a hash a fast path trusts"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SCANNED_BYTES),
+            "the kept row's chunks changed"
+        );
+    }
+
+    /// #544 PR-2 (H1): the row a cross-parser rename left awaiting a reparse is read again by
+    /// the next event on the bytes now on disk, rather than taken as unchanged: bytes with
+    /// chunks write the row under their own hash, and bytes with none drop it.
+    #[test]
+    fn a_row_left_awaiting_after_a_cross_parser_rename_is_reparsed_by_the_next_event() {
+        let (dir, db, registry, outcome) =
+            cross_parser_rename_whose_second_read_differs("i544-h1-chunks", SECOND_READ_BYTES);
+        assert_eq!(outcome, RenameOutcome::RenamedAcrossParsersAwaitingReparse);
+        let event = docx_entry(&dir.0, "note.md", SECOND_READ_BYTES);
+        let result = reindex_with(
+            &db,
+            &registry,
+            &event,
+            Reindex::Event,
+            &mut Embedder::stub_for_tests(2),
+            false,
+        );
+        assert!(
+            matches!(result, SingleResult::Updated { .. }),
+            "bytes with chunks: {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "the row's hash is not the hash of the bytes on disk"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SECOND_READ_BYTES),
+            "the row's chunks are not the bytes on disk"
+        );
+
+        let (dir, db, registry, outcome) =
+            cross_parser_rename_whose_second_read_differs("i544-h1-empty", b"");
+        assert_eq!(outcome, RenameOutcome::RenamedAcrossParsersAwaitingReparse);
+        let event = docx_entry(&dir.0, "note.md", b"");
+        let result = reindex_with(
+            &db,
+            &registry,
+            &event,
+            Reindex::Event,
+            &mut unreachable_embedder(),
+            false,
+        );
+        assert!(
+            matches!(
+                result,
+                SingleResult::NothingToIndex {
+                    deindexed: true,
+                    ..
+                }
+            ),
+            "bytes with no chunks: {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            None,
+            "the old parser's row is still there"
         );
     }
 }

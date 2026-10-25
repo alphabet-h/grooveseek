@@ -2369,7 +2369,10 @@ fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
         Ok(
             indexer::RenameOutcome::OldPathMissingAndRefused
             | indexer::RenameOutcome::RenamedButRefused
-            | indexer::RenameOutcome::RenamedButNotReindexed,
+            | indexer::RenameOutcome::RenamedButNotReindexed
+            // (#544 PR-2) The row was kept because the second read changed under the rename:
+            // the destination is looked at again, and a gone one drops the row.
+            | indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse,
         )
         | Err(_) => false,
     }
@@ -2620,6 +2623,17 @@ fn log_cleared_rename(
     }
 }
 
+/// (#544 PR-2) The line [`log_rename_outcome`] prints for
+/// [`indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse`]: the rename crossed a
+/// parser, the file changed while it was read, and the old parser's row waits under the new
+/// path for the next read. A function of its own so a test can read the line.
+fn awaiting_reparse_rename_message(old_rel: &str, new_rel: &str) -> String {
+    format!(
+        "watcher: renamed {old_rel} -> {new_rel} (the file changed while it was read; \
+         previous row kept under the new path until it is read again)"
+    )
+}
+
 /// The line [`dispatch_rename`] prints for what [`indexer::rename_single_file`] returned.
 fn log_rename_outcome(old_rel: &str, new_rel: &str, outcome: Result<indexer::RenameOutcome>) {
     match outcome {
@@ -2665,6 +2679,9 @@ fn log_rename_outcome(old_rel: &str, new_rel: &str, outcome: Result<indexer::Ren
                 "watcher: renamed {old_rel} -> {new_rel} (the new parser could not index it, \
                  document dropped from the index)"
             );
+        }
+        Ok(indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse) => {
+            wdiag!("{}", awaiting_reparse_rename_message(old_rel, new_rel));
         }
         // (BU-20) The reason is already on stderr from `read_for_index_under`; this
         // line says what happened to the document, which the reason does not.
@@ -6025,6 +6042,31 @@ mod tests {
             assert!(!rename_outcome_is_settled(&Ok(outcome)), "{label}");
         }
         assert!(!rename_outcome_is_settled(&Err(anyhow::anyhow!("x"))));
+    }
+
+    /// (#544 PR-2) A cross-parser rename that kept its row because the second read changed is
+    /// not settled: the destination is looked at again, as for the other kept-row outcomes.
+    #[test]
+    fn the_awaiting_rename_outcome_is_looked_at_again() {
+        assert!(!rename_outcome_is_settled(&Ok(
+            indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse
+        )));
+    }
+
+    /// (#544 PR-2) The line for a cross-parser rename kept awaiting a reparse names both paths
+    /// and stays ASCII for a CP932 console.
+    #[test]
+    fn the_awaiting_rename_line_is_ascii_and_names_both_paths() {
+        let line = awaiting_reparse_rename_message("dir/note.txt", "dir/note.md");
+        assert!(line.is_ascii(), "{line}");
+        assert!(
+            line.contains("dir/note.txt -> dir/note.md"),
+            "the line does not name both paths: {line}"
+        );
+        assert!(
+            !line.contains("dropped"),
+            "the row was kept, yet the line says it went: {line}"
+        );
     }
 
     /// The rows of an overwriting rename of `b.md` onto `a.md`, for the tests of a failure after
