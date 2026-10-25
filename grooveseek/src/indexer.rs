@@ -9006,4 +9006,378 @@ mod tests {
             SinglePathLook::There
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #544 PR-2: the row's hash comes from the bytes its chunks were built from
+    // -----------------------------------------------------------------------
+
+    /// #544 PR-2: the bytes the second read finds, a Markdown file of two sections.
+    const SECOND_READ_BYTES: &[u8] =
+        b"# Alpha\n\nThe first section of the file.\n\n# Beta\n\nThe second section of the file.\n";
+
+    /// #544 PR-2: the bytes the scan hashed, which the second read no longer finds.
+    const SCANNED_BYTES: &[u8] = b"# Gamma\n\nThe one section the scan read.\n";
+
+    /// #544 PR-2: [`index_single_disk_entry`] on `entry` in `mode`, under Off mode with no
+    /// declared fields, through `embedder`, with `row_dropped_unless_updated` as the caller
+    /// passes it. [`reindex`] with the two arguments it fixes left to the test.
+    fn reindex_with(
+        db: &Database,
+        registry: &Registry,
+        entry: &DiskEntry,
+        mode: Reindex,
+        embedder: &mut Embedder,
+        row_dropped_unless_updated: bool,
+    ) -> SingleResult {
+        index_single_disk_entry(
+            db,
+            embedder,
+            entry,
+            None,
+            registry,
+            mode,
+            ContextMode::Off,
+            DeclaredSet::Known {
+                list: &[],
+                pass: None,
+                generation: "[]",
+            },
+            row_dropped_unless_updated,
+        )
+        .unwrap()
+    }
+
+    /// #544 PR-2: the chunk bodies the index holds for `rel`, in order.
+    fn stored_bodies(db: &Database, rel: &str) -> Vec<String> {
+        db.stored_chunk_vectors_for_path(rel)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.content)
+            .collect()
+    }
+
+    /// #544 PR-2: the chunk bodies the Markdown parser makes of `bytes`.
+    fn parsed_bodies(registry: &Registry, rel: &str, bytes: &[u8]) -> Vec<String> {
+        parse_doc(registry, "md", rel, bytes)
+            .chunks
+            .into_iter()
+            .map(|c| c.content)
+            .collect()
+    }
+
+    /// The ordinary changed-content mode, as the scan and a watcher rename with changed bytes
+    /// call it.
+    const INCREMENTAL: Reindex = Reindex::Incremental {
+        check_frontmatter: false,
+        refresh_fields: false,
+    };
+
+    /// #544 PR-2 (P2-I1, the meta-only write): the row's chunks already are the second read's,
+    /// so only the metadata and the hash are written -- and the hash written is the one of the
+    /// bytes those chunks came from, not the scan's.
+    #[test]
+    fn a_second_read_that_differs_writes_its_own_hash_on_a_meta_update() {
+        let dir = mk_tmp("i544-second-read-meta");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let chunks = parse_doc(&registry, "md", "note.md", SECOND_READ_BYTES).chunks;
+        write_row(&db, "note.md", "hash-of-the-row", &chunks);
+        let entry = DiskEntry {
+            hash: "hash-the-scan-saw".to_string(),
+            ..docx_entry(&dir.0, "note.md", SECOND_READ_BYTES)
+        };
+
+        let result = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            INCREMENTAL,
+            &mut unreachable_embedder(),
+            false,
+        );
+        assert!(
+            matches!(result, SingleResult::Updated { .. }),
+            "the meta-only write, yet {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "the row's hash is not the hash of the bytes its chunks came from"
+        );
+    }
+
+    /// #544 PR-2 (P2-I1, the whole write): the row holds one chunk the second read no longer
+    /// has, so the document is written again -- each kept chunk with its stored vector, so
+    /// nothing is embedded -- under the hash of the bytes just parsed.
+    #[test]
+    fn a_second_read_that_differs_writes_its_own_hash_on_a_full_write() {
+        let dir = mk_tmp("i544-second-read-full");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let mut chunks = parse_doc(&registry, "md", "note.md", SECOND_READ_BYTES).chunks;
+        chunks.push(crate::parser::Chunk {
+            heading: Some("Delta".to_string()),
+            level: Some(1),
+            content: "A section the file no longer has.".to_string(),
+            ..Default::default()
+        });
+        write_row(&db, "note.md", "hash-of-the-row", &chunks);
+        let entry = DiskEntry {
+            hash: "hash-the-scan-saw".to_string(),
+            ..docx_entry(&dir.0, "note.md", SECOND_READ_BYTES)
+        };
+
+        let result = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            INCREMENTAL,
+            &mut unreachable_embedder(),
+            false,
+        );
+        assert!(
+            matches!(result, SingleResult::Updated { .. }),
+            "the whole write, yet {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "the row's hash is not the hash of the bytes its chunks came from"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SECOND_READ_BYTES),
+            "the row's chunks are not the second read's"
+        );
+    }
+
+    /// #544 PR-2 (P2-I1, Review Focus 2): after the meta-only write above, the file goes back to
+    /// the bytes the scan hashed. The row does not hold those bytes' chunks, so the next
+    /// incremental pass must read the file again rather than take the unchanged fast path.
+    #[test]
+    fn an_incremental_write_whose_bytes_return_to_the_scanned_ones_is_read_again() {
+        let dir = mk_tmp("i544-second-read-return");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let chunks = parse_doc(&registry, "md", "note.md", SECOND_READ_BYTES).chunks;
+        write_row(&db, "note.md", "hash-of-the-row", &chunks);
+        let scanned_hash = sha256_hex_bytes(SCANNED_BYTES);
+        let entry = DiskEntry {
+            hash: scanned_hash.clone(),
+            ..docx_entry(&dir.0, "note.md", SECOND_READ_BYTES)
+        };
+        let first = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            INCREMENTAL,
+            &mut unreachable_embedder(),
+            false,
+        );
+        assert!(
+            matches!(first, SingleResult::Updated { .. }),
+            "the meta-only write, yet {first:?}"
+        );
+
+        let back = docx_entry(&dir.0, "note.md", SCANNED_BYTES);
+        assert_eq!(back.hash, scanned_hash);
+        let again = reindex_with(
+            &db,
+            &registry,
+            &back,
+            INCREMENTAL,
+            &mut Embedder::stub_for_tests(2),
+            false,
+        );
+        assert_ne!(
+            again,
+            SingleResult::Unchanged,
+            "the row holds the other bytes' chunks under these bytes' hash"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(scanned_hash),
+            "the row's hash after the bytes came back"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SCANNED_BYTES),
+            "the row's chunks are not the bytes on disk"
+        );
+    }
+
+    /// #544 PR-2 (P2-I2): a forced write embeds every chunk of the second read and writes them
+    /// under the hash of the bytes they came from (Review Focus 4: the chunks are that parse's).
+    #[test]
+    fn a_forced_second_read_that_differs_writes_its_own_hash() {
+        let dir = mk_tmp("i544-second-read-force");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let old = parse_doc(&registry, "md", "note.md", SCANNED_BYTES).chunks;
+        write_row(&db, "note.md", "hash-the-scan-saw", &old);
+        let entry = DiskEntry {
+            hash: "hash-the-scan-saw".to_string(),
+            ..docx_entry(&dir.0, "note.md", SECOND_READ_BYTES)
+        };
+
+        let result = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            Reindex::Force,
+            &mut Embedder::stub_for_tests(2),
+            false,
+        );
+        assert!(
+            matches!(result, SingleResult::Updated { .. }),
+            "a forced write, yet {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "the row's hash is not the hash of the bytes its chunks came from"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SECOND_READ_BYTES),
+            "the row's chunks are not the second read's"
+        );
+    }
+
+    /// #544 PR-2 (P2-I3): the two modes [`rename_single_file`] reparses a destination in --
+    /// forced when the first read's hash is the row's, the ordinary changed-content mode when
+    /// it is not -- each write the hash of the bytes the second read found.
+    #[test]
+    fn a_rename_reparse_whose_second_read_differs_writes_its_own_hash() {
+        let registry = docx_registry();
+        let first_read_hash = "hash-the-first-read-saw";
+
+        // Same hash: the row moved under the hash the rename's first read took.
+        let dir = mk_tmp("i544-second-read-rename-force");
+        let db = reparse_db();
+        let old = parse_doc(&registry, "md", "moved.md", SCANNED_BYTES).chunks;
+        write_row(&db, "moved.md", first_read_hash, &old);
+        let entry = DiskEntry {
+            hash: first_read_hash.to_string(),
+            ..docx_entry(&dir.0, "moved.md", SECOND_READ_BYTES)
+        };
+        let forced = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            Reindex::Force,
+            &mut Embedder::stub_for_tests(2),
+            false,
+        );
+        assert!(
+            matches!(forced, SingleResult::Updated { .. }),
+            "same hash: {forced:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("moved.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "same hash (Force): the row's hash is not the second read's"
+        );
+
+        // Changed: the row's chunks already are the second read's, so the meta-only write.
+        let dir = mk_tmp("i544-second-read-rename-changed");
+        let db = reparse_db();
+        let chunks = parse_doc(&registry, "md", "moved.md", SECOND_READ_BYTES).chunks;
+        write_row(&db, "moved.md", "hash-of-the-row", &chunks);
+        let entry = DiskEntry {
+            hash: first_read_hash.to_string(),
+            ..docx_entry(&dir.0, "moved.md", SECOND_READ_BYTES)
+        };
+        let changed = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            INCREMENTAL,
+            &mut unreachable_embedder(),
+            false,
+        );
+        assert!(
+            matches!(changed, SingleResult::Updated { .. }),
+            "changed: {changed:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("moved.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "changed (Incremental): the row's hash is not the second read's"
+        );
+    }
+
+    /// #544 PR-2 (P2-I4): a reparse across a parser whose second read is not the bytes the scan
+    /// hashed learned nothing about the file, so it is the changed-during-read skip and the
+    /// settlement keeps the row, under the awaiting-reparse hash. Here the second read finds
+    /// nothing to chunk, which the settlement otherwise answers by dropping the row.
+    #[test]
+    fn a_cross_parser_reparse_whose_second_read_differs_keeps_the_row_awaiting() {
+        let dir = mk_tmp("i544-second-read-cross-differs");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let old = parse_doc(&registry, "md", "note.md", SCANNED_BYTES).chunks;
+        let scanned_hash = sha256_hex_bytes(SCANNED_BYTES);
+        write_row(&db, "note.md", &scanned_hash, &old);
+        let entry = DiskEntry {
+            hash: scanned_hash,
+            ..docx_entry(&dir.0, "note.md", b"")
+        };
+
+        let result = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            Reindex::Force,
+            &mut Embedder::stub_for_tests(2),
+            true,
+        );
+        settle_cross_parser_rename(&db, "note.md", &result).unwrap();
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the row went, or kept a hash a fast path trusts"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SCANNED_BYTES),
+            "the row's chunks changed"
+        );
+    }
+
+    /// #544 PR-2 (P2-I4, the control, Review Focus 3): the same reparse whose second read is
+    /// the bytes the scan hashed did learn the file has nothing to chunk, so the settlement
+    /// drops the row as before. Green before the fix and after it.
+    #[test]
+    fn a_cross_parser_reparse_whose_second_read_matches_still_drops_on_no_chunks() {
+        let dir = mk_tmp("i544-second-read-cross-matches");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let old = parse_doc(&registry, "md", "note.md", SCANNED_BYTES).chunks;
+        let entry = docx_entry(&dir.0, "note.md", b"");
+        write_row(&db, "note.md", &entry.hash, &old);
+
+        let result = reindex_with(
+            &db,
+            &registry,
+            &entry,
+            Reindex::Force,
+            &mut Embedder::stub_for_tests(2),
+            true,
+        );
+        settle_cross_parser_rename(&db, "note.md", &result).unwrap();
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_NO_CHUNKS,
+                frontmatter_unparsed: false
+            }
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            None,
+            "the row the old parser wrote is still there"
+        );
+    }
 }

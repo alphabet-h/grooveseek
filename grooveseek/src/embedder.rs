@@ -1536,6 +1536,50 @@ impl Reranker {
     }
 }
 
+/// (#544 PR-2, J1) A provider that answers every input in process with one fixed vector of its
+/// dimension, for the lib's unit tests of writes that embed: `Reindex::Force` reads no stored
+/// vectors and embeds every chunk, which the closed-port embedder of the indexer's tests cannot.
+#[cfg(test)]
+struct FixedVectorProvider {
+    dimension: usize,
+}
+
+#[cfg(test)]
+impl FixedVectorProvider {
+    /// A unit vector with every component equal, so its norm is one.
+    fn vector(&self) -> Vec<f32> {
+        let component = 1.0 / (self.dimension as f32).sqrt();
+        vec![component; self.dimension]
+    }
+}
+
+#[cfg(test)]
+impl EmbeddingProvider for FixedVectorProvider {
+    fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| self.vector()).collect())
+    }
+
+    fn embed_query(&mut self, _text: &str) -> Result<Vec<f32>> {
+        Ok(self.vector())
+    }
+}
+
+#[cfg(test)]
+impl Embedder {
+    /// (#544 PR-2, J1) An embedder that uses no network and answers each input with the same
+    /// `dimension`-long vector, under the identity `test-model` the indexer's test databases
+    /// declare. Its counts move as the real ones do: [`Embedder::embed_texts`] is the same code.
+    pub(crate) fn stub_for_tests(dimension: usize) -> Self {
+        Self::from_provider(
+            Box::new(FixedVectorProvider { dimension }),
+            EmbeddingIdentity {
+                model_id: "test-model".to_string(),
+                dimension,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
