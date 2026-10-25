@@ -1069,6 +1069,99 @@ fn deindex_if_removed_path_is_gone(
     }
 }
 
+/// (#544) How a create, modify or rename-to looks at its path inside the locks
+/// ([`written_path_on_disk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteLook {
+    /// Every segment of `rel` under its exact spelling, the look a remove event takes
+    /// ([`removed_path_on_disk`]): for a path an event named, whose spelling nothing else has
+    /// checked.
+    Spelled,
+    /// Only whether a regular file is at `rel` (`symlink_metadata`, links not followed), for a
+    /// path whose directories were spelled by a walk or by a look taken once for all of them.
+    /// No directory is listed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#544 Task 4 hands it to the scan callers")
+    )]
+    ExistsOnly,
+}
+
+/// (#544 A1/A3) What is at a path a write is about to (re)index, looked at as `look` says.
+/// [`OnDisk::Gone`] for anything but a regular file, and for a failed stat that
+/// [`indexer::stat_error_means_gone`] reads as "not there"; [`OnDisk::Unknown`] for any other
+/// failed stat or listing.
+fn written_path_on_disk(kb_path: &Path, rel: &str, look: WriteLook) -> OnDisk {
+    match look {
+        WriteLook::Spelled => removed_path_on_disk(kb_path, rel),
+        WriteLook::ExistsOnly => match std::fs::symlink_metadata(kb_path.join(rel)) {
+            Ok(meta) if meta.file_type().is_file() => OnDisk::Present,
+            Ok(_) => OnDisk::Gone,
+            Err(e) => probe_error_on_disk(e.kind()),
+        },
+    }
+}
+
+/// (#544 C4) Whether `rel` is a lossy spelling of the path the event named: that path's name
+/// below `kb_path` is not UTF-8, so `rel` holds U+FFFD where the name has other bytes
+/// ([`indexer::index_rel_path`]) and no look at `rel` can find the file. Asked of the event's
+/// own path ([`indexer::index_rel_path_exact`] is `None` for it), never of `rel`: a name may
+/// hold a real U+FFFD.
+///
+/// `None` (no event path at hand) is not lossy. A path not under `kb_path` as spelled is
+/// canonicalized once, as [`to_rel`] does; one that still cannot be placed is read as lossy, so
+/// a write keeps the row as it did before the look existed.
+fn rel_is_lossy(kb_path: &Path, raw: Option<&Path>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let lossy_under = |p: &Path| {
+        indexer::index_rel_path(kb_path, p)
+            .map(|_| indexer::index_rel_path_exact(kb_path, p).is_none())
+    };
+    lossy_under(raw)
+        .or_else(|| raw.canonicalize().ok().and_then(|c| lossy_under(&c)))
+        .unwrap_or(true)
+}
+
+/// What [`act_on_written_path`] did before a write's reindex.
+#[derive(Debug)]
+enum WrittenPathCheck {
+    /// The file is there (or `rel` is lossy and cannot be looked at): the reindex goes ahead.
+    Proceed,
+    /// The look could not tell: nothing touched, the reindex goes ahead, and the kind says why
+    /// the look failed.
+    ProceedUnknown(std::io::ErrorKind),
+    /// The path is gone under that spelling: the rows under `rel` were deleted (the result says
+    /// whether either was there) and no reindex runs.
+    Deindexed(Result<bool>),
+}
+
+/// (#544 A1/A3, D3) What a write does with the look inside the locks, before its reindex:
+///
+/// - [`OnDisk::Present`]: go ahead
+/// - [`OnDisk::Unknown`]: go ahead and keep the rows. A write is not a signal that the file is
+///   going (unlike a remove event, [`act_on_removed_path`]), and an editor holding the file
+///   while it saves must not cost the document its row
+/// - [`OnDisk::Gone`]: the row under `rel` and its folded legacy row go
+///   ([`deindex_removed_path`]), since the event's path is no longer one the index can hold
+///   (deleted since, a directory now, or there only under another case). Unless `lossy`
+///   ([`rel_is_lossy`]): a lossy `rel` always looks gone, and the row stays as before (C4)
+fn act_on_written_path(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    on_disk: OnDisk,
+    lossy: bool,
+) -> WrittenPathCheck {
+    match on_disk {
+        OnDisk::Present => WrittenPathCheck::Proceed,
+        OnDisk::Unknown(kind) => WrittenPathCheck::ProceedUnknown(kind),
+        OnDisk::Gone if lossy => WrittenPathCheck::Proceed,
+        OnDisk::Gone => WrittenPathCheck::Deindexed(deindex_removed_path(db, kb_path, rel)),
+    }
+}
+
 /// What a path is being judged for, which decides whether the name check
 /// ([`name_is_addressable`]) applies. Every other check is the same for both.
 ///
@@ -1364,21 +1457,163 @@ fn reindexed_message(
     format!("watcher: reindexed {rel} ({chunks} chunks, {reused} reused{note})")
 }
 
+/// A create, modify or rename-to of `rel`: [`dispatch_reindex_from`] as a write whose event
+/// path is not at hand, looked at under its exact spelling.
 fn dispatch_reindex(state: &WatcherState, rel: &str) {
+    dispatch_reindex_from(
+        state,
+        rel,
+        ReindexOrigin::Write {
+            raw: None,
+            look: WriteLook::Spelled,
+        },
+    );
+}
+
+/// (#544) What started a reindex, which decides what the look inside the locks does with a
+/// path that is not there.
+#[derive(Debug, Clone, Copy)]
+enum ReindexOrigin<'a> {
+    /// A remove event found a file at the path again ([`RemovalAction::Reindex`]):
+    /// [`check_removed_path`] and [`settle_removal_reindex`], as #543 made them.
+    Removal,
+    /// A create, modify or rename-to: [`act_on_written_path`] and [`settle_write_reindex`].
+    /// `raw` is the path the event named, when the caller has it ([`rel_is_lossy`]); `look` is
+    /// how `rel` is looked at ([`written_path_on_disk`]).
+    Write {
+        raw: Option<&'a Path>,
+        look: WriteLook,
+    },
+}
+
+/// (#544) Reindex `rel` with both locks held once, the disk looked at inside them before the
+/// reindex and, for a write the reindex did not settle, again after it. The look decides
+/// whether a row is written, kept or dropped, not the event kind alone: a path that is gone by
+/// the time the locks are held, is a directory, or is there only under another case of its
+/// name keeps no row under that spelling.
+fn dispatch_reindex_from(state: &WatcherState, rel: &str, origin: ReindexOrigin<'_>) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
+    match origin {
+        ReindexOrigin::Removal => reindex_after_removal_locked(state, &db, &mut embedder, rel),
+        ReindexOrigin::Write { raw, look } => {
+            reindex_after_write_locked(state, &db, &mut embedder, rel, raw, look)
+        }
+    }
+}
+
+/// The write half of [`dispatch_reindex_from`], for a caller holding both locks.
+fn reindex_after_write_locked(
+    state: &WatcherState,
+    db: &Database,
+    embedder: &mut Embedder,
+    rel: &str,
+    raw: Option<&Path>,
+    look: WriteLook,
+) {
+    let kb_path = &state.kb_path;
+    let lossy = rel_is_lossy(kb_path, raw);
+    match act_on_written_path(
+        db,
+        kb_path,
+        rel,
+        written_path_on_disk(kb_path, rel, look),
+        lossy,
+    ) {
+        WrittenPathCheck::Deindexed(outcome) => {
+            log_written_path_gone(rel, outcome);
+            return;
+        }
+        WrittenPathCheck::ProceedUnknown(kind) => {
+            wdiag!("watcher: could not look at {rel} ({kind:?}); reindexing it anyway");
+        }
+        WrittenPathCheck::Proceed => {}
+    }
     let texts_before = embedder.texts_embedded();
     let result = indexer::reindex_single_file(
-        &db,
-        &mut embedder,
-        &state.kb_path,
+        db,
+        embedder,
+        kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    let require_real_key = sweep_requires_real_key(&result);
-    log_reindex_result(rel, result, texts_before, &embedder);
-    sweep_legacy_row(&db, &state.kb_path, rel, require_real_key);
+    match settle_write_reindex(db, kb_path, rel, &result, lossy, || {
+        written_path_on_disk(kb_path, rel, look)
+    }) {
+        WriteReindexSettled::Kept | WriteReindexSettled::LeftAsIs => {
+            let require_real_key = sweep_requires_real_key(&result);
+            log_reindex_result(rel, result, texts_before, embedder);
+            sweep_legacy_row(db, kb_path, rel, require_real_key);
+        }
+        // `deindex_removed_path` already swept the folded row as a removal.
+        WriteReindexSettled::Deindexed(outcome) => {
+            log_reindex_result(rel, result, texts_before, embedder);
+            log_written_path_gone(rel, outcome);
+        }
+    }
+}
+
+/// What [`settle_write_reindex`] did after a write's reindex.
+#[derive(Debug)]
+enum WriteReindexSettled {
+    /// The reindex settled the row (written, unchanged, or dropped by the indexer): no second
+    /// look was taken.
+    Kept,
+    /// The reindex left the row as it was and the path is gone now: the rows under `rel` were
+    /// deleted, and the result says whether either was there.
+    Deindexed(Result<bool>),
+    /// The reindex left the row as it was, and the second look did not find the path gone (or
+    /// `rel` is lossy): nothing more was done.
+    LeftAsIs,
+}
+
+/// (#544 A1) After a write's reindex: a result that settled the row is left alone without a
+/// second look. One that left the row as it was -- a skip whatever its reason, a refusal, an
+/// error -- is looked at again (`relook`), since the file may have gone between the first look
+/// and the read; a path gone by then (and not lossy, [`rel_is_lossy`]) drops its rows as
+/// [`act_on_written_path`] does. Unknown or present leaves them. Split out of the dispatch so a
+/// test can run it with no [`crate::embedder::Embedder`].
+fn settle_write_reindex(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    result: &Result<indexer::SingleResult>,
+    lossy: bool,
+    relook: impl FnOnce() -> OnDisk,
+) -> WriteReindexSettled {
+    // Each named, not a catch-all, so a new variant stays a compile error (#251's way).
+    match result {
+        Ok(
+            indexer::SingleResult::Updated { .. }
+            | indexer::SingleResult::Unchanged
+            | indexer::SingleResult::MetadataRefreshed { .. }
+            | indexer::SingleResult::NothingToIndex { .. }
+            | indexer::SingleResult::OutsideKnowledgeBaseDeindexed,
+        ) => WriteReindexSettled::Kept,
+        Ok(indexer::SingleResult::Skipped { .. } | indexer::SingleResult::Refused) | Err(_) => {
+            match relook() {
+                OnDisk::Gone if !lossy => {
+                    WriteReindexSettled::Deindexed(deindex_removed_path(db, kb_path, rel))
+                }
+                OnDisk::Gone | OnDisk::Present | OnDisk::Unknown(_) => {
+                    WriteReindexSettled::LeftAsIs
+                }
+            }
+        }
+    }
+}
+
+/// What a write says when its path turned out not to be there under that spelling and its rows
+/// went. Silent when no row was there.
+fn log_written_path_gone(rel: &str, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => {
+            wdiag!("watcher: {rel} is no longer on disk under that spelling; deindexed it")
+        }
+        Ok(false) => { /* no-op: not in DB */ }
+        Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
+    }
 }
 
 /// (#543, local Codex, medium) The `require_real_key` that [`dispatch_reindex`] passes to
@@ -1408,12 +1643,21 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 /// -- a skip whatever its reason, a refusal, an error -- drops the rows as a removal does,
 /// whatever the disk shows afterwards.
 ///
-/// Only the remove path calls this: what a create, modify or rename does with a file gone
-/// before its read is unchanged.
+/// Only the remove path calls this. (#544) A create, modify or rename-to looks at the disk
+/// inside the locks too, with its own answers ([`ReindexOrigin::Write`]).
 fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
-    let mut embedder = recover(state.embedder.lock(), "embedder");
-    let db = recover_db(state.db.lock());
-    match check_removed_path(&db, &state.kb_path, rel) {
+    dispatch_reindex_from(state, rel, ReindexOrigin::Removal);
+}
+
+/// The removal half of [`dispatch_reindex_from`] ([`dispatch_reindex_after_removal`]'s body),
+/// for a caller holding both locks.
+fn reindex_after_removal_locked(
+    state: &WatcherState,
+    db: &Database,
+    embedder: &mut Embedder,
+    rel: &str,
+) {
+    match check_removed_path(db, &state.kb_path, rel) {
         RemovedPathCheck::Deindexed(outcome) => {
             log_removed_path_deindexed(rel, outcome);
             return;
@@ -1426,20 +1670,20 @@ fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
     }
     let texts_before = embedder.texts_embedded();
     let result = indexer::reindex_single_file(
-        &db,
-        &mut embedder,
+        db,
+        embedder,
         &state.kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    match settle_removal_reindex(&db, &state.kb_path, rel, &result) {
+    match settle_removal_reindex(db, &state.kb_path, rel, &result) {
         RemovalReindexSettled::Kept => {
-            log_reindex_result(rel, result, texts_before, &embedder);
-            sweep_legacy_row(&db, &state.kb_path, rel, true);
+            log_reindex_result(rel, result, texts_before, embedder);
+            sweep_legacy_row(db, &state.kb_path, rel, true);
         }
         RemovalReindexSettled::IndexerDeindexed(folded) => {
-            log_reindex_result(rel, result, texts_before, &embedder);
+            log_reindex_result(rel, result, texts_before, embedder);
             log_folded_sweep(rel, folded);
         }
         RemovalReindexSettled::Deindexed { reason, outcome } => {
@@ -4621,5 +4865,280 @@ mod tests {
             "watcher: reindexed a.md (5 chunks, 3 reused, frontmatter unparsed)"
         );
         assert!(plain.is_ascii() && unparsed.is_ascii());
+    }
+
+    /// A scratch knowledge base for the #544 write-look tests, removed when the guard drops.
+    fn i544_scratch_kb(tag: &str) -> (std::path::PathBuf, impl Drop) {
+        let kb = crate::test_support::unique_temp_path(tag);
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        (kb.clone(), Cleanup(kb))
+    }
+
+    /// (#544 A1) A write whose file is gone by the time the locks are held drops the row under
+    /// its path, and only that row; no reindex runs.
+    #[test]
+    fn a_write_whose_file_is_gone_drops_the_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-gone");
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let look = written_path_on_disk(&kb, "a.md", WriteLook::Spelled);
+        assert_eq!(look, OnDisk::Gone);
+        let check = act_on_written_path(&db, &kb, "a.md", look, false);
+        assert!(
+            matches!(check, WrittenPathCheck::Deindexed(Ok(true))),
+            "{check:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 A3) A write whose name is on disk only in another case (a case-only rename whose
+    /// new spelling's event comes on its own) drops the row under the spelling the event
+    /// named, and leaves the row under the other spelling. The look reads such a name as gone
+    /// on a case-insensitive volume (the old name opens the file) and on a case-sensitive one
+    /// (it is simply not there), for the leaf and for a directory on the way.
+    #[test]
+    fn a_write_whose_name_is_on_disk_only_in_another_case_drops_that_spelling() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-case");
+        let db = dir_rename_db(&["Old.md", "old.md"]);
+        let check = act_on_written_path(&db, &kb, "Old.md", OnDisk::Gone, false);
+        assert!(
+            matches!(check, WrittenPathCheck::Deindexed(Ok(true))),
+            "{check:?}"
+        );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["old.md".to_string()]);
+
+        std::fs::write(kb.join("A.md"), "# A\n").unwrap();
+        assert_eq!(
+            written_path_on_disk(&kb, "a.md", WriteLook::Spelled),
+            OnDisk::Gone
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "A.md", WriteLook::Spelled),
+            OnDisk::Present
+        );
+        std::fs::create_dir_all(kb.join("Dir")).unwrap();
+        std::fs::write(kb.join("Dir").join("note.md"), "# n\n").unwrap();
+        assert_eq!(
+            written_path_on_disk(&kb, "dir/note.md", WriteLook::Spelled),
+            OnDisk::Gone
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "Dir/note.md", WriteLook::Spelled),
+            OnDisk::Present
+        );
+    }
+
+    /// (#544 D3, Review Focus 1) A write whose look cannot tell -- on Windows, an editor holding
+    /// the file while it saves -- keeps the row and goes on to the reindex.
+    #[test]
+    fn a_write_whose_look_cannot_tell_still_reindexes() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unknown");
+        let db = dir_rename_db(&["locked.md", "other.md"]);
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let check = act_on_written_path(&db, &kb, "locked.md", OnDisk::Unknown(denied), false);
+        assert!(
+            matches!(check, WrittenPathCheck::ProceedUnknown(k) if k == denied),
+            "{check:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["locked.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544) A write of a file that is there under its exact spelling touches no row before
+    /// the reindex.
+    #[test]
+    fn a_write_of_a_present_file_proceeds() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-present");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let look = written_path_on_disk(&kb, "a.md", WriteLook::Spelled);
+        assert_eq!(look, OnDisk::Present);
+        let check = act_on_written_path(&db, &kb, "a.md", look, false);
+        assert!(matches!(check, WrittenPathCheck::Proceed), "{check:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544 C4, P1-L file branch) A file whose name is not UTF-8 is keyed by a lossy spelling
+    /// (U+FFFD), and a look at that spelling never finds it. Its write is not read as gone:
+    /// the row stays, as before the look existed. Asked of the event's path, so with none at
+    /// hand nothing is lossy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_under_a_lossy_name_is_never_read_as_gone() {
+        use std::os::unix::ffi::OsStrExt;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-lossy");
+        let raw = kb.join(std::ffi::OsStr::from_bytes(b"a\xff.md"));
+        std::fs::write(&raw, "# a\n").unwrap();
+        let rel = indexer::index_rel_path(&kb, &raw).unwrap();
+        let db = dir_rename_db(&[rel.as_str()]);
+        assert!(rel_is_lossy(&kb, Some(&raw)));
+        assert!(!rel_is_lossy(&kb, None));
+        assert_eq!(
+            written_path_on_disk(&kb, &rel, WriteLook::Spelled),
+            OnDisk::Gone,
+            "the lossy spelling names no file"
+        );
+        let check = act_on_written_path(&db, &kb, &rel, OnDisk::Gone, true);
+        assert!(matches!(check, WrittenPathCheck::Proceed), "{check:?}");
+        assert_eq!(db.all_document_paths().unwrap(), vec![rel]);
+    }
+
+    /// (#544 C4) A name holding a real U+FFFD is spelled exactly, so it is not lossy and its
+    /// look is the ordinary one.
+    #[test]
+    fn a_real_replacement_character_in_a_name_is_not_lossy() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-fffd");
+        let raw = kb.join("a\u{FFFD}.md");
+        std::fs::write(&raw, "# a\n").unwrap();
+        assert!(!rel_is_lossy(&kb, Some(&raw)));
+        assert_eq!(
+            written_path_on_disk(&kb, "a\u{FFFD}.md", WriteLook::Spelled),
+            OnDisk::Present
+        );
+    }
+
+    /// (#544 C4) An event path that cannot be placed under the knowledge base at all, even
+    /// canonicalized, is read as lossy: no look at a `rel` made for it can be trusted, so the
+    /// write keeps the row as it did before the look existed.
+    #[test]
+    fn an_event_path_that_cannot_be_placed_under_the_kb_reads_as_lossy() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unplaced");
+        let (elsewhere, _cleanup2) = i544_scratch_kb("groove-watcher-i544-elsewhere");
+        assert!(rel_is_lossy(&kb, Some(&elsewhere.join("x.md"))));
+        std::fs::write(kb.join("x.md"), "# x\n").unwrap();
+        assert!(!rel_is_lossy(&kb, Some(&kb.join("x.md"))));
+    }
+
+    /// (#544) A reindex that settled the row -- written, unchanged, refreshed, or dropped by
+    /// the indexer -- is not looked at again, and no row is touched.
+    #[test]
+    fn a_settled_write_reindex_does_not_look_again() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-settled");
+        let settled: [Result<indexer::SingleResult>; 5] = [
+            Ok(indexer::SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Unchanged),
+            Ok(indexer::SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::NothingToIndex {
+                deindexed: true,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed),
+        ];
+        for result in &settled {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let got = settle_write_reindex(&db, &kb, "a.md", result, false, || {
+                panic!("a settled reindex must not look again: {result:?}")
+            });
+            assert!(
+                matches!(got, WriteReindexSettled::Kept),
+                "{result:?}: {got:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["a.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+    }
+
+    /// (#544 A1) A reindex that left the row as it was -- a skip whatever its reason, a
+    /// refusal, an error -- looks again: a path gone by then drops its row; one present or
+    /// that cannot be looked at keeps it, and so does a lossy `rel` whatever the look says.
+    #[test]
+    fn an_unsettled_write_reindex_drops_the_row_when_the_file_is_gone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unsettled");
+        let unsettled = || -> [Result<indexer::SingleResult>; 3] {
+            [
+                Ok(indexer::SingleResult::Skipped {
+                    reason: "file no longer exists",
+                    frontmatter_unparsed: false,
+                }),
+                Ok(indexer::SingleResult::Refused),
+                Err(anyhow::anyhow!("x")),
+            ]
+        };
+        for result in &unsettled() {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let got = settle_write_reindex(&db, &kb, "a.md", result, false, || OnDisk::Gone);
+            assert!(
+                matches!(got, WriteReindexSettled::Deindexed(Ok(true))),
+                "{result:?}: {got:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()],
+                "{result:?}"
+            );
+        }
+        for look in [
+            OnDisk::Present,
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        ] {
+            for result in &unsettled() {
+                let db = dir_rename_db(&["a.md", "other.md"]);
+                let got = settle_write_reindex(&db, &kb, "a.md", result, false, || look);
+                assert!(
+                    matches!(got, WriteReindexSettled::LeftAsIs),
+                    "{look:?} {result:?}: {got:?}"
+                );
+                assert_eq!(
+                    db.all_document_paths().unwrap(),
+                    vec!["a.md".to_string(), "other.md".to_string()],
+                    "{look:?} {result:?}"
+                );
+            }
+        }
+        for result in &unsettled() {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let got = settle_write_reindex(&db, &kb, "a.md", result, true, || OnDisk::Gone);
+            assert!(
+                matches!(got, WriteReindexSettled::LeftAsIs),
+                "lossy {result:?}: {got:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["a.md".to_string(), "other.md".to_string()],
+                "lossy {result:?}"
+            );
+        }
+    }
+
+    /// (#544) The look that only asks whether a regular file is there reads a directory, and a
+    /// missing path, as gone, and a file as present.
+    #[test]
+    fn exists_only_look_reads_a_directory_as_gone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-existsonly");
+        std::fs::create_dir_all(kb.join("d.md")).unwrap();
+        std::fs::write(kb.join("f.md"), "# f\n").unwrap();
+        assert_eq!(
+            written_path_on_disk(&kb, "d.md", WriteLook::ExistsOnly),
+            OnDisk::Gone
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "f.md", WriteLook::ExistsOnly),
+            OnDisk::Present
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "missing.md", WriteLook::ExistsOnly),
+            OnDisk::Gone
+        );
     }
 }
