@@ -14,6 +14,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The live watcher keeps a document's row only for what it finds on disk.** Several file
+  operations left a row for a path that no longer held the document, searchable until the next
+  full `groove index`: the old name of a file renamed on macOS (where the rename can arrive as two
+  unpaired events), the old spelling after a case-only rename, both rows after renaming a file
+  over another indexed file (the move ran into the destination's row and failed), and the row of
+  a file replaced by a directory. Each created, modified or renamed-to path, and each directory
+  that arrives, is now looked at again while the watcher holds the index: a path that is gone, is
+  a directory, or is there only under another case of its name drops the row under the spelling
+  the event named, and renaming a file over an indexed one replaces the destination's row. A look
+  that fails with something other than "not found" (an access or I/O error) leaves the document
+  indexed and says why on stderr, so a file that is still there is never dropped on a guess. For
+  the same reason a rename whose destination cannot be checked no longer counts the destination
+  as missing, which used to drop the moved document's row. (#395)
+
 ## [1.21.1] - 2026-10-25
 
 ### Fixed

@@ -590,9 +590,11 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `rename_single_file` が **denylist 配下の新パスへ DB を
                 // 書き換えて残す**。除外したはずのファイルが index に居座る。
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
-                    RenameAction::Rename => dispatch_rename(state, &old_rel, &new_rel),
+                    RenameAction::Rename => {
+                        dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
+                    }
                     RenameAction::Deindex => dispatch_deindex(state, &old_rel),
-                    RenameAction::Reindex => dispatch_reindex(state, &new_rel),
+                    RenameAction::Reindex => dispatch_reindex(state, &new_rel, to),
                     RenameAction::Skip => continue,
                 }
             }
@@ -647,15 +649,25 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // `should_process`, and this must not be the one place that
                     // does otherwise.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()) {
+                        // (#544 A2/A5) The look above is outside the lock; the one that decides
+                        // the rows is taken again inside it, and only for an arrival, so an
+                        // ordinary directory Modify still costs no lock.
                         if arrived {
-                            dispatch_new_directory(state, p, &rel);
+                            let arrival = {
+                                let db = recover_db(state.db.lock());
+                                act_on_arrived_directory(&db, &state.kb_path, &rel, p)
+                                // `db` is dropped here, before the scan locks it again.
+                            };
+                            if log_arrived_directory(&rel, arrival) {
+                                dispatch_new_directory(state, p, &rel);
+                            }
                         }
                         // A directory never had anything else to do here:
                         // `should_process` rejects it on the extension filter.
                         continue;
                     }
                     if should_process(&rel, p, state) {
-                        dispatch_reindex(state, &rel);
+                        dispatch_reindex(state, &rel, p);
                     }
                 }
             }
@@ -887,11 +899,13 @@ enum OnDisk {
 /// (#543, local Codex r2, medium) What a failed stat or listing says about the path: only
 /// "not found" and "not a directory" (a file where a directory on the way was) say it is gone.
 /// Anything else, permission denied or an I/O error among them, says nothing about whether
-/// the file is still there.
+/// the file is still there. (#544) The question is [`indexer::stat_error_means_gone`]'s, the
+/// one the single-file paths ask too.
 fn probe_error_on_disk(kind: std::io::ErrorKind) -> OnDisk {
-    match kind {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => OnDisk::Gone,
-        other => OnDisk::Unknown(other),
+    if indexer::stat_error_means_gone(kind) {
+        OnDisk::Gone
+    } else {
+        OnDisk::Unknown(kind)
     }
 }
 
@@ -963,6 +977,8 @@ fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
     {
         return OnDisk::Present;
     }
+    #[cfg(test)]
+    LISTINGS.with(|n| n.set(n.get() + 1));
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => return OnDisk::Unknown(e.kind()),
@@ -978,6 +994,13 @@ fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
         }
     }
     failed.map_or(OnDisk::Gone, OnDisk::Unknown)
+}
+
+// (#544) How many directories [`spelled_on_disk`] listed on this thread, for the tests that pin
+// what a look costs. Per thread, so tests running side by side do not count each other's.
+#[cfg(test)]
+thread_local! {
+    static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`spelled_on_disk`] as a yes or no, for the tests written before it had three answers:
@@ -1064,6 +1087,274 @@ fn deindex_if_removed_path_is_gone(
             Some(outcome)
         }
         RemovedPathCheck::StillThere => None,
+    }
+}
+
+/// (#544) How a create, modify or rename-to looks at its path inside the locks
+/// ([`written_path_on_disk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteLook {
+    /// Every segment of `rel` under its exact spelling, the look a remove event takes
+    /// ([`removed_path_on_disk`]): for a path an event named, whose spelling nothing else has
+    /// checked.
+    Spelled,
+    /// Only whether a regular file is at `rel` (`symlink_metadata`, links not followed), for a
+    /// path whose directories were spelled by a walk or by a look taken once for all of them.
+    /// No directory is listed.
+    ExistsOnly,
+}
+
+/// (#544 A1/A3) What is at a path a write is about to (re)index, looked at as `look` says.
+/// [`OnDisk::Gone`] for anything but a regular file, and for a failed stat that
+/// [`indexer::stat_error_means_gone`] reads as "not there"; [`OnDisk::Unknown`] for any other
+/// failed stat or listing.
+fn written_path_on_disk(kb_path: &Path, rel: &str, look: WriteLook) -> OnDisk {
+    match look {
+        WriteLook::Spelled => removed_path_on_disk(kb_path, rel),
+        WriteLook::ExistsOnly => match std::fs::symlink_metadata(kb_path.join(rel)) {
+            Ok(meta) if meta.file_type().is_file() => OnDisk::Present,
+            Ok(_) => OnDisk::Gone,
+            Err(e) => probe_error_on_disk(e.kind()),
+        },
+    }
+}
+
+/// (#544 C4) Whether `rel` is a lossy spelling of the path the event named: that path's name
+/// below `kb_path` is not UTF-8, so `rel` holds U+FFFD where the name has other bytes
+/// ([`indexer::index_rel_path`]) and no look at `rel` can find the file. Asked of the event's
+/// own path ([`indexer::index_rel_path_exact`] is `None` for it), never of `rel`: a name may
+/// hold a real U+FFFD.
+///
+/// `None` (no event path at hand) is not lossy. A path not under `kb_path` as spelled is
+/// canonicalized once, as [`to_rel`] does; one that still cannot be placed is read as lossy, so
+/// a write keeps the row as it did before the look existed.
+fn rel_is_lossy(kb_path: &Path, raw: Option<&Path>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let lossy_under = |p: &Path| {
+        indexer::index_rel_path(kb_path, p)
+            .map(|_| indexer::index_rel_path_exact(kb_path, p).is_none())
+    };
+    lossy_under(raw)
+        .or_else(|| raw.canonicalize().ok().and_then(|c| lossy_under(&c)))
+        .unwrap_or(true)
+}
+
+/// What [`act_on_written_path`] did before a write's reindex.
+#[derive(Debug)]
+enum WrittenPathCheck {
+    /// The file is there (or `rel` is lossy and cannot be looked at): the reindex goes ahead.
+    Proceed,
+    /// The look could not tell: nothing touched, the reindex goes ahead, and the kind says why
+    /// the look failed.
+    ProceedUnknown(std::io::ErrorKind),
+    /// The path is gone under that spelling: the rows under `rel` were deleted (the result says
+    /// whether either was there) and no reindex runs.
+    Deindexed(Result<bool>),
+}
+
+/// (#544 A1/A3, D3) What a write does with the look inside the locks, before its reindex:
+///
+/// - [`OnDisk::Present`]: go ahead
+/// - [`OnDisk::Unknown`]: go ahead and keep the rows. A write is not a signal that the file is
+///   going (unlike a remove event, [`act_on_removed_path`]), and an editor holding the file
+///   while it saves must not cost the document its row
+/// - [`OnDisk::Gone`]: the row under `rel` and its folded legacy row go
+///   ([`deindex_removed_path`]), since the event's path is no longer one the index can hold
+///   (deleted since, a directory now, or there only under another case). Unless `lossy`
+///   ([`rel_is_lossy`]): a lossy `rel` always looks gone, and the row stays as before (C4)
+fn act_on_written_path(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    on_disk: OnDisk,
+    lossy: bool,
+) -> WrittenPathCheck {
+    match on_disk {
+        OnDisk::Present => WrittenPathCheck::Proceed,
+        OnDisk::Unknown(kind) => WrittenPathCheck::ProceedUnknown(kind),
+        OnDisk::Gone if lossy => WrittenPathCheck::Proceed,
+        OnDisk::Gone => WrittenPathCheck::Deindexed(deindex_removed_path(db, kb_path, rel)),
+    }
+}
+
+/// (#544 A2/A5) Whether every segment of `rel` -- the directory itself and each one above it,
+/// from the innermost out -- is on disk under its exact spelling ([`spelled_on_disk`], each
+/// against the directory above it, built from `kb_path` one segment at a time). The first
+/// answer other than [`OnDisk::Present`] is the answer. Nothing is asked of what is at `rel`;
+/// [`arrived_directory_look`] has already found a directory there.
+fn directory_spelled_on_disk(kb_path: &Path, rel: &str) -> OnDisk {
+    let mut full = kb_path.to_path_buf();
+    for segment in rel.split('/') {
+        full.push(segment);
+    }
+    let mut dir = full.as_path();
+    for segment in rel.rsplit('/') {
+        let Some(parent) = dir.parent() else {
+            return OnDisk::Gone;
+        };
+        let spelled = spelled_on_disk(parent, segment);
+        if spelled != OnDisk::Present {
+            return spelled;
+        }
+        dir = parent;
+    }
+    OnDisk::Present
+}
+
+/// (#544) What is at a directory an event said arrived, `rel` with the event's path `raw`:
+/// whether it is a directory (`symlink_metadata` of `raw`, links not followed; `None` for a
+/// failed stat) and the look that goes with it. For a directory, the look is
+/// [`directory_spelled_on_disk`]; for something else [`OnDisk::Gone`]; for a failed stat, the
+/// stat's kind read through [`probe_error_on_disk`]. One stat and one spelling look for the
+/// whole directory, however many files it holds.
+fn arrived_directory_look(kb_path: &Path, rel: &str, raw: &Path) -> (Option<bool>, OnDisk) {
+    match std::fs::symlink_metadata(raw) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            (Some(true), directory_spelled_on_disk(kb_path, rel))
+        }
+        Ok(_) => (Some(false), OnDisk::Gone),
+        Err(e) => (None, probe_error_on_disk(e.kind())),
+    }
+}
+
+/// (#544 A12) [`arrived_directory_look`] as one answer: [`OnDisk::Present`] only for a
+/// directory at `raw` whose `rel` is on disk under its exact spelling.
+fn arrived_directory_on_disk(kb_path: &Path, rel: &str, raw: &Path) -> OnDisk {
+    match arrived_directory_look(kb_path, rel, raw) {
+        (Some(true), spelled) => spelled,
+        (Some(false), _) => OnDisk::Gone,
+        (None, look) => look,
+    }
+}
+
+/// What [`act_on_arrived_directory`] did with a directory that arrived.
+#[derive(Debug)]
+enum ArrivedDirectory {
+    /// The directory is there under its spelling (or its name is lossy and cannot be looked
+    /// at): scan it. The result is the deletion of the row a file under the directory's name
+    /// left, `Ok(true)` when there was one.
+    Scan(Result<bool>),
+    /// The path is no longer a directory, or no longer there: nothing done, its own event
+    /// comes on its own.
+    NoLongerADirectory,
+    /// The directory is on disk only under another spelling: no scan, and the rows under the
+    /// spelling the event named went, the one at the name itself (`exact`) and every one under
+    /// it (`under`).
+    Dropped {
+        exact: Result<bool>,
+        under: Result<Vec<String>>,
+    },
+    /// The look could not tell: no row touched, and the directory is scanned all the same.
+    Unknown(std::io::ErrorKind),
+}
+
+/// (#544 A2/A5/A13) What an arrived directory does with the look inside the db lock, before
+/// its scan ([`act_on_arrived_directory_for`] once the disk has been looked at,
+/// [`arrived_directory_look`]). `raw` is the event's path, which also says whether `rel` is
+/// lossy ([`rel_is_lossy`]).
+fn act_on_arrived_directory(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    raw: &Path,
+) -> ArrivedDirectory {
+    let (is_dir, spelled) = arrived_directory_look(kb_path, rel, raw);
+    act_on_arrived_directory_for(
+        db,
+        kb_path,
+        rel,
+        is_dir,
+        spelled,
+        rel_is_lossy(kb_path, Some(raw)),
+    )
+}
+
+/// [`act_on_arrived_directory`] once the disk has been looked at, split out so a test can hand
+/// it a look no file system makes on demand. `is_dir` is the stat's answer (`None` when it
+/// failed, its kind then in `spelled`):
+///
+/// - not a directory, or a stat that says the path is gone, gives
+///   [`ArrivedDirectory::NoLongerADirectory`]
+/// - a stat that could not tell, or a directory whose spelling could not be looked at, gives
+///   [`ArrivedDirectory::Unknown`], touching no row (D3)
+/// - a lossy `rel` gives [`ArrivedDirectory::Scan`] and touches no row: its look never finds
+///   it, and a sibling whose name is lost the same way shares its prefix (C4)
+/// - a directory under its exact spelling: the row under its name goes (a file it replaced,
+///   with its folded legacy row), then [`ArrivedDirectory::Scan`] (A2)
+/// - a directory on disk only under another spelling: the row under its name and every row
+///   under `rel/` go, and no scan runs (spec r4 M-d). `documents.path` compares bytes, so any
+///   key under that spelling holds a segment the disk does not, and the full index drops it too
+fn act_on_arrived_directory_for(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    is_dir: Option<bool>,
+    spelled: OnDisk,
+    lossy: bool,
+) -> ArrivedDirectory {
+    match (is_dir, spelled) {
+        (Some(false), _) | (None, OnDisk::Gone | OnDisk::Present) => {
+            ArrivedDirectory::NoLongerADirectory
+        }
+        (None | Some(true), OnDisk::Unknown(kind)) => ArrivedDirectory::Unknown(kind),
+        // The knowledge base itself names no row.
+        (Some(true), _) if lossy || rel.is_empty() => ArrivedDirectory::Scan(Ok(false)),
+        (Some(true), OnDisk::Present) => {
+            ArrivedDirectory::Scan(deindex_removed_path(db, kb_path, rel))
+        }
+        (Some(true), OnDisk::Gone) => ArrivedDirectory::Dropped {
+            exact: deindex_removed_path(db, kb_path, rel),
+            under: indexer::deindex_subtree(db, rel),
+        },
+    }
+}
+
+/// The lines for what [`act_on_arrived_directory`] did; `true` when the directory is to be
+/// scanned.
+fn log_arrived_directory(rel: &str, arrival: ArrivedDirectory) -> bool {
+    match arrival {
+        ArrivedDirectory::Scan(exact) => {
+            match exact {
+                Ok(true) => {
+                    wdiag!(
+                        "watcher: {rel} is a directory now; deindexed the file indexed under its name"
+                    )
+                }
+                Ok(false) => {}
+                Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
+            }
+            true
+        }
+        ArrivedDirectory::NoLongerADirectory => false,
+        ArrivedDirectory::Dropped { exact, under } => {
+            let exact = match exact {
+                Ok(exact) => usize::from(exact),
+                Err(e) => {
+                    wdiag!("watcher: deindex {rel} failed: {e}");
+                    0
+                }
+            };
+            let under = match under {
+                Ok(deleted) => deleted.len(),
+                Err(e) => {
+                    wdiag!("watcher: deindexing under {rel}/ failed: {e}");
+                    0
+                }
+            };
+            if exact + under > 0 {
+                wdiag!(
+                    "watcher: the directory {rel} is on disk only under another spelling; deindexed {} documents at or under it",
+                    exact + under
+                );
+            }
+            false
+        }
+        ArrivedDirectory::Unknown(kind) => {
+            wdiag!("watcher: could not look at the directory {rel} ({kind:?}); scanning it anyway");
+            true
+        }
     }
 }
 
@@ -1255,11 +1546,11 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
 /// Filtering is [`crate::indexer::collect_source_files_under`]'s, i.e. the full
 /// index walk's, so a directory drop and a later `groove index` agree about
 /// what belongs in the index -- plus the one name check the walk leaves to the
-/// watcher ([`new_directory_rels`]). Re-checking with [`should_process`] here would be
+/// watcher ([`new_directory_entries`]). Re-checking with [`should_process`] here would be
 /// a second implementation of the same question, which is exactly how the
 /// watcher and the walk drifted apart twice before (AU-03, BU-19).
 fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
-    let found = match new_directory_rels(&state.kb_path, dir, &state.registry, &state.rules) {
+    let found = match new_directory_entries(&state.kb_path, dir, &state.registry, &state.rules) {
         Ok(found) => found,
         Err(e) => {
             // Not retried, and the consequence is stated rather than implied
@@ -1296,8 +1587,17 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
         found.len(),
         if found.len() == 1 { "" } else { "s" }
     );
-    for frel in &found {
-        dispatch_reindex(state, frel);
+    // (#544) Each file only asks whether a regular file is at its `rel`: the walk spelled
+    // the directories on the way.
+    for (frel, f) in &found {
+        dispatch_reindex_from(
+            state,
+            frel,
+            ReindexOrigin::Write {
+                raw: Some(f),
+                look: WriteLook::ExistsOnly,
+            },
+        );
     }
 }
 
@@ -1310,16 +1610,38 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
 /// name is judged here on the recovered `rel`, the one that would be written,
 /// which is the one question the walk left to the watcher -- not a second
 /// filter over the rest.
+///
+/// (#544) Each `rel` comes with the path the walk found it at, which the look inside the
+/// locks asks whether the name is lossy ([`rel_is_lossy`]).
+fn new_directory_entries(
+    kb_path: &Path,
+    dir: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> Result<Vec<(String, PathBuf)>> {
+    let found = crate::indexer::collect_source_files_under(kb_path, dir, registry, rules)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|f| {
+            to_rel(kb_path, &f)
+                .filter(|r| name_is_addressable(r, &f, false))
+                .map(|r| (r, f))
+        })
+        .collect())
+}
+
+/// The `rel`s alone of [`new_directory_entries`], which is how the tests written before the
+/// paths were kept ask for them. Only the Windows-only test asks for it.
+#[cfg(all(test, windows))]
 fn new_directory_rels(
     kb_path: &Path,
     dir: &Path,
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
 ) -> Result<Vec<String>> {
-    let found = crate::indexer::collect_source_files_under(kb_path, dir, registry, rules)?;
-    Ok(found
-        .iter()
-        .filter_map(|f| to_rel(kb_path, f).filter(|r| name_is_addressable(r, f, false)))
+    Ok(new_directory_entries(kb_path, dir, registry, rules)?
+        .into_iter()
+        .map(|(rel, _)| rel)
         .collect())
 }
 
@@ -1362,21 +1684,176 @@ fn reindexed_message(
     format!("watcher: reindexed {rel} ({chunks} chunks, {reused} reused{note})")
 }
 
-fn dispatch_reindex(state: &WatcherState, rel: &str) {
+/// A create, modify or rename-to of `rel` that an event named at `raw`:
+/// [`dispatch_reindex_from`] as a write, looked at under its exact spelling, with `raw`
+/// deciding whether `rel` is lossy ([`rel_is_lossy`]).
+fn dispatch_reindex(state: &WatcherState, rel: &str, raw: &Path) {
+    dispatch_reindex_from(
+        state,
+        rel,
+        ReindexOrigin::Write {
+            raw: Some(raw),
+            look: WriteLook::Spelled,
+        },
+    );
+}
+
+/// (#544) What started a reindex, which decides what the look inside the locks does with a
+/// path that is not there.
+#[derive(Debug, Clone, Copy)]
+enum ReindexOrigin<'a> {
+    /// A remove event found a file at the path again ([`RemovalAction::Reindex`]):
+    /// [`check_removed_path`] and [`settle_removal_reindex`], as #543 made them.
+    Removal,
+    /// A create, modify or rename-to: [`act_on_written_path`] and [`settle_write_reindex`].
+    /// `raw` is the path the event named, when the caller has it ([`rel_is_lossy`]); `look` is
+    /// how `rel` is looked at ([`written_path_on_disk`]).
+    Write {
+        raw: Option<&'a Path>,
+        look: WriteLook,
+    },
+}
+
+/// (#544) Reindex `rel` with both locks held once, the disk looked at inside them before the
+/// reindex and, for a write the reindex did not settle, again after it. The look decides
+/// whether a row is written, kept or dropped, not the event kind alone: a path that is gone by
+/// the time the locks are held, is a directory, or is there only under another case of its
+/// name keeps no row under that spelling.
+fn dispatch_reindex_from(state: &WatcherState, rel: &str, origin: ReindexOrigin<'_>) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
+    match origin {
+        ReindexOrigin::Removal => reindex_after_removal_locked(state, &db, &mut embedder, rel),
+        ReindexOrigin::Write { raw, look } => {
+            reindex_after_write_locked(state, &db, &mut embedder, rel, raw, look)
+        }
+    }
+}
+
+/// The write half of [`dispatch_reindex_from`], for a caller holding both locks.
+fn reindex_after_write_locked(
+    state: &WatcherState,
+    db: &Database,
+    embedder: &mut Embedder,
+    rel: &str,
+    raw: Option<&Path>,
+    look: WriteLook,
+) {
+    let kb_path = &state.kb_path;
+    let lossy = rel_is_lossy(kb_path, raw);
+    match act_on_written_path(
+        db,
+        kb_path,
+        rel,
+        written_path_on_disk(kb_path, rel, look),
+        lossy,
+    ) {
+        WrittenPathCheck::Deindexed(outcome) => {
+            log_written_path_gone(rel, outcome);
+            return;
+        }
+        WrittenPathCheck::ProceedUnknown(kind) => {
+            wdiag!("watcher: could not look at {rel} ({kind:?}); reindexing it anyway");
+        }
+        WrittenPathCheck::Proceed => {}
+    }
     let texts_before = embedder.texts_embedded();
     let result = indexer::reindex_single_file(
-        &db,
-        &mut embedder,
-        &state.kb_path,
+        db,
+        embedder,
+        kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    let require_real_key = sweep_requires_real_key(&result);
-    log_reindex_result(rel, result, texts_before, &embedder);
-    sweep_legacy_row(&db, &state.kb_path, rel, require_real_key);
+    match settle_write_reindex(db, kb_path, rel, &result, lossy, || {
+        written_path_on_disk(kb_path, rel, look)
+    }) {
+        WriteReindexSettled::Kept | WriteReindexSettled::LeftAsIs => {
+            let require_real_key = sweep_requires_real_key(&result);
+            log_reindex_result(rel, result, texts_before, embedder);
+            sweep_legacy_row(db, kb_path, rel, require_real_key);
+        }
+        // `deindex_removed_path` already swept the folded row as a removal.
+        WriteReindexSettled::Deindexed(outcome) => {
+            log_reindex_result(rel, result, texts_before, embedder);
+            log_written_path_gone(rel, outcome);
+        }
+    }
+}
+
+/// What [`settle_write_reindex`] did after a write's reindex.
+#[derive(Debug)]
+enum WriteReindexSettled {
+    /// The reindex settled the row (written, unchanged, or dropped by the indexer): no second
+    /// look was taken.
+    Kept,
+    /// The reindex left the row as it was and the path is gone now: the rows under `rel` were
+    /// deleted, and the result says whether either was there.
+    Deindexed(Result<bool>),
+    /// The reindex left the row as it was, and the second look did not find the path gone (or
+    /// `rel` is lossy): nothing more was done.
+    LeftAsIs,
+}
+
+/// (#544 A1) After a write's reindex: a result that settled the row is left alone without a
+/// second look. One that left the row as it was -- a skip whatever its reason, a refusal, an
+/// error -- is looked at again (`relook`), since the file may have gone between the first look
+/// and the read; a path gone by then (and not lossy, [`rel_is_lossy`]) drops its rows as
+/// [`act_on_written_path`] does. Unknown or present leaves them. Split out of the dispatch so a
+/// test can run it with no [`crate::embedder::Embedder`].
+fn settle_write_reindex(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    result: &Result<indexer::SingleResult>,
+    lossy: bool,
+    relook: impl FnOnce() -> OnDisk,
+) -> WriteReindexSettled {
+    if write_reindex_settled_the_row(result) {
+        return WriteReindexSettled::Kept;
+    }
+    match relook() {
+        OnDisk::Gone if !lossy => {
+            WriteReindexSettled::Deindexed(deindex_removed_path(db, kb_path, rel))
+        }
+        OnDisk::Gone | OnDisk::Present | OnDisk::Unknown(_) => WriteReindexSettled::LeftAsIs,
+    }
+}
+
+/// (#544) Whether a write's reindex settled the row of its path: it wrote a row there, found
+/// the row already right, or found nothing there to keep a row for
+/// ([`indexer::SingleResult::NothingToIndex`],
+/// [`indexer::SingleResult::OutsideKnowledgeBaseDeindexed`]). False when it skipped or refused
+/// the file or failed: the row is then as it was before the reindex. The one answer to that
+/// question for both [`settle_write_reindex`] (whether to look at the disk again) and
+/// [`log_cleared_rename`] (whether the destination of a failed rename is left without a row).
+/// Each variant named, not a catch-all, so a new variant stays a compile error (#251's way).
+fn write_reindex_settled_the_row(result: &Result<indexer::SingleResult>) -> bool {
+    match result {
+        Ok(
+            indexer::SingleResult::Updated { .. }
+            | indexer::SingleResult::Unchanged
+            | indexer::SingleResult::MetadataRefreshed { .. }
+            | indexer::SingleResult::NothingToIndex { .. }
+            | indexer::SingleResult::OutsideKnowledgeBaseDeindexed,
+        ) => true,
+        Ok(indexer::SingleResult::Skipped { .. } | indexer::SingleResult::Refused) | Err(_) => {
+            false
+        }
+    }
+}
+
+/// What a write says when its path turned out not to be there under that spelling and its rows
+/// went. Silent when no row was there.
+fn log_written_path_gone(rel: &str, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => {
+            wdiag!("watcher: {rel} is no longer on disk under that spelling; deindexed it")
+        }
+        Ok(false) => { /* no-op: not in DB */ }
+        Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
+    }
 }
 
 /// (#543, local Codex, medium) The `require_real_key` that [`dispatch_reindex`] passes to
@@ -1406,12 +1883,21 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 /// -- a skip whatever its reason, a refusal, an error -- drops the rows as a removal does,
 /// whatever the disk shows afterwards.
 ///
-/// Only the remove path calls this: what a create, modify or rename does with a file gone
-/// before its read is unchanged.
+/// Only the remove path calls this. (#544) A create, modify or rename-to looks at the disk
+/// inside the locks too, with its own answers ([`ReindexOrigin::Write`]).
 fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
-    let mut embedder = recover(state.embedder.lock(), "embedder");
-    let db = recover_db(state.db.lock());
-    match check_removed_path(&db, &state.kb_path, rel) {
+    dispatch_reindex_from(state, rel, ReindexOrigin::Removal);
+}
+
+/// The removal half of [`dispatch_reindex_from`] ([`dispatch_reindex_after_removal`]'s body),
+/// for a caller holding both locks.
+fn reindex_after_removal_locked(
+    state: &WatcherState,
+    db: &Database,
+    embedder: &mut Embedder,
+    rel: &str,
+) {
+    match check_removed_path(db, &state.kb_path, rel) {
         RemovedPathCheck::Deindexed(outcome) => {
             log_removed_path_deindexed(rel, outcome);
             return;
@@ -1424,20 +1910,20 @@ fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
     }
     let texts_before = embedder.texts_embedded();
     let result = indexer::reindex_single_file(
-        &db,
-        &mut embedder,
+        db,
+        embedder,
         &state.kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    match settle_removal_reindex(&db, &state.kb_path, rel, &result) {
+    match settle_removal_reindex(db, &state.kb_path, rel, &result) {
         RemovalReindexSettled::Kept => {
-            log_reindex_result(rel, result, texts_before, &embedder);
-            sweep_legacy_row(&db, &state.kb_path, rel, true);
+            log_reindex_result(rel, result, texts_before, embedder);
+            sweep_legacy_row(db, &state.kb_path, rel, true);
         }
         RemovalReindexSettled::IndexerDeindexed(folded) => {
-            log_reindex_result(rel, result, texts_before, &embedder);
+            log_reindex_result(rel, result, texts_before, embedder);
             log_folded_sweep(rel, folded);
         }
         RemovalReindexSettled::Deindexed { reason, outcome } => {
@@ -1713,6 +2199,11 @@ fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
     let Some((rel, outcome)) = deindex_subtree_parts(&db, &state.kb_path, p) else {
         return;
     };
+    log_subtree_deindex(&rel, outcome);
+}
+
+/// The line for a range delete under `rel/` already run ([`deindex_subtree_parts`]).
+fn log_subtree_deindex(rel: &str, outcome: Result<Vec<String>>) {
     match outcome {
         Ok(deleted) if deleted.is_empty() => {}
         Ok(deleted) => wdiag!(
@@ -1723,18 +2214,415 @@ fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
     }
 }
 
-fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
+/// What [`sweep_source_if_gone`] found at the source of a directory rename.
+#[derive(Debug)]
+enum SourceSweep {
+    /// The source is gone: what the store held under it was deleted ([`deindex_subtree_parts`],
+    /// `None` when the source names no prefix).
+    Swept(Option<(String, Result<Vec<String>>)>),
+    /// Something is at the source again: nothing deleted.
+    Present,
+    /// The stat failed in a way that does not say the source is gone: nothing deleted.
+    Unknown(std::io::Error),
+}
+
+/// (#544 A14) The sweep of a renamed directory's source, for a caller holding the db lock: the
+/// stat and the range delete in the same lock region, so no write of the same process lands
+/// between them. Gone is [`indexer::stat_error_means_gone`]'s (not found, or a file where a
+/// directory on the way was, under which nothing can be), not [`stat_unless_gone`]'s (not found
+/// only), so a source whose parent became a file is swept too. `symlink_metadata`, so a link
+/// left at the source is something there.
+fn sweep_source_if_gone(db: &Database, kb_path: &Path, from: &Path) -> SourceSweep {
+    match std::fs::symlink_metadata(from) {
+        Ok(_) => SourceSweep::Present,
+        Err(e) if indexer::stat_error_means_gone(e.kind()) => {
+            SourceSweep::Swept(deindex_subtree_parts(db, kb_path, from))
+        }
+        Err(e) => SourceSweep::Unknown(e),
+    }
+}
+
+/// (#544 P1-S) Whether a directory rename moves its rows to the destination, given the look at
+/// the destination's spelling taken once ([`arrived_directory_on_disk`]). Not when the
+/// destination is on disk only under another spelling: the moved rows would carry a spelling
+/// the disk does not hold, so the rows only leave the old path and the destination's own event
+/// indexes it. A look that cannot tell moves them as before (D3), and so does a lossy
+/// destination, whose look never finds it (C4).
+fn dir_rename_moves_its_steps(to_spelled: OnDisk, lossy: bool) -> bool {
+    match to_spelled {
+        OnDisk::Gone => lossy,
+        OnDisk::Present | OnDisk::Unknown(_) => true,
+    }
+}
+
+/// (#544) What a rename does with the look at its destination inside the locks, before the
+/// indexer's rename ([`rename_plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenamePlan {
+    /// The destination is not on disk under that spelling: both ends' rows go, nothing moves.
+    DropBoth,
+    /// The destination could not be looked at, and moving the row is not possible (no row at
+    /// the old end) or would run into the destination's row: every row stays as it is.
+    LeaveUnknown(std::io::ErrorKind),
+    /// The destination could not be looked at and only the old end holds a row: the row moves
+    /// to the new end with its content left as it was, nothing read.
+    MoveRowUnknown(std::io::ErrorKind),
+    /// The destination is there and both ends hold a row (an overwriting rename): the
+    /// destination's row goes, then the indexer's rename moves the source's onto it.
+    ClearDestinationThenRename,
+    /// The destination is there: the indexer's rename, as before.
+    Rename,
+}
+
+/// (#544 C1/A9/A10, D3) How a rename of `old_rel` to `new_rel` goes, given the look at the
+/// destination taken inside the locks:
+///
+/// - [`OnDisk::Gone`] gives [`RenamePlan::DropBoth`]
+/// - [`OnDisk::Unknown`] gives [`RenamePlan::MoveRowUnknown`] when only `old_rel` holds a row,
+///   [`RenamePlan::LeaveUnknown`] otherwise. The indexer's rename is not run: its own look
+///   would read a failed stat as a missing file and drop the row (C2)
+/// - [`OnDisk::Present`] gives [`RenamePlan::ClearDestinationThenRename`] when the two ends
+///   differ and both hold a row, [`RenamePlan::Rename`] otherwise. With no row at `old_rel` the
+///   destination's row is kept: the indexer reindexes it in place and reuses its vectors
+///
+/// The old end is not looked at: its row is only moved or dropped, and nothing is written there.
+fn rename_plan(db: &Database, old_rel: &str, new_rel: &str, dest: OnDisk) -> Result<RenamePlan> {
+    let has_row = |rel: &str| -> Result<bool> { Ok(db.get_document_hash(rel)?.is_some()) };
+    Ok(match dest {
+        OnDisk::Gone => RenamePlan::DropBoth,
+        OnDisk::Unknown(kind) => {
+            if has_row(old_rel)? && !has_row(new_rel)? {
+                RenamePlan::MoveRowUnknown(kind)
+            } else {
+                RenamePlan::LeaveUnknown(kind)
+            }
+        }
+        OnDisk::Present => {
+            if old_rel != new_rel && has_row(old_rel)? && has_row(new_rel)? {
+                RenamePlan::ClearDestinationThenRename
+            } else {
+                RenamePlan::Rename
+            }
+        }
+    })
+}
+
+/// (#544) The part of a [`RenamePlan`] that runs before the indexer's rename and needs no
+/// [`crate::embedder::Embedder`], with its line. `Ok(true)` when the indexer's rename is to run
+/// next ([`RenamePlan::ClearDestinationThenRename`] and [`RenamePlan::Rename`]). No transaction
+/// spans this and the rename: the rename opens its own. A failure in between, or of the rename
+/// before it moved the source's row, is settled inside the same locks by
+/// [`settle_cleared_rename`].
+fn apply_rename_plan_before(
+    db: &Database,
+    kb_path: &Path,
+    old_rel: &str,
+    new_rel: &str,
+    plan: &RenamePlan,
+) -> Result<bool> {
+    match plan {
+        RenamePlan::DropBoth => {
+            let old = deindex_removed_path(db, kb_path, old_rel)?;
+            let new = deindex_removed_path(db, kb_path, new_rel)?;
+            if old || new {
+                wdiag!(
+                    "watcher: {new_rel} is not on disk under that spelling; deindexed {old_rel} and {new_rel}"
+                );
+            }
+            Ok(false)
+        }
+        RenamePlan::LeaveUnknown(kind) => {
+            wdiag!("watcher: could not look at {new_rel} ({kind:?}); left the rows as they were");
+            Ok(false)
+        }
+        RenamePlan::MoveRowUnknown(kind) => {
+            db.rename_document(old_rel, new_rel, crate::db::FrontmatterTopic::Unread)?;
+            wdiag!(
+                "watcher: could not look at {new_rel} ({kind:?}); moved the row of {old_rel} without reading it"
+            );
+            Ok(false)
+        }
+        RenamePlan::ClearDestinationThenRename => {
+            deindex_removed_path(db, kb_path, new_rel)?;
+            wdiag!("watcher: {new_rel} was overwritten by {old_rel}; replaced its row");
+            Ok(true)
+        }
+        RenamePlan::Rename => Ok(true),
+    }
+}
+
+/// (#544 A7/A8) Whether the indexer's rename settled the row at `new_rel`: true when the row
+/// was moved, reindexed or dropped and the outcome says so. False for an outcome that left the
+/// row as it was (a refusal, a skipped reparse) and for an error, after which the destination
+/// is looked at again. Each named, not a catch-all, so a new variant is a compile error here.
+fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
+    match outcome {
+        Ok(
+            indexer::RenameOutcome::Renamed
+            | indexer::RenameOutcome::RenamedAndReindexed { .. }
+            | indexer::RenameOutcome::OldPathMissing
+            | indexer::RenameOutcome::RenamedSizeCapped
+            | indexer::RenameOutcome::RenamedSizeCappedAndDropped
+            | indexer::RenameOutcome::RenamedButRefusedAndDropped
+            | indexer::RenameOutcome::MovedOutOfTheKnowledgeBase,
+        ) => true,
+        Ok(
+            indexer::RenameOutcome::OldPathMissingAndRefused
+            | indexer::RenameOutcome::RenamedButRefused
+            | indexer::RenameOutcome::RenamedButNotReindexed,
+        )
+        | Err(_) => false,
+    }
+}
+
+/// (#544) A paired rename of `old_rel` to `new_rel`, with both locks held once: the destination
+/// is looked at as `look` says ([`written_path_on_disk`]) before anything is moved
+/// ([`rename_plan`], [`apply_rename_plan_before`]), and again after an indexer's rename that
+/// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
+/// is gone by then ([`finish_rename_locked`]).
+fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
-    match indexer::rename_single_file(
+    let kb_path = &state.kb_path;
+    let dest = written_path_on_disk(kb_path, new_rel, look);
+    let plan = match rename_plan(&db, old_rel, new_rel, dest) {
+        Ok(plan) => plan,
+        Err(e) => {
+            log_rename_failed(old_rel, new_rel, &e);
+            return;
+        }
+    };
+    let before = apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan);
+    let exclude_headings = state.exclude_headings.as_deref();
+    finish_rename_locked(
         &db,
-        &mut embedder,
-        &state.kb_path,
-        old_rel,
-        new_rel,
-        state.exclude_headings.as_deref(),
-        &state.registry,
-    ) {
+        kb_path,
+        (old_rel, new_rel),
+        look,
+        (plan, before),
+        &mut *embedder,
+        |embedder| {
+            indexer::rename_single_file(
+                &db,
+                embedder,
+                kb_path,
+                old_rel,
+                new_rel,
+                exclude_headings,
+                &state.registry,
+            )
+        },
+        |embedder| {
+            indexer::reindex_single_file(
+                &db,
+                embedder,
+                kb_path,
+                new_rel,
+                exclude_headings,
+                &state.registry,
+            )
+        },
+    );
+}
+
+/// The line a rename prints when it failed before the indexer's rename returned.
+fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
+    wdiag!(
+        "watcher: rename {old_rel} -> {new_rel} failed: {}",
+        crate::embedder::body_free_message(e)
+    );
+}
+
+/// (#544) The rest of [`dispatch_rename`] once the plan has run ([`apply_rename_plan_before`]
+/// gave `before`), with both locks still held. `rename` is the indexer's rename and `reindex`
+/// a reindex of `new_rel`, each handed `ctx` (the embedder), so a test can run this with no
+/// [`crate::embedder::Embedder`] and inject their failures.
+///
+/// (#544 C1) A plan that cleared the destination's row
+/// ([`RenamePlan::ClearDestinationThenRename`]) and then failed -- clearing it, or the
+/// indexer's rename -- goes to [`settle_cleared_rename`] before anything else, so a file on
+/// disk at `new_rel` gets a row from its own reindex when that reindex writes one. The
+/// source's row is not moved onto it there.
+#[allow(clippy::too_many_arguments)]
+fn finish_rename_locked<C>(
+    db: &Database,
+    kb_path: &Path,
+    (old_rel, new_rel): (&str, &str),
+    look: WriteLook,
+    (plan, before): (RenamePlan, Result<bool>),
+    ctx: &mut C,
+    rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
+    reindex: impl FnOnce(&mut C) -> Result<indexer::SingleResult>,
+) {
+    let cleared = plan == RenamePlan::ClearDestinationThenRename;
+    let settle_cleared = |ctx: &mut C| {
+        let recovery = settle_cleared_rename(
+            db,
+            kb_path,
+            (old_rel, new_rel),
+            || written_path_on_disk(kb_path, new_rel, look),
+            || written_path_on_disk(kb_path, old_rel, look),
+            || reindex(ctx),
+        );
+        log_cleared_rename(old_rel, new_rel, recovery);
+    };
+    match before {
+        Ok(true) => {}
+        // The rows are already where the plan put them; a moved row's folded rows follow it.
+        Ok(false) if matches!(plan, RenamePlan::MoveRowUnknown(_)) => {
+            sweep_legacy_row(db, kb_path, old_rel, false);
+            sweep_legacy_row(db, kb_path, new_rel, true);
+            return;
+        }
+        // Dropping swept the folded rows as a removal; leaving touches nothing.
+        Ok(false) => return,
+        Err(e) => {
+            log_rename_failed(old_rel, new_rel, &e);
+            if cleared {
+                settle_cleared(ctx);
+                sweep_legacy_row(db, kb_path, old_rel, false);
+                sweep_legacy_row(db, kb_path, new_rel, true);
+            }
+            return;
+        }
+    }
+    let outcome = rename(ctx);
+    let failed = outcome.is_err();
+    let settled = rename_outcome_is_settled(&outcome);
+    log_rename_outcome(old_rel, new_rel, outcome);
+    if cleared && failed {
+        settle_cleared(ctx);
+    }
+    if !settled && written_path_on_disk(kb_path, new_rel, look) == OnDisk::Gone {
+        log_written_path_gone(new_rel, deindex_removed_path(db, kb_path, new_rel));
+    }
+    // The file has left `old_rel` under every spelling; at `new_rel` the sweep
+    // follows the real key in, as it does after a reindex.
+    sweep_legacy_row(db, kb_path, old_rel, false);
+    sweep_legacy_row(db, kb_path, new_rel, true);
+}
+
+/// What [`settle_cleared_rename`] did at the destination.
+#[derive(Debug)]
+enum ClearedDestination {
+    /// A row is at `new_rel` (the failure came after the source's row moved): nothing touched.
+    RowInPlace,
+    /// Whether `new_rel` holds a row could not be read: nothing touched.
+    RowUnread(anyhow::Error),
+    /// The file is there: it was reindexed, with this result.
+    Reindexed(Result<indexer::SingleResult>),
+    /// The file is not there, or could not be looked at: nothing was written.
+    NotReindexed(OnDisk),
+}
+
+/// What [`settle_cleared_rename`] did with the source's row.
+#[derive(Debug)]
+enum ClearedSource {
+    /// Not looked at: the destination holds a row, or the source's row could not be read.
+    Untouched,
+    /// No row at `old_rel`.
+    NoRow,
+    /// The file is at `old_rel` again, or could not be looked at: the row stays, for that
+    /// file's own event.
+    Kept(OnDisk),
+    /// The file is gone from `old_rel`: the source's rows were deleted, and the result says
+    /// whether either was there. They are not moved onto the destination.
+    Dropped(Result<bool>),
+}
+
+/// (#544 C1) An overwriting rename cleared the destination's row
+/// ([`RenamePlan::ClearDestinationThenRename`]) and then failed, maybe before the source's row
+/// moved onto it. Inside the same locks, nothing looped:
+///
+/// - a row at `new_rel` means the move happened: nothing more is done
+/// - otherwise the destination is looked at again (`look_new`). A file there is reindexed
+///   (`reindex`), and that is the only way it gets a row here. When the reindex writes nothing
+///   (it fails, or skips the file), or the destination cannot be looked at, it is left with no
+///   row until its next event or a full index, and stderr says why ([`log_cleared_rename`])
+/// - the source's row is never moved onto the destination: the bytes there may be the
+///   source's and still not be what the destination's parser reads (local Codex r3: a
+///   Markdown row on a `.docx` path), and only the indexer's rename settles that. The row
+///   goes when its file is gone from `old_rel` (`look_old`); a file at `old_rel` again, or one
+///   that cannot be looked at, keeps its row
+///
+/// A failure here leaves the rows as they are and says so on stderr.
+fn settle_cleared_rename(
+    db: &Database,
+    kb_path: &Path,
+    (old_rel, new_rel): (&str, &str),
+    look_new: impl FnOnce() -> OnDisk,
+    look_old: impl FnOnce() -> OnDisk,
+    reindex: impl FnOnce() -> Result<indexer::SingleResult>,
+) -> (ClearedDestination, ClearedSource) {
+    match db.get_document_hash(new_rel) {
+        Ok(Some(_)) => return (ClearedDestination::RowInPlace, ClearedSource::Untouched),
+        Ok(None) => {}
+        Err(e) => return (ClearedDestination::RowUnread(e), ClearedSource::Untouched),
+    }
+    let dest = match look_new() {
+        OnDisk::Present => ClearedDestination::Reindexed(reindex()),
+        not_there => ClearedDestination::NotReindexed(not_there),
+    };
+    let source = match db.get_document_hash(old_rel) {
+        Ok(None) => ClearedSource::NoRow,
+        Err(_) => ClearedSource::Untouched,
+        Ok(Some(_)) => match look_old() {
+            OnDisk::Gone => ClearedSource::Dropped(deindex_removed_path(db, kb_path, old_rel)),
+            back @ (OnDisk::Present | OnDisk::Unknown(_)) => ClearedSource::Kept(back),
+        },
+    };
+    (dest, source)
+}
+
+/// The lines [`finish_rename_locked`] prints for what [`settle_cleared_rename`] did.
+fn log_cleared_rename(
+    old_rel: &str,
+    new_rel: &str,
+    (dest, source): (ClearedDestination, ClearedSource),
+) {
+    match dest {
+        ClearedDestination::RowInPlace => {}
+        ClearedDestination::RowUnread(e) => wdiag!(
+            "watcher: after the failed rename, could not read the row of {new_rel}; left the rows as they were: {}",
+            crate::embedder::body_free_message(&e)
+        ),
+        ClearedDestination::Reindexed(result) => {
+            // A destination the reindex did not settle has no row: it was cleared before.
+            let settled = write_reindex_settled_the_row(&result);
+            let what = match result {
+                Ok(result) => format!("reindexed {new_rel}: {result:?}"),
+                Err(e) => format!(
+                    "reindex {new_rel} failed: {}",
+                    crate::embedder::body_free_message(&e)
+                ),
+            };
+            if settled {
+                wdiag!("watcher: after the failed rename, {what}");
+            } else {
+                wdiag!(
+                    "watcher: after the failed rename, {what}; {new_rel} has no row until its next event or a full index"
+                );
+            }
+        }
+        ClearedDestination::NotReindexed(OnDisk::Gone) => {
+            wdiag!("watcher: after the failed rename, {new_rel} was not reindexed (Gone)")
+        }
+        ClearedDestination::NotReindexed(on_disk) => wdiag!(
+            "watcher: after the failed rename, {new_rel} was not reindexed ({on_disk:?}); it has no row until its next event or a full index"
+        ),
+    }
+    match source {
+        ClearedSource::Untouched | ClearedSource::NoRow => {}
+        ClearedSource::Kept(on_disk) => wdiag!(
+            "watcher: after the failed rename, left the row of {old_rel} as it was ({on_disk:?})"
+        ),
+        ClearedSource::Dropped(outcome) => log_written_path_gone(old_rel, outcome),
+    }
+}
+
+/// The line [`dispatch_rename`] prints for what [`indexer::rename_single_file`] returned.
+fn log_rename_outcome(old_rel: &str, new_rel: &str, outcome: Result<indexer::RenameOutcome>) {
+    match outcome {
         Ok(indexer::RenameOutcome::Renamed) => {
             wdiag!("watcher: renamed {old_rel} -> {new_rel}");
         }
@@ -1796,10 +2684,6 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
             crate::embedder::body_free_message(&e)
         ),
     }
-    // The file has left `old_rel` under every spelling; at `new_rel` the sweep
-    // follows the real key in, as it does after a reindex.
-    sweep_legacy_row(&db, &state.kb_path, old_rel, false);
-    sweep_legacy_row(&db, &state.kb_path, new_rel, true);
 }
 
 /// (feature-68) One stored document under a renamed directory, mapped to the
@@ -1945,6 +2829,8 @@ fn to_state(p: &Path) -> (ToState, Option<std::io::Error>) {
 /// (permission, a sharing violation, I/O) is returned as `Err`, because on
 /// this path "gone" leads to deleting rows and such a failure does not prove
 /// absence (local Codex r4, and the source end after the re-review of it).
+/// (#544 A14) Only the destination end asks it now; the source end is
+/// [`sweep_source_if_gone`], which also reads not-a-directory as gone.
 fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(p) {
         Ok(m) => Ok(Some(m)),
@@ -1968,8 +2854,14 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 /// is logged and left to the file rename. If the event was a directory
 /// rename, that is a skip for two directory names: its rows stay under the
 /// old path rather than being swept while the directory may still be there,
-/// and a full index recovers them. "Gone" is decided the same way at both
-/// ends, by [`stat_unless_gone`].
+/// and a full index recovers them. (#544 L-h) The destination's gone is
+/// [`stat_unless_gone`]'s (only not-found), the source's is
+/// [`sweep_source_if_gone`]'s under the db lock (not-found or not-a-directory,
+/// [`indexer::stat_error_means_gone`]); the two never both act in one call.
+/// (#544 P1-S) The destination's spelling is looked at once, in the listing's
+/// lock region ([`arrived_directory_on_disk`]): a destination on disk only
+/// under another spelling moves no row and is not scanned
+/// ([`dir_rename_moves_its_steps`]); the listed rows still leave the old path.
 ///
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
@@ -1978,10 +2870,10 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 ///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
 ///   already moved), so no listed row stays there even when the old directory
 ///   was recreated; rows added under the old prefix after the listing are
-///   swept by [`dispatch_deindex_subtree`] once `from` is gone; last,
+///   swept by [`sweep_source_if_gone`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
 /// - [`DirRenameEntry::SweepOnly`]: no move and no scan. When `from` is gone,
-///   one range sweep by [`dispatch_deindex_subtree`] drops the listed rows and
+///   one range sweep by [`sweep_source_if_gone`] drops the listed rows and
 ///   any added since. Otherwise (`from` recreated, or its stat failed) only
 ///   the rows the entry decision listed are dropped, one by one through
 ///   [`dispatch_deindex`], so a recreated directory's own rows are kept.
@@ -2045,11 +2937,23 @@ fn dispatch_directory_rename(
             return false;
         }
     };
+    // (#544 P1-S) Whether the rows move to `to`, from one look at its spelling taken in the
+    // listing's lock region. A sweep-only entry moves nothing whatever this says.
+    let mut moves = true;
     if entry == DirRenameEntry::ScanDestination {
-        let listed = {
+        let (listed, to_spelled) = {
             let db = recover_db(state.db.lock());
-            db.document_paths_under(old_rel)
+            (
+                db.document_paths_under(old_rel),
+                arrived_directory_on_disk(&state.kb_path, new_rel, to),
+            )
         };
+        moves = dir_rename_moves_its_steps(to_spelled, rel_is_lossy(&state.kb_path, Some(to)));
+        if !moves {
+            wdiag!(
+                "watcher: the renamed directory {new_rel} is not on disk under that spelling; its rows leave the old path and are not moved there"
+            );
+        }
         let paths = match listed {
             Ok(paths) => paths,
             Err(e) => {
@@ -2065,19 +2969,39 @@ fn dispatch_directory_rename(
                 "watcher: a renamed directory held {n} indexed document{}; following the rename for them (the file system reports only the directory).",
                 if n == 1 { "" } else { "s" }
             );
-            let steps = dir_rename_steps(
-                &paths,
-                &state.kb_path,
-                old_rel,
-                new_rel,
-                &state.registry,
-                &state.rules,
-            );
+            let steps = if moves {
+                dir_rename_steps(
+                    &paths,
+                    &state.kb_path,
+                    old_rel,
+                    new_rel,
+                    &state.registry,
+                    &state.rules,
+                )
+            } else {
+                Vec::new()
+            };
             for step in &steps {
                 match step.action {
-                    RenameAction::Rename => dispatch_rename(state, &step.old_rel, &step.new_rel),
+                    // (#544) Only whether a file is there: the destination directory was
+                    // spelled once above, and below it a step's `new_rel` is the row's own
+                    // spelling.
+                    RenameAction::Rename => {
+                        dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
+                    }
                     RenameAction::Deindex => dispatch_deindex(state, &step.old_rel),
-                    RenameAction::Reindex => dispatch_reindex(state, &step.new_rel),
+                    // (#544) No event path for a step (its `new_rel` is built from the
+                    // row's), so it is read as not lossy and only whether a file is there
+                    // is asked: a lossy row's step looks gone, the answer
+                    // `rename_single_file` already gives such a destination.
+                    RenameAction::Reindex => dispatch_reindex_from(
+                        state,
+                        &step.new_rel,
+                        ReindexOrigin::Write {
+                            raw: None,
+                            look: WriteLook::ExistsOnly,
+                        },
+                    ),
                     RenameAction::Skip => {}
                 }
             }
@@ -2093,21 +3017,29 @@ fn dispatch_directory_rename(
     }
     // The old prefix is swept only when `from` is known to be gone. A stat that
     // fails for another reason does not prove that, and sweeping a directory
-    // that is still there would delete its live rows.
-    let from_gone = match stat_unless_gone(from) {
-        Ok(None) => true,
-        Ok(Some(_)) => false,
-        Err(e) => {
+    // that is still there would delete its live rows. (#544 A14) The stat and the
+    // range delete share one db lock region; on the sweep-only path the delete
+    // takes the listed rows too.
+    let swept = {
+        let db = recover_db(state.db.lock());
+        sweep_source_if_gone(&db, &state.kb_path, from)
+        // `db` is dropped here, before any `dispatch_*` locks it again.
+    };
+    let from_gone = match swept {
+        SourceSweep::Swept(Some((rel, outcome))) => {
+            log_subtree_deindex(&rel, outcome);
+            true
+        }
+        SourceSweep::Swept(None) => true,
+        SourceSweep::Present => false,
+        SourceSweep::Unknown(e) => {
             wdiag!(
                 "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
             );
             false
         }
     };
-    if from_gone {
-        // One range delete; on the sweep-only path it takes the listed rows too.
-        dispatch_deindex_subtree(state, from);
-    } else if let DirRenameEntry::SweepOnly(paths) = &entry {
+    if !from_gone && let DirRenameEntry::SweepOnly(paths) = &entry {
         // (local Codex r5, r6) `from` was recreated, or cannot be stat'ed: the
         // listed rows predate the rename and go, but one by one, so a recreated
         // directory's own rows are not taken by a prefix sweep. Rare, so the
@@ -2124,7 +3056,7 @@ fn dispatch_directory_rename(
     // directory rename there is no such row and this is a no-op (one deletes
     // the exact row, the sweep what is strictly under it, as in feature-67).
     dispatch_deindex(state, old_rel);
-    if entry == DirRenameEntry::ScanDestination {
+    if entry == DirRenameEntry::ScanDestination && moves {
         dispatch_new_directory(state, to, new_rel);
     }
     true
@@ -4619,5 +5551,1016 @@ mod tests {
             "watcher: reindexed a.md (5 chunks, 3 reused, frontmatter unparsed)"
         );
         assert!(plain.is_ascii() && unparsed.is_ascii());
+    }
+
+    /// A scratch knowledge base for the #544 write-look tests, removed when the guard drops.
+    fn i544_scratch_kb(tag: &str) -> (std::path::PathBuf, impl Drop) {
+        let kb = crate::test_support::unique_temp_path(tag);
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        (kb.clone(), Cleanup(kb))
+    }
+
+    /// (#544 A1) A write whose file is gone by the time the locks are held drops the row under
+    /// its path, and only that row; no reindex runs.
+    #[test]
+    fn a_write_whose_file_is_gone_drops_the_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-gone");
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let look = written_path_on_disk(&kb, "a.md", WriteLook::Spelled);
+        assert_eq!(look, OnDisk::Gone);
+        let check = act_on_written_path(&db, &kb, "a.md", look, false);
+        assert!(
+            matches!(check, WrittenPathCheck::Deindexed(Ok(true))),
+            "{check:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 A3) A write whose name is on disk only in another case (a case-only rename whose
+    /// new spelling's event comes on its own) drops the row under the spelling the event
+    /// named, and leaves the row under the other spelling. The look reads such a name as gone
+    /// on a case-insensitive volume (the old name opens the file) and on a case-sensitive one
+    /// (it is simply not there), for the leaf and for a directory on the way.
+    #[test]
+    fn a_write_whose_name_is_on_disk_only_in_another_case_drops_that_spelling() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-case");
+        let db = dir_rename_db(&["Old.md", "old.md"]);
+        let check = act_on_written_path(&db, &kb, "Old.md", OnDisk::Gone, false);
+        assert!(
+            matches!(check, WrittenPathCheck::Deindexed(Ok(true))),
+            "{check:?}"
+        );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["old.md".to_string()]);
+
+        std::fs::write(kb.join("A.md"), "# A\n").unwrap();
+        assert_eq!(
+            written_path_on_disk(&kb, "a.md", WriteLook::Spelled),
+            OnDisk::Gone
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "A.md", WriteLook::Spelled),
+            OnDisk::Present
+        );
+        std::fs::create_dir_all(kb.join("Dir")).unwrap();
+        std::fs::write(kb.join("Dir").join("note.md"), "# n\n").unwrap();
+        assert_eq!(
+            written_path_on_disk(&kb, "dir/note.md", WriteLook::Spelled),
+            OnDisk::Gone
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "Dir/note.md", WriteLook::Spelled),
+            OnDisk::Present
+        );
+    }
+
+    /// (#544 D3, Review Focus 1) A write whose look cannot tell -- on Windows, an editor holding
+    /// the file while it saves -- keeps the row and goes on to the reindex.
+    #[test]
+    fn a_write_whose_look_cannot_tell_still_reindexes() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unknown");
+        let db = dir_rename_db(&["locked.md", "other.md"]);
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let check = act_on_written_path(&db, &kb, "locked.md", OnDisk::Unknown(denied), false);
+        assert!(
+            matches!(check, WrittenPathCheck::ProceedUnknown(k) if k == denied),
+            "{check:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["locked.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544) A write of a file that is there under its exact spelling touches no row before
+    /// the reindex.
+    #[test]
+    fn a_write_of_a_present_file_proceeds() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-present");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let look = written_path_on_disk(&kb, "a.md", WriteLook::Spelled);
+        assert_eq!(look, OnDisk::Present);
+        let check = act_on_written_path(&db, &kb, "a.md", look, false);
+        assert!(matches!(check, WrittenPathCheck::Proceed), "{check:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544 C4, P1-L file branch) A file whose name is not UTF-8 is keyed by a lossy spelling
+    /// (U+FFFD), and a look at that spelling never finds it. Its write is not read as gone:
+    /// the row stays, as before the look existed. Asked of the event's path, so with none at
+    /// hand nothing is lossy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_under_a_lossy_name_is_never_read_as_gone() {
+        use std::os::unix::ffi::OsStrExt;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-lossy");
+        let raw = kb.join(std::ffi::OsStr::from_bytes(b"a\xff.md"));
+        std::fs::write(&raw, "# a\n").unwrap();
+        let rel = indexer::index_rel_path(&kb, &raw).unwrap();
+        let db = dir_rename_db(&[rel.as_str()]);
+        assert!(rel_is_lossy(&kb, Some(&raw)));
+        assert!(!rel_is_lossy(&kb, None));
+        assert_eq!(
+            written_path_on_disk(&kb, &rel, WriteLook::Spelled),
+            OnDisk::Gone,
+            "the lossy spelling names no file"
+        );
+        let check = act_on_written_path(&db, &kb, &rel, OnDisk::Gone, true);
+        assert!(matches!(check, WrittenPathCheck::Proceed), "{check:?}");
+        assert_eq!(db.all_document_paths().unwrap(), vec![rel]);
+    }
+
+    /// (#544 C4) A name holding a real U+FFFD is spelled exactly, so it is not lossy and its
+    /// look is the ordinary one.
+    #[test]
+    fn a_real_replacement_character_in_a_name_is_not_lossy() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-fffd");
+        let raw = kb.join("a\u{FFFD}.md");
+        std::fs::write(&raw, "# a\n").unwrap();
+        assert!(!rel_is_lossy(&kb, Some(&raw)));
+        assert_eq!(
+            written_path_on_disk(&kb, "a\u{FFFD}.md", WriteLook::Spelled),
+            OnDisk::Present
+        );
+    }
+
+    /// (#544 C4) An event path that cannot be placed under the knowledge base at all, even
+    /// canonicalized, is read as lossy: no look at a `rel` made for it can be trusted, so the
+    /// write keeps the row as it did before the look existed.
+    #[test]
+    fn an_event_path_that_cannot_be_placed_under_the_kb_reads_as_lossy() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unplaced");
+        let (elsewhere, _cleanup2) = i544_scratch_kb("groove-watcher-i544-elsewhere");
+        assert!(rel_is_lossy(&kb, Some(&elsewhere.join("x.md"))));
+        std::fs::write(kb.join("x.md"), "# x\n").unwrap();
+        assert!(!rel_is_lossy(&kb, Some(&kb.join("x.md"))));
+    }
+
+    /// (#544) A reindex that settled the row -- written, unchanged, refreshed, or dropped by
+    /// the indexer -- is not looked at again, and no row is touched.
+    #[test]
+    fn a_settled_write_reindex_does_not_look_again() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-settled");
+        let settled: [Result<indexer::SingleResult>; 5] = [
+            Ok(indexer::SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Unchanged),
+            Ok(indexer::SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::NothingToIndex {
+                deindexed: true,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed),
+        ];
+        for result in &settled {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let got = settle_write_reindex(&db, &kb, "a.md", result, false, || {
+                panic!("a settled reindex must not look again: {result:?}")
+            });
+            assert!(
+                matches!(got, WriteReindexSettled::Kept),
+                "{result:?}: {got:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["a.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+    }
+
+    /// (#544 A1) A reindex that left the row as it was -- a skip whatever its reason, a
+    /// refusal, an error -- looks again: a path gone by then drops its row; one present or
+    /// that cannot be looked at keeps it, and so does a lossy `rel` whatever the look says.
+    #[test]
+    fn an_unsettled_write_reindex_drops_the_row_when_the_file_is_gone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unsettled");
+        let unsettled = || -> [Result<indexer::SingleResult>; 3] {
+            [
+                Ok(indexer::SingleResult::Skipped {
+                    reason: "file no longer exists",
+                    frontmatter_unparsed: false,
+                }),
+                Ok(indexer::SingleResult::Refused),
+                Err(anyhow::anyhow!("x")),
+            ]
+        };
+        for result in &unsettled() {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let got = settle_write_reindex(&db, &kb, "a.md", result, false, || OnDisk::Gone);
+            assert!(
+                matches!(got, WriteReindexSettled::Deindexed(Ok(true))),
+                "{result:?}: {got:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()],
+                "{result:?}"
+            );
+        }
+        for look in [
+            OnDisk::Present,
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        ] {
+            for result in &unsettled() {
+                let db = dir_rename_db(&["a.md", "other.md"]);
+                let got = settle_write_reindex(&db, &kb, "a.md", result, false, || look);
+                assert!(
+                    matches!(got, WriteReindexSettled::LeftAsIs),
+                    "{look:?} {result:?}: {got:?}"
+                );
+                assert_eq!(
+                    db.all_document_paths().unwrap(),
+                    vec!["a.md".to_string(), "other.md".to_string()],
+                    "{look:?} {result:?}"
+                );
+            }
+        }
+        for result in &unsettled() {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let got = settle_write_reindex(&db, &kb, "a.md", result, true, || OnDisk::Gone);
+            assert!(
+                matches!(got, WriteReindexSettled::LeftAsIs),
+                "lossy {result:?}: {got:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["a.md".to_string(), "other.md".to_string()],
+                "lossy {result:?}"
+            );
+        }
+    }
+
+    /// (#544) The look that only asks whether a regular file is there reads a directory, and a
+    /// missing path, as gone, and a file as present.
+    #[test]
+    fn exists_only_look_reads_a_directory_as_gone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-existsonly");
+        std::fs::create_dir_all(kb.join("d.md")).unwrap();
+        std::fs::write(kb.join("f.md"), "# f\n").unwrap();
+        assert_eq!(
+            written_path_on_disk(&kb, "d.md", WriteLook::ExistsOnly),
+            OnDisk::Gone
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "f.md", WriteLook::ExistsOnly),
+            OnDisk::Present
+        );
+        assert_eq!(
+            written_path_on_disk(&kb, "missing.md", WriteLook::ExistsOnly),
+            OnDisk::Gone
+        );
+    }
+
+    /// (#544 P1-I) On macOS a rename can arrive as an unpaired `Modify(Name(Any))` for the old
+    /// name, a path that is gone. The debouncer hands it on as one event of one path, the
+    /// watcher classifies it as a reindex of that path, and the look inside the locks then
+    /// finds the path gone and drops its row, with the event's own path deciding lossiness.
+    #[test]
+    fn an_unpaired_rename_reaches_the_watcher_as_a_write_of_one_path() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unpaired");
+        let gone = kb.join("a.md");
+        let name_any = EventKind::Modify(ModifyKind::Name(RenameMode::Any));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _d = new_debouncer_opt::<_, InjectWatcher, _>(
+            Duration::from_millis(100),
+            None,
+            tx,
+            notify_debouncer_full::NoCache,
+            notify::Config::default(),
+        )
+        .unwrap();
+        inject(name_any, &gone);
+        let got = drain_debounced(&rx, Duration::from_millis(800));
+        assert_eq!(got, vec![(name_any, vec![gone.clone()])]);
+
+        let evt = mk_evt(got[0].0, got[0].1.clone());
+        let Classified::Reindex(paths) = classify(&evt) else {
+            panic!("an unpaired Name(Any) must be a reindex");
+        };
+        assert_eq!(paths, std::slice::from_ref(&gone));
+
+        let rel = to_rel(&kb, &paths[0]).unwrap();
+        assert_eq!(rel, "a.md");
+        let db = dir_rename_db(&["a.md", "b.md"]);
+        let check = act_on_written_path(
+            &db,
+            &kb,
+            &rel,
+            written_path_on_disk(&kb, &rel, WriteLook::Spelled),
+            rel_is_lossy(&kb, Some(&paths[0])),
+        );
+        assert!(
+            matches!(check, WrittenPathCheck::Deindexed(Ok(true))),
+            "{check:?}"
+        );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["b.md".to_string()]);
+    }
+
+    /// (#544) The scan of a directory that just arrived hands over, with each `rel`, the path
+    /// the walk found it at, so the look inside the locks can ask that path whether its name is
+    /// lossy.
+    #[test]
+    fn the_scan_of_a_new_directory_hands_over_the_paths_it_found() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-scan");
+        std::fs::create_dir_all(kb.join("new").join("sub")).unwrap();
+        std::fs::write(kb.join("new").join("x.md"), "# x\n").unwrap();
+        std::fs::write(kb.join("new").join("sub").join("y.md"), "# y\n").unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        let mut found = new_directory_entries(&kb, &kb.join("new"), &reg, &rules).unwrap();
+        found.sort();
+        let rels: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(rels, vec!["new/sub/y.md", "new/x.md"]);
+        for (rel, path) in &found {
+            assert_eq!(
+                path.canonicalize().unwrap(),
+                kb.join(rel).canonicalize().unwrap(),
+                "{rel}"
+            );
+            assert!(!rel_is_lossy(&kb, Some(path)), "{rel}");
+        }
+    }
+
+    /// (#544 A9/A10) A rename whose destination is not on disk under that spelling (gone, a
+    /// directory, or there only in another case) moves no row: both ends' rows go, and the
+    /// indexer's rename is not run.
+    #[test]
+    fn a_rename_whose_destination_is_gone_drops_both_rows() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-rename-gone");
+        let db = dir_rename_db(&["a.md", "B.md", "other.md"]);
+        let plan = rename_plan(&db, "a.md", "B.md", OnDisk::Gone).unwrap();
+        assert_eq!(plan, RenamePlan::DropBoth);
+        let run_rename = apply_rename_plan_before(&db, &kb, "a.md", "B.md", &plan).unwrap();
+        assert!(!run_rename);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 D3, C2) A rename whose destination cannot be looked at deletes nothing: with no
+    /// row at the old end, or rows at both ends, the rows stay as they are; with a row at the
+    /// old end only, the row moves to the new end, its content left as it was.
+    #[test]
+    fn a_rename_whose_destination_cannot_be_looked_at_keeps_or_moves_rows() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-rename-unknown");
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let cases: [(&[&str], RenamePlan, &[&str]); 3] = [
+            (
+                &["b.md", "other.md"],
+                RenamePlan::LeaveUnknown(denied),
+                &["b.md", "other.md"],
+            ),
+            (
+                &["a.md", "b.md", "other.md"],
+                RenamePlan::LeaveUnknown(denied),
+                &["a.md", "b.md", "other.md"],
+            ),
+            (
+                &["a.md", "other.md"],
+                RenamePlan::MoveRowUnknown(denied),
+                &["b.md", "other.md"],
+            ),
+        ];
+        for (rows, want_plan, want_rows) in cases {
+            let db = dir_rename_db(rows);
+            let plan = rename_plan(&db, "a.md", "b.md", OnDisk::Unknown(denied)).unwrap();
+            assert_eq!(plan, want_plan, "{rows:?}");
+            let run_rename = apply_rename_plan_before(&db, &kb, "a.md", "b.md", &plan).unwrap();
+            assert!(!run_rename, "{rows:?}");
+            assert_eq!(db.all_document_paths().unwrap(), want_rows, "{rows:?}");
+        }
+    }
+
+    /// (#544 C1, D6) A rename over a path that holds a row, from one that holds a row too:
+    /// the destination's row goes first, so the indexer's move of the source row does not run
+    /// into it on the unique key.
+    #[test]
+    fn an_overwriting_rename_onto_an_indexed_path_clears_the_destination_first() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite");
+        let db = dir_rename_db(&["a.md", "b.md", "other.md"]);
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::ClearDestinationThenRename);
+        let run_rename = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan).unwrap();
+        assert!(run_rename);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["b.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544, spec r1 M1) A rename onto an indexed path from one with no row clears nothing:
+    /// the indexer reindexes the destination in place (`OldPathMissing`), reusing its vectors.
+    #[test]
+    fn a_rename_with_no_source_row_does_not_clear_the_destination() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-no-source");
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let run_rename = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan).unwrap();
+        assert!(run_rename);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544, feature-68 r11) A rename whose two ends are the same path is not an overwrite:
+    /// its own row is not cleared.
+    #[test]
+    fn a_rename_onto_itself_is_not_an_overwrite() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-self");
+        let db = dir_rename_db(&["docs"]);
+        let plan = rename_plan(&db, "docs", "docs", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let run_rename = apply_rename_plan_before(&db, &kb, "docs", "docs", &plan).unwrap();
+        assert!(run_rename);
+        assert_eq!(db.all_document_paths().unwrap(), vec!["docs".to_string()]);
+    }
+
+    /// (#544 A7/A8) Which outcomes of the indexer's rename settle the row, and which leave it
+    /// for a second look at the destination. Named one by one, as the function does.
+    #[test]
+    fn the_settled_rename_outcomes_are_named_one_by_one() {
+        use indexer::RenameOutcome as R;
+        let settled = [
+            R::Renamed,
+            R::RenamedAndReindexed { chunks: 1 },
+            R::OldPathMissing,
+            R::RenamedSizeCapped,
+            R::RenamedSizeCappedAndDropped,
+            R::RenamedButRefusedAndDropped,
+            R::MovedOutOfTheKnowledgeBase,
+        ];
+        for outcome in settled {
+            let label = format!("{outcome:?}");
+            assert!(rename_outcome_is_settled(&Ok(outcome)), "{label}");
+        }
+        let unsettled = [
+            R::OldPathMissingAndRefused,
+            R::RenamedButRefused,
+            R::RenamedButNotReindexed,
+        ];
+        for outcome in unsettled {
+            let label = format!("{outcome:?}");
+            assert!(!rename_outcome_is_settled(&Ok(outcome)), "{label}");
+        }
+        assert!(!rename_outcome_is_settled(&Err(anyhow::anyhow!("x"))));
+    }
+
+    /// The rows of an overwriting rename of `b.md` onto `a.md`, for the tests of a failure after
+    /// the destination's row went: the source's row has its own hash, so a test can tell which
+    /// content ended up at `a.md`.
+    fn overwrite_db() -> Database {
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        db.upsert_document("b.md", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        db
+    }
+
+    /// The reindex a test hands [`finish_rename_locked`]: writes a row at `rel` with hash
+    /// `fresh`, as a reindex of the file on disk would.
+    fn write_fresh_row(db: &Database, rel: &str) -> Result<indexer::SingleResult> {
+        db.upsert_document(rel, None, None, None, None, &[], None, "fresh", 0)?;
+        Ok(indexer::SingleResult::Updated {
+            chunks: 1,
+            frontmatter_unparsed: false,
+        })
+    }
+
+    /// (#544 C1) An overwriting rename whose indexer's rename fails before it moves the source's
+    /// row (a stat or a read racing the first look, a DB error): the destination's row is gone,
+    /// so the file at the destination is reindexed inside the same locks, and the source's row,
+    /// whose file is gone, goes. Both looks a rename takes: a file rename's and a directory
+    /// rename's step.
+    #[test]
+    fn an_overwrite_whose_rename_fails_before_the_move_reindexes_the_destination() {
+        for look in [WriteLook::Spelled, WriteLook::ExistsOnly] {
+            let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail");
+            std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+            let db = overwrite_db();
+            let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+            assert_eq!(plan, RenamePlan::ClearDestinationThenRename);
+            let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+            let mut reindexed = 0;
+            finish_rename_locked(
+                &db,
+                &kb,
+                ("b.md", "a.md"),
+                look,
+                (plan, before),
+                &mut reindexed,
+                |_| Err(anyhow::anyhow!("injected failure before the move")),
+                |n| {
+                    *n += 1;
+                    write_fresh_row(&db, "a.md")
+                },
+            );
+            assert_eq!(reindexed, 1, "{look:?}");
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["a.md".to_string(), "other.md".to_string()],
+                "{look:?}"
+            );
+            assert_eq!(
+                db.get_document_hash("a.md").unwrap().as_deref(),
+                Some("fresh"),
+                "{look:?}"
+            );
+        }
+    }
+
+    /// (#544 C1, local Codex r3) The same failure, and the reindex of the destination fails
+    /// too: the source's row does not move onto the destination, even though the file there
+    /// holds the source's bytes. The source is gone, so its row goes, and the destination is
+    /// left with no row for its next event or a full index. A source back on disk by then keeps
+    /// its row, and the destination still gets none.
+    #[test]
+    fn an_overwrite_whose_reindex_also_fails_leaves_the_destination_with_no_row() {
+        use sha2::Digest;
+        let source_hash = format!("{:x}", sha2::Sha256::digest(b"# b\n"));
+        for source_back in [false, true] {
+            let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-twice");
+            std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+            if source_back {
+                std::fs::write(kb.join("b.md"), "# b again\n").unwrap();
+            }
+            let db = overwrite_db();
+            db.upsert_document("b.md", None, None, None, None, &[], None, &source_hash, 0)
+                .unwrap();
+            let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+            let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+            finish_rename_locked(
+                &db,
+                &kb,
+                ("b.md", "a.md"),
+                WriteLook::Spelled,
+                (plan, before),
+                &mut (),
+                |_| Err(anyhow::anyhow!("injected failure before the move")),
+                |_| Err(anyhow::anyhow!("injected reindex failure")),
+            );
+            assert_eq!(
+                db.get_document_hash("a.md").unwrap(),
+                None,
+                "source back: {source_back}"
+            );
+            let expected: Vec<String> = if source_back {
+                vec!["b.md".to_string(), "other.md".to_string()]
+            } else {
+                vec!["other.md".to_string()]
+            };
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                expected,
+                "source back: {source_back}"
+            );
+        }
+    }
+
+    /// (#544 C1, local Codex r2) The same two failures, and the file at the destination is no
+    /// longer the one the source's row was read from (an editor or another process replaced it
+    /// after the overwrite): the source's row does not move onto it, so the replaced file is
+    /// not served with the source's old content. The source is gone, so its row goes, and the
+    /// destination is left with no row for its next event or a full index.
+    #[test]
+    fn an_overwrite_whose_destination_was_replaced_does_not_move_the_source_row() {
+        use sha2::Digest;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-replaced");
+        std::fs::write(kb.join("a.md"), "# replaced\n").unwrap();
+        let db = overwrite_db();
+        let source_hash = format!("{:x}", sha2::Sha256::digest(b"# b\n"));
+        db.upsert_document("b.md", None, None, None, None, &[], None, &source_hash, 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| Err(anyhow::anyhow!("injected reindex failure")),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 C1, local Codex r3) An overwriting rename across parsers (`b.md` onto `a.docx`, the
+    /// bytes still Markdown) fails before the move, and the reindex of `a.docx` writes nothing
+    /// (the docx parser skips Markdown bytes). The bytes hash to the source's row, but that row
+    /// holds Markdown chunks, which the docx parser would not have written: it does not move onto
+    /// `a.docx`. The source is gone, so its row goes, and `a.docx` is left with no row.
+    #[test]
+    fn an_overwrite_across_parsers_whose_reindex_writes_nothing_does_not_move_the_source_row() {
+        use sha2::Digest;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-cross-parser");
+        std::fs::write(kb.join("a.docx"), "# b\n").unwrap();
+        let db = dir_rename_db(&["a.docx", "other.md"]);
+        let source_hash = format!("{:x}", sha2::Sha256::digest(b"# b\n"));
+        db.upsert_document("b.md", None, None, None, None, &[], None, &source_hash, 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.md", "a.docx", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::ClearDestinationThenRename);
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.docx", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.docx"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| {
+                Ok(indexer::SingleResult::Skipped {
+                    reason: "not a docx",
+                    frontmatter_unparsed: false,
+                })
+            },
+        );
+        assert_eq!(db.get_document_hash("a.docx").unwrap(), None);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 C1) Clearing the destination fails after its exact row went (the folded-row sweep
+    /// returning an error): the indexer's rename is not run, and the destination is reindexed
+    /// inside the same locks as when the rename fails.
+    #[test]
+    fn an_overwrite_whose_clearing_fails_reindexes_the_destination() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-clear-fail");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        assert!(indexer::deindex_single_file(&db, "a.md").unwrap());
+        let before = Err(anyhow::anyhow!("injected failure of the folded-row sweep"));
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| panic!("the indexer's rename must not run after clearing failed"),
+            |_| write_fresh_row(&db, "a.md"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some("fresh")
+        );
+    }
+
+    /// (#544 C1) A failure after the source's row was moved leaves the moved row where it is: no
+    /// reindex runs, since the destination has a row.
+    #[test]
+    fn an_overwrite_that_fails_after_the_move_keeps_the_moved_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-after");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| {
+                db.rename_document("b.md", "a.md", crate::db::FrontmatterTopic::Unread)?;
+                Err(anyhow::anyhow!("injected failure after the move"))
+            },
+            |_| panic!("a destination with a row must not be reindexed"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
+    }
+
+    /// (#544 C1) After the same failure, a source that is on disk again keeps its row (its own
+    /// event follows), and a destination gone by then is not reindexed.
+    #[test]
+    fn an_overwrite_failure_keeps_a_source_that_is_back_and_skips_a_gone_destination() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-back");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        std::fs::write(kb.join("b.md"), "# b again\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| write_fresh_row(&db, "a.md"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![
+                "a.md".to_string(),
+                "b.md".to_string(),
+                "other.md".to_string()
+            ]
+        );
+
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-gone");
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| panic!("a destination gone by then must not be reindexed"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// The directory listings [`spelled_on_disk`] has made on this thread so far.
+    fn listings() -> usize {
+        LISTINGS.with(std::cell::Cell::get)
+    }
+
+    /// (#544 A2) A directory that arrived where an indexed file was: the file's row under the
+    /// directory's name goes, and the directory is scanned.
+    #[test]
+    fn an_arrived_directory_drops_the_row_of_the_file_it_replaced() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived");
+        std::fs::create_dir_all(kb.join("a.md")).unwrap();
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let got = act_on_arrived_directory(&db, &kb, "a.md", &kb.join("a.md"));
+        assert!(matches!(got, ArrivedDirectory::Scan(Ok(true))), "{got:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 P1-S2) A directory that arrived under a spelling the disk holds only in another
+    /// case: it is not scanned, and the rows under that spelling go, the directory's own and
+    /// every one under it, while the rows under the spelling on disk stay.
+    ///
+    /// The look is handed in: on a case-sensitive OS `Docs` is not found when only `docs` is
+    /// there, so the event never reaches the directory branch of the reindex arm (the extension
+    /// filter of [`should_process`] drops it). This branch comes from the file system only on a
+    /// case-insensitive volume.
+    #[test]
+    fn an_arrived_directory_held_only_in_another_case_drops_its_prefix() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-case");
+        let db = dir_rename_db(&["Docs", "Docs/a.md", "docs/b.md"]);
+        let got = act_on_arrived_directory_for(&db, &kb, "Docs", Some(true), OnDisk::Gone, false);
+        let ArrivedDirectory::Dropped { exact, under } = got else {
+            panic!("expected Dropped, got {got:?}");
+        };
+        assert!(exact.unwrap());
+        assert_eq!(under.unwrap(), vec!["Docs/a.md".to_string()]);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["docs/b.md".to_string()]
+        );
+    }
+
+    /// (#544 D3) A directory whose spelling could not be looked at keeps every row, and is
+    /// scanned as before.
+    #[test]
+    fn an_arrived_directory_that_cannot_be_looked_at_keeps_its_prefix() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-unknown");
+        let db = dir_rename_db(&["Docs", "Docs/a.md", "docs/b.md"]);
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let got = act_on_arrived_directory_for(
+            &db,
+            &kb,
+            "Docs",
+            Some(true),
+            OnDisk::Unknown(denied),
+            false,
+        );
+        assert!(
+            matches!(got, ArrivedDirectory::Unknown(k) if k == denied),
+            "{got:?}"
+        );
+        let got =
+            act_on_arrived_directory_for(&db, &kb, "Docs", None, OnDisk::Unknown(denied), false);
+        assert!(
+            matches!(got, ArrivedDirectory::Unknown(k) if k == denied),
+            "{got:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![
+                "Docs".to_string(),
+                "Docs/a.md".to_string(),
+                "docs/b.md".to_string()
+            ]
+        );
+    }
+
+    /// (#544) A path that is no longer a directory by the time the lock is held, or is not
+    /// there at all, is left alone: its own event comes on its own.
+    #[test]
+    fn an_arrived_directory_that_is_no_longer_one_is_left_alone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-not-dir");
+        let db = dir_rename_db(&["a.md", "a.md/x.md"]);
+        let got = act_on_arrived_directory_for(&db, &kb, "a.md", Some(false), OnDisk::Gone, false);
+        assert!(
+            matches!(got, ArrivedDirectory::NoLongerADirectory),
+            "{got:?}"
+        );
+        let got = act_on_arrived_directory_for(&db, &kb, "a.md", None, OnDisk::Gone, false);
+        assert!(
+            matches!(got, ArrivedDirectory::NoLongerADirectory),
+            "{got:?}"
+        );
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let got = act_on_arrived_directory(&db, &kb, "a.md", &kb.join("a.md"));
+        assert!(
+            matches!(got, ArrivedDirectory::NoLongerADirectory),
+            "{got:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "a.md/x.md".to_string()]
+        );
+    }
+
+    /// (#544 P1-L directory branch) A directory whose name is not UTF-8 is keyed by a lossy
+    /// spelling, which a sibling whose name differs only in the bytes that are not UTF-8 shares.
+    /// Its arrival is never read as a spelling gone from disk: it is scanned, and no row goes,
+    /// neither its own nor the sibling's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_arrived_directory_under_a_lossy_name_keeps_its_rows() {
+        use std::os::unix::ffi::OsStrExt;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-lossy");
+        let raw = kb.join(std::ffi::OsStr::from_bytes(b"d\xff"));
+        let sibling = kb.join(std::ffi::OsStr::from_bytes(b"d\xfe"));
+        std::fs::create_dir_all(&raw).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let rel = indexer::index_rel_path(&kb, &raw).unwrap();
+        assert_eq!(indexer::index_rel_path(&kb, &sibling).unwrap(), rel);
+        let under = format!("{rel}/a.md");
+        let db = dir_rename_db(&[under.as_str()]);
+        assert!(rel_is_lossy(&kb, Some(&raw)));
+        let got = act_on_arrived_directory(&db, &kb, &rel, &raw);
+        assert!(matches!(got, ArrivedDirectory::Scan(Ok(false))), "{got:?}");
+        let got = act_on_arrived_directory_for(&db, &kb, &rel, Some(true), OnDisk::Gone, true);
+        assert!(matches!(got, ArrivedDirectory::Scan(Ok(false))), "{got:?}");
+        assert_eq!(db.all_document_paths().unwrap(), vec![under]);
+    }
+
+    /// (#544 P1-S2) The scan of an arrived directory spells the directory once; each file it
+    /// found only asks whether a regular file is there, which lists no directory.
+    #[test]
+    fn the_scan_of_an_arrived_directory_lists_no_directory_per_file() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-cost");
+        std::fs::create_dir_all(kb.join("docs")).unwrap();
+        let names = ["a.md", "b.md", "c.md", "d.md"];
+        for name in names {
+            std::fs::write(kb.join("docs").join(name), "# x\n").unwrap();
+        }
+        let before = listings();
+        for name in names {
+            assert_eq!(
+                written_path_on_disk(&kb, &format!("docs/{name}"), WriteLook::ExistsOnly),
+                OnDisk::Present,
+                "{name}"
+            );
+        }
+        assert_eq!(listings(), before, "a file of the scan listed a directory");
+    }
+
+    /// (#544 P1-S) A directory renamed onto a name the disk holds only in another case moves
+    /// none of its rows there (the listed rows still leave the old path); one whose destination
+    /// is there, or cannot be looked at, moves them as before. A lossy destination is never read
+    /// as gone.
+    #[test]
+    fn a_directory_renamed_onto_a_name_held_only_in_another_case_moves_nothing() {
+        assert!(!dir_rename_moves_its_steps(OnDisk::Gone, false));
+        assert!(dir_rename_moves_its_steps(OnDisk::Present, false));
+        assert!(dir_rename_moves_its_steps(
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+            false
+        ));
+        assert!(dir_rename_moves_its_steps(OnDisk::Gone, true));
+    }
+
+    /// (#544 P1-S) A directory rename spells its destination once: after that look, each
+    /// step's destination only asks whether a regular file is there, which lists nothing more.
+    #[test]
+    fn a_directory_rename_spells_its_destination_once() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-dir-rename-cost");
+        std::fs::create_dir_all(kb.join("Dest")).unwrap();
+        let names = ["a.md", "b.md", "c.md", "d.md"];
+        for name in names {
+            std::fs::write(kb.join("Dest").join(name), "# x\n").unwrap();
+        }
+        assert_eq!(
+            arrived_directory_on_disk(&kb, "Dest", &kb.join("Dest")),
+            OnDisk::Present
+        );
+        let after_the_destination = listings();
+        for name in names {
+            assert_eq!(
+                written_path_on_disk(&kb, &format!("Dest/{name}"), WriteLook::ExistsOnly),
+                OnDisk::Present,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            listings(),
+            after_the_destination,
+            "a step listed a directory"
+        );
+        assert_eq!(
+            arrived_directory_on_disk(&kb, "dest", &kb.join("dest")),
+            OnDisk::Gone,
+            "the destination under another case is not there under that spelling"
+        );
+    }
+
+    /// (#544 A14) The source of a directory rename is swept, under the db lock, only when it
+    /// is gone: not found, or a file where a directory on the way was. A source that is there
+    /// again keeps its rows.
+    #[test]
+    fn the_source_of_a_directory_rename_is_swept_only_when_gone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-source-sweep");
+        let db = dir_rename_db(&["old/a.md", "other.md"]);
+        match sweep_source_if_gone(&db, &kb, &kb.join("old")) {
+            SourceSweep::Swept(Some((rel, Ok(deleted)))) => {
+                assert_eq!(rel, "old");
+                assert_eq!(deleted, vec!["old/a.md".to_string()]);
+            }
+            got => panic!("a missing source must be swept: {got:?}"),
+        }
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+
+        let db = dir_rename_db(&["old/a.md", "other.md"]);
+        std::fs::create_dir_all(kb.join("old")).unwrap();
+        let got = sweep_source_if_gone(&db, &kb, &kb.join("old"));
+        assert!(matches!(got, SourceSweep::Present), "{got:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["old/a.md".to_string(), "other.md".to_string()]
+        );
+
+        // A file where the directory above the source was: not a directory on Unix, not found
+        // on Windows (estimated), and gone either way.
+        std::fs::write(kb.join("f"), "x").unwrap();
+        let db = dir_rename_db(&["f/old/a.md", "other.md"]);
+        match sweep_source_if_gone(&db, &kb, &kb.join("f").join("old")) {
+            SourceSweep::Swept(Some((rel, Ok(deleted)))) => {
+                assert_eq!(rel, "f/old");
+                assert_eq!(deleted, vec!["f/old/a.md".to_string()]);
+            }
+            got => panic!("a source under a file must be swept: {got:?}"),
+        }
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 }
