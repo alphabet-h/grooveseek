@@ -592,7 +592,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
                     RenameAction::Rename => dispatch_rename(state, &old_rel, &new_rel),
                     RenameAction::Deindex => dispatch_deindex(state, &old_rel),
-                    RenameAction::Reindex => dispatch_reindex(state, &new_rel),
+                    RenameAction::Reindex => dispatch_reindex(state, &new_rel, to),
                     RenameAction::Skip => continue,
                 }
             }
@@ -655,7 +655,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                         continue;
                     }
                     if should_process(&rel, p, state) {
-                        dispatch_reindex(state, &rel);
+                        dispatch_reindex(state, &rel, p);
                     }
                 }
             }
@@ -1080,10 +1080,6 @@ enum WriteLook {
     /// Only whether a regular file is at `rel` (`symlink_metadata`, links not followed), for a
     /// path whose directories were spelled by a walk or by a look taken once for all of them.
     /// No directory is listed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#544 Task 4 hands it to the scan callers")
-    )]
     ExistsOnly,
 }
 
@@ -1350,11 +1346,11 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
 /// Filtering is [`crate::indexer::collect_source_files_under`]'s, i.e. the full
 /// index walk's, so a directory drop and a later `groove index` agree about
 /// what belongs in the index -- plus the one name check the walk leaves to the
-/// watcher ([`new_directory_rels`]). Re-checking with [`should_process`] here would be
+/// watcher ([`new_directory_entries`]). Re-checking with [`should_process`] here would be
 /// a second implementation of the same question, which is exactly how the
 /// watcher and the walk drifted apart twice before (AU-03, BU-19).
 fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
-    let found = match new_directory_rels(&state.kb_path, dir, &state.registry, &state.rules) {
+    let found = match new_directory_entries(&state.kb_path, dir, &state.registry, &state.rules) {
         Ok(found) => found,
         Err(e) => {
             // Not retried, and the consequence is stated rather than implied
@@ -1391,8 +1387,17 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
         found.len(),
         if found.len() == 1 { "" } else { "s" }
     );
-    for frel in &found {
-        dispatch_reindex(state, frel);
+    // (#544) Each file only asks whether a regular file is at its `rel`: the walk spelled
+    // the directories on the way.
+    for (frel, f) in &found {
+        dispatch_reindex_from(
+            state,
+            frel,
+            ReindexOrigin::Write {
+                raw: Some(f),
+                look: WriteLook::ExistsOnly,
+            },
+        );
     }
 }
 
@@ -1405,16 +1410,38 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
 /// name is judged here on the recovered `rel`, the one that would be written,
 /// which is the one question the walk left to the watcher -- not a second
 /// filter over the rest.
+///
+/// (#544) Each `rel` comes with the path the walk found it at, which the look inside the
+/// locks asks whether the name is lossy ([`rel_is_lossy`]).
+fn new_directory_entries(
+    kb_path: &Path,
+    dir: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> Result<Vec<(String, PathBuf)>> {
+    let found = crate::indexer::collect_source_files_under(kb_path, dir, registry, rules)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|f| {
+            to_rel(kb_path, &f)
+                .filter(|r| name_is_addressable(r, &f, false))
+                .map(|r| (r, f))
+        })
+        .collect())
+}
+
+/// The `rel`s alone of [`new_directory_entries`], which is how the tests written before the
+/// paths were kept ask for them.
+#[cfg(test)]
 fn new_directory_rels(
     kb_path: &Path,
     dir: &Path,
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
 ) -> Result<Vec<String>> {
-    let found = crate::indexer::collect_source_files_under(kb_path, dir, registry, rules)?;
-    Ok(found
-        .iter()
-        .filter_map(|f| to_rel(kb_path, f).filter(|r| name_is_addressable(r, f, false)))
+    Ok(new_directory_entries(kb_path, dir, registry, rules)?
+        .into_iter()
+        .map(|(rel, _)| rel)
         .collect())
 }
 
@@ -1457,14 +1484,15 @@ fn reindexed_message(
     format!("watcher: reindexed {rel} ({chunks} chunks, {reused} reused{note})")
 }
 
-/// A create, modify or rename-to of `rel`: [`dispatch_reindex_from`] as a write whose event
-/// path is not at hand, looked at under its exact spelling.
-fn dispatch_reindex(state: &WatcherState, rel: &str) {
+/// A create, modify or rename-to of `rel` that an event named at `raw`:
+/// [`dispatch_reindex_from`] as a write, looked at under its exact spelling, with `raw`
+/// deciding whether `rel` is lossy ([`rel_is_lossy`]).
+fn dispatch_reindex(state: &WatcherState, rel: &str, raw: &Path) {
     dispatch_reindex_from(
         state,
         rel,
         ReindexOrigin::Write {
-            raw: None,
+            raw: Some(raw),
             look: WriteLook::Spelled,
         },
     );
@@ -2323,7 +2351,18 @@ fn dispatch_directory_rename(
                 match step.action {
                     RenameAction::Rename => dispatch_rename(state, &step.old_rel, &step.new_rel),
                     RenameAction::Deindex => dispatch_deindex(state, &step.old_rel),
-                    RenameAction::Reindex => dispatch_reindex(state, &step.new_rel),
+                    // (#544) No event path for a step (its `new_rel` is built from the
+                    // row's), so it is read as not lossy and only whether a file is there
+                    // is asked: a lossy row's step looks gone, the answer
+                    // `rename_single_file` already gives such a destination.
+                    RenameAction::Reindex => dispatch_reindex_from(
+                        state,
+                        &step.new_rel,
+                        ReindexOrigin::Write {
+                            raw: None,
+                            look: WriteLook::ExistsOnly,
+                        },
+                    ),
                     RenameAction::Skip => {}
                 }
             }
@@ -5140,5 +5179,77 @@ mod tests {
             written_path_on_disk(&kb, "missing.md", WriteLook::ExistsOnly),
             OnDisk::Gone
         );
+    }
+
+    /// (#544 P1-I) On macOS a rename can arrive as an unpaired `Modify(Name(Any))` for the old
+    /// name, a path that is gone. The debouncer hands it on as one event of one path, the
+    /// watcher classifies it as a reindex of that path, and the look inside the locks then
+    /// finds the path gone and drops its row, with the event's own path deciding lossiness.
+    #[test]
+    fn an_unpaired_rename_reaches_the_watcher_as_a_write_of_one_path() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unpaired");
+        let gone = kb.join("a.md");
+        let name_any = EventKind::Modify(ModifyKind::Name(RenameMode::Any));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _d = new_debouncer_opt::<_, InjectWatcher, _>(
+            Duration::from_millis(100),
+            None,
+            tx,
+            notify_debouncer_full::NoCache,
+            notify::Config::default(),
+        )
+        .unwrap();
+        inject(name_any, &gone);
+        let got = drain_debounced(&rx, Duration::from_millis(800));
+        assert_eq!(got, vec![(name_any, vec![gone.clone()])]);
+
+        let evt = mk_evt(got[0].0, got[0].1.clone());
+        let Classified::Reindex(paths) = classify(&evt) else {
+            panic!("an unpaired Name(Any) must be a reindex");
+        };
+        assert_eq!(paths, std::slice::from_ref(&gone));
+
+        let rel = to_rel(&kb, &paths[0]).unwrap();
+        assert_eq!(rel, "a.md");
+        let db = dir_rename_db(&["a.md", "b.md"]);
+        let check = act_on_written_path(
+            &db,
+            &kb,
+            &rel,
+            written_path_on_disk(&kb, &rel, WriteLook::Spelled),
+            rel_is_lossy(&kb, Some(&paths[0])),
+        );
+        assert!(
+            matches!(check, WrittenPathCheck::Deindexed(Ok(true))),
+            "{check:?}"
+        );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["b.md".to_string()]);
+    }
+
+    /// (#544) The scan of a directory that just arrived hands over, with each `rel`, the path
+    /// the walk found it at, so the look inside the locks can ask that path whether its name is
+    /// lossy.
+    #[test]
+    fn the_scan_of_a_new_directory_hands_over_the_paths_it_found() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-scan");
+        std::fs::create_dir_all(kb.join("new").join("sub")).unwrap();
+        std::fs::write(kb.join("new").join("x.md"), "# x\n").unwrap();
+        std::fs::write(kb.join("new").join("sub").join("y.md"), "# y\n").unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        let mut found = new_directory_entries(&kb, &kb.join("new"), &reg, &rules).unwrap();
+        found.sort();
+        let rels: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(rels, vec!["new/sub/y.md", "new/x.md"]);
+        for (rel, path) in &found {
+            assert_eq!(
+                path.canonicalize().unwrap(),
+                kb.join(rel).canonicalize().unwrap(),
+                "{rel}"
+            );
+            assert!(!rel_is_lossy(&kb, Some(path)), "{rel}");
+        }
     }
 }
