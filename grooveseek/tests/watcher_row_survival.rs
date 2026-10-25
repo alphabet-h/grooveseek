@@ -7,8 +7,8 @@
 //!
 //! | test | spec id | OS |
 //! |---|---|---|
-//! | [`an_overwriting_rename_moves_the_source_row_onto_the_destination`] | P1-E1 | all |
-//! | [`a_file_replaced_by_a_directory_loses_its_row`] | P1-E5 | all |
+//! | [`crate::an_overwriting_rename_moves_the_source_row_onto_the_destination`] | P1-E1 | all |
+//! | [`crate::a_file_replaced_by_a_directory_loses_its_row`] | P1-E5 | all |
 //! | `an_unpaired_rename_drops_the_old_row` | P1-E3 | macOS |
 //! | `a_case_only_rename_leaves_one_row` | P1-E4 | macOS |
 //! | `a_japanese_name_survives_edit_and_rename` | P1-E6 | macOS |
