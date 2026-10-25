@@ -2385,6 +2385,7 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
     finish_rename_locked(
         &db,
         kb_path,
+        &state.registry,
         (old_rel, new_rel),
         look,
         (plan, before),
@@ -2429,11 +2430,14 @@ fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
 /// (#544 C1) A plan that cleared the destination's row
 /// ([`RenamePlan::ClearDestinationThenRename`]) and then failed -- clearing it, or the
 /// indexer's rename -- goes to [`settle_cleared_rename`] before anything else, so a file on
-/// disk at `new_rel` is not left with no row until its next event or a full index.
+/// disk at `new_rel` is not left with no row until its next event or a full index. `registry`
+/// is what that step reads the destination's content hash with
+/// ([`indexer::content_hash_on_disk`]).
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked<C>(
     db: &Database,
     kb_path: &Path,
+    registry: &Registry,
     (old_rel, new_rel): (&str, &str),
     look: WriteLook,
     (plan, before): (RenamePlan, Result<bool>),
@@ -2450,6 +2454,7 @@ fn finish_rename_locked<C>(
             || written_path_on_disk(kb_path, new_rel, look),
             || written_path_on_disk(kb_path, old_rel, look),
             || reindex(ctx),
+            || indexer::content_hash_on_disk(kb_path, new_rel, registry),
         );
         log_cleared_rename(old_rel, new_rel, recovery);
     };
@@ -2515,9 +2520,26 @@ enum ClearedSource {
     /// The file is gone from `old_rel` and the destination got its own row (or is gone too):
     /// the source's rows were deleted, and the result says whether either was there.
     Dropped(Result<bool>),
-    /// The file is gone from `old_rel` and the destination is left with no row of its own: the
-    /// source's row moved there with its content unread, as [`RenamePlan::MoveRowUnknown`] does.
+    /// The file is gone from `old_rel`, the destination is left with no row of its own, and the
+    /// file there hashes to the source's row: the row moved there, as the indexer's rename
+    /// moves a row whose bytes it found unchanged.
     Moved(Result<()>),
+    /// The file is gone from `old_rel` and the destination is left with no row of its own, but
+    /// the file there could not be shown to be the one the source's row was read from: the
+    /// source's rows were deleted (the result says whether either was there), and the
+    /// destination waits for its next event or a full index.
+    DroppedUnmatched(UnmatchedDestination, Result<bool>),
+}
+
+/// Why [`settle_cleared_rename`] did not move the source's row onto the destination.
+#[derive(Debug)]
+enum UnmatchedDestination {
+    /// The file there was read and its hash is not the source's row's: another file.
+    Differs,
+    /// The file there was not read: a refused read, or a link on the way.
+    NotRead,
+    /// Reading the file there failed.
+    ReadFailed(anyhow::Error),
 }
 
 /// (#544 C1, D3) An overwriting rename cleared the destination's row
@@ -2528,10 +2550,14 @@ enum ClearedSource {
 /// - otherwise the destination is looked at again (`look_new`). A file there is reindexed
 ///   (`reindex`), so the file the rename brought keeps a row
 /// - the source's row, whose file is gone from `old_rel` (`look_old`), goes when the
-///   destination got its own row or is gone; when the destination is there but the reindex
-///   wrote nothing, or it cannot be looked at, the source's row moves onto it unread instead
-///   (the file there is the one that row was read from). A file at `old_rel` again, or one that
-///   cannot be looked at, keeps its row
+///   destination got its own row or is gone. When the destination is there but the reindex
+///   wrote nothing, or it cannot be looked at, the file there is read and hashed (`hash_new`,
+///   [`indexer::content_hash_on_disk`]): the source's row moves onto it only when that hash is
+///   the row's, so the file there is the one the row was read from. Otherwise (another file
+///   replaced it after the overwrite, or the pair describes an older state of the disk, or it
+///   could not be read) the source's row goes and the destination is left with no row until
+///   its next event or a full index. A file at `old_rel` again, or one that cannot be looked
+///   at, keeps its row
 ///
 /// A failure here leaves the rows as they are and says so on stderr ([`log_cleared_rename`]).
 fn settle_cleared_rename(
@@ -2541,6 +2567,7 @@ fn settle_cleared_rename(
     look_new: impl FnOnce() -> OnDisk,
     look_old: impl FnOnce() -> OnDisk,
     reindex: impl FnOnce() -> Result<indexer::SingleResult>,
+    hash_new: impl FnOnce() -> Result<Option<String>>,
 ) -> (ClearedDestination, ClearedSource) {
     match db.get_document_hash(new_rel) {
         Ok(Some(_)) => return (ClearedDestination::RowInPlace, ClearedSource::Untouched),
@@ -2566,15 +2593,29 @@ fn settle_cleared_rename(
     let source = match db.get_document_hash(old_rel) {
         Ok(None) => ClearedSource::NoRow,
         Err(_) => ClearedSource::Untouched,
-        Ok(Some(_)) => match look_old() {
+        Ok(Some(stored)) => match look_old() {
             OnDisk::Gone if new_settled => {
                 ClearedSource::Dropped(deindex_removed_path(db, kb_path, old_rel))
             }
-            OnDisk::Gone => ClearedSource::Moved(db.rename_document(
-                old_rel,
-                new_rel,
-                crate::db::FrontmatterTopic::Unread,
-            )),
+            OnDisk::Gone => {
+                let unmatched = match hash_new() {
+                    Ok(Some(hash)) if hash == stored => None,
+                    Ok(Some(_)) => Some(UnmatchedDestination::Differs),
+                    Ok(None) => Some(UnmatchedDestination::NotRead),
+                    Err(e) => Some(UnmatchedDestination::ReadFailed(e)),
+                };
+                match unmatched {
+                    None => ClearedSource::Moved(db.rename_document(
+                        old_rel,
+                        new_rel,
+                        crate::db::FrontmatterTopic::Unread,
+                    )),
+                    Some(why) => ClearedSource::DroppedUnmatched(
+                        why,
+                        deindex_removed_path(db, kb_path, old_rel),
+                    ),
+                }
+            }
             back @ (OnDisk::Present | OnDisk::Unknown(_)) => ClearedSource::Kept(back),
         },
     };
@@ -2611,8 +2652,22 @@ fn log_cleared_rename(
         ),
         ClearedSource::Dropped(outcome) => log_written_path_gone(old_rel, outcome),
         ClearedSource::Moved(Ok(())) => wdiag!(
-            "watcher: after the failed rename, moved the row of {old_rel} to {new_rel} without reading it"
+            "watcher: after the failed rename, moved the row of {old_rel} to {new_rel}, whose content hashes to it"
         ),
+        ClearedSource::DroppedUnmatched(why, outcome) => {
+            let why = match why {
+                UnmatchedDestination::Differs => "its content is another file's".to_string(),
+                UnmatchedDestination::NotRead => "its content was not read".to_string(),
+                UnmatchedDestination::ReadFailed(e) => format!(
+                    "reading it failed: {}",
+                    crate::embedder::body_free_message(&e)
+                ),
+            };
+            wdiag!(
+                "watcher: after the failed rename, did not move the row of {old_rel} to {new_rel} ({why}); {new_rel} has no row until its next event or a full index"
+            );
+            log_written_path_gone(old_rel, outcome);
+        }
         ClearedSource::Moved(Err(e)) => wdiag!(
             "watcher: after the failed rename, moving the row of {old_rel} to {new_rel} failed; left the rows as they were: {}",
             crate::embedder::body_free_message(&e)
@@ -6065,6 +6120,7 @@ mod tests {
             finish_rename_locked(
                 &db,
                 &kb,
+                &Registry::defaults(),
                 ("b.md", "a.md"),
                 look,
                 (plan, before),
@@ -6090,18 +6146,24 @@ mod tests {
     }
 
     /// (#544 C1, D3) The same failure, and the reindex of the destination fails too: the
-    /// source's row moves onto the destination with its content left as it was (the file there
-    /// is the one that row was read from), rather than leaving the destination with no row.
+    /// source's row moves onto the destination with its content left as it was, rather than
+    /// leaving the destination with no row: the file there hashes to that row, so it is the
+    /// one the row was read from (local Codex r2: the row carries the real hash of the bytes).
     #[test]
     fn an_overwrite_whose_reindex_also_fails_moves_the_source_row() {
+        use sha2::Digest;
         let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-twice");
         std::fs::write(kb.join("a.md"), "# b\n").unwrap();
         let db = overwrite_db();
+        let source_hash = format!("{:x}", sha2::Sha256::digest(b"# b\n"));
+        db.upsert_document("b.md", None, None, None, None, &[], None, &source_hash, 0)
+            .unwrap();
         let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
         let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
         finish_rename_locked(
             &db,
             &kb,
+            &Registry::defaults(),
             ("b.md", "a.md"),
             WriteLook::Spelled,
             (plan, before),
@@ -6113,7 +6175,43 @@ mod tests {
             db.all_document_paths().unwrap(),
             vec!["a.md".to_string(), "other.md".to_string()]
         );
-        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some(source_hash.as_str())
+        );
+    }
+
+    /// (#544 C1, local Codex r2) The same two failures, and the file at the destination is no
+    /// longer the one the source's row was read from (an editor or another process replaced it
+    /// after the overwrite): the source's row does not move onto it, so the replaced file is
+    /// not served with the source's old content. The source is gone, so its row goes, and the
+    /// destination is left with no row for its next event or a full index.
+    #[test]
+    fn an_overwrite_whose_destination_was_replaced_does_not_move_the_source_row() {
+        use sha2::Digest;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-replaced");
+        std::fs::write(kb.join("a.md"), "# replaced\n").unwrap();
+        let db = overwrite_db();
+        let source_hash = format!("{:x}", sha2::Sha256::digest(b"# b\n"));
+        db.upsert_document("b.md", None, None, None, None, &[], None, &source_hash, 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            &Registry::defaults(),
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| Err(anyhow::anyhow!("injected reindex failure")),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// (#544 C1) Clearing the destination fails after its exact row went (the folded-row sweep
@@ -6130,6 +6228,7 @@ mod tests {
         finish_rename_locked(
             &db,
             &kb,
+            &Registry::defaults(),
             ("b.md", "a.md"),
             WriteLook::Spelled,
             (plan, before),
@@ -6159,6 +6258,7 @@ mod tests {
         finish_rename_locked(
             &db,
             &kb,
+            &Registry::defaults(),
             ("b.md", "a.md"),
             WriteLook::Spelled,
             (plan, before),
@@ -6189,6 +6289,7 @@ mod tests {
         finish_rename_locked(
             &db,
             &kb,
+            &Registry::defaults(),
             ("b.md", "a.md"),
             WriteLook::Spelled,
             (plan, before),
@@ -6212,6 +6313,7 @@ mod tests {
         finish_rename_locked(
             &db,
             &kb,
+            &Registry::defaults(),
             ("b.md", "a.md"),
             WriteLook::Spelled,
             (plan, before),
