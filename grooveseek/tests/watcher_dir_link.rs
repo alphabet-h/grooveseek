@@ -560,3 +560,92 @@ fn a_rename_whose_directory_on_the_way_is_a_file_link_moves_out() {
     drop(db);
     assert_dir_empty(&fx.cache);
 }
+
+/// `kb/sub`, an indexed directory, replaced by a symlink to itself: a stat through it fails
+/// with a loop error, which is neither not-found nor not-a-directory. Asserts that, so the
+/// tests below exercise a failed stat and not a gone one. Unix only.
+#[cfg(unix)]
+fn replace_with_a_link_to_itself(kb: &Path) {
+    std::fs::remove_dir_all(kb.join("sub")).expect("remove sub/");
+    std::os::unix::fs::symlink("sub", kb.join("sub")).expect("link sub to itself");
+    let stat = std::fs::metadata(kb.join("sub").join("note.md")).expect_err("a loop of links");
+    assert!(
+        !matches!(
+            stat.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+        "{stat:?}"
+    );
+}
+
+/// (issue #544, GitHub codex r1 P2 on PR #395) A write of `sub/note.md` handled after its indexed
+/// directory became a link to itself: the stat fails with a loop error, and the link on the way
+/// settles it before that error is returned. The row goes, as the full walk (which does not
+/// follow the link) drops it, rather than the reindex failing and keeping it. Unix only.
+#[cfg(unix)]
+#[test]
+fn a_document_whose_directory_became_a_link_to_itself_leaves_the_index() {
+    if run_in_hermetic_child("a_document_whose_directory_became_a_link_to_itself_leaves_the_index")
+    {
+        return;
+    }
+    let fx = fixture(
+        "i544-self-link",
+        &[("in.md", NOTE), ("sub/note.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    replace_with_a_link_to_itself(&kb);
+
+    let outcome = reindex_single_file(&db, &mut embedder, &kb, "sub/note.md", None, &registry)
+        .expect("reindex");
+    assert_eq!(outcome, SingleResult::OutsideKnowledgeBaseDeindexed);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["in.md".to_string()]
+    );
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
+/// (issue #544, GitHub codex r1 P2 on PR #395) The same for a rename whose destination is under a
+/// directory that became a link to itself: the document left the knowledge base, so its old row
+/// and the destination's row both go. Unix only.
+#[cfg(unix)]
+#[test]
+fn a_rename_onto_a_directory_that_became_a_link_to_itself_moves_out() {
+    if run_in_hermetic_child("a_rename_onto_a_directory_that_became_a_link_to_itself_moves_out") {
+        return;
+    }
+    let fx = fixture(
+        "i544-self-link-rename",
+        &[("in.md", NOTE), ("sub/note.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    replace_with_a_link_to_itself(&kb);
+    std::fs::remove_file(kb.join("in.md")).expect("the note left its old name");
+
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "in.md",
+        "sub/note.md",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert_eq!(outcome, RenameOutcome::MovedOutOfTheKnowledgeBase);
+    assert!(db.all_document_paths().expect("paths").is_empty());
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}

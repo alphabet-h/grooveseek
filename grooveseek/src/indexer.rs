@@ -300,6 +300,47 @@ fn path_is_there(full: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// What the first look of a single-file path ([`look_at_single_path`]) found.
+#[derive(Debug, PartialEq, Eq)]
+enum SinglePathLook {
+    /// `full` can be stat'ed. Whether it may be read is the next question
+    /// ([`readable_as_the_walk_reads`]).
+    There,
+    /// The stat did not reach a file (gone, or a stat that failed), and a component of `rel` is
+    /// a link ([`a_link_is_on_the_way`]): the path is not one the full walk collects, whatever
+    /// the stat would have said.
+    ThroughALink,
+    /// Not there ([`stat_error_means_gone`]) and no link on the way.
+    Missing,
+}
+
+/// (#544, GitHub codex r1 P2 on PR #395) [`path_is_there`] for `full` (`kb_path` joined with
+/// `rel`), with a failed stat settled by the links on the way. A link anywhere below `kb_path`
+/// decides on its own that the path is not in the index, so it is asked before a stat error is
+/// returned, not only after a stat that read as gone: an indexed directory replaced by a link
+/// to itself fails the stat with a loop error, which says nothing about being gone, and
+/// returning it kept the row of every file the walk no longer collects there. The one place
+/// both [`reindex_single_file`] and [`rename_single_file`] take this first look.
+fn look_at_single_path(kb_path: &Path, rel: &str, full: &Path) -> std::io::Result<SinglePathLook> {
+    sort_single_path_look(path_is_there(full), || a_link_is_on_the_way(kb_path, rel))
+}
+
+/// [`look_at_single_path`]'s decision, apart from the disk so a test can hand it any stat
+/// answer. The link is asked only when the stat did not find the path there.
+fn sort_single_path_look(
+    there: std::io::Result<bool>,
+    link_on_the_way: impl FnOnce() -> bool,
+) -> std::io::Result<SinglePathLook> {
+    if let Ok(true) = there {
+        return Ok(SinglePathLook::There);
+    }
+    // `Ok(false)` or a stat error: the link first, then the stat's own answer.
+    if link_on_the_way() {
+        return Ok(SinglePathLook::ThroughALink);
+    }
+    there.map(|_| SinglePathLook::Missing)
+}
+
 /// (audit AX-02, GitHub codex r1 on PR #391) Whether the watcher may read `rel` (at `full`) and
 /// write or keep its row: the invariant is the full walk's, **no component below `kb_path` is a
 /// link** ([`a_link_is_on_the_way`]), so a link to another directory inside the knowledge base
@@ -3071,12 +3112,17 @@ pub fn reindex_single_file(
     registry: &Registry,
 ) -> Result<SingleResult> {
     let full = kb_path.join(rel);
-    if !path_is_there(&full).with_context(|| format!("failed to stat {}", full.display()))? {
+    match look_at_single_path(kb_path, rel, &full)
+        .with_context(|| format!("failed to stat {}", full.display()))?
+    {
+        SinglePathLook::There => {}
         // (local Codex r3) `exists` follows links, so a path through a link whose target is
         // gone -- a directory replaced by a dangling link -- reads as missing. The full index
         // does not follow the link and drops the row, so this does too. The same component
-        // check as for an existing file below ([`readable_as_the_walk_reads`]).
-        if a_link_is_on_the_way(kb_path, rel) {
+        // check as for an existing file below ([`readable_as_the_walk_reads`]). (#544) A stat
+        // that failed outright -- a directory replaced by a link to itself -- is settled the
+        // same way when a link is on the way ([`look_at_single_path`]).
+        SinglePathLook::ThroughALink => {
             eprintln!("{}", outside_kb_line(rel));
             return Ok(if deindex_outside_kb(db, kb_path, rel)? {
                 SingleResult::OutsideKnowledgeBaseDeindexed
@@ -3084,10 +3130,12 @@ pub fn reindex_single_file(
                 SingleResult::Refused
             });
         }
-        return Ok(SingleResult::Skipped {
-            reason: "file no longer exists",
-            frontmatter_unparsed: false,
-        });
+        SinglePathLook::Missing => {
+            return Ok(SingleResult::Skipped {
+                reason: "file no longer exists",
+                frontmatter_unparsed: false,
+            });
+        }
     }
     // (audit AX-02) Before the size stat and the read, both of which follow every link on
     // the way. Nothing is read or written for the file. (review P2-1) A row already under
@@ -3514,25 +3562,31 @@ pub fn rename_single_file(
 
     // 新 path の実体 hash を読み直し、DB 側 (= old_hash) と比較
     let full = kb_path.join(new_rel);
-    if !path_is_there(&full).with_context(|| format!("failed to stat {}", full.display()))? {
+    match look_at_single_path(kb_path, new_rel, &full)
+        .with_context(|| format!("failed to stat {}", full.display()))?
+    {
+        SinglePathLook::There => {}
         // (local Codex after PR #391 r1) `exists` follows links: a destination through a link
         // whose target is gone is settled as one reached through a link -- the old row and
         // whatever the index holds for the destination (its row and its folded legacy row)
-        // go, as the full index drops them.
-        if a_link_is_on_the_way(kb_path, new_rel) {
+        // go, as the full index drops them. (#544) So is one whose stat failed outright with a
+        // link on the way ([`look_at_single_path`]).
+        SinglePathLook::ThroughALink => {
             eprintln!("{}", outside_kb_line(new_rel));
             db.delete_document(old_rel)?;
             deindex_outside_kb(db, kb_path, new_rel)?;
             return Ok(RenameOutcome::MovedOutOfTheKnowledgeBase);
         }
-        // 新 path のファイルも無い。通常起こらないが起きたら DB も掃除
-        db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
-        db.delete_document(new_rel)?;
-        // The file is gone under every spelling, so an older version's folded row for the
-        // destination goes too (a removal's sweep); the watcher's sweep after a rename asks for
-        // the real key, which was just deleted, and would keep it.
-        sweep_legacy_folded_row(db, kb_path, new_rel, false)?;
-        return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
+        SinglePathLook::Missing => {
+            // 新 path のファイルも無い。通常起こらないが起きたら DB も掃除
+            db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
+            db.delete_document(new_rel)?;
+            // The file is gone under every spelling, so an older version's folded row for the
+            // destination goes too (a removal's sweep); the watcher's sweep after a rename asks
+            // for the real key, which was just deleted, and would keep it.
+            sweep_legacy_folded_row(db, kb_path, new_rel, false)?;
+            return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
+        }
     }
     // (audit AX-02) A destination reached through a directory link is not in the knowledge
     // base, so the document has left it: the row is dropped, as for a move into an excluded
@@ -8920,5 +8974,36 @@ mod tests {
         assert!(path_is_there(&file).unwrap());
         assert!(!path_is_there(&root.join("missing.md")).unwrap());
         assert!(!path_is_there(&file.join("x.md")).unwrap());
+    }
+
+    /// (#544, GitHub codex r1 P2 on PR #395) [`sort_single_path_look`]: a stat that failed for
+    /// a reason that says nothing about being gone (a loop of links, a denied permission) is
+    /// settled as a path through a link when a link is on the way, and is returned only when
+    /// none is.
+    #[test]
+    fn a_failed_stat_with_a_link_on_the_way_is_a_path_through_a_link() {
+        use std::io::{Error, ErrorKind};
+        let look =
+            |kind: ErrorKind, link: bool| sort_single_path_look(Err(Error::from(kind)), || link);
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            assert_eq!(
+                look(kind, true).unwrap(),
+                SinglePathLook::ThroughALink,
+                "{kind:?}"
+            );
+            assert_eq!(look(kind, false).unwrap_err().kind(), kind);
+        }
+        assert_eq!(
+            sort_single_path_look(Ok(false), || true).unwrap(),
+            SinglePathLook::ThroughALink
+        );
+        assert_eq!(
+            sort_single_path_look(Ok(false), || false).unwrap(),
+            SinglePathLook::Missing
+        );
+        assert_eq!(
+            sort_single_path_look(Ok(true), || true).unwrap(),
+            SinglePathLook::There
+        );
     }
 }
