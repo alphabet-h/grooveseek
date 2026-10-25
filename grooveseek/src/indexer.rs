@@ -3460,39 +3460,6 @@ pub enum RenameOutcome {
 ///   とって無効なので残せず、reindex が [`SingleResult::Updated`] で終わらなければ行ごと消える
 ///   ([`settle_cross_parser_rename`])
 ///
-/// (#544 C1, local Codex r2) The content hash of the file at `rel`, taken as
-/// [`rename_single_file`] takes the new path's before comparing it with the row's: the bytes
-/// read under the cap for its extension ([`read_for_index_under`]) and hashed with
-/// [`sha256_hex_bytes`], with no normalization, so it equals a row's hash exactly when the row
-/// was read from those bytes. `Ok(None)` when the file is not read: a path a link is on the way
-/// to ([`readable_as_the_walk_reads`]), or a refused read (said on stderr). `Err` when it could
-/// not be read. The watcher asks it before moving a row onto a file it has not reindexed.
-pub(crate) fn content_hash_on_disk(
-    kb_path: &Path,
-    rel: &str,
-    registry: &Registry,
-) -> Result<Option<String>> {
-    let full = kb_path.join(rel);
-    if !readable_as_the_walk_reads(kb_path, rel, &full)
-        .with_context(|| format!("failed to resolve {}", full.display()))?
-    {
-        return Ok(None);
-    }
-    let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let is_binary_ext = registry
-        .binary_extensions()
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(ext));
-    let cap = applicable_cap(
-        is_binary_ext,
-        registry.limits().binary.cap_bytes(),
-        registry.limits().text.cap_bytes(),
-    );
-    let (bytes, _) = read_for_index_under(&full, rel, cap, size_cap_key(is_binary_ext))
-        .with_context(|| format!("failed to read {}", full.display()))?;
-    Ok(bytes.map(|bytes| sha256_hex_bytes(&bytes)))
-}
-
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
     db: &Database,
