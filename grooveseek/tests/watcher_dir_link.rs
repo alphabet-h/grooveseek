@@ -485,3 +485,78 @@ fn a_rename_into_a_directory_link_takes_the_document_out_of_the_index() {
     drop(db);
     assert_dir_empty(&fx.cache);
 }
+
+/// (issue #544, P1-E2: the indexer's side, recorded before the fix) Renaming `b.md` over an
+/// indexed `a.md` and handing the rename to the indexer: moving the row onto a path that already
+/// has one fails on the `documents.path` unique key, and both rows stay. The indexer's contract is
+/// left as it is; the watcher clears the destination's row before it asks for the move.
+#[test]
+fn a_rename_onto_an_indexed_path_fails_on_the_unique_key() {
+    if run_in_hermetic_child("a_rename_onto_an_indexed_path_fails_on_the_unique_key") {
+        return;
+    }
+    let fx = fixture(
+        "i544-rename-unique",
+        &[("a.md", NOTE), ("b.md", SECRET)],
+        "",
+    );
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["a.md".to_string(), "b.md".to_string()]
+    );
+
+    std::fs::rename(kb.join("b.md"), kb.join("a.md")).expect("rename b.md over a.md");
+    let outcome = rename_single_file(&db, &mut embedder, &kb, "b.md", "a.md", None, &registry);
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(
+        db.all_document_paths().expect("paths"),
+        vec!["a.md".to_string(), "b.md".to_string()]
+    );
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
+
+/// (issue #544, P1-X) A rename whose destination `sub/x.md` has a file link as `sub`: the stat of
+/// the destination fails with not-a-directory, not not-found, and the document is settled as one
+/// that left the knowledge base through a link -- its old row goes. Unix only, where a symlink to
+/// a file needs no privilege.
+#[cfg(unix)]
+#[test]
+fn a_rename_whose_directory_on_the_way_is_a_file_link_moves_out() {
+    if run_in_hermetic_child("a_rename_whose_directory_on_the_way_is_a_file_link_moves_out") {
+        return;
+    }
+    let fx = fixture("i544-rename-notdir", &[("in.md", NOTE)], "");
+    fx.index();
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+
+    let target = fx.layout.root().join("plain.txt");
+    std::fs::write(&target, "a file, not a directory").expect("write the link's target");
+    std::os::unix::fs::symlink(&target, kb.join("sub")).expect("link sub to a file");
+    std::fs::remove_file(kb.join("in.md")).expect("the note left its old name");
+    let stat = std::fs::metadata(kb.join("sub").join("x.md")).expect_err("sub is not a directory");
+    assert_eq!(stat.kind(), std::io::ErrorKind::NotADirectory, "{stat:?}");
+
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "in.md",
+        "sub/x.md",
+        None,
+        &registry,
+    )
+    .expect("rename");
+    assert_eq!(outcome, RenameOutcome::MovedOutOfTheKnowledgeBase);
+    assert!(db.all_document_paths().expect("paths").is_empty());
+    drop(db);
+    assert_dir_empty(&fx.cache);
+}
