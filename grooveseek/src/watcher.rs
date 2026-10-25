@@ -649,8 +649,18 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // `should_process`, and this must not be the one place that
                     // does otherwise.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()) {
+                        // (#544 A2/A5) The look above is outside the lock; the one that decides
+                        // the rows is taken again inside it, and only for an arrival, so an
+                        // ordinary directory Modify still costs no lock.
                         if arrived {
-                            dispatch_new_directory(state, p, &rel);
+                            let arrival = {
+                                let db = recover_db(state.db.lock());
+                                act_on_arrived_directory(&db, &state.kb_path, &rel, p)
+                                // `db` is dropped here, before the scan locks it again.
+                            };
+                            if log_arrived_directory(&rel, arrival) {
+                                dispatch_new_directory(state, p, &rel);
+                            }
                         }
                         // A directory never had anything else to do here:
                         // `should_process` rejects it on the extension filter.
@@ -967,6 +977,8 @@ fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
     {
         return OnDisk::Present;
     }
+    #[cfg(test)]
+    LISTINGS.with(|n| n.set(n.get() + 1));
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => return OnDisk::Unknown(e.kind()),
@@ -982,6 +994,13 @@ fn spelled_on_disk(dir: &Path, name: &str) -> OnDisk {
         }
     }
     failed.map_or(OnDisk::Gone, OnDisk::Unknown)
+}
+
+// (#544) How many directories [`spelled_on_disk`] listed on this thread, for the tests that pin
+// what a look costs. Per thread, so tests running side by side do not count each other's.
+#[cfg(test)]
+thread_local! {
+    static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`spelled_on_disk`] as a yes or no, for the tests written before it had three answers:
@@ -1157,6 +1176,175 @@ fn act_on_written_path(
         OnDisk::Unknown(kind) => WrittenPathCheck::ProceedUnknown(kind),
         OnDisk::Gone if lossy => WrittenPathCheck::Proceed,
         OnDisk::Gone => WrittenPathCheck::Deindexed(deindex_removed_path(db, kb_path, rel)),
+    }
+}
+
+/// (#544 A2/A5) Whether every segment of `rel` -- the directory itself and each one above it,
+/// from the innermost out -- is on disk under its exact spelling ([`spelled_on_disk`], each
+/// against the directory above it, built from `kb_path` one segment at a time). The first
+/// answer other than [`OnDisk::Present`] is the answer. Nothing is asked of what is at `rel`;
+/// [`arrived_directory_look`] has already found a directory there.
+fn directory_spelled_on_disk(kb_path: &Path, rel: &str) -> OnDisk {
+    let mut full = kb_path.to_path_buf();
+    for segment in rel.split('/') {
+        full.push(segment);
+    }
+    let mut dir = full.as_path();
+    for segment in rel.rsplit('/') {
+        let Some(parent) = dir.parent() else {
+            return OnDisk::Gone;
+        };
+        let spelled = spelled_on_disk(parent, segment);
+        if spelled != OnDisk::Present {
+            return spelled;
+        }
+        dir = parent;
+    }
+    OnDisk::Present
+}
+
+/// (#544) What is at a directory an event said arrived, `rel` with the event's path `raw`:
+/// whether it is a directory (`symlink_metadata` of `raw`, links not followed; `None` for a
+/// failed stat) and the look that goes with it. For a directory, the look is
+/// [`directory_spelled_on_disk`]; for something else [`OnDisk::Gone`]; for a failed stat, the
+/// stat's kind read through [`probe_error_on_disk`]. One stat and one spelling look for the
+/// whole directory, however many files it holds.
+fn arrived_directory_look(kb_path: &Path, rel: &str, raw: &Path) -> (Option<bool>, OnDisk) {
+    match std::fs::symlink_metadata(raw) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            (Some(true), directory_spelled_on_disk(kb_path, rel))
+        }
+        Ok(_) => (Some(false), OnDisk::Gone),
+        Err(e) => (None, probe_error_on_disk(e.kind())),
+    }
+}
+
+/// What [`act_on_arrived_directory`] did with a directory that arrived.
+#[derive(Debug)]
+enum ArrivedDirectory {
+    /// The directory is there under its spelling (or its name is lossy and cannot be looked
+    /// at): scan it. The result is the deletion of the row a file under the directory's name
+    /// left, `Ok(true)` when there was one.
+    Scan(Result<bool>),
+    /// The path is no longer a directory, or no longer there: nothing done, its own event
+    /// comes on its own.
+    NoLongerADirectory,
+    /// The directory is on disk only under another spelling: no scan, and the rows under the
+    /// spelling the event named went, the one at the name itself (`exact`) and every one under
+    /// it (`under`).
+    Dropped {
+        exact: Result<bool>,
+        under: Result<Vec<String>>,
+    },
+    /// The look could not tell: no row touched, and the directory is scanned all the same.
+    Unknown(std::io::ErrorKind),
+}
+
+/// (#544 A2/A5/A13) What an arrived directory does with the look inside the db lock, before
+/// its scan ([`act_on_arrived_directory_for`] once the disk has been looked at,
+/// [`arrived_directory_look`]). `raw` is the event's path, which also says whether `rel` is
+/// lossy ([`rel_is_lossy`]).
+fn act_on_arrived_directory(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    raw: &Path,
+) -> ArrivedDirectory {
+    let (is_dir, spelled) = arrived_directory_look(kb_path, rel, raw);
+    act_on_arrived_directory_for(
+        db,
+        kb_path,
+        rel,
+        is_dir,
+        spelled,
+        rel_is_lossy(kb_path, Some(raw)),
+    )
+}
+
+/// [`act_on_arrived_directory`] once the disk has been looked at, split out so a test can hand
+/// it a look no file system makes on demand. `is_dir` is the stat's answer (`None` when it
+/// failed, its kind then in `spelled`):
+///
+/// - not a directory, or a stat that says the path is gone, gives
+///   [`ArrivedDirectory::NoLongerADirectory`]
+/// - a stat that could not tell, or a directory whose spelling could not be looked at, gives
+///   [`ArrivedDirectory::Unknown`], touching no row (D3)
+/// - a lossy `rel` gives [`ArrivedDirectory::Scan`] and touches no row: its look never finds
+///   it, and a sibling whose name is lost the same way shares its prefix (C4)
+/// - a directory under its exact spelling: the row under its name goes (a file it replaced,
+///   with its folded legacy row), then [`ArrivedDirectory::Scan`] (A2)
+/// - a directory on disk only under another spelling: the row under its name and every row
+///   under `rel/` go, and no scan runs (spec r4 M-d). `documents.path` compares bytes, so any
+///   key under that spelling holds a segment the disk does not, and the full index drops it too
+fn act_on_arrived_directory_for(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    is_dir: Option<bool>,
+    spelled: OnDisk,
+    lossy: bool,
+) -> ArrivedDirectory {
+    match (is_dir, spelled) {
+        (Some(false), _) | (None, OnDisk::Gone | OnDisk::Present) => {
+            ArrivedDirectory::NoLongerADirectory
+        }
+        (None | Some(true), OnDisk::Unknown(kind)) => ArrivedDirectory::Unknown(kind),
+        // The knowledge base itself names no row.
+        (Some(true), _) if lossy || rel.is_empty() => ArrivedDirectory::Scan(Ok(false)),
+        (Some(true), OnDisk::Present) => {
+            ArrivedDirectory::Scan(deindex_removed_path(db, kb_path, rel))
+        }
+        (Some(true), OnDisk::Gone) => ArrivedDirectory::Dropped {
+            exact: deindex_removed_path(db, kb_path, rel),
+            under: indexer::deindex_subtree(db, rel),
+        },
+    }
+}
+
+/// The lines for what [`act_on_arrived_directory`] did; `true` when the directory is to be
+/// scanned.
+fn log_arrived_directory(rel: &str, arrival: ArrivedDirectory) -> bool {
+    match arrival {
+        ArrivedDirectory::Scan(exact) => {
+            match exact {
+                Ok(true) => {
+                    wdiag!(
+                        "watcher: {rel} is a directory now; deindexed the file indexed under its name"
+                    )
+                }
+                Ok(false) => {}
+                Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
+            }
+            true
+        }
+        ArrivedDirectory::NoLongerADirectory => false,
+        ArrivedDirectory::Dropped { exact, under } => {
+            let exact = match exact {
+                Ok(exact) => usize::from(exact),
+                Err(e) => {
+                    wdiag!("watcher: deindex {rel} failed: {e}");
+                    0
+                }
+            };
+            let under = match under {
+                Ok(deleted) => deleted.len(),
+                Err(e) => {
+                    wdiag!("watcher: deindexing under {rel}/ failed: {e}");
+                    0
+                }
+            };
+            if exact + under > 0 {
+                wdiag!(
+                    "watcher: the directory {rel} is on disk only under another spelling; deindexed {} documents at or under it",
+                    exact + under
+                );
+            }
+            false
+        }
+        ArrivedDirectory::Unknown(kind) => {
+            wdiag!("watcher: could not look at the directory {rel} ({kind:?}); scanning it anyway");
+            true
+        }
     }
 }
 
@@ -5544,5 +5732,158 @@ mod tests {
             assert!(!rename_outcome_is_settled(&Ok(outcome)), "{label}");
         }
         assert!(!rename_outcome_is_settled(&Err(anyhow::anyhow!("x"))));
+    }
+
+    /// The directory listings [`spelled_on_disk`] has made on this thread so far.
+    fn listings() -> usize {
+        LISTINGS.with(std::cell::Cell::get)
+    }
+
+    /// (#544 A2) A directory that arrived where an indexed file was: the file's row under the
+    /// directory's name goes, and the directory is scanned.
+    #[test]
+    fn an_arrived_directory_drops_the_row_of_the_file_it_replaced() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived");
+        std::fs::create_dir_all(kb.join("a.md")).unwrap();
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let got = act_on_arrived_directory(&db, &kb, "a.md", &kb.join("a.md"));
+        assert!(matches!(got, ArrivedDirectory::Scan(Ok(true))), "{got:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 P1-S2) A directory that arrived under a spelling the disk holds only in another
+    /// case: it is not scanned, and the rows under that spelling go, the directory's own and
+    /// every one under it, while the rows under the spelling on disk stay.
+    ///
+    /// The look is handed in: on a case-sensitive OS `Docs` is not found when only `docs` is
+    /// there, so the event never reaches the directory branch of the reindex arm (the extension
+    /// filter of [`should_process`] drops it). This branch comes from the file system only on a
+    /// case-insensitive volume.
+    #[test]
+    fn an_arrived_directory_held_only_in_another_case_drops_its_prefix() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-case");
+        let db = dir_rename_db(&["Docs", "Docs/a.md", "docs/b.md"]);
+        let got = act_on_arrived_directory_for(&db, &kb, "Docs", Some(true), OnDisk::Gone, false);
+        let ArrivedDirectory::Dropped { exact, under } = got else {
+            panic!("expected Dropped, got {got:?}");
+        };
+        assert!(exact.unwrap());
+        assert_eq!(under.unwrap(), vec!["Docs/a.md".to_string()]);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["docs/b.md".to_string()]
+        );
+    }
+
+    /// (#544 D3) A directory whose spelling could not be looked at keeps every row, and is
+    /// scanned as before.
+    #[test]
+    fn an_arrived_directory_that_cannot_be_looked_at_keeps_its_prefix() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-unknown");
+        let db = dir_rename_db(&["Docs", "Docs/a.md", "docs/b.md"]);
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let got = act_on_arrived_directory_for(
+            &db,
+            &kb,
+            "Docs",
+            Some(true),
+            OnDisk::Unknown(denied),
+            false,
+        );
+        assert!(
+            matches!(got, ArrivedDirectory::Unknown(k) if k == denied),
+            "{got:?}"
+        );
+        let got =
+            act_on_arrived_directory_for(&db, &kb, "Docs", None, OnDisk::Unknown(denied), false);
+        assert!(
+            matches!(got, ArrivedDirectory::Unknown(k) if k == denied),
+            "{got:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![
+                "Docs".to_string(),
+                "Docs/a.md".to_string(),
+                "docs/b.md".to_string()
+            ]
+        );
+    }
+
+    /// (#544) A path that is no longer a directory by the time the lock is held, or is not
+    /// there at all, is left alone: its own event comes on its own.
+    #[test]
+    fn an_arrived_directory_that_is_no_longer_one_is_left_alone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-not-dir");
+        let db = dir_rename_db(&["a.md", "a.md/x.md"]);
+        let got = act_on_arrived_directory_for(&db, &kb, "a.md", Some(false), OnDisk::Gone, false);
+        assert!(
+            matches!(got, ArrivedDirectory::NoLongerADirectory),
+            "{got:?}"
+        );
+        let got = act_on_arrived_directory_for(&db, &kb, "a.md", None, OnDisk::Gone, false);
+        assert!(
+            matches!(got, ArrivedDirectory::NoLongerADirectory),
+            "{got:?}"
+        );
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let got = act_on_arrived_directory(&db, &kb, "a.md", &kb.join("a.md"));
+        assert!(
+            matches!(got, ArrivedDirectory::NoLongerADirectory),
+            "{got:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "a.md/x.md".to_string()]
+        );
+    }
+
+    /// (#544 P1-L directory branch) A directory whose name is not UTF-8 is keyed by a lossy
+    /// spelling, which a sibling whose name differs only in the bytes that are not UTF-8 shares.
+    /// Its arrival is never read as a spelling gone from disk: it is scanned, and no row goes,
+    /// neither its own nor the sibling's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_arrived_directory_under_a_lossy_name_keeps_its_rows() {
+        use std::os::unix::ffi::OsStrExt;
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-lossy");
+        let raw = kb.join(std::ffi::OsStr::from_bytes(b"d\xff"));
+        let sibling = kb.join(std::ffi::OsStr::from_bytes(b"d\xfe"));
+        std::fs::create_dir_all(&raw).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let rel = indexer::index_rel_path(&kb, &raw).unwrap();
+        assert_eq!(indexer::index_rel_path(&kb, &sibling).unwrap(), rel);
+        let under = format!("{rel}/a.md");
+        let db = dir_rename_db(&[under.as_str()]);
+        assert!(rel_is_lossy(&kb, Some(&raw)));
+        let got = act_on_arrived_directory(&db, &kb, &rel, &raw);
+        assert!(matches!(got, ArrivedDirectory::Scan(Ok(false))), "{got:?}");
+        let got = act_on_arrived_directory_for(&db, &kb, &rel, Some(true), OnDisk::Gone, true);
+        assert!(matches!(got, ArrivedDirectory::Scan(Ok(false))), "{got:?}");
+        assert_eq!(db.all_document_paths().unwrap(), vec![under]);
+    }
+
+    /// (#544 P1-S2) The scan of an arrived directory spells the directory once; each file it
+    /// found only asks whether a regular file is there, which lists no directory.
+    #[test]
+    fn the_scan_of_an_arrived_directory_lists_no_directory_per_file() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-arrived-cost");
+        std::fs::create_dir_all(kb.join("docs")).unwrap();
+        let names = ["a.md", "b.md", "c.md", "d.md"];
+        for name in names {
+            std::fs::write(kb.join("docs").join(name), "# x\n").unwrap();
+        }
+        let before = listings();
+        for name in names {
+            assert_eq!(
+                written_path_on_disk(&kb, &format!("docs/{name}"), WriteLook::ExistsOnly),
+                OnDisk::Present,
+                "{name}"
+            );
+        }
+        assert_eq!(listings(), before, "a file of the scan listed a directory");
     }
 }
