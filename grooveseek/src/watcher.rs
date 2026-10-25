@@ -2298,8 +2298,9 @@ fn rename_plan(db: &Database, old_rel: &str, new_rel: &str, dest: OnDisk) -> Res
 /// (#544) The part of a [`RenamePlan`] that runs before the indexer's rename and needs no
 /// [`crate::embedder::Embedder`], with its line. `Ok(true)` when the indexer's rename is to run
 /// next ([`RenamePlan::ClearDestinationThenRename`] and [`RenamePlan::Rename`]). No transaction
-/// spans this and the rename: the rename opens its own, and a failure in between leaves the
-/// destination with no row until its next event or a full index.
+/// spans this and the rename: the rename opens its own. A failure in between, or of the rename
+/// before it moved the source's row, is settled inside the same locks by
+/// [`settle_cleared_rename`].
 fn apply_rename_plan_before(
     db: &Database,
     kb_path: &Path,
@@ -2366,54 +2367,257 @@ fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
 /// is looked at as `look` says ([`written_path_on_disk`]) before anything is moved
 /// ([`rename_plan`], [`apply_rename_plan_before`]), and again after an indexer's rename that
 /// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
-/// is gone by then.
+/// is gone by then ([`finish_rename_locked`]).
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
     let kb_path = &state.kb_path;
     let dest = written_path_on_disk(kb_path, new_rel, look);
-    let before = rename_plan(&db, old_rel, new_rel, dest).and_then(|plan| {
-        Ok((
-            plan,
-            apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan)?,
-        ))
-    });
+    let plan = match rename_plan(&db, old_rel, new_rel, dest) {
+        Ok(plan) => plan,
+        Err(e) => {
+            log_rename_failed(old_rel, new_rel, &e);
+            return;
+        }
+    };
+    let before = apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan);
+    let exclude_headings = state.exclude_headings.as_deref();
+    finish_rename_locked(
+        &db,
+        kb_path,
+        (old_rel, new_rel),
+        look,
+        (plan, before),
+        &mut *embedder,
+        |embedder| {
+            indexer::rename_single_file(
+                &db,
+                embedder,
+                kb_path,
+                old_rel,
+                new_rel,
+                exclude_headings,
+                &state.registry,
+            )
+        },
+        |embedder| {
+            indexer::reindex_single_file(
+                &db,
+                embedder,
+                kb_path,
+                new_rel,
+                exclude_headings,
+                &state.registry,
+            )
+        },
+    );
+}
+
+/// The line a rename prints when it failed before the indexer's rename returned.
+fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
+    wdiag!(
+        "watcher: rename {old_rel} -> {new_rel} failed: {}",
+        crate::embedder::body_free_message(e)
+    );
+}
+
+/// (#544) The rest of [`dispatch_rename`] once the plan has run ([`apply_rename_plan_before`]
+/// gave `before`), with both locks still held. `rename` is the indexer's rename and `reindex`
+/// a reindex of `new_rel`, each handed `ctx` (the embedder), so a test can run this with no
+/// [`crate::embedder::Embedder`] and inject their failures.
+///
+/// (#544 C1) A plan that cleared the destination's row
+/// ([`RenamePlan::ClearDestinationThenRename`]) and then failed -- clearing it, or the
+/// indexer's rename -- goes to [`settle_cleared_rename`] before anything else, so a file on
+/// disk at `new_rel` is not left with no row until its next event or a full index.
+#[allow(clippy::too_many_arguments)]
+fn finish_rename_locked<C>(
+    db: &Database,
+    kb_path: &Path,
+    (old_rel, new_rel): (&str, &str),
+    look: WriteLook,
+    (plan, before): (RenamePlan, Result<bool>),
+    ctx: &mut C,
+    rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
+    reindex: impl FnOnce(&mut C) -> Result<indexer::SingleResult>,
+) {
+    let cleared = plan == RenamePlan::ClearDestinationThenRename;
+    let settle_cleared = |ctx: &mut C| {
+        let recovery = settle_cleared_rename(
+            db,
+            kb_path,
+            (old_rel, new_rel),
+            || written_path_on_disk(kb_path, new_rel, look),
+            || written_path_on_disk(kb_path, old_rel, look),
+            || reindex(ctx),
+        );
+        log_cleared_rename(old_rel, new_rel, recovery);
+    };
     match before {
-        Ok((_, true)) => {}
+        Ok(true) => {}
         // The rows are already where the plan put them; a moved row's folded rows follow it.
-        Ok((RenamePlan::MoveRowUnknown(_), false)) => {
-            sweep_legacy_row(&db, kb_path, old_rel, false);
-            sweep_legacy_row(&db, kb_path, new_rel, true);
+        Ok(false) if matches!(plan, RenamePlan::MoveRowUnknown(_)) => {
+            sweep_legacy_row(db, kb_path, old_rel, false);
+            sweep_legacy_row(db, kb_path, new_rel, true);
             return;
         }
         // Dropping swept the folded rows as a removal; leaving touches nothing.
-        Ok((_, false)) => return,
+        Ok(false) => return,
         Err(e) => {
-            wdiag!(
-                "watcher: rename {old_rel} -> {new_rel} failed: {}",
-                crate::embedder::body_free_message(&e)
-            );
+            log_rename_failed(old_rel, new_rel, &e);
+            if cleared {
+                settle_cleared(ctx);
+                sweep_legacy_row(db, kb_path, old_rel, false);
+                sweep_legacy_row(db, kb_path, new_rel, true);
+            }
             return;
         }
     }
-    let outcome = indexer::rename_single_file(
-        &db,
-        &mut embedder,
-        kb_path,
-        old_rel,
-        new_rel,
-        state.exclude_headings.as_deref(),
-        &state.registry,
-    );
+    let outcome = rename(ctx);
+    let failed = outcome.is_err();
     let settled = rename_outcome_is_settled(&outcome);
     log_rename_outcome(old_rel, new_rel, outcome);
+    if cleared && failed {
+        settle_cleared(ctx);
+    }
     if !settled && written_path_on_disk(kb_path, new_rel, look) == OnDisk::Gone {
-        log_written_path_gone(new_rel, deindex_removed_path(&db, kb_path, new_rel));
+        log_written_path_gone(new_rel, deindex_removed_path(db, kb_path, new_rel));
     }
     // The file has left `old_rel` under every spelling; at `new_rel` the sweep
     // follows the real key in, as it does after a reindex.
-    sweep_legacy_row(&db, kb_path, old_rel, false);
-    sweep_legacy_row(&db, kb_path, new_rel, true);
+    sweep_legacy_row(db, kb_path, old_rel, false);
+    sweep_legacy_row(db, kb_path, new_rel, true);
+}
+
+/// What [`settle_cleared_rename`] did at the destination.
+#[derive(Debug)]
+enum ClearedDestination {
+    /// A row is at `new_rel` (the failure came after the source's row moved): nothing touched.
+    RowInPlace,
+    /// Whether `new_rel` holds a row could not be read: nothing touched.
+    RowUnread(anyhow::Error),
+    /// The file is there: it was reindexed, with this result.
+    Reindexed(Result<indexer::SingleResult>),
+    /// The file is not there, or could not be looked at: nothing was written.
+    NotReindexed(OnDisk),
+}
+
+/// What [`settle_cleared_rename`] did with the source's row.
+#[derive(Debug)]
+enum ClearedSource {
+    /// Not looked at: the destination holds a row, or the source's row could not be read.
+    Untouched,
+    /// No row at `old_rel`.
+    NoRow,
+    /// The file is at `old_rel` again, or could not be looked at: the row stays, for that
+    /// file's own event.
+    Kept(OnDisk),
+    /// The file is gone from `old_rel` and the destination got its own row (or is gone too):
+    /// the source's rows were deleted, and the result says whether either was there.
+    Dropped(Result<bool>),
+    /// The file is gone from `old_rel` and the destination is left with no row of its own: the
+    /// source's row moved there with its content unread, as [`RenamePlan::MoveRowUnknown`] does.
+    Moved(Result<()>),
+}
+
+/// (#544 C1, D3) An overwriting rename cleared the destination's row
+/// ([`RenamePlan::ClearDestinationThenRename`]) and then failed, maybe before the source's row
+/// moved onto it. Inside the same locks, nothing looped:
+///
+/// - a row at `new_rel` means the move happened: nothing more is done
+/// - otherwise the destination is looked at again (`look_new`). A file there is reindexed
+///   (`reindex`), so the file the rename brought keeps a row
+/// - the source's row, whose file is gone from `old_rel` (`look_old`), goes when the
+///   destination got its own row or is gone; when the destination is there but the reindex
+///   wrote nothing, or it cannot be looked at, the source's row moves onto it unread instead
+///   (the file there is the one that row was read from). A file at `old_rel` again, or one that
+///   cannot be looked at, keeps its row
+///
+/// A failure here leaves the rows as they are and says so on stderr ([`log_cleared_rename`]).
+fn settle_cleared_rename(
+    db: &Database,
+    kb_path: &Path,
+    (old_rel, new_rel): (&str, &str),
+    look_new: impl FnOnce() -> OnDisk,
+    look_old: impl FnOnce() -> OnDisk,
+    reindex: impl FnOnce() -> Result<indexer::SingleResult>,
+) -> (ClearedDestination, ClearedSource) {
+    match db.get_document_hash(new_rel) {
+        Ok(Some(_)) => return (ClearedDestination::RowInPlace, ClearedSource::Untouched),
+        Ok(None) => {}
+        Err(e) => return (ClearedDestination::RowUnread(e), ClearedSource::Untouched),
+    }
+    let (dest, new_settled) = match look_new() {
+        OnDisk::Present => {
+            let result = reindex();
+            let wrote = matches!(
+                result,
+                Ok(indexer::SingleResult::Updated { .. }
+                    | indexer::SingleResult::Unchanged
+                    | indexer::SingleResult::MetadataRefreshed { .. }
+                    | indexer::SingleResult::NothingToIndex { .. }
+                    | indexer::SingleResult::OutsideKnowledgeBaseDeindexed)
+            );
+            (ClearedDestination::Reindexed(result), wrote)
+        }
+        OnDisk::Gone => (ClearedDestination::NotReindexed(OnDisk::Gone), true),
+        unknown @ OnDisk::Unknown(_) => (ClearedDestination::NotReindexed(unknown), false),
+    };
+    let source = match db.get_document_hash(old_rel) {
+        Ok(None) => ClearedSource::NoRow,
+        Err(_) => ClearedSource::Untouched,
+        Ok(Some(_)) => match look_old() {
+            OnDisk::Gone if new_settled => {
+                ClearedSource::Dropped(deindex_removed_path(db, kb_path, old_rel))
+            }
+            OnDisk::Gone => ClearedSource::Moved(db.rename_document(
+                old_rel,
+                new_rel,
+                crate::db::FrontmatterTopic::Unread,
+            )),
+            back @ (OnDisk::Present | OnDisk::Unknown(_)) => ClearedSource::Kept(back),
+        },
+    };
+    (dest, source)
+}
+
+/// The lines [`finish_rename_locked`] prints for what [`settle_cleared_rename`] did.
+fn log_cleared_rename(
+    old_rel: &str,
+    new_rel: &str,
+    (dest, source): (ClearedDestination, ClearedSource),
+) {
+    match dest {
+        ClearedDestination::RowInPlace => {}
+        ClearedDestination::RowUnread(e) => wdiag!(
+            "watcher: after the failed rename, could not read the row of {new_rel}; left the rows as they were: {}",
+            crate::embedder::body_free_message(&e)
+        ),
+        ClearedDestination::Reindexed(Ok(result)) => {
+            wdiag!("watcher: after the failed rename, reindexed {new_rel}: {result:?}")
+        }
+        ClearedDestination::Reindexed(Err(e)) => wdiag!(
+            "watcher: after the failed rename, reindex {new_rel} failed: {}",
+            crate::embedder::body_free_message(&e)
+        ),
+        ClearedDestination::NotReindexed(on_disk) => {
+            wdiag!("watcher: after the failed rename, {new_rel} was not reindexed ({on_disk:?})")
+        }
+    }
+    match source {
+        ClearedSource::Untouched | ClearedSource::NoRow => {}
+        ClearedSource::Kept(on_disk) => wdiag!(
+            "watcher: after the failed rename, left the row of {old_rel} as it was ({on_disk:?})"
+        ),
+        ClearedSource::Dropped(outcome) => log_written_path_gone(old_rel, outcome),
+        ClearedSource::Moved(Ok(())) => wdiag!(
+            "watcher: after the failed rename, moved the row of {old_rel} to {new_rel} without reading it"
+        ),
+        ClearedSource::Moved(Err(e)) => wdiag!(
+            "watcher: after the failed rename, moving the row of {old_rel} to {new_rel} failed; left the rows as they were: {}",
+            crate::embedder::body_free_message(&e)
+        ),
+    }
 }
 
 /// The line [`dispatch_rename`] prints for what [`indexer::rename_single_file`] returned.
@@ -5821,6 +6025,204 @@ mod tests {
             assert!(!rename_outcome_is_settled(&Ok(outcome)), "{label}");
         }
         assert!(!rename_outcome_is_settled(&Err(anyhow::anyhow!("x"))));
+    }
+
+    /// The rows of an overwriting rename of `b.md` onto `a.md`, for the tests of a failure after
+    /// the destination's row went: the source's row has its own hash, so a test can tell which
+    /// content ended up at `a.md`.
+    fn overwrite_db() -> Database {
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        db.upsert_document("b.md", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        db
+    }
+
+    /// The reindex a test hands [`finish_rename_locked`]: writes a row at `rel` with hash
+    /// `fresh`, as a reindex of the file on disk would.
+    fn write_fresh_row(db: &Database, rel: &str) -> Result<indexer::SingleResult> {
+        db.upsert_document(rel, None, None, None, None, &[], None, "fresh", 0)?;
+        Ok(indexer::SingleResult::Updated {
+            chunks: 1,
+            frontmatter_unparsed: false,
+        })
+    }
+
+    /// (#544 C1) An overwriting rename whose indexer's rename fails before it moves the source's
+    /// row (a stat or a read racing the first look, a DB error): the destination's row is gone,
+    /// so the file at the destination is reindexed inside the same locks, and the source's row,
+    /// whose file is gone, goes. Both looks a rename takes: a file rename's and a directory
+    /// rename's step.
+    #[test]
+    fn an_overwrite_whose_rename_fails_before_the_move_reindexes_the_destination() {
+        for look in [WriteLook::Spelled, WriteLook::ExistsOnly] {
+            let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail");
+            std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+            let db = overwrite_db();
+            let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+            assert_eq!(plan, RenamePlan::ClearDestinationThenRename);
+            let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+            let mut reindexed = 0;
+            finish_rename_locked(
+                &db,
+                &kb,
+                ("b.md", "a.md"),
+                look,
+                (plan, before),
+                &mut reindexed,
+                |_| Err(anyhow::anyhow!("injected failure before the move")),
+                |n| {
+                    *n += 1;
+                    write_fresh_row(&db, "a.md")
+                },
+            );
+            assert_eq!(reindexed, 1, "{look:?}");
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["a.md".to_string(), "other.md".to_string()],
+                "{look:?}"
+            );
+            assert_eq!(
+                db.get_document_hash("a.md").unwrap().as_deref(),
+                Some("fresh"),
+                "{look:?}"
+            );
+        }
+    }
+
+    /// (#544 C1, D3) The same failure, and the reindex of the destination fails too: the
+    /// source's row moves onto the destination with its content left as it was (the file there
+    /// is the one that row was read from), rather than leaving the destination with no row.
+    #[test]
+    fn an_overwrite_whose_reindex_also_fails_moves_the_source_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-twice");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| Err(anyhow::anyhow!("injected reindex failure")),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
+    }
+
+    /// (#544 C1) Clearing the destination fails after its exact row went (the folded-row sweep
+    /// returning an error): the indexer's rename is not run, and the destination is reindexed
+    /// inside the same locks as when the rename fails.
+    #[test]
+    fn an_overwrite_whose_clearing_fails_reindexes_the_destination() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-clear-fail");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        assert!(indexer::deindex_single_file(&db, "a.md").unwrap());
+        let before = Err(anyhow::anyhow!("injected failure of the folded-row sweep"));
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| panic!("the indexer's rename must not run after clearing failed"),
+            |_| write_fresh_row(&db, "a.md"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some("fresh")
+        );
+    }
+
+    /// (#544 C1) A failure after the source's row was moved leaves the moved row where it is: no
+    /// reindex runs, since the destination has a row.
+    #[test]
+    fn an_overwrite_that_fails_after_the_move_keeps_the_moved_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-after");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| {
+                db.rename_document("b.md", "a.md", crate::db::FrontmatterTopic::Unread)?;
+                Err(anyhow::anyhow!("injected failure after the move"))
+            },
+            |_| panic!("a destination with a row must not be reindexed"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
+    }
+
+    /// (#544 C1) After the same failure, a source that is on disk again keeps its row (its own
+    /// event follows), and a destination gone by then is not reindexed.
+    #[test]
+    fn an_overwrite_failure_keeps_a_source_that_is_back_and_skips_a_gone_destination() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-back");
+        std::fs::write(kb.join("a.md"), "# b\n").unwrap();
+        std::fs::write(kb.join("b.md"), "# b again\n").unwrap();
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| write_fresh_row(&db, "a.md"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![
+                "a.md".to_string(),
+                "b.md".to_string(),
+                "other.md".to_string()
+            ]
+        );
+
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite-fail-gone");
+        let db = overwrite_db();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |_| panic!("a destination gone by then must not be reindexed"),
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// The directory listings [`spelled_on_disk`] has made on this thread so far.
