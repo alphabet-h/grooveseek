@@ -1810,7 +1810,26 @@ fn settle_write_reindex(
     lossy: bool,
     relook: impl FnOnce() -> OnDisk,
 ) -> WriteReindexSettled {
-    // Each named, not a catch-all, so a new variant stays a compile error (#251's way).
+    if write_reindex_settled_the_row(result) {
+        return WriteReindexSettled::Kept;
+    }
+    match relook() {
+        OnDisk::Gone if !lossy => {
+            WriteReindexSettled::Deindexed(deindex_removed_path(db, kb_path, rel))
+        }
+        OnDisk::Gone | OnDisk::Present | OnDisk::Unknown(_) => WriteReindexSettled::LeftAsIs,
+    }
+}
+
+/// (#544) Whether a write's reindex settled the row of its path: it wrote a row there, found
+/// the row already right, or found nothing there to keep a row for
+/// ([`indexer::SingleResult::NothingToIndex`],
+/// [`indexer::SingleResult::OutsideKnowledgeBaseDeindexed`]). False when it skipped or refused
+/// the file or failed: the row is then as it was before the reindex. The one answer to that
+/// question for both [`settle_write_reindex`] (whether to look at the disk again) and
+/// [`log_cleared_rename`] (whether the destination of a failed rename is left without a row).
+/// Each variant named, not a catch-all, so a new variant stays a compile error (#251's way).
+fn write_reindex_settled_the_row(result: &Result<indexer::SingleResult>) -> bool {
     match result {
         Ok(
             indexer::SingleResult::Updated { .. }
@@ -1818,16 +1837,9 @@ fn settle_write_reindex(
             | indexer::SingleResult::MetadataRefreshed { .. }
             | indexer::SingleResult::NothingToIndex { .. }
             | indexer::SingleResult::OutsideKnowledgeBaseDeindexed,
-        ) => WriteReindexSettled::Kept,
+        ) => true,
         Ok(indexer::SingleResult::Skipped { .. } | indexer::SingleResult::Refused) | Err(_) => {
-            match relook() {
-                OnDisk::Gone if !lossy => {
-                    WriteReindexSettled::Deindexed(deindex_removed_path(db, kb_path, rel))
-                }
-                OnDisk::Gone | OnDisk::Present | OnDisk::Unknown(_) => {
-                    WriteReindexSettled::LeftAsIs
-                }
-            }
+            false
         }
     }
 }
@@ -2562,27 +2574,6 @@ fn settle_cleared_rename(
     (dest, source)
 }
 
-/// Whether the reindex [`settle_cleared_rename`] ran settled the destination: it wrote a row
-/// there, or found nothing there to keep a row for
-/// ([`indexer::SingleResult::NothingToIndex`],
-/// [`indexer::SingleResult::OutsideKnowledgeBaseDeindexed`]). False when it skipped or refused
-/// the file or failed: the destination then has no row until its next event or a full index.
-/// Each named, not a catch-all, so a new variant is a compile error here.
-fn cleared_reindex_settled(result: &Result<indexer::SingleResult>) -> bool {
-    match result {
-        Ok(
-            indexer::SingleResult::Updated { .. }
-            | indexer::SingleResult::Unchanged
-            | indexer::SingleResult::MetadataRefreshed { .. }
-            | indexer::SingleResult::NothingToIndex { .. }
-            | indexer::SingleResult::OutsideKnowledgeBaseDeindexed,
-        ) => true,
-        Ok(indexer::SingleResult::Skipped { .. } | indexer::SingleResult::Refused) | Err(_) => {
-            false
-        }
-    }
-}
-
 /// The lines [`finish_rename_locked`] prints for what [`settle_cleared_rename`] did.
 fn log_cleared_rename(
     old_rel: &str,
@@ -2596,7 +2587,8 @@ fn log_cleared_rename(
             crate::embedder::body_free_message(&e)
         ),
         ClearedDestination::Reindexed(result) => {
-            let settled = cleared_reindex_settled(&result);
+            // A destination the reindex did not settle has no row: it was cleared before.
+            let settled = write_reindex_settled_the_row(&result);
             let what = match result {
                 Ok(result) => format!("reindexed {new_rel}: {result:?}"),
                 Err(e) => format!(
