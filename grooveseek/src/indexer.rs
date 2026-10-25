@@ -804,8 +804,24 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// Shared by [`rebuild_index`]'s rename loop and [`rename_single_file`], the only two callers
 /// of [`rename_crosses_a_parser`], so the decision has one home (AGENTS.md "one question gets
 /// one implementation") rather than being reimplemented at each call site.
+///
+/// (#544, D5) Except a skip for bytes that were not the ones the scan (or the rename's first
+/// read) hashed ([`SKIPPED_CHANGED_DURING_READ`]): nothing was learned about the file, so the
+/// row stays, under [`HASH_AWAITING_REPARSE`] so that no later fast path keeps the old parser's
+/// chunks.
 fn settle_cross_parser_rename(db: &Database, rel: &str, outcome: &SingleResult) -> Result<()> {
-    if !matches!(outcome, SingleResult::Updated { .. }) {
+    let keep_awaiting = match outcome {
+        SingleResult::Updated { .. } => return Ok(()),
+        SingleResult::Skipped { reason, .. } => *reason == SKIPPED_CHANGED_DURING_READ,
+        SingleResult::Unchanged
+        | SingleResult::MetadataRefreshed { .. }
+        | SingleResult::Refused
+        | SingleResult::OutsideKnowledgeBaseDeindexed
+        | SingleResult::NothingToIndex { .. } => false,
+    };
+    if keep_awaiting {
+        db.overwrite_content_hash(&[rel], HASH_AWAITING_REPARSE)?;
+    } else {
         db.delete_document(rel)?;
     }
     Ok(())
@@ -2342,6 +2358,11 @@ const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 /// (feature-62) The one-time pass (ADR-0029) returns it too, and there it means something else:
 /// for a [`Reindex::Reparse`] entry the skip leaves the row unsettled, so the end-of-run step
 /// gives it [`HASH_AWAITING_REPARSE`].
+///
+/// (#544, D5) For the destination of a rename that [`rename_crosses_a_parser`],
+/// [`index_single_disk_entry`] returns it before parsing when the second read is not the bytes
+/// the scan (or the rename's first read) hashed, and [`settle_cross_parser_rename`] then keeps
+/// the row rather than dropping it, writing [`HASH_AWAITING_REPARSE`] over its hash.
 const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
 
 /// The stored content hash of `rel` when the parser the registry would hand it is the one for
@@ -2655,6 +2676,16 @@ fn index_single_disk_entry(
         hash: read_hash.clone(),
         ..entry.clone()
     };
+    // (#544, D5) A cross-parser rename drops its row on any result but `Updated`, so bytes that
+    // are not the ones the scan (or the rename's first read) hashed must not get as far as the
+    // parse: what they fail or yield says nothing about the file the rename was decided on.
+    // Before the parse, so nothing was parsed and no frontmatter warning was written.
+    if row_dropped_unless_updated && read_hash != entry.hash {
+        return Ok(SingleResult::Skipped {
+            reason: SKIPPED_CHANGED_DURING_READ,
+            frontmatter_unparsed: false,
+        });
+    }
     let excludes: Vec<&str> = match exclude_headings {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => crate::parser::DEFAULT_EXCLUDED_HEADINGS.to_vec(),
@@ -9391,6 +9422,103 @@ mod tests {
             db.get_document_hash("note.md").unwrap(),
             None,
             "the row the old parser wrote is still there"
+        );
+    }
+
+    /// #544 PR-2 (B5): the settlement keeps the row of a cross-parser rename whose second read
+    /// changed under it, under the awaiting-reparse hash; every other skip, and a refusal, still
+    /// drops it (J3).
+    #[test]
+    fn settling_a_cross_parser_rename_keeps_a_changed_during_read_skip_awaiting_reparse() {
+        let db = reparse_db();
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        settle_cross_parser_rename(
+            &db,
+            "note.md",
+            &SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the changed-during-read skip dropped the row, or left a hash a fast path trusts"
+        );
+
+        let dropped = [
+            SingleResult::Skipped {
+                reason: "parse failed",
+                frontmatter_unparsed: false,
+            },
+            SingleResult::Refused,
+            SingleResult::Skipped {
+                reason: SKIPPED_NO_CHUNKS,
+                frontmatter_unparsed: false,
+            },
+            SingleResult::Skipped {
+                reason: SKIPPED_EMBED_REJECTED,
+                frontmatter_unparsed: false,
+            },
+        ];
+        for outcome in &dropped {
+            db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+                .unwrap();
+            settle_cross_parser_rename(&db, "note.md", outcome).unwrap();
+            assert_eq!(
+                db.get_document_hash("note.md").unwrap(),
+                None,
+                "{outcome:?} left the old parser's row"
+            );
+        }
+    }
+
+    /// #544 PR-2 (B4): on a cross-parser reparse the second read is checked against the hash
+    /// before the bytes are parsed, so bytes the scan did not hash cannot be the reason the row
+    /// is dropped. The bytes here fail to parse, which the matching case shows.
+    #[test]
+    fn a_cross_parser_reparse_whose_second_read_differs_skips_before_parsing() {
+        let dir = mk_tmp("i544-second-read-cross-before-parse");
+        let (db, registry) = (reparse_db(), docx_registry());
+        let matching = docx_entry(&dir.0, "note.docx", b"not a zip archive");
+
+        let control = reindex_with(
+            &db,
+            &registry,
+            &matching,
+            Reindex::Force,
+            &mut unreachable_embedder(),
+            true,
+        );
+        assert_eq!(
+            control,
+            SingleResult::Skipped {
+                reason: "parse failed",
+                frontmatter_unparsed: false
+            },
+            "the bytes were meant to fail to parse"
+        );
+
+        let differs = DiskEntry {
+            hash: "hash-the-scan-saw".to_string(),
+            ..matching
+        };
+        let result = reindex_with(
+            &db,
+            &registry,
+            &differs,
+            Reindex::Force,
+            &mut unreachable_embedder(),
+            true,
+        );
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
         );
     }
 }
