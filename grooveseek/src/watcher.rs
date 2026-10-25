@@ -1219,6 +1219,16 @@ fn arrived_directory_look(kb_path: &Path, rel: &str, raw: &Path) -> (Option<bool
     }
 }
 
+/// (#544 A12) [`arrived_directory_look`] as one answer: [`OnDisk::Present`] only for a
+/// directory at `raw` whose `rel` is on disk under its exact spelling.
+fn arrived_directory_on_disk(kb_path: &Path, rel: &str, raw: &Path) -> OnDisk {
+    match arrived_directory_look(kb_path, rel, raw) {
+        (Some(true), spelled) => spelled,
+        (Some(false), _) => OnDisk::Gone,
+        (None, look) => look,
+    }
+}
+
 /// What [`act_on_arrived_directory`] did with a directory that arrived.
 #[derive(Debug)]
 enum ArrivedDirectory {
@@ -2177,6 +2187,11 @@ fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
     let Some((rel, outcome)) = deindex_subtree_parts(&db, &state.kb_path, p) else {
         return;
     };
+    log_subtree_deindex(&rel, outcome);
+}
+
+/// The line for a range delete under `rel/` already run ([`deindex_subtree_parts`]).
+fn log_subtree_deindex(rel: &str, outcome: Result<Vec<String>>) {
     match outcome {
         Ok(deleted) if deleted.is_empty() => {}
         Ok(deleted) => wdiag!(
@@ -2184,6 +2199,47 @@ fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
             deleted.len()
         ),
         Err(e) => wdiag!("watcher: deindexing under {rel}/ failed: {e}"),
+    }
+}
+
+/// What [`sweep_source_if_gone`] found at the source of a directory rename.
+#[derive(Debug)]
+enum SourceSweep {
+    /// The source is gone: what the store held under it was deleted ([`deindex_subtree_parts`],
+    /// `None` when the source names no prefix).
+    Swept(Option<(String, Result<Vec<String>>)>),
+    /// Something is at the source again: nothing deleted.
+    Present,
+    /// The stat failed in a way that does not say the source is gone: nothing deleted.
+    Unknown(std::io::Error),
+}
+
+/// (#544 A14) The sweep of a renamed directory's source, for a caller holding the db lock: the
+/// stat and the range delete in the same lock region, so no write of the same process lands
+/// between them. Gone is [`indexer::stat_error_means_gone`]'s (not found, or a file where a
+/// directory on the way was, under which nothing can be), not [`stat_unless_gone`]'s (not found
+/// only), so a source whose parent became a file is swept too. `symlink_metadata`, so a link
+/// left at the source is something there.
+fn sweep_source_if_gone(db: &Database, kb_path: &Path, from: &Path) -> SourceSweep {
+    match std::fs::symlink_metadata(from) {
+        Ok(_) => SourceSweep::Present,
+        Err(e) if indexer::stat_error_means_gone(e.kind()) => {
+            SourceSweep::Swept(deindex_subtree_parts(db, kb_path, from))
+        }
+        Err(e) => SourceSweep::Unknown(e),
+    }
+}
+
+/// (#544 P1-S) Whether a directory rename moves its rows to the destination, given the look at
+/// the destination's spelling taken once ([`arrived_directory_on_disk`]). Not when the
+/// destination is on disk only under another spelling: the moved rows would carry a spelling
+/// the disk does not hold, so the rows only leave the old path and the destination's own event
+/// indexes it. A look that cannot tell moves them as before (D3), and so does a lossy
+/// destination, whose look never finds it (C4).
+fn dir_rename_moves_its_steps(to_spelled: OnDisk, lossy: bool) -> bool {
+    match to_spelled {
+        OnDisk::Gone => lossy,
+        OnDisk::Present | OnDisk::Unknown(_) => true,
     }
 }
 
@@ -2569,6 +2625,8 @@ fn to_state(p: &Path) -> (ToState, Option<std::io::Error>) {
 /// (permission, a sharing violation, I/O) is returned as `Err`, because on
 /// this path "gone" leads to deleting rows and such a failure does not prove
 /// absence (local Codex r4, and the source end after the re-review of it).
+/// (#544 A14) Only the destination end asks it now; the source end is
+/// [`sweep_source_if_gone`], which also reads not-a-directory as gone.
 fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(p) {
         Ok(m) => Ok(Some(m)),
@@ -2592,8 +2650,14 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 /// is logged and left to the file rename. If the event was a directory
 /// rename, that is a skip for two directory names: its rows stay under the
 /// old path rather than being swept while the directory may still be there,
-/// and a full index recovers them. "Gone" is decided the same way at both
-/// ends, by [`stat_unless_gone`].
+/// and a full index recovers them. (#544 L-h) The destination's gone is
+/// [`stat_unless_gone`]'s (only not-found), the source's is
+/// [`sweep_source_if_gone`]'s under the db lock (not-found or not-a-directory,
+/// [`indexer::stat_error_means_gone`]); the two never both act in one call.
+/// (#544 P1-S) The destination's spelling is looked at once, in the listing's
+/// lock region ([`arrived_directory_on_disk`]): a destination on disk only
+/// under another spelling moves no row and is not scanned
+/// ([`dir_rename_moves_its_steps`]); the listed rows still leave the old path.
 ///
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
@@ -2602,10 +2666,10 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 ///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
 ///   already moved), so no listed row stays there even when the old directory
 ///   was recreated; rows added under the old prefix after the listing are
-///   swept by [`dispatch_deindex_subtree`] once `from` is gone; last,
+///   swept by [`sweep_source_if_gone`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
 /// - [`DirRenameEntry::SweepOnly`]: no move and no scan. When `from` is gone,
-///   one range sweep by [`dispatch_deindex_subtree`] drops the listed rows and
+///   one range sweep by [`sweep_source_if_gone`] drops the listed rows and
 ///   any added since. Otherwise (`from` recreated, or its stat failed) only
 ///   the rows the entry decision listed are dropped, one by one through
 ///   [`dispatch_deindex`], so a recreated directory's own rows are kept.
@@ -2669,11 +2733,23 @@ fn dispatch_directory_rename(
             return false;
         }
     };
+    // (#544 P1-S) Whether the rows move to `to`, from one look at its spelling taken in the
+    // listing's lock region. A sweep-only entry moves nothing whatever this says.
+    let mut moves = true;
     if entry == DirRenameEntry::ScanDestination {
-        let listed = {
+        let (listed, to_spelled) = {
             let db = recover_db(state.db.lock());
-            db.document_paths_under(old_rel)
+            (
+                db.document_paths_under(old_rel),
+                arrived_directory_on_disk(&state.kb_path, new_rel, to),
+            )
         };
+        moves = dir_rename_moves_its_steps(to_spelled, rel_is_lossy(&state.kb_path, Some(to)));
+        if !moves {
+            wdiag!(
+                "watcher: the renamed directory {new_rel} is not on disk under that spelling; its rows leave the old path and are not moved there"
+            );
+        }
         let paths = match listed {
             Ok(paths) => paths,
             Err(e) => {
@@ -2689,18 +2765,23 @@ fn dispatch_directory_rename(
                 "watcher: a renamed directory held {n} indexed document{}; following the rename for them (the file system reports only the directory).",
                 if n == 1 { "" } else { "s" }
             );
-            let steps = dir_rename_steps(
-                &paths,
-                &state.kb_path,
-                old_rel,
-                new_rel,
-                &state.registry,
-                &state.rules,
-            );
+            let steps = if moves {
+                dir_rename_steps(
+                    &paths,
+                    &state.kb_path,
+                    old_rel,
+                    new_rel,
+                    &state.registry,
+                    &state.rules,
+                )
+            } else {
+                Vec::new()
+            };
             for step in &steps {
                 match step.action {
-                    // (#544) Only whether a file is there: below the destination directory a
-                    // step's `new_rel` is the row's own spelling.
+                    // (#544) Only whether a file is there: the destination directory was
+                    // spelled once above, and below it a step's `new_rel` is the row's own
+                    // spelling.
                     RenameAction::Rename => {
                         dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
                     }
@@ -2732,21 +2813,29 @@ fn dispatch_directory_rename(
     }
     // The old prefix is swept only when `from` is known to be gone. A stat that
     // fails for another reason does not prove that, and sweeping a directory
-    // that is still there would delete its live rows.
-    let from_gone = match stat_unless_gone(from) {
-        Ok(None) => true,
-        Ok(Some(_)) => false,
-        Err(e) => {
+    // that is still there would delete its live rows. (#544 A14) The stat and the
+    // range delete share one db lock region; on the sweep-only path the delete
+    // takes the listed rows too.
+    let swept = {
+        let db = recover_db(state.db.lock());
+        sweep_source_if_gone(&db, &state.kb_path, from)
+        // `db` is dropped here, before any `dispatch_*` locks it again.
+    };
+    let from_gone = match swept {
+        SourceSweep::Swept(Some((rel, outcome))) => {
+            log_subtree_deindex(&rel, outcome);
+            true
+        }
+        SourceSweep::Swept(None) => true,
+        SourceSweep::Present => false,
+        SourceSweep::Unknown(e) => {
             wdiag!(
                 "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
             );
             false
         }
     };
-    if from_gone {
-        // One range delete; on the sweep-only path it takes the listed rows too.
-        dispatch_deindex_subtree(state, from);
-    } else if let DirRenameEntry::SweepOnly(paths) = &entry {
+    if !from_gone && let DirRenameEntry::SweepOnly(paths) = &entry {
         // (local Codex r5, r6) `from` was recreated, or cannot be stat'ed: the
         // listed rows predate the rename and go, but one by one, so a recreated
         // directory's own rows are not taken by a prefix sweep. Rare, so the
@@ -2763,7 +2852,7 @@ fn dispatch_directory_rename(
     // directory rename there is no such row and this is a no-op (one deletes
     // the exact row, the sweep what is strictly under it, as in feature-67).
     dispatch_deindex(state, old_rel);
-    if entry == DirRenameEntry::ScanDestination {
+    if entry == DirRenameEntry::ScanDestination && moves {
         dispatch_new_directory(state, to, new_rel);
     }
     true
@@ -5885,5 +5974,99 @@ mod tests {
             );
         }
         assert_eq!(listings(), before, "a file of the scan listed a directory");
+    }
+
+    /// (#544 P1-S) A directory renamed onto a name the disk holds only in another case moves
+    /// none of its rows there (the listed rows still leave the old path); one whose destination
+    /// is there, or cannot be looked at, moves them as before. A lossy destination is never read
+    /// as gone.
+    #[test]
+    fn a_directory_renamed_onto_a_name_held_only_in_another_case_moves_nothing() {
+        assert!(!dir_rename_moves_its_steps(OnDisk::Gone, false));
+        assert!(dir_rename_moves_its_steps(OnDisk::Present, false));
+        assert!(dir_rename_moves_its_steps(
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+            false
+        ));
+        assert!(dir_rename_moves_its_steps(OnDisk::Gone, true));
+    }
+
+    /// (#544 P1-S) A directory rename spells its destination once: after that look, each
+    /// step's destination only asks whether a regular file is there, which lists nothing more.
+    #[test]
+    fn a_directory_rename_spells_its_destination_once() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-dir-rename-cost");
+        std::fs::create_dir_all(kb.join("Dest")).unwrap();
+        let names = ["a.md", "b.md", "c.md", "d.md"];
+        for name in names {
+            std::fs::write(kb.join("Dest").join(name), "# x\n").unwrap();
+        }
+        assert_eq!(
+            arrived_directory_on_disk(&kb, "Dest", &kb.join("Dest")),
+            OnDisk::Present
+        );
+        let after_the_destination = listings();
+        for name in names {
+            assert_eq!(
+                written_path_on_disk(&kb, &format!("Dest/{name}"), WriteLook::ExistsOnly),
+                OnDisk::Present,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            listings(),
+            after_the_destination,
+            "a step listed a directory"
+        );
+        assert_eq!(
+            arrived_directory_on_disk(&kb, "dest", &kb.join("dest")),
+            OnDisk::Gone,
+            "the destination under another case is not there under that spelling"
+        );
+    }
+
+    /// (#544 A14) The source of a directory rename is swept, under the db lock, only when it
+    /// is gone: not found, or a file where a directory on the way was. A source that is there
+    /// again keeps its rows.
+    #[test]
+    fn the_source_of_a_directory_rename_is_swept_only_when_gone() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-source-sweep");
+        let db = dir_rename_db(&["old/a.md", "other.md"]);
+        match sweep_source_if_gone(&db, &kb, &kb.join("old")) {
+            SourceSweep::Swept(Some((rel, Ok(deleted)))) => {
+                assert_eq!(rel, "old");
+                assert_eq!(deleted, vec!["old/a.md".to_string()]);
+            }
+            got => panic!("a missing source must be swept: {got:?}"),
+        }
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+
+        let db = dir_rename_db(&["old/a.md", "other.md"]);
+        std::fs::create_dir_all(kb.join("old")).unwrap();
+        let got = sweep_source_if_gone(&db, &kb, &kb.join("old"));
+        assert!(matches!(got, SourceSweep::Present), "{got:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["old/a.md".to_string(), "other.md".to_string()]
+        );
+
+        // A file where the directory above the source was: not a directory on Unix, not found
+        // on Windows (estimated), and gone either way.
+        std::fs::write(kb.join("f"), "x").unwrap();
+        let db = dir_rename_db(&["f/old/a.md", "other.md"]);
+        match sweep_source_if_gone(&db, &kb, &kb.join("f").join("old")) {
+            SourceSweep::Swept(Some((rel, Ok(deleted)))) => {
+                assert_eq!(rel, "f/old");
+                assert_eq!(deleted, vec!["f/old/a.md".to_string()]);
+            }
+            got => panic!("a source under a file must be swept: {got:?}"),
+        }
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 }
