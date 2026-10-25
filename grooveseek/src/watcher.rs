@@ -590,7 +590,9 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `rename_single_file` が **denylist 配下の新パスへ DB を
                 // 書き換えて残す**。除外したはずのファイルが index に居座る。
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
-                    RenameAction::Rename => dispatch_rename(state, &old_rel, &new_rel),
+                    RenameAction::Rename => {
+                        dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
+                    }
                     RenameAction::Deindex => dispatch_deindex(state, &old_rel),
                     RenameAction::Reindex => dispatch_reindex(state, &new_rel, to),
                     RenameAction::Skip => continue,
@@ -1997,18 +1999,182 @@ fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
     }
 }
 
-fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
+/// (#544) What a rename does with the look at its destination inside the locks, before the
+/// indexer's rename ([`rename_plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenamePlan {
+    /// The destination is not on disk under that spelling: both ends' rows go, nothing moves.
+    DropBoth,
+    /// The destination could not be looked at, and moving the row is not possible (no row at
+    /// the old end) or would run into the destination's row: every row stays as it is.
+    LeaveUnknown(std::io::ErrorKind),
+    /// The destination could not be looked at and only the old end holds a row: the row moves
+    /// to the new end with its content left as it was, nothing read.
+    MoveRowUnknown(std::io::ErrorKind),
+    /// The destination is there and both ends hold a row (an overwriting rename): the
+    /// destination's row goes, then the indexer's rename moves the source's onto it.
+    ClearDestinationThenRename,
+    /// The destination is there: the indexer's rename, as before.
+    Rename,
+}
+
+/// (#544 C1/A9/A10, D3) How a rename of `old_rel` to `new_rel` goes, given the look at the
+/// destination taken inside the locks:
+///
+/// - [`OnDisk::Gone`] gives [`RenamePlan::DropBoth`]
+/// - [`OnDisk::Unknown`] gives [`RenamePlan::MoveRowUnknown`] when only `old_rel` holds a row,
+///   [`RenamePlan::LeaveUnknown`] otherwise. The indexer's rename is not run: its own look
+///   would read a failed stat as a missing file and drop the row (C2)
+/// - [`OnDisk::Present`] gives [`RenamePlan::ClearDestinationThenRename`] when the two ends
+///   differ and both hold a row, [`RenamePlan::Rename`] otherwise. With no row at `old_rel` the
+///   destination's row is kept: the indexer reindexes it in place and reuses its vectors
+///
+/// The old end is not looked at: its row is only moved or dropped, and nothing is written there.
+fn rename_plan(db: &Database, old_rel: &str, new_rel: &str, dest: OnDisk) -> Result<RenamePlan> {
+    let has_row = |rel: &str| -> Result<bool> { Ok(db.get_document_hash(rel)?.is_some()) };
+    Ok(match dest {
+        OnDisk::Gone => RenamePlan::DropBoth,
+        OnDisk::Unknown(kind) => {
+            if has_row(old_rel)? && !has_row(new_rel)? {
+                RenamePlan::MoveRowUnknown(kind)
+            } else {
+                RenamePlan::LeaveUnknown(kind)
+            }
+        }
+        OnDisk::Present => {
+            if old_rel != new_rel && has_row(old_rel)? && has_row(new_rel)? {
+                RenamePlan::ClearDestinationThenRename
+            } else {
+                RenamePlan::Rename
+            }
+        }
+    })
+}
+
+/// (#544) The part of a [`RenamePlan`] that runs before the indexer's rename and needs no
+/// [`crate::embedder::Embedder`], with its line. `Ok(true)` when the indexer's rename is to run
+/// next ([`RenamePlan::ClearDestinationThenRename`] and [`RenamePlan::Rename`]). No transaction
+/// spans this and the rename: the rename opens its own, and a failure in between leaves the
+/// destination with no row until its next event or a full index.
+fn apply_rename_plan_before(
+    db: &Database,
+    kb_path: &Path,
+    old_rel: &str,
+    new_rel: &str,
+    plan: &RenamePlan,
+) -> Result<bool> {
+    match plan {
+        RenamePlan::DropBoth => {
+            let old = deindex_removed_path(db, kb_path, old_rel)?;
+            let new = deindex_removed_path(db, kb_path, new_rel)?;
+            if old || new {
+                wdiag!(
+                    "watcher: {new_rel} is not on disk under that spelling; deindexed {old_rel} and {new_rel}"
+                );
+            }
+            Ok(false)
+        }
+        RenamePlan::LeaveUnknown(kind) => {
+            wdiag!("watcher: could not look at {new_rel} ({kind:?}); left the rows as they were");
+            Ok(false)
+        }
+        RenamePlan::MoveRowUnknown(kind) => {
+            db.rename_document(old_rel, new_rel, crate::db::FrontmatterTopic::Unread)?;
+            wdiag!(
+                "watcher: could not look at {new_rel} ({kind:?}); moved the row of {old_rel} without reading it"
+            );
+            Ok(false)
+        }
+        RenamePlan::ClearDestinationThenRename => {
+            deindex_removed_path(db, kb_path, new_rel)?;
+            wdiag!("watcher: {new_rel} was overwritten by {old_rel}; replaced its row");
+            Ok(true)
+        }
+        RenamePlan::Rename => Ok(true),
+    }
+}
+
+/// (#544 A7/A8) Whether the indexer's rename settled the row at `new_rel`: true when the row
+/// was moved, reindexed or dropped and the outcome says so. False for an outcome that left the
+/// row as it was (a refusal, a skipped reparse) and for an error, after which the destination
+/// is looked at again. Each named, not a catch-all, so a new variant is a compile error here.
+fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
+    match outcome {
+        Ok(
+            indexer::RenameOutcome::Renamed
+            | indexer::RenameOutcome::RenamedAndReindexed { .. }
+            | indexer::RenameOutcome::OldPathMissing
+            | indexer::RenameOutcome::RenamedSizeCapped
+            | indexer::RenameOutcome::RenamedSizeCappedAndDropped
+            | indexer::RenameOutcome::RenamedButRefusedAndDropped
+            | indexer::RenameOutcome::MovedOutOfTheKnowledgeBase,
+        ) => true,
+        Ok(
+            indexer::RenameOutcome::OldPathMissingAndRefused
+            | indexer::RenameOutcome::RenamedButRefused
+            | indexer::RenameOutcome::RenamedButNotReindexed,
+        )
+        | Err(_) => false,
+    }
+}
+
+/// (#544) A paired rename of `old_rel` to `new_rel`, with both locks held once: the destination
+/// is looked at as `look` says ([`written_path_on_disk`]) before anything is moved
+/// ([`rename_plan`], [`apply_rename_plan_before`]), and again after an indexer's rename that
+/// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
+/// is gone by then.
+fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
-    match indexer::rename_single_file(
+    let kb_path = &state.kb_path;
+    let dest = written_path_on_disk(kb_path, new_rel, look);
+    let before = rename_plan(&db, old_rel, new_rel, dest).and_then(|plan| {
+        Ok((
+            plan,
+            apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan)?,
+        ))
+    });
+    match before {
+        Ok((_, true)) => {}
+        // The rows are already where the plan put them; a moved row's folded rows follow it.
+        Ok((RenamePlan::MoveRowUnknown(_), false)) => {
+            sweep_legacy_row(&db, kb_path, old_rel, false);
+            sweep_legacy_row(&db, kb_path, new_rel, true);
+            return;
+        }
+        // Dropping swept the folded rows as a removal; leaving touches nothing.
+        Ok((_, false)) => return,
+        Err(e) => {
+            wdiag!(
+                "watcher: rename {old_rel} -> {new_rel} failed: {}",
+                crate::embedder::body_free_message(&e)
+            );
+            return;
+        }
+    }
+    let outcome = indexer::rename_single_file(
         &db,
         &mut embedder,
-        &state.kb_path,
+        kb_path,
         old_rel,
         new_rel,
         state.exclude_headings.as_deref(),
         &state.registry,
-    ) {
+    );
+    let settled = rename_outcome_is_settled(&outcome);
+    log_rename_outcome(old_rel, new_rel, outcome);
+    if !settled && written_path_on_disk(kb_path, new_rel, look) == OnDisk::Gone {
+        log_written_path_gone(new_rel, deindex_removed_path(&db, kb_path, new_rel));
+    }
+    // The file has left `old_rel` under every spelling; at `new_rel` the sweep
+    // follows the real key in, as it does after a reindex.
+    sweep_legacy_row(&db, kb_path, old_rel, false);
+    sweep_legacy_row(&db, kb_path, new_rel, true);
+}
+
+/// The line [`dispatch_rename`] prints for what [`indexer::rename_single_file`] returned.
+fn log_rename_outcome(old_rel: &str, new_rel: &str, outcome: Result<indexer::RenameOutcome>) {
+    match outcome {
         Ok(indexer::RenameOutcome::Renamed) => {
             wdiag!("watcher: renamed {old_rel} -> {new_rel}");
         }
@@ -2070,10 +2236,6 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
             crate::embedder::body_free_message(&e)
         ),
     }
-    // The file has left `old_rel` under every spelling; at `new_rel` the sweep
-    // follows the real key in, as it does after a reindex.
-    sweep_legacy_row(&db, &state.kb_path, old_rel, false);
-    sweep_legacy_row(&db, &state.kb_path, new_rel, true);
 }
 
 /// (feature-68) One stored document under a renamed directory, mapped to the
@@ -2349,7 +2511,11 @@ fn dispatch_directory_rename(
             );
             for step in &steps {
                 match step.action {
-                    RenameAction::Rename => dispatch_rename(state, &step.old_rel, &step.new_rel),
+                    // (#544) Only whether a file is there: below the destination directory a
+                    // step's `new_rel` is the row's own spelling.
+                    RenameAction::Rename => {
+                        dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
+                    }
                     RenameAction::Deindex => dispatch_deindex(state, &step.old_rel),
                     // (#544) No event path for a step (its `new_rel` is built from the
                     // row's), so it is read as not lossy and only whether a file is there
@@ -5251,5 +5417,132 @@ mod tests {
             );
             assert!(!rel_is_lossy(&kb, Some(path)), "{rel}");
         }
+    }
+
+    /// (#544 A9/A10) A rename whose destination is not on disk under that spelling (gone, a
+    /// directory, or there only in another case) moves no row: both ends' rows go, and the
+    /// indexer's rename is not run.
+    #[test]
+    fn a_rename_whose_destination_is_gone_drops_both_rows() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-rename-gone");
+        let db = dir_rename_db(&["a.md", "B.md", "other.md"]);
+        let plan = rename_plan(&db, "a.md", "B.md", OnDisk::Gone).unwrap();
+        assert_eq!(plan, RenamePlan::DropBoth);
+        let run_rename = apply_rename_plan_before(&db, &kb, "a.md", "B.md", &plan).unwrap();
+        assert!(!run_rename);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544 D3, C2) A rename whose destination cannot be looked at deletes nothing: with no
+    /// row at the old end, or rows at both ends, the rows stay as they are; with a row at the
+    /// old end only, the row moves to the new end, its content left as it was.
+    #[test]
+    fn a_rename_whose_destination_cannot_be_looked_at_keeps_or_moves_rows() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-rename-unknown");
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let cases: [(&[&str], RenamePlan, &[&str]); 3] = [
+            (
+                &["b.md", "other.md"],
+                RenamePlan::LeaveUnknown(denied),
+                &["b.md", "other.md"],
+            ),
+            (
+                &["a.md", "b.md", "other.md"],
+                RenamePlan::LeaveUnknown(denied),
+                &["a.md", "b.md", "other.md"],
+            ),
+            (
+                &["a.md", "other.md"],
+                RenamePlan::MoveRowUnknown(denied),
+                &["b.md", "other.md"],
+            ),
+        ];
+        for (rows, want_plan, want_rows) in cases {
+            let db = dir_rename_db(rows);
+            let plan = rename_plan(&db, "a.md", "b.md", OnDisk::Unknown(denied)).unwrap();
+            assert_eq!(plan, want_plan, "{rows:?}");
+            let run_rename = apply_rename_plan_before(&db, &kb, "a.md", "b.md", &plan).unwrap();
+            assert!(!run_rename, "{rows:?}");
+            assert_eq!(db.all_document_paths().unwrap(), want_rows, "{rows:?}");
+        }
+    }
+
+    /// (#544 C1, D6) A rename over a path that holds a row, from one that holds a row too:
+    /// the destination's row goes first, so the indexer's move of the source row does not run
+    /// into it on the unique key.
+    #[test]
+    fn an_overwriting_rename_onto_an_indexed_path_clears_the_destination_first() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-overwrite");
+        let db = dir_rename_db(&["a.md", "b.md", "other.md"]);
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::ClearDestinationThenRename);
+        let run_rename = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan).unwrap();
+        assert!(run_rename);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["b.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544, spec r1 M1) A rename onto an indexed path from one with no row clears nothing:
+    /// the indexer reindexes the destination in place (`OldPathMissing`), reusing its vectors.
+    #[test]
+    fn a_rename_with_no_source_row_does_not_clear_the_destination() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-no-source");
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let run_rename = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan).unwrap();
+        assert!(run_rename);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["a.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (#544, feature-68 r11) A rename whose two ends are the same path is not an overwrite:
+    /// its own row is not cleared.
+    #[test]
+    fn a_rename_onto_itself_is_not_an_overwrite() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-self");
+        let db = dir_rename_db(&["docs"]);
+        let plan = rename_plan(&db, "docs", "docs", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let run_rename = apply_rename_plan_before(&db, &kb, "docs", "docs", &plan).unwrap();
+        assert!(run_rename);
+        assert_eq!(db.all_document_paths().unwrap(), vec!["docs".to_string()]);
+    }
+
+    /// (#544 A7/A8) Which outcomes of the indexer's rename settle the row, and which leave it
+    /// for a second look at the destination. Named one by one, as the function does.
+    #[test]
+    fn the_settled_rename_outcomes_are_named_one_by_one() {
+        use indexer::RenameOutcome as R;
+        let settled = [
+            R::Renamed,
+            R::RenamedAndReindexed { chunks: 1 },
+            R::OldPathMissing,
+            R::RenamedSizeCapped,
+            R::RenamedSizeCappedAndDropped,
+            R::RenamedButRefusedAndDropped,
+            R::MovedOutOfTheKnowledgeBase,
+        ];
+        for outcome in settled {
+            let label = format!("{outcome:?}");
+            assert!(rename_outcome_is_settled(&Ok(outcome)), "{label}");
+        }
+        let unsettled = [
+            R::OldPathMissingAndRefused,
+            R::RenamedButRefused,
+            R::RenamedButNotReindexed,
+        ];
+        for outcome in unsettled {
+            let label = format!("{outcome:?}");
+            assert!(!rename_outcome_is_settled(&Ok(outcome)), "{label}");
+        }
+        assert!(!rename_outcome_is_settled(&Err(anyhow::anyhow!("x"))));
     }
 }
