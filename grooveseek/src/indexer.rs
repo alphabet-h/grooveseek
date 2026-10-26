@@ -843,14 +843,17 @@ pub(crate) fn settle_cross_parser_rename(
 /// Why [`Reindex::Event`]: the row's hash is the sentinel, so no mode takes the fast path, and
 /// this one is the only mode that checks the bytes it parses against the hash just taken (a
 /// changed read is a [`SKIPPED_CHANGED_DURING_READ`] skip again) while writing the hash on a
-/// meta-only update. Its result alone decides the row: written from these bytes, dropped when
-/// they hold nothing to embed ([`SingleResult::NothingToIndex`], what `--force` leaves), and
-/// otherwise -- a failed or refused read, a failed parse, an endpoint's rejection, bytes that
-/// changed again -- kept under the sentinel (D5). Not [`Reindex::Force`] with
-/// [`settle_cross_parser_rename`], which drops the row on a failed parse or a refusal, and not
-/// [`Reindex::Reparse`], whose matching-chunks exit writes no hash and leaves the sentinel over
-/// chunks it found current. A read that fails is the skip the loop gives one ("read failed"),
-/// so the run goes on.
+/// meta-only update. Not [`Reindex::Reparse`], whose matching-chunks exit writes no hash and
+/// leaves the sentinel over chunks it found current. The check runs before the parse, as for
+/// the rename's first read, so a failed parse is always one of the bytes this read hashed. A
+/// read that fails is the skip the loop gives one ("read failed"), so the run goes on.
+///
+/// (#544, local Codex r3, J3) The caller settles the result with
+/// [`settle_cross_parser_rename`], as the loop settled the first read: the row is written from
+/// these bytes, or dropped when the new parser cannot index them (a failed or refused read, a
+/// failed parse, an endpoint's rejection, nothing to embed), and kept under the sentinel only
+/// for bytes that changed again. A refusal records the length it measured first; the row it
+/// lands on is then deleted, which leaves nothing behind.
 fn read_crossed_rename_again(
     db: &Database,
     embedder: &mut Embedder,
@@ -906,7 +909,10 @@ fn read_crossed_rename_again(
         Reindex::Event,
         context_mode,
         declared,
-        false,
+        // The caller settles the result with `settle_cross_parser_rename`: bytes other than the
+        // ones hashed above are a changed-during-read skip before they are parsed, so a parse
+        // failure is always one of the verified bytes.
+        true,
     )
 }
 
@@ -1886,6 +1892,13 @@ pub fn rebuild_index(
                 generation: &declared_json,
             },
         )?;
+        // (#544, local Codex r3, J3) Settled as the loop's read was: bytes this read verified
+        // and the new parser cannot index drop the row; only bytes that changed again keep it
+        // awaiting. A dropped row holds nothing open.
+        if settle_cross_parser_rename(db, &entry.rel, &again)? {
+            unsettled.remove(&entry.rel);
+            refresh_pending_rows.remove(&entry.rel);
+        }
         tally.skipped = tally.skipped.saturating_sub(1);
         match again {
             SingleResult::Updated {
@@ -1923,13 +1936,7 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
                 ..
             } => {
-                unsettled.remove(&entry.rel);
-                // (#544, local Codex r2) Dropped: pending only while a row is still there, as
-                // the loop's own `NothingToIndex` arm decides it.
-                refresh_pending_rows.remove(&entry.rel);
-                if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
-                    refresh_pending_rows.insert(entry.rel.clone());
-                }
+                // Dropped, by the read and by the settlement above.
                 tally.skipped += 1;
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
@@ -9955,12 +9962,13 @@ mod tests {
         assert_eq!((result.updated, result.skipped), (1, 0), "{result:?}");
     }
 
-    /// #544 PR-2 (local Codex r1, D5): the same run, and the bytes on disk are ones the new
-    /// parser cannot read. The further read does not settle them, so the row stays, under the
-    /// awaiting-reparse hash with the chunks it had, rather than being dropped, and the run
-    /// counts one skip.
+    /// #544 PR-2 (local Codex r3, J3): the same run, and the bytes on disk are ones the new
+    /// parser cannot read. The further read verified them, so its parse failure is settled as
+    /// the rename's first read would be: the old parser's row goes, and the run counts one
+    /// skip. (Before r3 the row was kept awaiting, and stayed listed with a kb URI that
+    /// `get_document` could no longer open.)
     #[test]
-    fn a_full_run_keeps_a_crossed_rename_awaiting_when_the_further_read_cannot_parse() {
+    fn a_full_run_drops_a_crossed_rename_when_the_further_read_cannot_parse() {
         let (_dir, db, _registry, result) = crossed_rename_rewritten_during_the_run(
             "i544-cx1-rebuild-second-read-unparsed",
             ("note.md", "note.docx"),
@@ -9968,17 +9976,12 @@ mod tests {
             b"not a zip archive, as rewritten",
         );
         assert_eq!(
-            db.get_document_hash("note.docx").unwrap().as_deref(),
-            Some(HASH_AWAITING_REPARSE),
-            "the row went, or kept a hash a fast path trusts"
+            db.get_document_hash("note.docx").unwrap(),
+            None,
+            "the old parser's row is still there"
         );
-        assert_eq!(
-            stored_bodies(&db, "note.docx").len(),
-            parse_doc(&docx_registry(), "md", "note.md", SCANNED_BYTES)
-                .chunks
-                .len(),
-            "the kept row's chunks changed"
-        );
+        assert!(stored_bodies(&db, "note.docx").is_empty());
+        assert_eq!(db.get_document_hash("note.md").unwrap(), None);
         assert_eq!((result.updated, result.skipped), (0, 1), "{result:?}");
     }
 
@@ -10081,11 +10084,12 @@ mod tests {
         );
     }
 
-    /// #544 PR-2 (local Codex r2): the same run, and the bytes on disk are not UTF-8, so the
-    /// further read fails to parse them. The row stays awaiting, the check stays pending, and
-    /// the run does not record the policy.
+    /// #544 PR-2 (local Codex r3, J3): the same run, and the bytes on disk are not UTF-8, so the
+    /// further read fails to parse them. The read verified those bytes, so the row is dropped;
+    /// no row is left to hold the check pending, and the run records the policy.
     #[test]
-    fn a_crossed_rename_the_further_read_cannot_parse_holds_the_frontmatter_policy() {
+    fn a_crossed_rename_the_further_read_cannot_parse_is_dropped_and_releases_the_frontmatter_policy()
+     {
         let (_dir, db, _registry, _result) = crossed_rename_rewritten_during_the_run(
             "i544-cx2-rebuild-policy-unsettled",
             ("note.txt", "note.md"),
@@ -10093,14 +10097,14 @@ mod tests {
             b"\xff\xfe not UTF-8, as rewritten",
         );
         assert_eq!(
-            db.get_document_hash("note.md").unwrap().as_deref(),
-            Some(HASH_AWAITING_REPARSE),
-            "the row went, or kept a hash a fast path trusts"
+            db.get_document_hash("note.md").unwrap(),
+            None,
+            "the old parser's row is still there"
         );
         assert_eq!(
-            db.read_frontmatter_policy().unwrap(),
-            None,
-            "the run recorded the policy over a row no read has settled"
+            db.read_frontmatter_policy().unwrap().as_deref(),
+            Some(FRONTMATTER_POLICY),
+            "the run left the check pending for a row its further read dropped"
         );
     }
 }

@@ -2615,13 +2615,20 @@ where
     let result = reindex(ctx);
     let dropped = settle_crossed_read_again(db, new_rel, &result);
     let requires_real_key = !dropped && sweep_requires_real_key(&result);
+    let settled = read_again_settles_the_row(&result);
     log_rename_read_again(old_rel, new_rel, result);
-    if dropped {
-        wdiag!(
-            "watcher: {new_rel} crosses a parser from {old_rel}; dropped its row, whose bytes the new parser cannot index"
-        );
+    if dropped && !settled {
+        log_crossed_row_dropped(old_rel, new_rel);
     }
     requires_real_key
+}
+
+/// (#544, local Codex r3) The line printed after [`settle_crossed_read_again`] dropped a row
+/// whose further read had kept it ([`log_rename_read_again`] said "kept the row" just before).
+fn log_crossed_row_dropped(old_rel: &str, new_rel: &str) {
+    wdiag!(
+        "watcher: {new_rel} crosses a parser from {old_rel}; dropped its row, whose bytes the new parser cannot index"
+    );
 }
 
 /// (#544, local Codex r3, J3) The settlement of a further read of a row a rename across a parser
@@ -2654,10 +2661,12 @@ fn settle_crossed_read_again(
 
 /// (#544, local Codex r2) [`read_destination_again`] for a row [`RenamePlan::MoveRowUnknown`]
 /// moved unread across a parser ([`unread_move_crosses_a_parser`]), read whether or not its
-/// hash was written: a read that does not rewrite or drop the row
-/// ([`read_again_settles_the_row`]) leaves the old parser's chunks, so the hash is written
-/// again as [`indexer::HASH_AWAITING_REPARSE`] (D5: an unverified read never drops the row). A
-/// failure of that write is logged and the dispatch goes on.
+/// hash was written. (local Codex r3, J3) The read is settled as a crossed rename's first read
+/// is ([`settle_crossed_read_again`]): bytes it verified and the new parser cannot index drop
+/// the row. A read that neither rewrites nor drops it ([`read_again_settles_the_row`]) -- bytes
+/// that changed again, or a read that verified nothing -- leaves the old parser's chunks, so
+/// the hash is written again as [`indexer::HASH_AWAITING_REPARSE`] (D5: an unverified read
+/// never drops the row). A failure of that write is logged and the dispatch goes on.
 fn read_unread_move_again<C, R>(
     db: &Database,
     ctx: &mut C,
@@ -2671,10 +2680,13 @@ where
         return true;
     };
     let result = reindex(ctx);
-    let requires_real_key = sweep_requires_real_key(&result);
+    let dropped = settle_crossed_read_again(db, new_rel, &result);
+    let requires_real_key = !dropped && sweep_requires_real_key(&result);
     let settled = read_again_settles_the_row(&result);
     log_rename_read_again(old_rel, new_rel, result);
-    if !settled {
+    if dropped && !settled {
+        log_crossed_row_dropped(old_rel, new_rel);
+    } else if !settled {
         let marked = db
             .overwrite_content_hash(&[new_rel], indexer::HASH_AWAITING_REPARSE)
             .map(|written| written > 0);
@@ -7291,13 +7303,21 @@ mod tests {
 
     /// (#544, local Codex r2) A row moved unread across a parser (`a.md` to `a.txt`) whose
     /// awaiting hash could not be written (a trigger refuses it while `fault.armed` is 1): the
-    /// destination is read once all the same, and a read that does not rewrite or drop the row
-    /// is followed by a second attempt at the hash. Each case says whether the read lifts the
-    /// fault, what the read returns, and the hash `a.txt` ends with.
+    /// destination is read once all the same. (local Codex r3, J3) A read that verified bytes
+    /// the new parser cannot index drops the row, fault or not; one whose bytes changed again,
+    /// or that verified nothing, is followed by a second attempt at the hash. Each case says
+    /// whether the read lifts the fault, what the read returns, and the hash `a.txt` ends with.
     #[test]
-    fn an_unread_move_across_a_parser_is_read_again_when_its_mark_fails() {
+    fn an_unread_move_across_a_parser_is_read_again_when_its_mark_fails_and_dropped_when_unindexable()
+     {
         type Read = fn(&Database) -> Result<indexer::SingleResult>;
-        let kept: Read = |_| {
+        let changed: Read = |_| {
+            Ok(indexer::SingleResult::Skipped {
+                reason: "changed between scan and read",
+                frontmatter_unparsed: false,
+            })
+        };
+        let unparsed: Read = |_| {
             Ok(indexer::SingleResult::Skipped {
                 reason: "parse failed",
                 frontmatter_unparsed: false,
@@ -7307,11 +7327,13 @@ mod tests {
         let failed: Read = |_| Err(anyhow::anyhow!("injected failure of the read"));
         let fresh: Read = |db| write_fresh_row(db, "a.txt");
         let awaiting = Some(indexer::HASH_AWAITING_REPARSE);
-        let cases: [(&str, bool, Read, Option<&str>); 6] = [
-            ("kept, mark retried", true, kept, awaiting),
+        let cases: [(&str, bool, Read, Option<&str>); 8] = [
+            ("changed again, mark retried", true, changed, awaiting),
             ("unchanged, mark retried", true, unchanged, awaiting),
             ("read failed, mark retried", true, failed, awaiting),
-            ("kept, mark fails again", false, kept, Some("h")),
+            ("changed again, mark fails again", false, changed, Some("h")),
+            ("cannot parse, dropped", true, unparsed, None),
+            ("cannot parse, fault, dropped", false, unparsed, None),
             ("rewritten, no mark over it", true, fresh, Some("fresh")),
             ("rewritten under the fault", false, fresh, Some("fresh")),
         ];
