@@ -810,10 +810,13 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// row stays, under [`HASH_AWAITING_REPARSE`] so that no later fast path keeps the old parser's
 /// chunks.
 ///
-/// (#544, local Codex r3) Also the settlement of the watcher's further read of a crossed rename
-/// kept awaiting ([`crate::watcher`]). `Ok(true)` when the row was dropped.
+/// A further read of a crossed rename this kept awaiting -- [`read_crossed_rename_again`] in
+/// [`rebuild_index`], or the watcher's reread ([`crate::watcher`]) -- does not come here: it is
+/// settled by [`settle_further_crossed_read`] (#544, local Codex r4/r5). `Ok(true)` when the
+/// row was dropped.
 ///
-/// (#552) Both callers overwrite the old row's hash with [`HASH_AWAITING_REPARSE`] before the
+/// (#552) Both callers (the second through [`reindex_renamed_entry`] and its refusal exits)
+/// overwrite the old row's hash with [`HASH_AWAITING_REPARSE`] before the
 /// rename moves it ([`rebuild_index`] for every pair that crosses a parser, and
 /// [`rename_single_file`] for its one rename), so when either calls this the row already holds
 /// the sentinel; what this does with the outcome is the same as before the mark.

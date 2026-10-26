@@ -1402,8 +1402,11 @@ impl Database {
     ///   [`FrontmatterTopic::Unread`] で渡す (codex P2 round 4 on PR #388)。行の topic は、その行の
     ///   chunk を作った bytes (か同じ hash の bytes) から作る。まだ index されていない bytes の
     ///   topic は、続く reindex が行を書き換えた時にだけ書かれ、書き換えなければ (同じ parser の間の
-    ///   移動なら) 保存値が旧 chunk と対のまま残る。parser をまたぐ移動は、reindex が成功しなければ
-    ///   呼び出し側が行ごと消すので、保存値は残らない
+    ///   移動なら) 保存値が旧 chunk と対のまま残る。parser をまたぐ移動は、reindex が
+    ///   [`crate::indexer::SingleResult::Updated`] で終わらなければ呼び出し側が行ごと消すので、
+    ///   保存値は残らない。ただし reindex が `Err` で抜けた時と、読んでいる間に bytes が変わった
+    ///   skip (`SKIPPED_CHANGED_DURING_READ`) の時は、行を消さずに番兵の hash
+    ///   (`HASH_AWAITING_REPARSE`) で残し、次の event / run が読み直す (#544 D5、#552)
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
     /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。

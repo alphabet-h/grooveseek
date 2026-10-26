@@ -2788,8 +2788,11 @@ fn read_again_settles_the_row(result: &Result<indexer::SingleResult>) -> bool {
 /// error came after the move, and the row holds the old parser's chunks. It is read as a row
 /// kept awaiting is, and for an overwriting rename the settlement of a failed overwrite
 /// ([`settle_cleared_rename`]), which would find the moved row in place and do nothing, is
-/// skipped so that the read can run. A rename that failed before the move left no row at the
-/// destination, and one within a parser is not read again.
+/// skipped so that the read can run. Whichever event marked it -- this rename, or an earlier
+/// one that left a sentinel row there before this rename failed without moving anything (its
+/// source row already gone) -- a destination row still under the sentinel after a failed
+/// crossed rename is read once, checked. A failed crossed rename that leaves no sentinel row at
+/// the destination, and one within a parser, is not read again.
 ///
 /// `reindex` here takes no flag: it is [`finish_rename_locked_checked`] with a reindex that
 /// ignores whether it was asked to check its bytes before parsing. Only the tests call this
@@ -2938,9 +2941,18 @@ fn finish_rename_locked_checked<C, R>(
 }
 
 /// (#552) Whether the row at `rel` holds [`indexer::HASH_AWAITING_REPARSE`]. A failed read of
-/// the row answers false: the dispatch then goes on as it did before #552.
+/// the row is logged and answers false: the dispatch then goes on as it did before #552.
 fn awaits_reparse_at(db: &Database, rel: &str) -> bool {
-    db.get_document_hash(rel).ok().flatten().as_deref() == Some(indexer::HASH_AWAITING_REPARSE)
+    match db.get_document_hash(rel) {
+        Ok(hash) => hash.as_deref() == Some(indexer::HASH_AWAITING_REPARSE),
+        Err(e) => {
+            wdiag!(
+                "watcher: could not read the stored hash of {rel}: {}",
+                crate::embedder::body_free_message(&e)
+            );
+            false
+        }
+    }
 }
 
 /// (#552) The line [`finish_rename_locked`] prints when an indexer's rename across a parser
