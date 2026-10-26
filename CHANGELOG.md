@@ -29,6 +29,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   indexed and says why on stderr, so a file that is still there is never dropped on a guess. For
   the same reason a rename whose destination cannot be checked no longer counts the destination
   as missing, which used to drop the moved document's row. (#395)
+- **A document's stored hash is the hash of the bytes its chunks came from, and a file that
+  changes while it is read is no longer dropped by a rename.** groove hashes a file when it scans
+  it and reads it again to index it; the row took the scan's hash with the second read's chunks.
+  A file that changed between the two reads and then went back to the bytes the scan saw kept the
+  second read's chunks until a full `--force`, since the hashes matched. A rename into another
+  parser (`.md` to `.txt`, say) whose second read caught the file mid-write dropped the document's
+  row. In the live watcher, renaming an empty file over an indexed one kept the moved file's earlier
+  content under the new path, and a rename whose destination could not be looked at moved the row
+  into another parser without reading it, so the old parser's chunks stayed until `--force`. The
+  row now takes the hash of the bytes it was indexed from; a cross-parser rename whose second read
+  differs keeps the row and reads the file once more in the same watcher event or index run, as
+  does a cross-parser rename whose destination cannot be looked at. When that read checks the bytes
+  and the new parser cannot index them, the row is dropped, as a rename read at once drops it; only
+  bytes that changed again, or a read that failed, leave the row marked to be read again on the
+  next event or run. A watcher rename whose reindex wrote nothing
+  reads the destination again, so moved content with nothing to index drops the row, as for a file
+  emptied in place. The last point applies to renames the watcher handles only: the Rust
+  library's `rename_single_file` still returns `RenamedButNotReindexed` and keeps the old content
+  under the new path, as before, so this is not a change of that contract. (#396)
 
 ## [1.21.1] - 2026-10-25
 

@@ -9,6 +9,7 @@
 //! |---|---|---|
 //! | [`crate::an_overwriting_rename_moves_the_source_row_onto_the_destination`] | P1-E1 | all |
 //! | [`crate::a_file_replaced_by_a_directory_loses_its_row`] | P1-E5 | all |
+//! | [`crate::an_overwriting_rename_of_an_empty_file_leaves_no_row`] | Review Focus 4 (PR-2) | all |
 //! | a rename that reaches the watcher as two unpaired events | P1-E3 | macOS |
 //! | a rename that changes only the case of a name | P1-E4 | macOS |
 //! | a Japanese file name through an edit and a rename | P1-E6 | macOS |
@@ -289,6 +290,38 @@ fn a_directory_renamed_onto_a_japanese_name_keeps_its_rows() {
             text_of(fx, "ガイド集/a.md").contains("alphamarker")
                 && text_of(fx, "ガイド集/b.md").contains("bravomarker")
         },
+    );
+    drop(guard);
+}
+
+/// (Review Focus 4) The same rename with a source that holds nothing to embed by the time it is
+/// moved: neither the destination's old row nor the source's stays. `b.md` is emptied before the
+/// server starts, so its row (with the earlier text) is still in the index when the rename comes.
+#[test]
+fn an_overwriting_rename_of_an_empty_file_leaves_no_row() {
+    let fx = fixture(
+        "i544-overwrite-empty",
+        &[
+            ("a.md", &note("Alpha", "alphamarker")),
+            ("b.md", &note("Bravo", "bravomarker")),
+        ],
+        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
+    );
+    fx.index();
+    fx.layout.write("b.md", "");
+    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
+        hermetic(c, &fx.cache);
+    });
+    assert_eq!(paths(&fx), ["a.md", "b.md"]);
+
+    std::fs::rename(fx.kb().join("b.md"), fx.kb().join("a.md")).expect("rename b.md over a.md");
+
+    assert_settles_on(
+        &fx,
+        &guard,
+        &[],
+        "overwriting rename of an empty file",
+        |_| true,
     );
     drop(guard);
 }
