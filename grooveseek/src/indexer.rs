@@ -10064,7 +10064,7 @@ mod tests {
     /// parser cannot read. The further read verified them, so its parse failure is settled as
     /// the rename's first read would be: the old parser's row goes, and the run counts one
     /// skip. (Before r3 the row was kept awaiting, and stayed listed with a kb URI that
-    /// `get_document` could no longer open.)
+    /// `get_document` of [`crate::server`] could no longer open.)
     #[test]
     fn a_full_run_drops_a_crossed_rename_when_the_further_read_cannot_parse() {
         let (_dir, db, _registry, result) = crossed_rename_rewritten_during_the_run(
