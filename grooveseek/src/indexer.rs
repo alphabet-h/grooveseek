@@ -1640,15 +1640,19 @@ pub fn rebuild_index(
     // open, or that this loop skips or refuses, keeps the check pending: its row is
     // retained, so when the file is back with the same content the fast path would
     // otherwise hide it for good.
-    let mut refresh_pending = false;
+    // (#544, local Codex r2) Held as the scan's part and the loop's rows apart, so a row the
+    // further read of a crossed rename settles below stops holding the check pending; read as
+    // one value only at the end of the run.
+    let mut refresh_pending_scan = false;
     if refresh_any {
         for rel in &skipped_paths {
             if indexed_hash_for(db, registry, rel, "md")?.is_some() {
-                refresh_pending = true;
+                refresh_pending_scan = true;
                 break;
             }
         }
     }
+    let mut refresh_pending_rows: HashSet<String> = HashSet::new();
     // (feature-62) The rows of a one-time pass (ADR-0029) that this run did not bring in line
     // with the new rules. Marked at the end, after the sweep -- never inside the loop, so a run
     // that stops midway leaves every hash as it was (I-4).
@@ -1802,7 +1806,7 @@ pub fn rebuild_index(
                     && let Some(row_hash) = indexed_hash_for(db, registry, &entry.rel, "md")?
                     && (reason != SKIPPED_NO_CHUNKS || row_hash != entry.hash)
                 {
-                    refresh_pending = true;
+                    refresh_pending_rows.insert(entry.rel.clone());
                 }
                 progress.report_unchanged(&entry.rel);
             }
@@ -1816,7 +1820,7 @@ pub fn rebuild_index(
             | SingleResult::NothingToIndex { .. } => {
                 tally.skipped += 1;
                 if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
-                    refresh_pending = true;
+                    refresh_pending_rows.insert(entry.rel.clone());
                 }
                 progress.report_unchanged(&entry.rel);
             }
@@ -1872,6 +1876,9 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
             } => {
                 unsettled.remove(&entry.rel);
+                // (#544, local Codex r2) Written by this parser from the bytes on disk: the
+                // one-time check has read what the row is now.
+                refresh_pending_rows.remove(&entry.rel);
                 tally.updated += 1;
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
@@ -1900,6 +1907,12 @@ pub fn rebuild_index(
                 ..
             } => {
                 unsettled.remove(&entry.rel);
+                // (#544, local Codex r2) Dropped: pending only while a row is still there, as
+                // the loop's own `NothingToIndex` arm decides it.
+                refresh_pending_rows.remove(&entry.rel);
+                if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
+                    refresh_pending_rows.insert(entry.rel.clone());
+                }
                 tally.skipped += 1;
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
@@ -1962,6 +1975,9 @@ pub fn rebuild_index(
     // sweep never got to prune. Written after the loop on purpose either way: a run that stops
     // halfway leaves the key absent and the next run looks again -- and so does one that could
     // not read a document it holds a row for.
+    // (#544, local Codex r2) Read from the rows as they are after the further read of the
+    // crossed renames, not as the loop left them.
+    let refresh_pending = refresh_pending_scan || !refresh_pending_rows.is_empty();
     if force || (refresh_frontmatter && !refresh_pending) {
         db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
     }
@@ -9947,5 +9963,76 @@ mod tests {
             "the kept row's chunks changed"
         );
         assert_eq!((result.updated, result.skipped), (0, 1), "{result:?}");
+    }
+
+    /// #544 PR-2 (local Codex r2): the run of
+    /// [`a_full_run_reads_a_crossed_rename_it_kept_awaiting_once_more`] starts with no frontmatter
+    /// policy recorded, so its loop holds the one-time check pending for the crossed rename onto
+    /// `.md` it kept awaiting. The further read writes that row from the bytes on disk, so the
+    /// check is no longer pending when the run ends, and the run records the policy.
+    #[test]
+    fn a_crossed_rename_the_further_read_settles_does_not_hold_the_frontmatter_policy() {
+        let (_dir, db, _registry, _result) = crossed_rename_rewritten_during_the_run(
+            "i544-cx2-rebuild-policy-settled",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            SECOND_READ_BYTES,
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "the further read did not settle the row"
+        );
+        assert_eq!(
+            db.read_frontmatter_policy().unwrap().as_deref(),
+            Some(FRONTMATTER_POLICY),
+            "the run left the check pending for a row its further read settled"
+        );
+    }
+
+    /// #544 PR-2 (local Codex r2): the same run, and the bytes on disk are empty. The further
+    /// read finds nothing to embed and drops the row, so nothing holds the check pending and
+    /// the run records the policy.
+    #[test]
+    fn a_crossed_rename_the_further_read_drops_does_not_hold_the_frontmatter_policy() {
+        let (_dir, db, _registry, _result) = crossed_rename_rewritten_during_the_run(
+            "i544-cx2-rebuild-policy-dropped",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            b"",
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            None,
+            "the further read did not drop the row"
+        );
+        assert_eq!(
+            db.read_frontmatter_policy().unwrap().as_deref(),
+            Some(FRONTMATTER_POLICY),
+            "the run left the check pending for a row its further read dropped"
+        );
+    }
+
+    /// #544 PR-2 (local Codex r2): the same run, and the bytes on disk are not UTF-8, so the
+    /// further read fails to parse them. The row stays awaiting, the check stays pending, and
+    /// the run does not record the policy.
+    #[test]
+    fn a_crossed_rename_the_further_read_cannot_parse_holds_the_frontmatter_policy() {
+        let (_dir, db, _registry, _result) = crossed_rename_rewritten_during_the_run(
+            "i544-cx2-rebuild-policy-unsettled",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            b"\xff\xfe not UTF-8, as rewritten",
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the row went, or kept a hash a fast path trusts"
+        );
+        assert_eq!(
+            db.read_frontmatter_policy().unwrap(),
+            None,
+            "the run recorded the policy over a row no read has settled"
+        );
     }
 }
