@@ -2560,6 +2560,9 @@ fn finish_rename_locked<C, R>(
     {
         settle_cleared(ctx, reindex);
     }
+    // The write form of the sweep at `new_rel`, unless the destination's second read below
+    // decides otherwise.
+    let mut new_requires_real_key = true;
     if !settled {
         match written_path_on_disk(kb_path, new_rel, look) {
             OnDisk::Gone => {
@@ -2567,16 +2570,19 @@ fn finish_rename_locked<C, R>(
             }
             OnDisk::Present if unreindexed => {
                 if let Some(reindex) = reindex.take() {
-                    log_rename_read_again(old_rel, new_rel, reindex(ctx));
+                    let result = reindex(ctx);
+                    new_requires_real_key = sweep_requires_real_key(&result);
+                    log_rename_read_again(old_rel, new_rel, result);
                 }
             }
             OnDisk::Present | OnDisk::Unknown(_) => {}
         }
     }
     // The file has left `old_rel` under every spelling; at `new_rel` the sweep
-    // follows the real key in, as it does after a reindex.
+    // follows the real key in, as it does after a reindex, and a second read that found
+    // nothing to embed sweeps it as a removal ([`sweep_requires_real_key`]).
     sweep_legacy_row(db, kb_path, old_rel, false);
-    sweep_legacy_row(db, kb_path, new_rel, true);
+    sweep_legacy_row(db, kb_path, new_rel, new_requires_real_key);
 }
 
 /// (#544 Review Focus 4) The line [`finish_rename_locked`] prints after it read the destination
@@ -6604,6 +6610,46 @@ mod tests {
         );
         assert_eq!(reindexed, 1);
         assert_eq!(db.get_document_hash("a.md").unwrap(), None);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544, Task 5 review) A rename onto `a\b.md`, a name a version up to 1.12.0 stored folded
+    /// as `a/b.md`, whose reparse wrote nothing: the second read of `a\b.md` finds nothing to
+    /// embed and drops the real key, and the folded row goes with it, swept as a removal by that
+    /// read's own result. The write form of the sweep would keep it, since the real key holds
+    /// no row by then. Not on Windows, where `\` separates components and there is no folded row.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rename_whose_second_read_found_nothing_sweeps_the_folded_row_as_a_removal() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unreindexed-folded");
+        std::fs::write(kb.join("a\\b.md"), "").unwrap();
+        let db = dir_rename_db(&["a/b.md", "other.md"]);
+        db.upsert_document("c.md", None, None, None, None, &[], None, "hc", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "c.md", "a\\b.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let before = apply_rename_plan_before(&db, &kb, "c.md", "a\\b.md", &plan);
+        assert!(matches!(before, Ok(true)), "{before:?}");
+        let mut reindexed = 0;
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("c.md", "a\\b.md"),
+            WriteLook::ExistsOnly,
+            (plan, before),
+            &mut reindexed,
+            |_| move_row_unreindexed(&db, "c.md", "a\\b.md"),
+            |n| {
+                *n += 1;
+                drop_row_nothing_to_index(&db, "a\\b.md")
+            },
+        );
+        assert_eq!(reindexed, 1);
+        assert_eq!(db.get_document_hash("a\\b.md").unwrap(), None);
+        assert_eq!(db.get_document_hash("a/b.md").unwrap(), None);
         assert_eq!(
             db.all_document_paths().unwrap(),
             vec!["other.md".to_string()]
