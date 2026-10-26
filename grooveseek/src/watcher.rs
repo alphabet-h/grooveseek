@@ -2595,6 +2595,63 @@ where
     requires_real_key
 }
 
+/// (#544, local Codex r3, J3) [`read_destination_again`] for a row a rename across a parser kept
+/// awaiting a reparse ([`KeptRow::AwaitingReparse`]): the read's result is settled as the
+/// rename's first read is ([`settle_crossed_read_again`]), so bytes the read verified and the
+/// new parser cannot index drop the row, and only bytes that changed again keep it awaiting. A
+/// dropped row's folded rows are swept as a removal.
+fn read_awaiting_destination_again<C, R>(
+    db: &Database,
+    ctx: &mut C,
+    reindex: &mut Option<R>,
+    (old_rel, new_rel): (&str, &str),
+) -> bool
+where
+    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+{
+    let Some(reindex) = reindex.take() else {
+        return true;
+    };
+    let result = reindex(ctx);
+    let dropped = settle_crossed_read_again(db, new_rel, &result);
+    let requires_real_key = !dropped && sweep_requires_real_key(&result);
+    log_rename_read_again(old_rel, new_rel, result);
+    if dropped {
+        wdiag!(
+            "watcher: {new_rel} crosses a parser from {old_rel}; dropped its row, whose bytes the new parser cannot index"
+        );
+    }
+    requires_real_key
+}
+
+/// (#544, local Codex r3, J3) The settlement of a further read of a row a rename across a parser
+/// left with the old parser's chunks: a result that read and checked the bytes on disk goes to
+/// [`indexer::settle_cross_parser_rename`], the rule the rename's first read follows. A result
+/// that verified no bytes -- an error, or an unchanged or metadata-only answer, which a row
+/// under [`indexer::HASH_AWAITING_REPARSE`] does not get -- touches nothing (D5). `true` when
+/// the row was dropped. A failure of the settlement is logged and the row is left as it was.
+fn settle_crossed_read_again(
+    db: &Database,
+    new_rel: &str,
+    result: &Result<indexer::SingleResult>,
+) -> bool {
+    let verified = match result {
+        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed { .. })
+        | Err(_) => return false,
+        Ok(verified) => verified,
+    };
+    match indexer::settle_cross_parser_rename(db, new_rel, verified) {
+        Ok(dropped) => dropped,
+        Err(e) => {
+            wdiag!(
+                "watcher: could not settle the row of {new_rel} after reading it again: {}",
+                crate::embedder::body_free_message(&e)
+            );
+            false
+        }
+    }
+}
+
 /// (#544, local Codex r2) [`read_destination_again`] for a row [`RenamePlan::MoveRowUnknown`]
 /// moved unread across a parser ([`unread_move_crosses_a_parser`]), read whether or not its
 /// hash was written: a read that does not rewrite or drop the row
@@ -2674,7 +2731,9 @@ fn read_again_settles_the_row(result: &Result<indexer::SingleResult>) -> bool {
 /// ([`RenameStart::unread_move_awaits`]; local Codex r2: whether or not
 /// [`await_reparse_after_unread_move`] wrote its hash). That read's own result decides the row:
 /// a read that cannot settle the bytes leaves the mark (D5), written again after an unread move
-/// ([`read_unread_move_again`]).
+/// ([`read_unread_move_again`]). (local Codex r3, J3) For the row kept awaiting, a read that
+/// verified bytes the new parser cannot index drops it, as the rename's first read would
+/// ([`read_awaiting_destination_again`]); only bytes that changed again keep the mark.
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked<C, R>(
     db: &Database,
@@ -2755,8 +2814,11 @@ fn finish_rename_locked<C, R>(
                 log_written_path_gone(new_rel, deindex_removed_path(db, kb_path, new_rel));
             }
             on_disk if reads_destination_again(kept, on_disk) => {
-                new_requires_real_key =
-                    read_destination_again(ctx, &mut reindex, (old_rel, new_rel));
+                new_requires_real_key = if kept == Some(KeptRow::AwaitingReparse) {
+                    read_awaiting_destination_again(db, ctx, &mut reindex, (old_rel, new_rel))
+                } else {
+                    read_destination_again(ctx, &mut reindex, (old_rel, new_rel))
+                };
             }
             OnDisk::Present | OnDisk::Unknown(_) => {}
         }
@@ -6999,6 +7061,92 @@ mod tests {
             );
             assert_eq!(db.get_document_hash("b.txt").unwrap(), None);
         }
+    }
+
+    /// (#544, local Codex r3, J3) The same rename across a parser, whose further read verified
+    /// the bytes on disk and could not index them under the new parser: the row goes, as the
+    /// rename's first read would have dropped it. Only a read whose bytes changed again keeps
+    /// the row awaiting a reparse.
+    #[test]
+    fn an_awaiting_rename_whose_further_read_cannot_index_the_bytes_drops_the_row() {
+        let skipped = |reason| indexer::SingleResult::Skipped {
+            reason,
+            frontmatter_unparsed: false,
+        };
+        let cases = [
+            (skipped("parse failed"), None),
+            (skipped("no embeddable chunks"), None),
+            (skipped("embedding endpoint rejected the input"), None),
+            (indexer::SingleResult::Refused, None),
+            (
+                skipped("changed between scan and read"),
+                Some(indexer::HASH_AWAITING_REPARSE),
+            ),
+        ];
+        for (read, want) in cases {
+            let label = format!("{read:?}");
+            let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-awaiting-unindexable");
+            std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+            let db = dir_rename_db(&["other.md"]);
+            db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+                .unwrap();
+            let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+            let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+            let mut reindexed = 0;
+            finish_rename_locked(
+                &db,
+                &kb,
+                ("b.txt", "a.md"),
+                WriteLook::Spelled,
+                (plan, before),
+                &mut reindexed,
+                |_| move_row_awaiting(&db, "b.txt", "a.md"),
+                |n| {
+                    *n += 1;
+                    Ok(read)
+                },
+            );
+            assert_eq!(reindexed, 1, "{label}");
+            assert_eq!(
+                db.get_document_hash("a.md").unwrap().as_deref(),
+                want,
+                "{label}"
+            );
+            assert_eq!(db.get_document_hash("b.txt").unwrap(), None, "{label}");
+        }
+    }
+
+    /// (#544, local Codex r3, J2) A rename within one parser whose reparse wrote nothing, and
+    /// whose further read fails to parse the bytes: the row stays, as for a file edited in
+    /// place. Only a rename across a parser drops it.
+    #[test]
+    fn a_same_parser_rename_whose_further_read_fails_to_parse_keeps_the_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-same-parser-unparsed");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.md", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        let mut reindexed = 0;
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut reindexed,
+            |_| move_row_unreindexed(&db, "b.md", "a.md"),
+            |n| {
+                *n += 1;
+                Ok(indexer::SingleResult::Skipped {
+                    reason: "parse failed",
+                    frontmatter_unparsed: false,
+                })
+            },
+        );
+        assert_eq!(reindexed, 1);
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
     }
 
     /// (#544, local Codex r1) The same rename with the destination gone by the second look: the

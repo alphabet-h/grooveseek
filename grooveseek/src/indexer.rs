@@ -809,9 +809,16 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// read) hashed ([`SKIPPED_CHANGED_DURING_READ`]): nothing was learned about the file, so the
 /// row stays, under [`HASH_AWAITING_REPARSE`] so that no later fast path keeps the old parser's
 /// chunks.
-fn settle_cross_parser_rename(db: &Database, rel: &str, outcome: &SingleResult) -> Result<()> {
+///
+/// (#544, local Codex r3) Also the settlement of the watcher's further read of a crossed rename
+/// kept awaiting ([`crate::watcher`]). `Ok(true)` when the row was dropped.
+pub(crate) fn settle_cross_parser_rename(
+    db: &Database,
+    rel: &str,
+    outcome: &SingleResult,
+) -> Result<bool> {
     let keep_awaiting = match outcome {
-        SingleResult::Updated { .. } => return Ok(()),
+        SingleResult::Updated { .. } => return Ok(false),
         SingleResult::Skipped { reason, .. } => *reason == SKIPPED_CHANGED_DURING_READ,
         SingleResult::Unchanged
         | SingleResult::MetadataRefreshed { .. }
@@ -824,7 +831,7 @@ fn settle_cross_parser_rename(db: &Database, rel: &str, outcome: &SingleResult) 
     } else {
         db.delete_document(rel)?;
     }
-    Ok(())
+    Ok(!keep_awaiting)
 }
 
 /// (#544, local Codex r1) The further read [`rebuild_index`] gives, once, before it returns, a
