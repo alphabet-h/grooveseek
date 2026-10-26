@@ -1405,8 +1405,8 @@ impl Database {
     ///   移動なら) 保存値が旧 chunk と対のまま残る。parser をまたぐ移動は、reindex が
     ///   [`crate::indexer::SingleResult::Updated`] で終わらなければ呼び出し側が行ごと消すので、
     ///   保存値は残らない。ただし reindex が `Err` で抜けた時と、読んでいる間に bytes が変わった
-    ///   skip (`SKIPPED_CHANGED_DURING_READ`) の時は、行を消さずに番兵の hash
-    ///   (`HASH_AWAITING_REPARSE`) で残し、次の event / run が読み直す (#544 D5、#552)
+    ///   skip ([`crate::indexer`] の `SKIPPED_CHANGED_DURING_READ`) の時は、行を消さずに番兵の hash
+    ///   ([`crate::indexer::HASH_AWAITING_REPARSE`]) で残し、次の event / run が読み直す (#544 D5、#552)
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
     /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
