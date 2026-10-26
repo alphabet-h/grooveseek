@@ -2588,13 +2588,36 @@ fn finish_rename_locked<C, R>(
 /// (#544 Review Focus 4) The line [`finish_rename_locked`] prints after it read the destination
 /// of a rename again because the indexer's reparse wrote nothing.
 fn log_rename_read_again(old_rel: &str, new_rel: &str, result: Result<indexer::SingleResult>) {
-    let what = match result {
-        Ok(result) => format!("{result:?}"),
-        Err(e) => format!("failed: {}", crate::embedder::body_free_message(&e)),
-    };
+    let what = read_again_outcome(&result);
     wdiag!(
         "watcher: renamed {old_rel} -> {new_rel}, whose content the reparse did not index; read {new_rel} again: {what}"
     );
+}
+
+/// What [`log_rename_read_again`] says the destination's second read did to the row there, in
+/// words. Every variant is named so a new one is a compile error rather than a silent line.
+fn read_again_outcome(result: &Result<indexer::SingleResult>) -> String {
+    match result {
+        Ok(indexer::SingleResult::Updated { chunks, .. }) => {
+            format!("rewrote the row ({chunks} chunks)")
+        }
+        Ok(indexer::SingleResult::Unchanged) => "kept the row (content unchanged)".to_string(),
+        Ok(indexer::SingleResult::MetadataRefreshed { .. }) => {
+            "rewrote the row's metadata".to_string()
+        }
+        Ok(indexer::SingleResult::Skipped { reason, .. }) => format!("kept the row ({reason})"),
+        Ok(indexer::SingleResult::Refused) => "kept the row (the file was refused)".to_string(),
+        Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed) => {
+            "dropped the row (the file is reached through a link)".to_string()
+        }
+        Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: true, ..
+        }) => "dropped the row (nothing to embed)".to_string(),
+        Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: false, ..
+        }) => "wrote no row (nothing to embed)".to_string(),
+        Err(e) => format!("failed ({})", crate::embedder::body_free_message(e)),
+    }
 }
 
 /// What [`settle_cleared_rename`] did at the destination.
@@ -6972,5 +6995,54 @@ mod tests {
             db.all_document_paths().unwrap(),
             vec!["other.md".to_string()]
         );
+    }
+
+    /// (#544 M4) The rename follow-up's line words the second read's outcome as prose in ASCII,
+    /// never as the Rust value it came from.
+    #[test]
+    fn read_again_outcome_is_ascii_prose() {
+        let dropped = read_again_outcome(&Ok(indexer::SingleResult::NothingToIndex {
+            deindexed: true,
+            frontmatter_unparsed: false,
+        }));
+        assert_eq!(dropped, "dropped the row (nothing to embed)");
+        let rewrote = read_again_outcome(&Ok(indexer::SingleResult::Updated {
+            chunks: 3,
+            frontmatter_unparsed: false,
+        }));
+        assert_eq!(rewrote, "rewrote the row (3 chunks)");
+        let every: [Result<indexer::SingleResult>; 9] = [
+            Ok(indexer::SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: true,
+            }),
+            Ok(indexer::SingleResult::Unchanged),
+            Ok(indexer::SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Skipped {
+                reason: indexer::SKIPPED_NO_CHUNKS,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Refused),
+            Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed),
+            Ok(indexer::SingleResult::NothingToIndex {
+                deindexed: true,
+                frontmatter_unparsed: true,
+            }),
+            Ok(indexer::SingleResult::NothingToIndex {
+                deindexed: false,
+                frontmatter_unparsed: false,
+            }),
+            Err(anyhow::anyhow!("disk went away")),
+        ];
+        for result in &every {
+            let line = read_again_outcome(result);
+            assert!(line.is_ascii(), "{line}");
+            assert!(
+                !line.contains('{') && !line.contains("SingleResult"),
+                "a Debug value leaked: {line}"
+            );
+        }
     }
 }
