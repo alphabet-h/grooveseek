@@ -866,7 +866,17 @@ fn read_crossed_rename_again(
     );
     let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, size_cap_key(is_binary)) {
         Ok((Some(bytes), _)) => bytes,
-        Ok((None, _)) => return Ok(SingleResult::Refused),
+        Ok((None, measured)) => {
+            // (#544, GitHub codex P2 on PR #396) The file can have grown past the cap since
+            // the scan: this read is then the only current measurement, and the kept row
+            // would otherwise go on advertising the scan's servable size.
+            if let Some(len) = measured
+                && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
+            {
+                tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
+            }
+            return Ok(SingleResult::Refused);
+        }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
@@ -9963,6 +9973,57 @@ mod tests {
             "the kept row's chunks changed"
         );
         assert_eq!((result.updated, result.skipped), (0, 1), "{result:?}");
+    }
+
+    /// #544 PR-2 (GitHub codex P2 on PR #396): the further read of a crossed rename kept
+    /// awaiting finds the file grown past the text cap since the scan. The read refuses it, and
+    /// the length it measured is recorded on the row, as the other refusals record theirs, so
+    /// the resource surface stops offering a document a read now rejects. The row itself stays
+    /// awaiting (D5).
+    #[test]
+    fn the_further_read_of_a_crossed_rename_records_the_size_it_refused() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let dir = mk_tmp("i544-gh1-further-read-oversize");
+        let db = reparse_db();
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(16),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string()];
+        let registry =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+                .expect("md + txt");
+        write_row(&db, "note.md", HASH_AWAITING_REPARSE, &[]);
+        let grown = [b'x'; 64];
+        let full = dir.0.join("note.md");
+        std::fs::write(&full, grown).unwrap();
+        let entry = DiskEntry {
+            rel: "note.md".to_string(),
+            hash: sha256_hex_bytes(b"small"),
+            full,
+            size: 5,
+        };
+        let result = read_crossed_rename_again(
+            &db,
+            &mut unreachable_embedder(),
+            &entry,
+            None,
+            &registry,
+            ContextMode::Off,
+            DeclaredSet::FromIndex,
+        )
+        .unwrap();
+        assert!(matches!(result, SingleResult::Refused), "{result:?}");
+        assert_eq!(
+            db.documents_larger_than(0).unwrap(),
+            vec![("note.md".to_string(), grown.len() as u64)],
+            "the row kept a size the read has just disproved"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the refused row left the awaiting state"
+        );
     }
 
     /// #544 PR-2 (local Codex r2): the run of
