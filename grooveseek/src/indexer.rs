@@ -3350,6 +3350,32 @@ pub fn reindex_single_file(
     exclude_headings: Option<&[String]>,
     registry: &Registry,
 ) -> Result<SingleResult> {
+    reindex_single_file_checked(
+        db,
+        embedder,
+        kb_path,
+        rel,
+        exclude_headings,
+        registry,
+        false,
+    )
+}
+
+/// (#544, local Codex r3, D5) [`reindex_single_file`] for the destination of a rename across a
+/// parser, whose result the caller settles with [`settle_cross_parser_rename`]
+/// (`row_dropped_unless_updated`, as [`index_single_disk_entry`] names it): bytes other than the
+/// ones this function's first read hashed are a changed-during-read skip before they are
+/// parsed, so a parse failure that drops the row is always one of the bytes checked. Every
+/// other caller passes false, through [`reindex_single_file`].
+pub(crate) fn reindex_single_file_checked(
+    db: &Database,
+    embedder: &mut Embedder,
+    kb_path: &Path,
+    rel: &str,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    row_dropped_unless_updated: bool,
+) -> Result<SingleResult> {
     let full = kb_path.join(rel);
     match look_at_single_path(kb_path, rel, &full)
         .with_context(|| format!("failed to stat {}", full.display()))?
@@ -3477,7 +3503,7 @@ pub fn reindex_single_file(
         Reindex::Event,
         context_mode,
         DeclaredSet::FromIndex,
-        false,
+        row_dropped_unless_updated,
     )
 }
 

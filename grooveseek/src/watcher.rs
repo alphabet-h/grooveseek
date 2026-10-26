@@ -2479,7 +2479,7 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
     let before = apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan);
     let start = rename_start(&db, &state.registry, (old_rel, new_rel), plan, before);
     let exclude_headings = state.exclude_headings.as_deref();
-    finish_rename_locked(
+    finish_rename_locked_checked(
         &db,
         kb_path,
         (old_rel, new_rel),
@@ -2497,14 +2497,15 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
                 &state.registry,
             )
         },
-        |embedder| {
-            indexer::reindex_single_file(
+        |embedder, checked| {
+            indexer::reindex_single_file_checked(
                 &db,
                 embedder,
                 kb_path,
                 new_rel,
                 exclude_headings,
                 &state.registry,
+                checked,
             )
         },
     );
@@ -2577,19 +2578,21 @@ fn reads_destination_again(kept: Option<KeptRow>, on_disk: OnDisk) -> bool {
 /// (#544) The destination's second read in [`finish_rename_locked`]: the caller's reindex of
 /// `new_rel`, taken from `reindex` so it runs at most once per dispatch, and its line. Returns
 /// the `require_real_key` of the sweep at `new_rel` that read's own result asks for
-/// ([`sweep_requires_real_key`]); the write form when the reindex was already taken.
+/// ([`sweep_requires_real_key`]); the write form when the reindex was already taken. The read
+/// is not asked to check its bytes before parsing (the reindex's flag is false): a row within
+/// one parser is kept on a failed parse, as for a file edited in place (J2).
 fn read_destination_again<C, R>(
     ctx: &mut C,
     reindex: &mut Option<R>,
     (old_rel, new_rel): (&str, &str),
 ) -> bool
 where
-    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+    R: FnOnce(&mut C, bool) -> Result<indexer::SingleResult>,
 {
     let Some(reindex) = reindex.take() else {
         return true;
     };
-    let result = reindex(ctx);
+    let result = reindex(ctx, false);
     let requires_real_key = sweep_requires_real_key(&result);
     log_rename_read_again(old_rel, new_rel, result);
     requires_real_key
@@ -2599,7 +2602,10 @@ where
 /// awaiting a reparse ([`KeptRow::AwaitingReparse`]): the read's result is settled as the
 /// rename's first read is ([`settle_crossed_read_again`]), so bytes the read verified and the
 /// new parser cannot index drop the row, and only bytes that changed again keep it awaiting. A
-/// dropped row's folded rows are swept as a removal.
+/// dropped row's folded rows are swept as a removal. The read checks its bytes against its own
+/// hash before parsing (the reindex's flag is true,
+/// [`indexer::reindex_single_file_checked`]), so a parse failure that drops the row is always
+/// one of the bytes checked (D5).
 fn read_awaiting_destination_again<C, R>(
     db: &Database,
     ctx: &mut C,
@@ -2607,12 +2613,12 @@ fn read_awaiting_destination_again<C, R>(
     (old_rel, new_rel): (&str, &str),
 ) -> bool
 where
-    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+    R: FnOnce(&mut C, bool) -> Result<indexer::SingleResult>,
 {
     let Some(reindex) = reindex.take() else {
         return true;
     };
-    let result = reindex(ctx);
+    let result = reindex(ctx, true);
     let dropped = settle_crossed_read_again(db, new_rel, &result);
     let requires_real_key = !dropped && sweep_requires_real_key(&result);
     let settled = read_again_settles_the_row(&result);
@@ -2666,7 +2672,9 @@ fn settle_crossed_read_again(
 /// the row. A read that neither rewrites nor drops it ([`read_again_settles_the_row`]) -- bytes
 /// that changed again, or a read that verified nothing -- leaves the old parser's chunks, so
 /// the hash is written again as [`indexer::HASH_AWAITING_REPARSE`] (D5: an unverified read
-/// never drops the row). A failure of that write is logged and the dispatch goes on.
+/// never drops the row). A failure of that write is logged and the dispatch goes on. The read
+/// checks its bytes before parsing (the reindex's flag is true), as
+/// [`read_awaiting_destination_again`]'s does.
 fn read_unread_move_again<C, R>(
     db: &Database,
     ctx: &mut C,
@@ -2674,12 +2682,12 @@ fn read_unread_move_again<C, R>(
     (old_rel, new_rel): (&str, &str),
 ) -> bool
 where
-    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+    R: FnOnce(&mut C, bool) -> Result<indexer::SingleResult>,
 {
     let Some(reindex) = reindex.take() else {
         return true;
     };
-    let result = reindex(ctx);
+    let result = reindex(ctx, true);
     let dropped = settle_crossed_read_again(db, new_rel, &result);
     let requires_real_key = !dropped && sweep_requires_real_key(&result);
     let settled = read_again_settles_the_row(&result);
@@ -2746,8 +2754,44 @@ fn read_again_settles_the_row(result: &Result<indexer::SingleResult>) -> bool {
 /// ([`read_unread_move_again`]). (local Codex r3, J3) For the row kept awaiting, a read that
 /// verified bytes the new parser cannot index drops it, as the rename's first read would
 /// ([`read_awaiting_destination_again`]); only bytes that changed again keep the mark.
+///
+/// `reindex` here takes no flag: it is [`finish_rename_locked_checked`] with a reindex that
+/// ignores whether it was asked to check its bytes before parsing. Only the tests call this
+/// form; [`dispatch_rename`] calls the checked one.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn finish_rename_locked<C, R>(
+    db: &Database,
+    kb_path: &Path,
+    pair: (&str, &str),
+    look: WriteLook,
+    start: impl Into<RenameStart>,
+    ctx: &mut C,
+    rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
+    reindex: R,
+) where
+    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+{
+    finish_rename_locked_checked(
+        db,
+        kb_path,
+        pair,
+        look,
+        start,
+        ctx,
+        rename,
+        move |ctx: &mut C, _checked: bool| reindex(ctx),
+    );
+}
+
+/// (#544, local Codex r3, D5) [`finish_rename_locked`], whose `reindex` is told whether the read
+/// must check its bytes against its own hash before parsing
+/// ([`indexer::reindex_single_file_checked`]): true for the further read of a row a rename
+/// across a parser left with the old parser's chunks ([`read_awaiting_destination_again`],
+/// [`read_unread_move_again`]), whose result can drop the row; false for every other read.
+/// The reindex still runs at most once per dispatch.
+#[allow(clippy::too_many_arguments)]
+fn finish_rename_locked_checked<C, R>(
     db: &Database,
     kb_path: &Path,
     (old_rel, new_rel): (&str, &str),
@@ -2757,7 +2801,7 @@ fn finish_rename_locked<C, R>(
     rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
     reindex: R,
 ) where
-    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+    R: FnOnce(&mut C, bool) -> Result<indexer::SingleResult>,
 {
     let RenameStart {
         plan,
@@ -2775,7 +2819,7 @@ fn finish_rename_locked<C, R>(
             (old_rel, new_rel),
             || written_path_on_disk(kb_path, new_rel, look),
             || written_path_on_disk(kb_path, old_rel, look),
-            || reindex(ctx),
+            || reindex(ctx, false),
         );
         log_cleared_rename(old_rel, new_rel, recovery);
     };
@@ -7126,6 +7170,114 @@ mod tests {
             );
             assert_eq!(db.get_document_hash("b.txt").unwrap(), None, "{label}");
         }
+    }
+
+    /// The reindex a test hands [`finish_rename_locked_checked`] for bytes that change between
+    /// the read's two looks at them: a read asked to check its bytes before parsing sees the
+    /// change, and one not asked parses the changed bytes and fails. Counts the reads in `n` and
+    /// records the flag it was given.
+    fn read_bytes_changing_under_the_parse(
+        (n, flag): &mut (usize, Option<bool>),
+        checked: bool,
+    ) -> Result<indexer::SingleResult> {
+        *n += 1;
+        *flag = Some(checked);
+        Ok(indexer::SingleResult::Skipped {
+            reason: if checked {
+                "changed between scan and read"
+            } else {
+                "parse failed"
+            },
+            frontmatter_unparsed: false,
+        })
+    }
+
+    /// (#544, local Codex r3, D5) The further read of a row a rename across a parser kept
+    /// awaiting (`b.txt` to `a.md`) is asked to check its bytes before parsing, so bytes that
+    /// change under it keep the row awaiting rather than drop it on a parse of bytes nobody
+    /// checked.
+    #[test]
+    fn an_awaiting_rename_checks_its_further_read_before_parsing() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-awaiting-checked");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut seen,
+            |_| move_row_awaiting(&db, "b.txt", "a.md"),
+            read_bytes_changing_under_the_parse,
+        );
+        assert_eq!(seen, (1, Some(true)));
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some(indexer::HASH_AWAITING_REPARSE),
+            "the row went on bytes its read did not check"
+        );
+    }
+
+    /// (#544, local Codex r3, D5) The same for a row moved unread across a parser (`a.md` to
+    /// `a.txt`, the look at `a.txt` failed).
+    #[test]
+    fn an_unread_move_across_a_parser_checks_its_read_before_parsing() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unread-move-checked");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let plan = rename_plan(&db, "a.md", "a.txt", OnDisk::Unknown(denied)).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "a.txt", &plan);
+        let start = rename_start(&db, &reg, ("a.md", "a.txt"), plan, before);
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("a.md", "a.txt"),
+            WriteLook::Spelled,
+            start,
+            &mut seen,
+            |_| panic!("an unread move does not run the indexer's rename"),
+            read_bytes_changing_under_the_parse,
+        );
+        assert_eq!(seen, (1, Some(true)));
+        assert_eq!(
+            db.get_document_hash("a.txt").unwrap().as_deref(),
+            Some(indexer::HASH_AWAITING_REPARSE),
+            "the row went on bytes its read did not check"
+        );
+    }
+
+    /// (#544, local Codex r3, J2) A rename within one parser whose reparse wrote nothing reads
+    /// the destination again without the check, and its parse failure keeps the row.
+    #[test]
+    fn a_same_parser_rename_reads_the_destination_again_unchecked() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-same-parser-unchecked");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.md", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.md", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.md", "a.md", &plan);
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.md", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut seen,
+            |_| move_row_unreindexed(&db, "b.md", "a.md"),
+            read_bytes_changing_under_the_parse,
+        );
+        assert_eq!(seen, (1, Some(false)));
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
     }
 
     /// (#544, local Codex r3, J2) A rename within one parser whose reparse wrote nothing, and
