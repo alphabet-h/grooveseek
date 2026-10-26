@@ -1397,6 +1397,7 @@ impl Database {
     ///   ままの通常の full run は hash が一致して行に触らないので直さない。ただし parser をまたぐ
     ///   移動で上限超えか読み込みの拒否なら、呼び出し側 ([`crate::indexer::rename_single_file`]) が
     ///   行ごと消すので保存値は残らない。読み込みの失敗は parser をまたいでも行を消さない
+    ///   (番兵の hash で残る、#552)
     /// - 中身も変わった watcher の移動 (読めた bytes の hash が行と違う) も
     ///   [`FrontmatterTopic::Unread`] で渡す (codex P2 round 4 on PR #388)。行の topic は、その行の
     ///   chunk を作った bytes (か同じ hash の bytes) から作る。まだ index されていない bytes の

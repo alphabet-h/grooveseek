@@ -813,9 +813,10 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// (#544, local Codex r3) Also the settlement of the watcher's further read of a crossed rename
 /// kept awaiting ([`crate::watcher`]). `Ok(true)` when the row was dropped.
 ///
-/// (#552) [`rebuild_index`] overwrites the old row's hash with [`HASH_AWAITING_REPARSE`] before
-/// the rename moves it, so when it calls this the row already holds the sentinel; what this
-/// does with the outcome is the same as before the mark.
+/// (#552) Both callers overwrite the old row's hash with [`HASH_AWAITING_REPARSE`] before the
+/// rename moves it ([`rebuild_index`] for every pair that crosses a parser, and
+/// [`rename_single_file`] for its one rename), so when either calls this the row already holds
+/// the sentinel; what this does with the outcome is the same as before the mark.
 pub(crate) fn settle_cross_parser_rename(
     db: &Database,
     rel: &str,
@@ -1624,7 +1625,8 @@ pub fn rebuild_index(
         // that read settles it the row holds the old parser's chunks under the hash of the
         // unchanged bytes. Its hash is overwritten with [`HASH_AWAITING_REPARSE`] before the
         // row moves, so a run that fails anywhere after the move leaves a row no fast path
-        // keeps; every settlement below writes the hash again or drops the row. A failed
+        // keeps; every settlement below rewrites the hash (the bytes' hash, or the sentinel
+        // again for a read that changed under it) or drops the row. A failed
         // rename after the mark leaves the old row under the sentinel, which the next run's
         // rename detection does not pair; the pair would have been re-embedded in full anyway.
         if !crossed_old_paths.is_empty() {
@@ -3858,7 +3860,7 @@ pub enum RenameOutcome {
 ///   無効なので行ごと消える ([`settle_cross_parser_rename`]。結果は
 ///   [`RenameOutcome::RenamedSizeCappedAndDropped`] か
 ///   [`RenameOutcome::RenamedButRefusedAndDropped`])。読み込みの失敗 (`Err`) は parser を
-///   またいでも行を消さない
+///   またいでも行を消さない (番兵の hash で残る、#552)
 /// - 中身も変わった移動 (hash が行と違う) も、移す時点では `category` だけを新 path から作り、
 ///   topic は保存値のまま残す (codex P2 round 4 on PR #388)。続く reindex が行を書き換えれば、
 ///   topic は index 時の規則で新しい bytes から書かれる。書き換えなければ (chunk が 0・2 度目の
@@ -3868,6 +3870,10 @@ pub enum RenameOutcome {
 ///   ([`settle_cross_parser_rename`])。ただし 2 度目の読み込みが 1 度目と違う bytes だった時
 ///   (#544) は何も分からないので、行は番兵の hash で残る
 ///   ([`RenameOutcome::RenamedAcrossParsersAwaitingReparse`])
+/// - parser をまたぐ移動は、行を移す前に旧行の hash を番兵 ([`HASH_AWAITING_REPARSE`]) に
+///   する (#552)。移した後の reindex か後始末が `Err` で終わっても、行は番兵で残り、次の
+///   event / run が読み直す。`Ok` で終わる経路は hash を書き直すか行を消すので、結果は
+///   今までと同じ
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -3948,6 +3954,16 @@ pub fn rename_single_file(
             sweep_legacy_folded_row(db, kb_path, new_rel, false)?;
             return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
         }
+    }
+    // (#552) A rename that crosses a parser moves a row holding the old parser's chunks, and
+    // until the reparse below settles it the row would keep the hash of bytes that may be the
+    // ones on disk. Every exit from here on that moves the row (the link check's failed look,
+    // the size cap, a failed or refused read, the move before the reparse) comes after this
+    // mark, so one that ends in `Err` after the move leaves a row no fast path keeps; the next
+    // event or run reads it again. The `Ok` exits rewrite the hash or drop the row, as before.
+    // `same_hash` below is still decided on `old_hash`, read before the mark.
+    if crosses_a_parser {
+        db.overwrite_content_hash(&[old_rel], HASH_AWAITING_REPARSE)?;
     }
     // (audit AX-02) A destination reached through a directory link is not in the knowledge
     // base, so the document has left it: the row is dropped, as for a move into an excluded
@@ -10580,5 +10596,77 @@ mod tests {
         );
         assert_eq!(db.get_document_hash("a.md").unwrap(), None);
         assert_eq!(db.get_document_hash("b.md").unwrap(), Some(hash));
+    }
+
+    /// #552: makes every write of [`HASH_AWAITING_REPARSE`] into a row's hash fail, as the
+    /// mark a crossed rename writes before moving the row would fail on a locked or full
+    /// database.
+    fn i552_fail_marking_awaiting(db: &Database) {
+        db.execute_for_test(&format!(
+            concat!(
+                "CREATE TRIGGER inject_mark_failure BEFORE UPDATE OF content_hash ON documents ",
+                "WHEN NEW.content_hash = '{}' ",
+                "BEGIN SELECT RAISE(ABORT, 'injected mark failure'); END;"
+            ),
+            HASH_AWAITING_REPARSE
+        ))
+        .unwrap();
+    }
+
+    /// #552: the watcher's [`rename_single_file`] of `note.txt` -> `note.md`, a rename that
+    /// crosses a parser, cannot write the mark it writes before moving the row. The rename
+    /// fails and moves nothing: the row stays at `note.txt` under the hash it had, as a rename
+    /// that failed before the move always left it. Control: a same-parser rename (`a.md` ->
+    /// `b.md`) under the same fault writes no mark and moves its row on the fast path.
+    #[test]
+    fn i552_a_watcher_rename_whose_mark_fails_moves_nothing() {
+        let (dir, db, registry) = i552_crossed_rename("i552-mark-fails", I552_BYTES);
+        i552_fail_marking_awaiting(&db);
+        let err = rename_single_file(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            "note.txt",
+            "note.md",
+            None,
+            &registry,
+        )
+        .expect_err("the injected mark failure was meant to fail the rename");
+        assert!(
+            format!("{err:#}").contains("injected mark failure"),
+            "the rename failed somewhere other than the mark: {err:#}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.txt").unwrap(),
+            Some(sha256_hex_bytes(I552_BYTES)),
+            "the row left its old path, or its hash changed, although the mark was not written"
+        );
+        assert_eq!(db.get_document_hash("note.md").unwrap(), None);
+
+        let same = mk_tmp("i552-mark-fails-same-parser");
+        let same_db = reparse_db();
+        assert!(!rename_crosses_a_parser(&registry, "a.md", "b.md"));
+        std::fs::write(same.0.join("b.md"), I552_BYTES).unwrap();
+        let hash = sha256_hex_bytes(I552_BYTES);
+        write_row(
+            &same_db,
+            "a.md",
+            &hash,
+            &parse_doc(&registry, "md", "a.md", I552_BYTES).chunks,
+        );
+        i552_fail_marking_awaiting(&same_db);
+        let outcome = rename_single_file(
+            &same_db,
+            &mut Embedder::stub_for_tests(2),
+            &same.0,
+            "a.md",
+            "b.md",
+            None,
+            &registry,
+        )
+        .expect("a same-parser rename writes no mark");
+        assert_eq!(outcome, RenameOutcome::Renamed);
+        assert_eq!(same_db.get_document_hash("a.md").unwrap(), None);
+        assert_eq!(same_db.get_document_hash("b.md").unwrap(), Some(hash));
     }
 }
