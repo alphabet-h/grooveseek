@@ -834,6 +834,31 @@ pub(crate) fn settle_cross_parser_rename(
     Ok(!keep_awaiting)
 }
 
+/// (#544, local Codex r4, D5) The settlement of a further read of a crossed rename this branch
+/// adds after the first read kept the row awaiting: [`read_crossed_rename_again`] in
+/// [`rebuild_index`], and the watcher's crossed rereads ([`crate::watcher`]). A read that
+/// checked no bytes -- it failed ([`SKIPPED_READ_FAILED`]) -- leaves the row as it is, under
+/// [`HASH_AWAITING_REPARSE`], for the next event or run. Every other result goes to
+/// [`settle_cross_parser_rename`]; a refusal among them is a fact about the file (over the size
+/// cap, a hard link, not a regular file), never a failed read, which is an error of its own.
+/// `Ok(true)` when the row was dropped.
+pub(crate) fn settle_further_crossed_read(
+    db: &Database,
+    rel: &str,
+    outcome: &SingleResult,
+) -> Result<bool> {
+    if matches!(
+        outcome,
+        SingleResult::Skipped {
+            reason: SKIPPED_READ_FAILED,
+            ..
+        }
+    ) {
+        return Ok(false);
+    }
+    settle_cross_parser_rename(db, rel, outcome)
+}
+
 /// (#544, local Codex r1) The further read [`rebuild_index`] gives, once, before it returns, a
 /// crossed rename its loop kept under [`HASH_AWAITING_REPARSE`] ([`settle_cross_parser_rename`]
 /// on a [`SKIPPED_CHANGED_DURING_READ`] skip): the file is read and hashed again, and those
@@ -846,14 +871,15 @@ pub(crate) fn settle_cross_parser_rename(
 /// meta-only update. Not [`Reindex::Reparse`], whose matching-chunks exit writes no hash and
 /// leaves the sentinel over chunks it found current. The check runs before the parse, as for
 /// the rename's first read, so a failed parse is always one of the bytes this read hashed. A
-/// read that fails is the skip the loop gives one ("read failed"), so the run goes on.
+/// read that fails is the skip the loop gives one ([`SKIPPED_READ_FAILED`]), so the run goes on.
 ///
 /// (#544, local Codex r3, J3) The caller settles the result with
-/// [`settle_cross_parser_rename`], as the loop settled the first read: the row is written from
-/// these bytes, or dropped when the new parser cannot index them (a failed or refused read, a
-/// failed parse, an endpoint's rejection, nothing to embed), and kept under the sentinel only
-/// for bytes that changed again. A refusal records the length it measured first; the row it
-/// lands on is then deleted, which leaves nothing behind.
+/// [`settle_further_crossed_read`], as the loop settled the first read: the row is written from
+/// these bytes, or dropped when the new parser cannot index them (a refused read, a failed
+/// parse, an endpoint's rejection, nothing to embed), and kept under the sentinel for bytes
+/// that changed again and (local Codex r4, D5) for a read that failed, which checked no bytes.
+/// A refusal records the length it measured first; the row it lands on is then deleted, which
+/// leaves nothing behind.
 fn read_crossed_rename_again(
     db: &Database,
     embedder: &mut Embedder,
@@ -890,7 +916,7 @@ fn read_crossed_rename_again(
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
-                reason: "read failed",
+                reason: SKIPPED_READ_FAILED,
                 frontmatter_unparsed: false,
             });
         }
@@ -1894,8 +1920,9 @@ pub fn rebuild_index(
         )?;
         // (#544, local Codex r3, J3) Settled as the loop's read was: bytes this read verified
         // and the new parser cannot index drop the row; only bytes that changed again keep it
-        // awaiting. A dropped row holds nothing open.
-        if settle_cross_parser_rename(db, &entry.rel, &again)? {
+        // awaiting. A dropped row holds nothing open. (local Codex r4, D5) A read that failed
+        // checked no bytes and keeps the row awaiting, unsettled and pending.
+        if settle_further_crossed_read(db, &entry.rel, &again)? {
             unsettled.remove(&entry.rel);
             refresh_pending_rows.remove(&entry.rel);
         }
@@ -2545,6 +2572,12 @@ pub(crate) const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
 /// file is skipped on its own and the run goes on; the row it had stays.
 const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 
+/// The [`SingleResult::Skipped`] reason for a file whose read failed (an I/O error: sharing,
+/// permission, a file gone between the look and the read). No bytes were read, so nothing was
+/// learned about the file. (#544, local Codex r4) [`settle_further_crossed_read`] keeps the
+/// row on it.
+const SKIPPED_READ_FAILED: &str = "read failed";
+
 /// The [`SingleResult::Skipped`] reason the one-time frontmatter check (#251) returns when
 /// the bytes it read are not the bytes the scan hashed: the file was swapped between the
 /// two reads, so nothing about the retained row has been learned, and the skip keeps the
@@ -2851,7 +2884,7 @@ fn index_single_disk_entry(
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
-                reason: "read failed",
+                reason: SKIPPED_READ_FAILED,
                 frontmatter_unparsed: false,
             });
         }
@@ -10009,6 +10042,56 @@ mod tests {
         assert!(stored_bodies(&db, "note.docx").is_empty());
         assert_eq!(db.get_document_hash("note.md").unwrap(), None);
         assert_eq!((result.updated, result.skipped), (0, 1), "{result:?}");
+    }
+
+    /// #544 PR-2 (local Codex r4, D5): a crossed rename the loop kept awaiting, because the file
+    /// changed under the loop's read, whose further read then cannot read the file at all (it
+    /// is gone by then; a sharing or permission error reads the same). No bytes were checked,
+    /// so the row stays, under the awaiting-reparse hash, for the next event or run.
+    #[test]
+    fn a_full_run_keeps_a_crossed_rename_awaiting_when_the_further_read_fails() {
+        let dir = mk_tmp("i544-cx4-rebuild-further-read-fails");
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "docx".into()]).unwrap();
+        std::fs::write(dir.0.join("note.md"), SCANNED_BYTES).unwrap();
+        let old = parse_doc(&registry, "md", "note.txt", SCANNED_BYTES).chunks;
+        write_row(&db, "note.txt", &sha256_hex_bytes(SCANNED_BYTES), &old);
+        let full = dir.0.join("note.md");
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            match event {
+                // The loop's read sees other bytes than the scan hashed: kept awaiting.
+                progress::ProgressEvent::Renamed { new: "note.md", .. } => {
+                    std::fs::write(&full, SECOND_READ_BYTES).unwrap();
+                }
+                // Reported by the loop, before the further read: that read finds nothing.
+                progress::ProgressEvent::Unchanged { rel: "note.md", .. } => {
+                    std::fs::remove_file(&full).unwrap();
+                }
+                _ => {}
+            }
+        }));
+        rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            None,
+            false,
+            None,
+            &[],
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+        .unwrap();
+        assert!(
+            !dir.0.join("note.md").exists(),
+            "the further read was meant to find no file"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "a further read that checked no bytes dropped the row, or left a hash a fast path trusts"
+        );
     }
 
     /// #544 PR-2 (GitHub codex P2 on PR #396): the further read of a crossed rename kept

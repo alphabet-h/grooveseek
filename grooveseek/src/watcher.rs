@@ -2639,9 +2639,10 @@ fn log_crossed_row_dropped(old_rel: &str, new_rel: &str) {
 
 /// (#544, local Codex r3, J3) The settlement of a further read of a row a rename across a parser
 /// left with the old parser's chunks: a result that read and checked the bytes on disk goes to
-/// [`indexer::settle_cross_parser_rename`], the rule the rename's first read follows. A result
+/// [`indexer::settle_further_crossed_read`], the rule the rename's first read follows. A result
 /// that verified no bytes -- an error, or an unchanged or metadata-only answer, which a row
-/// under [`indexer::HASH_AWAITING_REPARSE`] does not get -- touches nothing (D5). `true` when
+/// under [`indexer::HASH_AWAITING_REPARSE`] does not get, and (local Codex r4) a skip for a
+/// read that failed inside the indexer -- touches nothing (D5). `true` when
 /// the row was dropped. A failure of the settlement is logged and the row is left as it was.
 fn settle_crossed_read_again(
     db: &Database,
@@ -2653,7 +2654,7 @@ fn settle_crossed_read_again(
         | Err(_) => return false,
         Ok(verified) => verified,
     };
-    match indexer::settle_cross_parser_rename(db, new_rel, verified) {
+    match indexer::settle_further_crossed_read(db, new_rel, verified) {
         Ok(dropped) => dropped,
         Err(e) => {
             wdiag!(
@@ -7251,6 +7252,70 @@ mod tests {
             db.get_document_hash("a.txt").unwrap().as_deref(),
             Some(indexer::HASH_AWAITING_REPARSE),
             "the row went on bytes its read did not check"
+        );
+    }
+
+    /// (#544, local Codex r4, D5) The further read of a row a rename across a parser left with
+    /// the old parser's chunks fails inside the indexer (a "read failed" skip): no bytes were
+    /// checked, so the row stays awaiting, for the row kept awaiting and for one moved unread.
+    #[test]
+    fn a_crossed_further_read_that_fails_keeps_the_row_awaiting() {
+        let read_failed = |n: &mut usize, _checked: bool| {
+            *n += 1;
+            Ok(indexer::SingleResult::Skipped {
+                reason: "read failed",
+                frontmatter_unparsed: false,
+            })
+        };
+
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-awaiting-read-failed");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        let mut reindexed = 0;
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut reindexed,
+            |_| move_row_awaiting(&db, "b.txt", "a.md"),
+            read_failed,
+        );
+        assert_eq!(reindexed, 1);
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some(indexer::HASH_AWAITING_REPARSE),
+            "kept awaiting: a read that checked no bytes dropped the row"
+        );
+
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unread-move-read-failed");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let plan = rename_plan(&db, "a.md", "a.txt", OnDisk::Unknown(denied)).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "a.txt", &plan);
+        let start = rename_start(&db, &reg, ("a.md", "a.txt"), plan, before);
+        let mut reindexed = 0;
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("a.md", "a.txt"),
+            WriteLook::Spelled,
+            start,
+            &mut reindexed,
+            |_| panic!("an unread move does not run the indexer's rename"),
+            read_failed,
+        );
+        assert_eq!(reindexed, 1);
+        assert_eq!(
+            db.get_document_hash("a.txt").unwrap().as_deref(),
+            Some(indexer::HASH_AWAITING_REPARSE),
+            "moved unread: a read that checked no bytes dropped the row"
         );
     }
 
