@@ -812,6 +812,9 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 ///
 /// (#544, local Codex r3) Also the settlement of the watcher's further read of a crossed rename
 /// kept awaiting ([`crate::watcher`]). `Ok(true)` when the row was dropped.
+///
+/// (#552) By the time this is called the row already holds [`HASH_AWAITING_REPARSE`], marked
+/// before the rename moved it; what this does with the outcome is the same as before the mark.
 pub(crate) fn settle_cross_parser_rename(
     db: &Database,
     rel: &str,
@@ -1605,18 +1608,32 @@ pub fn rebuild_index(
         let pairs = detect_renames(&disk_entries, &db_path_hashes, &skipped_paths);
         // evaluator 指摘 High #2: rename フェーズ全体を単一 transaction に
         // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
-        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
-        // its topic comes from the bytes the pair was matched on.
-        db.rename_documents_atomic(&pairs, &frontmatter_topics)?;
+        let mut crossed_old_paths: Vec<&str> = Vec::new();
         for (old_path, new_path) in &pairs {
-            progress.report_renamed(old_path, new_path);
             let crossed = rename_crosses_a_parser(registry, old_path, new_path);
             if context_mode == ContextMode::Static || crossed {
                 renamed_new_paths.insert(new_path.clone());
             }
             if crossed {
                 crossed_parser_renames.insert(new_path.clone());
+                crossed_old_paths.push(old_path.as_str());
             }
+        }
+        // (#552) A pair that crosses a parser is re-read under the new parser below, and until
+        // that read settles it the row holds the old parser's chunks under the hash of the
+        // unchanged bytes. Its hash is overwritten with [`HASH_AWAITING_REPARSE`] before the
+        // row moves, so a run that fails anywhere after the move leaves a row no fast path
+        // keeps; every settlement below writes the hash again or drops the row. A failed
+        // rename after the mark leaves the old row under the sentinel, which the next run's
+        // rename detection does not pair; the pair would have been re-embedded in full anyway.
+        if !crossed_old_paths.is_empty() {
+            db.overwrite_content_hash(&crossed_old_paths, HASH_AWAITING_REPARSE)?;
+        }
+        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
+        // its topic comes from the bytes the pair was matched on.
+        db.rename_documents_atomic(&pairs, &frontmatter_topics)?;
+        for (old_path, new_path) in &pairs {
+            progress.report_renamed(old_path, new_path);
         }
         pairs.len() as u32
     };
@@ -10484,5 +10501,83 @@ mod tests {
             Some(HASH_AWAITING_REPARSE),
             "the moved row holds the old parser's chunks under a hash the fast path trusts"
         );
+    }
+
+    /// #552 (Review Focus 2): a full run marks the crossed pair's old row awaiting a reparse
+    /// and then the rename's transaction fails, so the row stays at `note.txt` under the
+    /// sentinel. The next run must not pair it (no bytes hash to the sentinel): the old row is
+    /// swept with the files the disk no longer holds, and `note.md` is indexed as a new file
+    /// with the Markdown parser's chunks under the hash of its bytes.
+    #[test]
+    fn i552_a_failed_rename_after_the_mark_leaves_the_old_row_unpaired() {
+        let (dir, db, registry) = i552_crossed_rename("i552-mark-then-fail", I552_BYTES);
+        db.execute_for_test(concat!(
+            "CREATE TABLE fault (armed INTEGER NOT NULL); INSERT INTO fault VALUES (1); ",
+            "CREATE TRIGGER inject_rename_failure BEFORE UPDATE OF path ON documents ",
+            "WHEN (SELECT armed FROM fault) = 1 ",
+            "BEGIN SELECT RAISE(ABORT, 'injected rename failure'); END;"
+        ))
+        .unwrap();
+        let err = i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry)
+            .expect_err("the injected rename failure was meant to fail the run");
+        assert!(
+            format!("{err:#}").contains("injected rename failure"),
+            "the run failed somewhere other than the rename: {err:#}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.txt").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the old row was not left under the sentinel by the failed rename"
+        );
+        assert_eq!(db.get_document_hash("note.md").unwrap(), None);
+
+        db.execute_for_test("UPDATE fault SET armed = 0").unwrap();
+        let result = i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry)
+            .expect("the second run");
+        assert_eq!(
+            result.renamed, 0,
+            "the second run paired the sentinel row: {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.txt").unwrap(),
+            None,
+            "the old row was not swept"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(I552_BYTES))
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", I552_BYTES),
+            "note.md was not indexed under the Markdown parser"
+        );
+    }
+
+    /// #552 (control): the mark is for a pair that crosses a parser only. A full run that
+    /// pairs `a.md` -> `b.md`, both read by the Markdown parser, moves the row and keeps it on
+    /// the unchanged fast path: nothing is read again, and the row keeps the hash it had.
+    ///
+    /// Red if every pair is marked: the moved row is read again (`updated` 1).
+    #[test]
+    fn i552_a_full_run_leaves_a_same_parser_rename_on_the_fast_path() {
+        let dir = mk_tmp("i552-same-parser");
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        assert!(!rename_crosses_a_parser(&registry, "a.md", "b.md"));
+        std::fs::write(dir.0.join("b.md"), I552_BYTES).unwrap();
+        let md_chunks = parse_doc(&registry, "md", "a.md", I552_BYTES).chunks;
+        let hash = sha256_hex_bytes(I552_BYTES);
+        write_row(&db, "a.md", &hash, &md_chunks);
+
+        let result =
+            i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry).expect("the run");
+        assert_eq!(result.renamed, 1, "the pair was not detected: {result:?}");
+        assert_eq!(
+            result.updated, 0,
+            "the same-parser rename was read again: {result:?}"
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap(), None);
+        assert_eq!(db.get_document_hash("b.md").unwrap(), Some(hash));
     }
 }
