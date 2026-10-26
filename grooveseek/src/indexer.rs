@@ -813,8 +813,9 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// (#544, local Codex r3) Also the settlement of the watcher's further read of a crossed rename
 /// kept awaiting ([`crate::watcher`]). `Ok(true)` when the row was dropped.
 ///
-/// (#552) By the time this is called the row already holds [`HASH_AWAITING_REPARSE`], marked
-/// before the rename moved it; what this does with the outcome is the same as before the mark.
+/// (#552) [`rebuild_index`] overwrites the old row's hash with [`HASH_AWAITING_REPARSE`] before
+/// the rename moves it, so when it calls this the row already holds the sentinel; what this
+/// does with the outcome is the same as before the mark.
 pub(crate) fn settle_cross_parser_rename(
     db: &Database,
     rel: &str,
