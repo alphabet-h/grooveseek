@@ -760,7 +760,7 @@ fn detect_renames(
 /// sites (AGENTS "one question gets one implementation"): the parser-crossing
 /// decision has one definition, and both rename paths ask it the same
 /// question.
-fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) -> bool {
+pub(crate) fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) -> bool {
     let parser_of = |rel: &str| {
         let ext = Path::new(rel)
             .extension()

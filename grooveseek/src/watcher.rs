@@ -2351,6 +2351,48 @@ fn apply_rename_plan_before(
     }
 }
 
+/// (#544 J4) A row [`RenamePlan::MoveRowUnknown`] moved to `new_rel` without reading it
+/// (`before` is `Ok(false)`), across a parser ([`indexer::rename_crosses_a_parser`]): its chunks
+/// were written by the parser of `old_rel`, so its hash is overwritten with
+/// [`indexer::HASH_AWAITING_REPARSE`] and the next event for `new_rel` reads it again instead of
+/// taking the unchanged bytes as indexed. `Ok(true)` when the hash was written; `Ok(false)` for
+/// any other plan, a `before` that did not move the row, or a rename within one parser, all of
+/// which write nothing. Kept apart from [`apply_rename_plan_before`] so that its signature
+/// needs no [`Registry`].
+fn await_reparse_after_unread_move(
+    db: &Database,
+    registry: &Registry,
+    old_rel: &str,
+    new_rel: &str,
+    plan: &RenamePlan,
+    before: &Result<bool>,
+) -> Result<bool> {
+    if !matches!(plan, RenamePlan::MoveRowUnknown(_))
+        || !matches!(before, Ok(false))
+        || !indexer::rename_crosses_a_parser(registry, old_rel, new_rel)
+    {
+        return Ok(false);
+    }
+    let written = db.overwrite_content_hash(&[new_rel], indexer::HASH_AWAITING_REPARSE)?;
+    Ok(written > 0)
+}
+
+/// (#544 J4) The line [`dispatch_rename`] prints after [`await_reparse_after_unread_move`]:
+/// one when the hash was written, one when writing it failed (the row stays moved, with the
+/// old row's hash), and none when there was nothing to write.
+fn log_await_reparse_after_unread_move(old_rel: &str, new_rel: &str, result: &Result<bool>) {
+    match result {
+        Ok(true) => wdiag!(
+            "watcher: {new_rel} crosses a parser from {old_rel}; it is read again on its next event"
+        ),
+        Ok(false) => {}
+        Err(e) => wdiag!(
+            "watcher: {new_rel} crosses a parser from {old_rel}; could not mark it for a reparse: {}",
+            crate::embedder::body_free_message(e)
+        ),
+    }
+}
+
 /// (#544 A7/A8) Whether the indexer's rename settled the row at `new_rel`: true when the row
 /// was moved, reindexed or dropped and the outcome says so. False for an outcome that left the
 /// row as it was (a refusal, a skipped reparse) and for an error, after which the destination
@@ -2396,6 +2438,11 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
         }
     };
     let before = apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan);
+    log_await_reparse_after_unread_move(
+        old_rel,
+        new_rel,
+        &await_reparse_after_unread_move(&db, &state.registry, old_rel, new_rel, &plan, &before),
+    );
     let exclude_headings = state.exclude_headings.as_deref();
     finish_rename_locked(
         &db,
@@ -6005,6 +6052,77 @@ mod tests {
             assert!(!run_rename, "{rows:?}");
             assert_eq!(db.all_document_paths().unwrap(), want_rows, "{rows:?}");
         }
+    }
+
+    /// (#544 J4) A row moved unread to a path read by another parser (`a.md` to `a.txt`) gets
+    /// the awaiting hash, so the next event for `a.txt` reads it again. Within one parser
+    /// (`a.md` to `b.md`) the hash stays, and the plans that do not move a row unread write
+    /// nothing.
+    #[test]
+    fn a_row_moved_unread_across_a_parser_awaits_a_reparse() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unread-cross-parser");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let denied = std::io::ErrorKind::PermissionDenied;
+
+        let moved = |new_rel: &str| {
+            let db = dir_rename_db(&["a.md", "other.md"]);
+            let plan = rename_plan(&db, "a.md", new_rel, OnDisk::Unknown(denied)).unwrap();
+            assert_eq!(plan, RenamePlan::MoveRowUnknown(denied), "{new_rel}");
+            let before = apply_rename_plan_before(&db, &kb, "a.md", new_rel, &plan);
+            assert!(matches!(before, Ok(false)), "{new_rel}: {before:?}");
+            let wrote = await_reparse_after_unread_move(&db, &reg, "a.md", new_rel, &plan, &before)
+                .unwrap();
+            (db, wrote)
+        };
+
+        let (db, wrote) = moved("a.txt");
+        assert!(wrote);
+        assert_eq!(db.get_document_hash("a.md").unwrap(), None);
+        assert_eq!(
+            db.get_document_hash("a.txt").unwrap().as_deref(),
+            Some(indexer::HASH_AWAITING_REPARSE)
+        );
+        assert_eq!(
+            db.get_document_hash("other.md").unwrap().as_deref(),
+            Some("h")
+        );
+
+        let (db, wrote) = moved("b.md");
+        assert!(!wrote);
+        assert_eq!(db.get_document_hash("b.md").unwrap().as_deref(), Some("h"));
+
+        // A plain rename across a parser: the indexer's rename reads the file, nothing here.
+        let db = dir_rename_db(&["a.md"]);
+        let before = Ok(true);
+        assert!(
+            !await_reparse_after_unread_move(
+                &db,
+                &reg,
+                "a.md",
+                "a.txt",
+                &RenamePlan::Rename,
+                &before
+            )
+            .unwrap()
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("h"));
+
+        // Left as it was: the row at `a.md` keeps its hash and none appears at `a.txt`.
+        let plan = RenamePlan::LeaveUnknown(denied);
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "a.txt", &plan);
+        assert!(
+            !await_reparse_after_unread_move(&db, &reg, "a.md", "a.txt", &plan, &before).unwrap()
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("h"));
+        assert_eq!(db.get_document_hash("a.txt").unwrap(), None);
+
+        // A move that failed wrote no row at `a.txt`, so there is no hash to mark.
+        let plan = RenamePlan::MoveRowUnknown(denied);
+        let before = Err(anyhow::anyhow!("injected failure of the move"));
+        assert!(
+            !await_reparse_after_unread_move(&db, &reg, "a.md", "a.txt", &plan, &before).unwrap()
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("h"));
     }
 
     /// (#544 C1, D6) A rename over a path that holds a row, from one that holds a row too:
