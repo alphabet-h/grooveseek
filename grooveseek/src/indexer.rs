@@ -827,6 +827,72 @@ fn settle_cross_parser_rename(db: &Database, rel: &str, outcome: &SingleResult) 
     Ok(())
 }
 
+/// (#544, local Codex r1) The further read [`rebuild_index`] gives, once, before it returns, a
+/// crossed rename its loop kept under [`HASH_AWAITING_REPARSE`] ([`settle_cross_parser_rename`]
+/// on a [`SKIPPED_CHANGED_DURING_READ`] skip): the file is read and hashed again, and those
+/// bytes are indexed as a watcher event indexes a file ([`Reindex::Event`]), under the run's
+/// declared set and context mode.
+///
+/// Why [`Reindex::Event`]: the row's hash is the sentinel, so no mode takes the fast path, and
+/// this one is the only mode that checks the bytes it parses against the hash just taken (a
+/// changed read is a [`SKIPPED_CHANGED_DURING_READ`] skip again) while writing the hash on a
+/// meta-only update. Its result alone decides the row: written from these bytes, dropped when
+/// they hold nothing to embed ([`SingleResult::NothingToIndex`], what `--force` leaves), and
+/// otherwise -- a failed or refused read, a failed parse, an endpoint's rejection, bytes that
+/// changed again -- kept under the sentinel (D5). Not [`Reindex::Force`] with
+/// [`settle_cross_parser_rename`], which drops the row on a failed parse or a refusal, and not
+/// [`Reindex::Reparse`], whose matching-chunks exit writes no hash and leaves the sentinel over
+/// chunks it found current. A read that fails is the skip the loop gives one ("read failed"),
+/// so the run goes on.
+fn read_crossed_rename_again(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+) -> Result<SingleResult> {
+    let ext = entry
+        .full
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let is_binary = registry.by_extension(ext).is_some_and(|p| p.is_binary());
+    let cap = applicable_cap(
+        is_binary,
+        registry.limits().binary.cap_bytes(),
+        registry.limits().text.cap_bytes(),
+    );
+    let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, size_cap_key(is_binary)) {
+        Ok((Some(bytes), _)) => bytes,
+        Ok((None, _)) => return Ok(SingleResult::Refused),
+        Err(e) => {
+            eprintln!("Skipping {}: failed to read: {e}", entry.rel);
+            return Ok(SingleResult::Skipped {
+                reason: "read failed",
+                frontmatter_unparsed: false,
+            });
+        }
+    };
+    let again = DiskEntry {
+        hash: sha256_hex_bytes(&bytes),
+        size: bytes.len() as u64,
+        ..entry.clone()
+    };
+    index_single_disk_entry(
+        db,
+        embedder,
+        &again,
+        exclude_headings,
+        registry,
+        Reindex::Event,
+        context_mode,
+        declared,
+        false,
+    )
+}
+
 /// この document path を現在の registry で開けるか。
 ///
 /// 「どの行を提供できるか」と「どの行が registry から外れたか」(AU-06) を
@@ -1588,6 +1654,9 @@ pub fn rebuild_index(
     // that stops midway leaves every hash as it was (I-4).
     // (feature-65) Rows of any stale pass ([`stale_row`]), not only `.docx` ones.
     let mut unsettled: HashSet<String> = HashSet::new();
+    // (#544, local Codex r1) The crossed renames the loop kept under [`HASH_AWAITING_REPARSE`],
+    // in loop order, for the further read after it.
+    let mut crossed_awaiting: Vec<&DiskEntry> = Vec::new();
 
     // 2. Process each file
     //
@@ -1654,6 +1723,16 @@ pub fn rebuild_index(
         // `settle_cross_parser_rename`'s doc for why.
         if crossed {
             settle_cross_parser_rename(db, &entry.rel, &single_result)?;
+            // (#544, local Codex r1) Kept awaiting: read once more after the loop.
+            if matches!(
+                single_result,
+                SingleResult::Skipped {
+                    reason: SKIPPED_CHANGED_DURING_READ,
+                    ..
+                }
+            ) {
+                crossed_awaiting.push(entry);
+            }
         }
         // (feature-62) Settled: written by this parser, re-read and found to match, or dropped
         // by the re-read. Anything else -- a parse failure, a refusal, bytes that changed under
@@ -1758,6 +1837,80 @@ pub fn rebuild_index(
                 // Verbose / Quiet は no-op (= 既存挙動保持)。
                 progress.report_unchanged(&entry.rel);
             }
+        }
+    }
+
+    // (#544, local Codex r1) A crossed rename the loop kept awaiting a reparse holds the old
+    // parser's chunks: it gets one further read of the bytes on disk before the run returns
+    // ([`read_crossed_rename_again`]), whose result alone decides the row and replaces the skip
+    // the loop counted for it. Ahead of C4, so a cancel stops it between two reads: a row not
+    // read again keeps the sentinel, which no fast path trusts. Not reported to `progress`,
+    // which already counted the file.
+    for entry in crossed_awaiting {
+        if progress.is_cancelled() {
+            break;
+        }
+        let refused_after_accepting_before = embedder.documents_refused_after_accepting();
+        let texts_before = embedder.texts_embedded();
+        let again = read_crossed_rename_again(
+            db,
+            embedder,
+            entry,
+            exclude_headings,
+            registry,
+            context_mode,
+            DeclaredSet::Known {
+                list: &declared_fields,
+                pass: pass_token.as_deref(),
+                generation: &declared_json,
+            },
+        )?;
+        tally.skipped = tally.skipped.saturating_sub(1);
+        match again {
+            SingleResult::Updated {
+                chunks,
+                frontmatter_unparsed: fm_unparsed,
+            } => {
+                unsettled.remove(&entry.rel);
+                tally.updated += 1;
+                if fm_unparsed {
+                    tally.frontmatter_unparsed += 1;
+                }
+                let counts = ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
+                tally.chunks_embedded = tally.chunks_embedded.saturating_add(counts.embedded);
+                tally.chunks_reused = tally.chunks_reused.saturating_add(counts.reused);
+            }
+            SingleResult::Skipped {
+                reason,
+                frontmatter_unparsed: fm_unparsed,
+            } => {
+                tally.skipped += 1;
+                if reason == SKIPPED_EMBED_REJECTED
+                    && embedder.documents_refused_after_accepting()
+                        == refused_after_accepting_before
+                {
+                    tally.embed_rejected += 1;
+                }
+                if fm_unparsed {
+                    tally.frontmatter_unparsed += 1;
+                }
+            }
+            SingleResult::NothingToIndex {
+                frontmatter_unparsed: fm_unparsed,
+                ..
+            } => {
+                unsettled.remove(&entry.rel);
+                tally.skipped += 1;
+                if fm_unparsed {
+                    tally.frontmatter_unparsed += 1;
+                }
+            }
+            SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed => {
+                tally.skipped += 1;
+            }
+            // Neither comes back for a row under the sentinel: no hash matches it, and
+            // `Reindex::Event` runs no one-time check. Named so a new variant is a compile error.
+            SingleResult::Unchanged | SingleResult::MetadataRefreshed { .. } => {}
         }
     }
 
@@ -9694,5 +9847,105 @@ mod tests {
             None,
             "the old parser's row is still there"
         );
+    }
+
+    /// #544 PR-2 (local Codex r1): a full run over `old_rel`'s row renamed on disk to `new_rel`
+    /// -- a pair that crosses a parser -- whose file is rewritten to `rewritten` once the rename
+    /// is applied (the [`progress::ProgressEvent::Renamed`] callback), so the loop's read of it
+    /// is not the bytes the scan hashed. Returns the scratch directory, the index, the
+    /// registry and the run's result.
+    fn crossed_rename_rewritten_during_the_run(
+        tag: &str,
+        (old_rel, new_rel): (&str, &str),
+        scanned: &'static [u8],
+        rewritten: &'static [u8],
+    ) -> (TmpDir, Database, Registry, IndexResult) {
+        let dir = mk_tmp(tag);
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "docx".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&registry, old_rel, new_rel),
+            "the pair was meant to cross a parser"
+        );
+        std::fs::write(dir.0.join(new_rel), scanned).unwrap();
+        let old = parse_doc(&registry, "md", old_rel, SCANNED_BYTES).chunks;
+        write_row(&db, old_rel, &sha256_hex_bytes(scanned), &old);
+        let full = dir.0.join(new_rel);
+        let (old_owned, new_owned) = (old_rel.to_string(), new_rel.to_string());
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if let progress::ProgressEvent::Renamed { old, new } = event
+                && old == old_owned
+                && new == new_owned
+            {
+                std::fs::write(&full, rewritten).unwrap();
+            }
+        }));
+        let result = rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            None,
+            false,
+            None,
+            &[],
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+        .unwrap();
+        (dir, db, registry, result)
+    }
+
+    /// #544 PR-2 (local Codex r1): a crossed rename the loop kept awaiting a reparse, because
+    /// the file changed between the scan and the loop's read, is read once more before the run
+    /// ends, and that read writes the row from the bytes on disk, under their hash. It is
+    /// counted as the update it became, not as the loop's skip.
+    #[test]
+    fn a_full_run_reads_a_crossed_rename_it_kept_awaiting_once_more() {
+        let (_dir, db, registry, result) = crossed_rename_rewritten_during_the_run(
+            "i544-cx1-rebuild-second-read",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            SECOND_READ_BYTES,
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(SECOND_READ_BYTES)),
+            "the run returned with the row awaiting, or under a hash other than the disk's"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", SECOND_READ_BYTES),
+            "the row's chunks are not the bytes on disk"
+        );
+        assert_eq!(db.get_document_hash("note.txt").unwrap(), None);
+        assert_eq!((result.updated, result.skipped), (1, 0), "{result:?}");
+    }
+
+    /// #544 PR-2 (local Codex r1, D5): the same run, and the bytes on disk are ones the new
+    /// parser cannot read. The further read does not settle them, so the row stays, under the
+    /// awaiting-reparse hash with the chunks it had, rather than being dropped, and the run
+    /// counts one skip.
+    #[test]
+    fn a_full_run_keeps_a_crossed_rename_awaiting_when_the_further_read_cannot_parse() {
+        let (_dir, db, _registry, result) = crossed_rename_rewritten_during_the_run(
+            "i544-cx1-rebuild-second-read-unparsed",
+            ("note.md", "note.docx"),
+            b"not a zip archive, as scanned",
+            b"not a zip archive, as rewritten",
+        );
+        assert_eq!(
+            db.get_document_hash("note.docx").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the row went, or kept a hash a fast path trusts"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.docx").len(),
+            parse_doc(&docx_registry(), "md", "note.md", SCANNED_BYTES)
+                .chunks
+                .len(),
+            "the kept row's chunks changed"
+        );
+        assert_eq!((result.updated, result.skipped), (0, 1), "{result:?}");
     }
 }

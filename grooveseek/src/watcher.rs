@@ -2354,10 +2354,11 @@ fn apply_rename_plan_before(
 /// (#544 J4) A row [`RenamePlan::MoveRowUnknown`] moved to `new_rel` without reading it
 /// (`before` is `Ok(false)`), across a parser ([`indexer::rename_crosses_a_parser`]): its chunks
 /// were written by the parser of `old_rel`, so its hash is overwritten with
-/// [`indexer::HASH_AWAITING_REPARSE`] and the next event for `new_rel` reads it again instead of
-/// taking the unchanged bytes as indexed. `Ok(true)` when the hash was written; `Ok(false)` for
-/// any other plan, a `before` that did not move the row, or a rename within one parser, all of
-/// which write nothing. Kept apart from [`apply_rename_plan_before`] so that its signature
+/// [`indexer::HASH_AWAITING_REPARSE`] and no read of `new_rel` takes the unchanged bytes as
+/// indexed: (local Codex r1) [`finish_rename_locked`] reads it once in the same dispatch, and
+/// when that read cannot settle it, the next event does. `Ok(true)` when the hash was written;
+/// `Ok(false)` for any other plan, a `before` that did not move the row, or a rename within one
+/// parser, all of which write nothing. Kept apart from [`apply_rename_plan_before`] so that its signature
 /// needs no [`Registry`].
 fn await_reparse_after_unread_move(
     db: &Database,
@@ -2382,9 +2383,9 @@ fn await_reparse_after_unread_move(
 /// old row's hash), and none when there was nothing to write.
 fn log_await_reparse_after_unread_move(old_rel: &str, new_rel: &str, result: &Result<bool>) {
     match result {
-        Ok(true) => wdiag!(
-            "watcher: {new_rel} crosses a parser from {old_rel}; it is read again on its next event"
-        ),
+        Ok(true) => {
+            wdiag!("watcher: {new_rel} crosses a parser from {old_rel}; marked to be read again")
+        }
         Ok(false) => {}
         Err(e) => wdiag!(
             "watcher: {new_rel} crosses a parser from {old_rel}; could not mark it for a reparse: {}",
@@ -2438,18 +2439,20 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
         }
     };
     let before = apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan);
-    log_await_reparse_after_unread_move(
-        old_rel,
-        new_rel,
-        &await_reparse_after_unread_move(&db, &state.registry, old_rel, new_rel, &plan, &before),
-    );
+    let awaits =
+        await_reparse_after_unread_move(&db, &state.registry, old_rel, new_rel, &plan, &before);
+    log_await_reparse_after_unread_move(old_rel, new_rel, &awaits);
     let exclude_headings = state.exclude_headings.as_deref();
     finish_rename_locked(
         &db,
         kb_path,
         (old_rel, new_rel),
         look,
-        (plan, before),
+        RenameStart {
+            plan,
+            before,
+            unread_move_awaits: matches!(awaits, Ok(true)),
+        },
         &mut *embedder,
         |embedder| {
             indexer::rename_single_file(
@@ -2483,6 +2486,82 @@ fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
     );
 }
 
+/// (#544, local Codex r1) What [`finish_rename_locked`] starts from: the [`RenamePlan`], what
+/// [`apply_rename_plan_before`] gave for it, and whether [`await_reparse_after_unread_move`]
+/// overwrote the hash of the row the plan moved unread. A `(plan, before)` pair converts to one
+/// whose hash was not overwritten.
+#[derive(Debug)]
+struct RenameStart {
+    plan: RenamePlan,
+    before: Result<bool>,
+    unread_move_awaits: bool,
+}
+
+impl From<(RenamePlan, Result<bool>)> for RenameStart {
+    fn from((plan, before): (RenamePlan, Result<bool>)) -> Self {
+        Self {
+            plan,
+            before,
+            unread_move_awaits: false,
+        }
+    }
+}
+
+/// (#544, local Codex r1) The row an unsettled indexer's rename left at the destination with
+/// chunks it did not build from the bytes there: the reparse wrote nothing
+/// ([`indexer::RenameOutcome::RenamedButNotReindexed`]), or the rename crossed a parser and its
+/// reparse found other bytes than its first read hashed
+/// ([`indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptRow {
+    NotReindexed,
+    AwaitingReparse,
+}
+
+/// The [`KeptRow`] an outcome of the indexer's rename left, if any.
+fn kept_row(outcome: &Result<indexer::RenameOutcome>) -> Option<KeptRow> {
+    match outcome {
+        Ok(indexer::RenameOutcome::RenamedButNotReindexed) => Some(KeptRow::NotReindexed),
+        Ok(indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse) => {
+            Some(KeptRow::AwaitingReparse)
+        }
+        _ => None,
+    }
+}
+
+/// (#544, local Codex r1) Whether [`finish_rename_locked`]'s second look at the destination,
+/// `on_disk`, reads it again for the row `kept`: a destination that is there, for either kept
+/// row; and one the look could not tell, for a row kept awaiting a reparse, whose chunks are
+/// another parser's -- one attempt, whose failure leaves the mark (D5). A gone destination is
+/// never read: its row goes.
+fn reads_destination_again(kept: Option<KeptRow>, on_disk: OnDisk) -> bool {
+    matches!(
+        (kept, on_disk),
+        (Some(_), OnDisk::Present) | (Some(KeptRow::AwaitingReparse), OnDisk::Unknown(_))
+    )
+}
+
+/// (#544) The destination's second read in [`finish_rename_locked`]: the caller's reindex of
+/// `new_rel`, taken from `reindex` so it runs at most once per dispatch, and its line. Returns
+/// the `require_real_key` of the sweep at `new_rel` that read's own result asks for
+/// ([`sweep_requires_real_key`]); the write form when the reindex was already taken.
+fn read_destination_again<C, R>(
+    ctx: &mut C,
+    reindex: &mut Option<R>,
+    (old_rel, new_rel): (&str, &str),
+) -> bool
+where
+    R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
+{
+    let Some(reindex) = reindex.take() else {
+        return true;
+    };
+    let result = reindex(ctx);
+    let requires_real_key = sweep_requires_real_key(&result);
+    log_rename_read_again(old_rel, new_rel, result);
+    requires_real_key
+}
+
 /// (#544) The rest of [`dispatch_rename`] once the plan has run ([`apply_rename_plan_before`]
 /// gave `before`), with both locks still held. `rename` is the indexer's rename and `reindex`
 /// a reindex of `new_rel`, each handed `ctx` (the embedder), so a test can run this with no
@@ -2501,22 +2580,35 @@ fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
 /// [`RenamePlan::ClearDestinationThenRename`]: Windows delivers an overwriting rename as a
 /// removal of the destination followed by a plain rename, and a plain rename whose bytes left
 /// nothing to index would otherwise keep the source's old content under the new path.
+///
+/// (#544, local Codex r1) The same second read, once, for a rename across a parser whose row
+/// was kept under [`indexer::HASH_AWAITING_REPARSE`]
+/// ([`indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse`]) -- on a destination that
+/// is there, or that the second look could not tell ([`reads_destination_again`]) -- and for a
+/// row [`RenamePlan::MoveRowUnknown`] moved unread across a parser, whose hash
+/// [`await_reparse_after_unread_move`] overwrote (`start`'s `unread_move_awaits`). That read's
+/// own result decides the row: a read that cannot settle the bytes leaves the mark (D5).
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked<C, R>(
     db: &Database,
     kb_path: &Path,
     (old_rel, new_rel): (&str, &str),
     look: WriteLook,
-    (plan, before): (RenamePlan, Result<bool>),
+    start: impl Into<RenameStart>,
     ctx: &mut C,
     rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
     reindex: R,
 ) where
     R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
 {
+    let RenameStart {
+        plan,
+        before,
+        unread_move_awaits,
+    } = start.into();
     let cleared = plan == RenamePlan::ClearDestinationThenRename;
-    // Taken by the settlement of a failed overwrite or by the second read of a rename whose
-    // reparse wrote nothing; a rename reaches at most one of them.
+    // Taken by the settlement of a failed overwrite or by the destination's second read
+    // ([`read_destination_again`]); a rename reaches at most one of them.
     let mut reindex = Some(reindex);
     let settle_cleared = |ctx: &mut C, reindex: R| {
         let recovery = settle_cleared_rename(
@@ -2532,9 +2624,16 @@ fn finish_rename_locked<C, R>(
     match before {
         Ok(true) => {}
         // The rows are already where the plan put them; a moved row's folded rows follow it.
+        // (#544, local Codex r1) A row moved unread across a parser, marked awaiting a reparse,
+        // is read once here, and that read's own result decides the row and the sweep.
         Ok(false) if matches!(plan, RenamePlan::MoveRowUnknown(_)) => {
+            let new_requires_real_key = if unread_move_awaits {
+                read_destination_again(ctx, &mut reindex, (old_rel, new_rel))
+            } else {
+                true
+            };
             sweep_legacy_row(db, kb_path, old_rel, false);
-            sweep_legacy_row(db, kb_path, new_rel, true);
+            sweep_legacy_row(db, kb_path, new_rel, new_requires_real_key);
             return;
         }
         // Dropping swept the folded rows as a removal; leaving touches nothing.
@@ -2552,7 +2651,7 @@ fn finish_rename_locked<C, R>(
     let outcome = rename(ctx);
     let failed = outcome.is_err();
     let settled = rename_outcome_is_settled(&outcome);
-    let unreindexed = matches!(outcome, Ok(indexer::RenameOutcome::RenamedButNotReindexed));
+    let kept = kept_row(&outcome);
     log_rename_outcome(old_rel, new_rel, outcome);
     if cleared
         && failed
@@ -2568,12 +2667,9 @@ fn finish_rename_locked<C, R>(
             OnDisk::Gone => {
                 log_written_path_gone(new_rel, deindex_removed_path(db, kb_path, new_rel));
             }
-            OnDisk::Present if unreindexed => {
-                if let Some(reindex) = reindex.take() {
-                    let result = reindex(ctx);
-                    new_requires_real_key = sweep_requires_real_key(&result);
-                    log_rename_read_again(old_rel, new_rel, result);
-                }
+            on_disk if reads_destination_again(kept, on_disk) => {
+                new_requires_real_key =
+                    read_destination_again(ctx, &mut reindex, (old_rel, new_rel));
             }
             OnDisk::Present | OnDisk::Unknown(_) => {}
         }
@@ -2586,11 +2682,13 @@ fn finish_rename_locked<C, R>(
 }
 
 /// (#544 Review Focus 4) The line [`finish_rename_locked`] prints after it read the destination
-/// of a rename again because the indexer's reparse wrote nothing.
+/// of a rename again because the rename did not index its content: the indexer's reparse wrote
+/// nothing, or (local Codex r1) the row was kept awaiting a reparse or moved unread across a
+/// parser.
 fn log_rename_read_again(old_rel: &str, new_rel: &str, result: Result<indexer::SingleResult>) {
     let what = read_again_outcome(&result);
     wdiag!(
-        "watcher: renamed {old_rel} -> {new_rel}, whose content the reparse did not index; read {new_rel} again: {what}"
+        "watcher: renamed {old_rel} -> {new_rel}, whose content the rename did not index; read {new_rel} again: {what}"
     );
 }
 
@@ -6748,6 +6846,212 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// The rename a test hands [`finish_rename_locked`] for a rename across a parser whose
+    /// reparse found bytes other than the ones its first read hashed: the source's row moves to
+    /// `new_rel` under [`indexer::HASH_AWAITING_REPARSE`], as
+    /// [`crate::indexer::rename_single_file`] leaves it.
+    fn move_row_awaiting(
+        db: &Database,
+        old_rel: &str,
+        new_rel: &str,
+    ) -> Result<indexer::RenameOutcome> {
+        db.rename_document(old_rel, new_rel, crate::db::FrontmatterTopic::Unread)?;
+        db.overwrite_content_hash(&[new_rel], indexer::HASH_AWAITING_REPARSE)?;
+        Ok(indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse)
+    }
+
+    /// (#544, local Codex r1) A rename across a parser (`b.txt` to `a.md`) that kept its row
+    /// awaiting a reparse, with the file still at `a.md` on the second look: `a.md` is read
+    /// again inside the same locks, once, and that read alone decides the row. Here it writes
+    /// the row; when it too cannot settle the bytes, the row stays awaiting.
+    #[test]
+    fn an_awaiting_rename_whose_destination_is_present_reads_it_again() {
+        for writes in [true, false] {
+            let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-awaiting-present");
+            std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+            let db = dir_rename_db(&["other.md"]);
+            db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+                .unwrap();
+            let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+            assert_eq!(plan, RenamePlan::Rename, "writes: {writes}");
+            let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+            assert!(matches!(before, Ok(true)), "{before:?}");
+            let mut reindexed = 0;
+            finish_rename_locked(
+                &db,
+                &kb,
+                ("b.txt", "a.md"),
+                WriteLook::Spelled,
+                (plan, before),
+                &mut reindexed,
+                |_| move_row_awaiting(&db, "b.txt", "a.md"),
+                |n| {
+                    *n += 1;
+                    if writes {
+                        write_fresh_row(&db, "a.md")
+                    } else {
+                        Ok(indexer::SingleResult::Skipped {
+                            reason: "changed between scan and read",
+                            frontmatter_unparsed: false,
+                        })
+                    }
+                },
+            );
+            assert_eq!(reindexed, 1, "writes: {writes}");
+            let want = if writes {
+                "fresh"
+            } else {
+                indexer::HASH_AWAITING_REPARSE
+            };
+            assert_eq!(
+                db.get_document_hash("a.md").unwrap().as_deref(),
+                Some(want),
+                "writes: {writes}"
+            );
+            assert_eq!(db.get_document_hash("b.txt").unwrap(), None);
+        }
+    }
+
+    /// (#544, local Codex r1) The same rename with the destination gone by the second look: the
+    /// row goes, and the destination is not read.
+    #[test]
+    fn an_awaiting_rename_whose_destination_is_gone_drops_the_row_unread() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-awaiting-gone");
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        let mut reindexed = 0;
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut reindexed,
+            |_| move_row_awaiting(&db, "b.txt", "a.md"),
+            |n| {
+                *n += 1;
+                write_fresh_row(&db, "a.md")
+            },
+        );
+        assert_eq!(reindexed, 0);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#544, local Codex r1) Which second looks read the destination of an unsettled rename
+    /// again: a reparse that wrote nothing, on a destination that is there; a row kept awaiting
+    /// a reparse, on a destination that is there or that the look could not tell (one attempt,
+    /// whose failure leaves the mark). A gone destination is never read, and an outcome that
+    /// kept no row reads nothing.
+    #[test]
+    fn the_second_look_reads_the_destination_again_for_the_kept_rows_only() {
+        use indexer::RenameOutcome as R;
+        let denied = OnDisk::Unknown(std::io::ErrorKind::PermissionDenied);
+        let cases: [(Result<R>, OnDisk, bool); 9] = [
+            (Ok(R::RenamedButNotReindexed), OnDisk::Present, true),
+            (Ok(R::RenamedButNotReindexed), denied, false),
+            (Ok(R::RenamedButNotReindexed), OnDisk::Gone, false),
+            (
+                Ok(R::RenamedAcrossParsersAwaitingReparse),
+                OnDisk::Present,
+                true,
+            ),
+            (Ok(R::RenamedAcrossParsersAwaitingReparse), denied, true),
+            (
+                Ok(R::RenamedAcrossParsersAwaitingReparse),
+                OnDisk::Gone,
+                false,
+            ),
+            (Ok(R::RenamedButRefused), OnDisk::Present, false),
+            (Ok(R::OldPathMissingAndRefused), denied, false),
+            (Err(anyhow::anyhow!("x")), OnDisk::Present, false),
+        ];
+        for (outcome, on_disk, want) in cases {
+            let label = format!("{outcome:?} {on_disk:?}");
+            assert_eq!(
+                reads_destination_again(kept_row(&outcome), on_disk),
+                want,
+                "{label}"
+            );
+        }
+    }
+
+    /// (#544, local Codex r1) A row moved unread across a parser (`a.md` to `a.txt`, the look at
+    /// `a.txt` failed), whose hash [`await_reparse_after_unread_move`] overwrote: `a.txt` is read
+    /// once inside the same locks, and that read decides the row.
+    #[test]
+    fn an_unread_move_across_a_parser_reads_the_destination_once() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unread-move-read");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let plan = rename_plan(&db, "a.md", "a.txt", OnDisk::Unknown(denied)).unwrap();
+        assert_eq!(plan, RenamePlan::MoveRowUnknown(denied));
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "a.txt", &plan);
+        let awaits =
+            await_reparse_after_unread_move(&db, &reg, "a.md", "a.txt", &plan, &before).unwrap();
+        assert!(awaits);
+        let mut reindexed = 0;
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("a.md", "a.txt"),
+            WriteLook::Spelled,
+            RenameStart {
+                plan,
+                before,
+                unread_move_awaits: awaits,
+            },
+            &mut reindexed,
+            |_| panic!("an unread move does not run the indexer's rename"),
+            |n| {
+                *n += 1;
+                write_fresh_row(&db, "a.txt")
+            },
+        );
+        assert_eq!(reindexed, 1);
+        assert_eq!(
+            db.get_document_hash("a.txt").unwrap().as_deref(),
+            Some("fresh")
+        );
+        assert_eq!(db.get_document_hash("a.md").unwrap(), None);
+    }
+
+    /// (#544, local Codex r1) A row moved unread within one parser (`a.md` to `b.md`) keeps its
+    /// own parser's chunks under its own hash: nothing marked it, so nothing reads it again.
+    #[test]
+    fn an_unread_move_within_one_parser_is_not_read_again() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-unread-move-same");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let plan = rename_plan(&db, "a.md", "b.md", OnDisk::Unknown(denied)).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "b.md", &plan);
+        let awaits =
+            await_reparse_after_unread_move(&db, &reg, "a.md", "b.md", &plan, &before).unwrap();
+        assert!(!awaits);
+        finish_rename_locked(
+            &db,
+            &kb,
+            ("a.md", "b.md"),
+            WriteLook::Spelled,
+            RenameStart {
+                plan,
+                before,
+                unread_move_awaits: awaits,
+            },
+            &mut (),
+            |_| panic!("an unread move does not run the indexer's rename"),
+            |_| panic!("a row moved within one parser must not be read again"),
+        );
+        assert_eq!(db.get_document_hash("b.md").unwrap().as_deref(), Some("h"));
     }
 
     /// The directory listings [`spelled_on_disk`] has made on this thread so far.
