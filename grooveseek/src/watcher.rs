@@ -2956,10 +2956,11 @@ fn awaits_reparse_at(db: &Database, rel: &str) -> bool {
 }
 
 /// (#552) The line [`finish_rename_locked`] prints when an indexer's rename across a parser
-/// failed after it moved the row, before it reads the destination again.
+/// failed after it moved the row, before it looks at the destination again: the look reads it,
+/// or drops the row unread when the file is gone.
 fn log_crossed_rename_failed_after_the_move(old_rel: &str, new_rel: &str) {
     wdiag!(
-        "watcher: rename {old_rel} -> {new_rel} failed after the row moved; read {new_rel} again"
+        "watcher: rename {old_rel} -> {new_rel} failed after the row moved; look at {new_rel} again"
     );
 }
 
