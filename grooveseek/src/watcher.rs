@@ -2586,8 +2586,8 @@ where
 /// ([`indexer::RenameOutcome::RenamedAcrossParsersAwaitingReparse`]) -- on a destination that
 /// is there, or that the second look could not tell ([`reads_destination_again`]) -- and for a
 /// row [`RenamePlan::MoveRowUnknown`] moved unread across a parser, whose hash
-/// [`await_reparse_after_unread_move`] overwrote (`start`'s `unread_move_awaits`). That read's
-/// own result decides the row: a read that cannot settle the bytes leaves the mark (D5).
+/// [`await_reparse_after_unread_move`] overwrote ([`RenameStart::unread_move_awaits`]). That
+/// read's own result decides the row: a read that cannot settle the bytes leaves the mark (D5).
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked<C, R>(
     db: &Database,
