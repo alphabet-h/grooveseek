@@ -2447,11 +2447,13 @@ fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
 /// disk at `new_rel` gets a row from its own reindex when that reindex writes one. The
 /// source's row is not moved onto it there.
 ///
-/// (#544 Review Focus 4, J2) The same plan, whose indexer's rename moved the source's row but
-/// whose reparse wrote nothing ([`indexer::RenameOutcome::RenamedButNotReindexed`]), with the
-/// file still at `new_rel` on the second look: `new_rel` is read again, once, by `reindex`, and
-/// its result alone decides the row. A rename that overwrote nothing ([`RenamePlan::Rename`])
-/// keeps the moved row as the indexer left it.
+/// (#544 Review Focus 4) A rename whose indexer's rename moved the source's row but whose
+/// reparse wrote nothing ([`indexer::RenameOutcome::RenamedButNotReindexed`]), with the file
+/// still at `new_rel` on the second look: `new_rel` is read again, once, by `reindex`, and its
+/// result alone decides the row. This holds for a plain [`RenamePlan::Rename`] as well as for
+/// [`RenamePlan::ClearDestinationThenRename`]: Windows delivers an overwriting rename as a
+/// removal of the destination followed by a plain rename, and a plain rename whose bytes left
+/// nothing to index would otherwise keep the source's old content under the new path.
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked<C, R>(
     db: &Database,
@@ -2466,8 +2468,8 @@ fn finish_rename_locked<C, R>(
     R: FnOnce(&mut C) -> Result<indexer::SingleResult>,
 {
     let cleared = plan == RenamePlan::ClearDestinationThenRename;
-    // Taken by the settlement of a failed overwrite or by the second read of one whose reparse
-    // wrote nothing; a rename reaches at most one of them.
+    // Taken by the settlement of a failed overwrite or by the second read of a rename whose
+    // reparse wrote nothing; a rename reaches at most one of them.
     let mut reindex = Some(reindex);
     let settle_cleared = |ctx: &mut C, reindex: R| {
         let recovery = settle_cleared_rename(
@@ -2511,38 +2513,34 @@ fn finish_rename_locked<C, R>(
     {
         settle_cleared(ctx, reindex);
     }
-    // At `new_rel` the sweep follows the real key in, as it does after a reindex, unless the
-    // second read left nothing to embed there (`sweep_requires_real_key`).
-    let mut require_real_key = true;
     if !settled {
         match written_path_on_disk(kb_path, new_rel, look) {
             OnDisk::Gone => {
                 log_written_path_gone(new_rel, deindex_removed_path(db, kb_path, new_rel));
             }
-            OnDisk::Present if cleared && unreindexed => {
+            OnDisk::Present if unreindexed => {
                 if let Some(reindex) = reindex.take() {
-                    let result = reindex(ctx);
-                    require_real_key = sweep_requires_real_key(&result);
-                    log_overwrite_read_again(old_rel, new_rel, result);
+                    log_rename_read_again(old_rel, new_rel, reindex(ctx));
                 }
             }
             OnDisk::Present | OnDisk::Unknown(_) => {}
         }
     }
-    // The file has left `old_rel` under every spelling.
+    // The file has left `old_rel` under every spelling; at `new_rel` the sweep
+    // follows the real key in, as it does after a reindex.
     sweep_legacy_row(db, kb_path, old_rel, false);
-    sweep_legacy_row(db, kb_path, new_rel, require_real_key);
+    sweep_legacy_row(db, kb_path, new_rel, true);
 }
 
 /// (#544 Review Focus 4) The line [`finish_rename_locked`] prints after it read the destination
-/// of an overwriting rename again because the indexer's reparse wrote nothing.
-fn log_overwrite_read_again(old_rel: &str, new_rel: &str, result: Result<indexer::SingleResult>) {
+/// of a rename again because the indexer's reparse wrote nothing.
+fn log_rename_read_again(old_rel: &str, new_rel: &str, result: Result<indexer::SingleResult>) {
     let what = match result {
         Ok(result) => format!("{result:?}"),
         Err(e) => format!("failed: {}", crate::embedder::body_free_message(&e)),
     };
     wdiag!(
-        "watcher: {new_rel} was overwritten by {old_rel}, whose content the reparse did not index; read {new_rel} again: {what}"
+        "watcher: renamed {old_rel} -> {new_rel}, whose content the reparse did not index; read {new_rel} again: {what}"
     );
 }
 
@@ -6457,11 +6455,12 @@ mod tests {
         );
     }
 
-    /// (#544 J2) A rename that overwrote nothing, whose reparse wrote nothing: the destination
-    /// is not read again. The row the indexer's rename moved stays with its old content, as
-    /// the indexer's contract has it.
+    /// (#544 Review Focus 4) A rename that overwrote nothing, whose reparse wrote nothing (the
+    /// shape an overwrite takes on Windows, after the destination's removal dropped its row):
+    /// the destination is read again, and that reindex decides the row. Here it finds nothing
+    /// to embed, so the source's old content is not left at `a.md`.
     #[test]
-    fn a_plain_rename_whose_reparse_wrote_nothing_is_not_read_again() {
+    fn a_plain_rename_whose_reparse_wrote_nothing_reads_the_destination_again() {
         let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-plain-unreindexed");
         std::fs::write(kb.join("a.md"), "").unwrap();
         let db = dir_rename_db(&["other.md"]);
@@ -6485,11 +6484,11 @@ mod tests {
                 drop_row_nothing_to_index(&db, "a.md")
             },
         );
-        assert_eq!(reindexed, 0);
-        assert_eq!(db.get_document_hash("a.md").unwrap().as_deref(), Some("hb"));
+        assert_eq!(reindexed, 1);
+        assert_eq!(db.get_document_hash("a.md").unwrap(), None);
         assert_eq!(
             db.all_document_paths().unwrap(),
-            vec!["a.md".to_string(), "other.md".to_string()]
+            vec!["other.md".to_string()]
         );
     }
 
