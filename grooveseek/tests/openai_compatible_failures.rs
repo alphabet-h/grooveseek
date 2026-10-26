@@ -1049,6 +1049,62 @@ fn search_paths(fx: &common::embed_cli::Fixture, query: &str) -> Vec<String> {
         .collect()
 }
 
+/// #552: a text note that is Markdown too, with one heading the Markdown parser
+/// gives its section and the plain-text parser does not.
+const HARBOUR_NOTE: &str = "# Harbour\n\nThe tides turn twice a day at the harbour mouth.\n";
+
+/// #552: `groove index` pairs `note.txt` -> `note.md`, a rename that crosses a
+/// parser, moves the row, and the Markdown reparse fails on a 503 (one attempt,
+/// `max_retries = 0`), so the run stops. The row under `note.md` still holds
+/// the plain-text parser's chunks; the next `groove index` must read it again,
+/// as Markdown, rather than find its hash current and keep them.
+///
+/// Red before the fix: the second run counts `0 updated`, and the hit for the
+/// note carries no heading.
+#[test]
+fn a_cross_parser_rename_that_fails_on_a_503_is_read_again_by_the_next_index() {
+    let alpha = note("Alpha", ALPHA);
+    let fx = fixture(
+        "groove-i552-cross-503",
+        &[("alpha.md", alpha.as_str()), ("note.txt", HARBOUR_NOTE)],
+        &format!("max_retries = 0\n{TXT_AND_MD}"),
+    );
+    fx.index();
+    assert_eq!(fx.documents(), 2);
+
+    std::fs::rename(fx.kb().join("note.txt"), fx.kb().join("note.md")).expect("rename note.txt");
+    fx.answer_with(|_| reply(503, &[("Retry-After", "0")]));
+    let failed = fx.run_index();
+    fx.answer_normally();
+    let failed_stderr = stderr_of(&failed);
+    assert!(!failed.status.success(), "{failed_stderr}");
+    assert!(
+        failed_stderr.contains("failed to embed chunks for note.md"),
+        "the run was meant to fail on the crossed rename's embed:\n{failed_stderr}"
+    );
+
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("1 updated"),
+        "the next index did not read note.md again:\n{stderr}"
+    );
+    assert_eq!(fx.documents(), 2);
+    let hits = fx.search_json("tides harbour mouth");
+    let note_hit = hits
+        .get("results")
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.iter().find(|h| h["path"].as_str() == Some("note.md")))
+        .unwrap_or_else(|| panic!("no hit for note.md: {hits}"));
+    assert_eq!(
+        note_hit["heading"].as_str(),
+        Some("Harbour"),
+        "note.md still holds the plain-text parser's chunks: {note_hit}"
+    );
+    assert_dir_empty(&fx.cache);
+}
+
 /// A 503 whose body is cut short (the connection closes before the promised
 /// `Content-Length`) is still a 503: it is retried after the `Retry-After` its
 /// headers carried, and the retry succeeds.

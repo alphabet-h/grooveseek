@@ -10296,4 +10296,193 @@ mod tests {
             "the run left the check pending for a row its further read dropped"
         );
     }
+
+    /// #552: Markdown whose chunks under the Markdown parser are not the ones the plain-text
+    /// parser makes of the same bytes, so a row the text parser wrote is told apart from one
+    /// the Markdown parser wrote, and the reparse after a rename embeds rather than reuses.
+    const I552_BYTES: &[u8] = b"# Harbour\n\nThe tides turn twice a day at the harbour mouth.\n";
+
+    /// #552: Markdown that the Markdown parser makes no chunk of (a frontmatter-only stub), so
+    /// the reparse of a crossed rename ends in a skip, which the settlement answers by deleting
+    /// the row.
+    const I552_NO_CHUNK_BYTES: &[u8] = b"---\ntitle: x\n---\n";
+
+    /// #552: a scratch knowledge base holding `bytes` at `note.md`, and an index whose row for
+    /// `note.txt` holds what the plain-text parser made of the same bytes, under their hash:
+    /// the state a `note.txt` -> `note.md` rename leaves before anything reads it. The pair
+    /// crosses a parser.
+    fn i552_crossed_rename(tag: &str, bytes: &[u8]) -> (TmpDir, Database, Registry) {
+        let dir = mk_tmp(tag);
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&registry, "note.txt", "note.md"),
+            "the pair was meant to cross a parser"
+        );
+        std::fs::write(dir.0.join("note.md"), bytes).unwrap();
+        let txt_chunks = parse_doc(&registry, "txt", "note.txt", bytes).chunks;
+        write_row(&db, "note.txt", &sha256_hex_bytes(bytes), &txt_chunks);
+        (dir, db, registry)
+    }
+
+    /// #552: makes every delete of the `note.md` row fail, as a write the settlement of a
+    /// crossed rename makes would fail on a locked or full database.
+    fn i552_fail_deleting_note_md(db: &Database) {
+        db.execute_for_test(concat!(
+            "CREATE TABLE fault (armed INTEGER NOT NULL); INSERT INTO fault VALUES (1); ",
+            "CREATE TRIGGER inject_delete_failure BEFORE DELETE ON documents ",
+            "WHEN OLD.path = 'note.md' AND (SELECT armed FROM fault) = 1 ",
+            "BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;"
+        ))
+        .unwrap();
+    }
+
+    /// [`rebuild_index`] over `dir`, not forced, under Off mode, with a quiet reporter.
+    fn i552_rebuild(
+        db: &Database,
+        embedder: &mut Embedder,
+        dir: &TmpDir,
+        registry: &Registry,
+    ) -> Result<IndexResult> {
+        rebuild_index(
+            db,
+            embedder,
+            &dir.0,
+            None,
+            false,
+            None,
+            &[],
+            registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+            ContextMode::Off,
+        )
+    }
+
+    /// #552 (R2): a full run pairs `note.txt` -> `note.md`, a rename that crosses a parser,
+    /// moves the row, and then fails to embed the Markdown parser's chunks. The row under
+    /// `note.md` still holds the text parser's chunks, so it must not be left under the hash of
+    /// the bytes on disk: the next run would find the hash current and keep those chunks until
+    /// `--force`. Left awaiting a reparse instead, the next run reads it as Markdown.
+    ///
+    /// Red before the fix: the row keeps `sha256(bytes)`, and the next run counts it unchanged.
+    #[test]
+    fn i552_a_full_run_that_fails_to_embed_a_crossed_rename_leaves_it_awaiting() {
+        let (dir, db, registry) = i552_crossed_rename("i552-r2-embed", I552_BYTES);
+        assert_ne!(
+            stored_bodies(&db, "note.txt"),
+            parsed_bodies(&registry, "note.md", I552_BYTES),
+            "the two parsers were meant to make different chunks of the bytes"
+        );
+        let err = i552_rebuild(&db, &mut unreachable_embedder(), &dir, &registry)
+            .expect_err("the embed on the closed port was meant to fail the run");
+        assert!(
+            format!("{err:#}").contains("failed to embed chunks for note.md"),
+            "the run failed somewhere other than the crossed rename's embed: {err:#}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the moved row holds the old parser's chunks under a hash the fast path trusts"
+        );
+
+        let result = i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry)
+            .expect("the second run");
+        assert_eq!(
+            result.updated, 1,
+            "the second run did not reread note.md: {result:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(I552_BYTES))
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", I552_BYTES),
+            "the row's chunks are still the old parser's"
+        );
+    }
+
+    /// #552 (R3): a full run pairs the crossed rename, the Markdown parser makes no chunk of the
+    /// bytes, and the settlement's delete of the row fails. The row moved to `note.md` with the
+    /// text parser's chunks; it must not keep the hash of the bytes on disk.
+    ///
+    /// Red before the fix: the row keeps `sha256(bytes)`.
+    #[test]
+    fn i552_a_full_run_whose_crossed_settlement_fails_leaves_it_awaiting() {
+        let (dir, db, registry) = i552_crossed_rename("i552-r3-settle", I552_NO_CHUNK_BYTES);
+        i552_fail_deleting_note_md(&db);
+        let err = i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry)
+            .expect_err("the injected delete failure was meant to fail the run");
+        assert!(
+            format!("{err:#}").contains("injected"),
+            "the run failed somewhere other than the injected fault: {err:#}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the moved row holds the old parser's chunks under a hash the fast path trusts"
+        );
+    }
+
+    /// #552 (W4): the watcher's [`rename_single_file`] of `note.txt` -> `note.md`, a rename
+    /// that crosses a parser, moves the row and then fails to embed the Markdown parser's
+    /// chunks. The row under `note.md` must be left awaiting a reparse, not under the hash of
+    /// the bytes on disk.
+    ///
+    /// Red before the fix: the row keeps `sha256(bytes)`.
+    #[test]
+    fn i552_a_watcher_rename_that_fails_to_embed_across_a_parser_leaves_it_awaiting() {
+        let (dir, db, registry) = i552_crossed_rename("i552-w4-embed", I552_BYTES);
+        let err = rename_single_file(
+            &db,
+            &mut unreachable_embedder(),
+            &dir.0,
+            "note.txt",
+            "note.md",
+            None,
+            &registry,
+        )
+        .expect_err("the embed on the closed port was meant to fail the rename");
+        assert!(
+            format!("{err:#}").contains("failed to embed chunks for note.md"),
+            "the rename failed somewhere other than the embed: {err:#}"
+        );
+        assert_eq!(db.get_document_hash("note.txt").unwrap(), None);
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the moved row holds the old parser's chunks under a hash the fast path trusts"
+        );
+    }
+
+    /// #552 (W5): the watcher's [`rename_single_file`] of the crossed rename, the Markdown
+    /// parser makes no chunk of the bytes, and the settlement's delete of the row fails. The
+    /// row moved to `note.md` must be left awaiting a reparse.
+    ///
+    /// Red before the fix: the row keeps `sha256(bytes)`.
+    #[test]
+    fn i552_a_watcher_rename_whose_crossed_settlement_fails_leaves_it_awaiting() {
+        let (dir, db, registry) = i552_crossed_rename("i552-w5-settle", I552_NO_CHUNK_BYTES);
+        i552_fail_deleting_note_md(&db);
+        let err = rename_single_file(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            "note.txt",
+            "note.md",
+            None,
+            &registry,
+        )
+        .expect_err("the injected delete failure was meant to fail the rename");
+        assert!(
+            format!("{err:#}").contains("injected"),
+            "the rename failed somewhere other than the injected fault: {err:#}"
+        );
+        assert_eq!(db.get_document_hash("note.txt").unwrap(), None);
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the moved row holds the old parser's chunks under a hash the fast path trusts"
+        );
+    }
 }
