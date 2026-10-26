@@ -10672,4 +10672,46 @@ mod tests {
         assert_eq!(same_db.get_document_hash("a.md").unwrap(), None);
         assert_eq!(same_db.get_document_hash("b.md").unwrap(), Some(hash));
     }
+
+    /// #552 (final review): the watcher's [`rename_single_file`] of `note.txt` -> `note.md`, a
+    /// rename that crosses a parser, succeeds. The mark it writes before moving the row must
+    /// not outlive the reparse: the row ends under the hash of the bytes on disk, with the
+    /// Markdown parser's chunks, and nothing is left at `note.txt`.
+    ///
+    /// Red if the reparse's write does not put the bytes' hash over the mark: the row stays
+    /// under the sentinel and every later event reads it again.
+    #[test]
+    fn i552_a_watcher_rename_across_a_parser_that_succeeds_ends_under_the_bytes_hash() {
+        let (dir, db, registry) = i552_crossed_rename("i552-w-success", I552_BYTES);
+        assert_ne!(
+            stored_bodies(&db, "note.txt"),
+            parsed_bodies(&registry, "note.md", I552_BYTES),
+            "the two parsers were meant to make different chunks of the bytes"
+        );
+        let outcome = rename_single_file(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            "note.txt",
+            "note.md",
+            None,
+            &registry,
+        )
+        .expect("the crossed rename with a working embedder");
+        assert!(
+            matches!(outcome, RenameOutcome::RenamedAndReindexed { .. }),
+            "the rename did not reparse the moved row: {outcome:?}"
+        );
+        assert_eq!(db.get_document_hash("note.txt").unwrap(), None);
+        assert_eq!(
+            db.get_document_hash("note.md").unwrap(),
+            Some(sha256_hex_bytes(I552_BYTES)),
+            "the moved row did not end under the hash of the bytes on disk"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.md"),
+            parsed_bodies(&registry, "note.md", I552_BYTES),
+            "the row's chunks are not the Markdown parser's"
+        );
+    }
 }
