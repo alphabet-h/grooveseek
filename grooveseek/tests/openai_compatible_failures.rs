@@ -1050,8 +1050,10 @@ fn search_paths(fx: &common::embed_cli::Fixture, query: &str) -> Vec<String> {
 }
 
 /// #552: a text note that is Markdown too, with one heading the Markdown parser
-/// gives its section and the plain-text parser does not.
-const HARBOUR_NOTE: &str = "# Harbour\n\nThe tides turn twice a day at the harbour mouth.\n";
+/// gives its section and the plain-text parser does not. An H2: the Markdown
+/// parser starts a section at H2 and H3 only, so an H1 would leave the heading
+/// empty under both parsers.
+const HARBOUR_NOTE: &str = "## Harbour\n\nThe tides turn twice a day at the harbour mouth.\n";
 
 /// #552: `groove index` pairs `note.txt` -> `note.md`, a rename that crosses a
 /// parser, moves the row, and the Markdown reparse fails on a 503 (one attempt,
