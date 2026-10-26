@@ -2638,23 +2638,20 @@ fn log_crossed_row_dropped(old_rel: &str, new_rel: &str) {
 }
 
 /// (#544, local Codex r3, J3) The settlement of a further read of a row a rename across a parser
-/// left with the old parser's chunks: a result that read and checked the bytes on disk goes to
-/// [`indexer::settle_further_crossed_read`], the rule the rename's first read follows. A result
-/// that verified no bytes -- an error, or an unchanged or metadata-only answer, which a row
-/// under [`indexer::HASH_AWAITING_REPARSE`] does not get, and (local Codex r4) a skip for a
-/// read that failed inside the indexer -- touches nothing (D5). `true` when
-/// the row was dropped. A failure of the settlement is logged and the row is left as it was.
+/// left with the old parser's chunks: (local Codex r5) every result goes to
+/// [`indexer::settle_further_crossed_read`], which names the outcomes that may drop the row and
+/// keeps it under [`indexer::HASH_AWAITING_REPARSE`] on every other one. An error of the read
+/// checked no bytes and touches nothing (D5). `true` when the row was dropped. A failure of the
+/// settlement is logged and the row is left as it was.
 fn settle_crossed_read_again(
     db: &Database,
     new_rel: &str,
     result: &Result<indexer::SingleResult>,
 ) -> bool {
-    let verified = match result {
-        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed { .. })
-        | Err(_) => return false,
-        Ok(verified) => verified,
+    let Ok(outcome) = result else {
+        return false;
     };
-    match indexer::settle_further_crossed_read(db, new_rel, verified) {
+    match indexer::settle_further_crossed_read(db, new_rel, outcome) {
         Ok(dropped) => dropped,
         Err(e) => {
             wdiag!(
@@ -7253,6 +7250,55 @@ mod tests {
             Some(indexer::HASH_AWAITING_REPARSE),
             "the row went on bytes its read did not check"
         );
+    }
+
+    /// (#544, local Codex r5) Which results of the further read of a row a rename across a
+    /// parser kept awaiting (`b.txt` to `a.md`) drop it: a destination the read found gone (D1)
+    /// and one it measured over the size cap (J3) do; a skip whose reason the settlement does
+    /// not name, and an unchanged answer, keep it awaiting.
+    #[test]
+    fn a_crossed_further_read_drops_the_row_only_on_a_named_outcome() {
+        let skipped = |reason| indexer::SingleResult::Skipped {
+            reason,
+            frontmatter_unparsed: false,
+        };
+        let awaiting = Some(indexer::HASH_AWAITING_REPARSE);
+        let cases = [
+            (skipped("file no longer exists"), None),
+            (skipped("file too large"), None),
+            (skipped("a reason nobody named"), awaiting),
+            (indexer::SingleResult::Unchanged, awaiting),
+        ];
+        for (read, want) in cases {
+            let label = format!("{read:?}");
+            let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i544-awaiting-named");
+            std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+            let db = dir_rename_db(&["other.md"]);
+            db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+                .unwrap();
+            let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+            let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+            let mut reindexed = 0;
+            finish_rename_locked_checked(
+                &db,
+                &kb,
+                ("b.txt", "a.md"),
+                WriteLook::Spelled,
+                (plan, before),
+                &mut reindexed,
+                |_| move_row_awaiting(&db, "b.txt", "a.md"),
+                |n, _checked| {
+                    *n += 1;
+                    Ok(read)
+                },
+            );
+            assert_eq!(reindexed, 1, "{label}");
+            assert_eq!(
+                db.get_document_hash("a.md").unwrap().as_deref(),
+                want,
+                "{label}"
+            );
+        }
     }
 
     /// (#544, local Codex r4, D5) The further read of a row a rename across a parser left with

@@ -834,29 +834,55 @@ pub(crate) fn settle_cross_parser_rename(
     Ok(!keep_awaiting)
 }
 
-/// (#544, local Codex r4, D5) The settlement of a further read of a crossed rename this branch
-/// adds after the first read kept the row awaiting: [`read_crossed_rename_again`] in
-/// [`rebuild_index`], and the watcher's crossed rereads ([`crate::watcher`]). A read that
-/// checked no bytes -- it failed ([`SKIPPED_READ_FAILED`]) -- leaves the row as it is, under
-/// [`HASH_AWAITING_REPARSE`], for the next event or run. Every other result goes to
-/// [`settle_cross_parser_rename`]; a refusal among them is a fact about the file (over the size
-/// cap, a hard link, not a regular file), never a failed read, which is an error of its own.
-/// `Ok(true)` when the row was dropped.
+/// (#544, local Codex r4/r5, D5) The settlement of a further read of a crossed rename this
+/// branch adds after the first read kept the row awaiting: [`read_crossed_rename_again`] in
+/// [`rebuild_index`], and the watcher's crossed rereads ([`crate::watcher`]). Both ask the read
+/// to check its bytes against its own hash before parsing (`row_dropped_unless_updated` on
+/// [`index_single_disk_entry`]), and only results of such a read come here.
+///
+/// It names the outcomes that may drop the row; every other one keeps it under
+/// [`HASH_AWAITING_REPARSE`], for the next event or run. The row is dropped for:
+///
+/// - a result reached after the bytes were checked: [`SingleResult::NothingToIndex`] (the read
+///   already removed the row), and a [`SingleResult::Skipped`] for [`SKIPPED_PARSE_FAILED`],
+///   [`SKIPPED_NO_CHUNKS`] or [`SKIPPED_EMBED_REJECTED`]
+/// - a destination established gone: [`SKIPPED_FILE_GONE`] (#544 D1), and
+///   [`SingleResult::OutsideKnowledgeBaseDeindexed`], a path reached through a link, whose row
+///   the read already removed
+/// - a fact [`crate::links::read_checked`] or the size look established about the file (J3): [`SKIPPED_TOO_LARGE`]
+///   and [`SingleResult::Refused`] (over the cap, a hard link, not a regular file; a failed
+///   read is an error of its own, never a refusal)
+///
+/// Kept: [`SKIPPED_READ_FAILED`], [`SKIPPED_CHANGED_DURING_READ`], any other skip reason,
+/// [`SingleResult::Unchanged`], [`SingleResult::MetadataRefreshed`]. [`SingleResult::Updated`]
+/// wrote the row and is left alone. A new variant is a compile error here; a new skip reason
+/// keeps the row until it is named. `Ok(true)` when the row was dropped.
 pub(crate) fn settle_further_crossed_read(
     db: &Database,
     rel: &str,
     outcome: &SingleResult,
 ) -> Result<bool> {
-    if matches!(
-        outcome,
-        SingleResult::Skipped {
-            reason: SKIPPED_READ_FAILED,
-            ..
-        }
-    ) {
-        return Ok(false);
+    let drop = match outcome {
+        SingleResult::Updated { .. } => return Ok(false),
+        SingleResult::NothingToIndex { .. }
+        | SingleResult::OutsideKnowledgeBaseDeindexed
+        | SingleResult::Refused => true,
+        SingleResult::Skipped { reason, .. } => matches!(
+            *reason,
+            SKIPPED_PARSE_FAILED
+                | SKIPPED_NO_CHUNKS
+                | SKIPPED_EMBED_REJECTED
+                | SKIPPED_FILE_GONE
+                | SKIPPED_TOO_LARGE
+        ),
+        SingleResult::Unchanged | SingleResult::MetadataRefreshed { .. } => false,
+    };
+    if drop {
+        db.delete_document(rel)?;
+    } else {
+        db.overwrite_content_hash(&[rel], HASH_AWAITING_REPARSE)?;
     }
-    settle_cross_parser_rename(db, rel, outcome)
+    Ok(drop)
 }
 
 /// (#544, local Codex r1) The further read [`rebuild_index`] gives, once, before it returns, a
@@ -2578,6 +2604,19 @@ const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 /// row on it.
 const SKIPPED_READ_FAILED: &str = "read failed";
 
+/// The [`SingleResult::Skipped`] reason for bytes the parser rejected. Returned after the
+/// bytes were read and, for a caller that asked for it (`row_dropped_unless_updated` on
+/// [`index_single_disk_entry`]), checked against the read's hash.
+const SKIPPED_PARSE_FAILED: &str = "parse failed";
+
+/// The [`SingleResult::Skipped`] reason [`reindex_single_file_checked`] gives for a path whose
+/// look found no file there: the destination is established gone (#544 D1).
+const SKIPPED_FILE_GONE: &str = "file no longer exists";
+
+/// The [`SingleResult::Skipped`] reason [`reindex_single_file_checked`] gives for a file whose
+/// measured size is over the cap, before it reads it.
+const SKIPPED_TOO_LARGE: &str = "file too large";
+
 /// The [`SingleResult::Skipped`] reason the one-time frontmatter check (#251) returns when
 /// the bytes it read are not the bytes the scan hashed: the file was swapped between the
 /// two reads, so nothing about the retained row has been learned, and the skip keeps the
@@ -2923,7 +2962,7 @@ fn index_single_disk_entry(
         Err(e) => {
             eprintln!("Skipping {}: parse failed: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
-                reason: "parse failed",
+                reason: SKIPPED_PARSE_FAILED,
                 frontmatter_unparsed: false,
             });
         }
@@ -3430,7 +3469,7 @@ pub(crate) fn reindex_single_file_checked(
         }
         SinglePathLook::Missing => {
             return Ok(SingleResult::Skipped {
-                reason: "file no longer exists",
+                reason: SKIPPED_FILE_GONE,
                 frontmatter_unparsed: false,
             });
         }
@@ -3479,7 +3518,7 @@ pub(crate) fn reindex_single_file_checked(
             tracing::warn!("failed to record the grown size of {rel}: {e}");
         }
         return Ok(SingleResult::Skipped {
-            reason: "file too large",
+            reason: SKIPPED_TOO_LARGE,
             frontmatter_unparsed: false,
         });
     }
@@ -10091,6 +10130,47 @@ mod tests {
             db.get_document_hash("note.md").unwrap().as_deref(),
             Some(HASH_AWAITING_REPARSE),
             "a further read that checked no bytes dropped the row, or left a hash a fast path trusts"
+        );
+    }
+
+    /// #544 PR-2 (local Codex r5): the further read of a crossed rename kept awaiting comes back
+    /// with a skip its settlement does not name as one that may drop the row (here an extension
+    /// no parser takes, decided before any byte is read). The row stays, under the
+    /// awaiting-reparse hash.
+    #[test]
+    fn a_further_crossed_read_with_an_unnamed_skip_keeps_the_row_awaiting() {
+        let dir = mk_tmp("i544-cx5-unnamed-skip");
+        let db = reparse_db();
+        write_row(&db, "note.xyz", HASH_AWAITING_REPARSE, &[]);
+        let full = dir.0.join("note.xyz");
+        std::fs::write(&full, SCANNED_BYTES).unwrap();
+        let entry = DiskEntry {
+            rel: "note.xyz".to_string(),
+            hash: sha256_hex_bytes(SCANNED_BYTES),
+            full,
+            size: SCANNED_BYTES.len() as u64,
+        };
+        let result = read_crossed_rename_again(
+            &db,
+            &mut unreachable_embedder(),
+            &entry,
+            None,
+            &docx_registry(),
+            ContextMode::Off,
+            DeclaredSet::FromIndex,
+        )
+        .unwrap();
+        assert!(
+            matches!(result, SingleResult::Skipped { reason, .. }
+                if !matches!(reason, "parse failed" | SKIPPED_NO_CHUNKS | SKIPPED_EMBED_REJECTED
+                    | "file no longer exists" | "file too large")),
+            "the read was meant to end in a skip the settlement does not name: {result:?}"
+        );
+        assert!(!settle_further_crossed_read(&db, "note.xyz", &result).unwrap());
+        assert_eq!(
+            db.get_document_hash("note.xyz").unwrap().as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "a skip nobody named dropped the row"
         );
     }
 
