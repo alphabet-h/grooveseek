@@ -815,11 +815,11 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// settled by [`settle_further_crossed_read`] (#544, local Codex r4/r5). `Ok(true)` when the
 /// row was dropped.
 ///
-/// (#552) Both callers (the second through [`reindex_renamed_entry`] and its refusal exits)
-/// overwrite the old row's hash with [`HASH_AWAITING_REPARSE`] before the
-/// rename moves it ([`rebuild_index`] for every pair that crosses a parser, and
-/// [`rename_single_file`] for its one rename), so when either calls this the row already holds
-/// the sentinel; what this does with the outcome is the same as before the mark.
+/// (#552) Both callers overwrite the old row's hash with [`HASH_AWAITING_REPARSE`] before the
+/// rename moves it: [`rebuild_index`] for every pair that crosses a parser, and
+/// [`rename_single_file`] for its one rename (which then reaches this through its refusal exits
+/// and through [`reindex_renamed_entry`]). So when either calls this the row already holds the
+/// sentinel; what this does with the outcome is the same as before the mark.
 pub(crate) fn settle_cross_parser_rename(
     db: &Database,
     rel: &str,
