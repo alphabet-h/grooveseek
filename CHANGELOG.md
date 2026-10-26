@@ -35,8 +35,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   A file that changed between the two reads and then went back to the bytes the scan saw kept the
   second read's chunks until a full `--force`, since the hashes matched. A rename into another
   parser (`.md` to `.txt`, say) whose second read caught the file mid-write dropped the document's
-  row. In the live watcher, renaming an empty file over an indexed one kept the destination's old
-  content under its path, and a rename whose destination could not be looked at moved the row
+  row. In the live watcher, renaming an empty file over an indexed one kept the moved file's earlier
+  content under the new path, and a rename whose destination could not be looked at moved the row
   into another parser without reading it, so the old parser's chunks stayed until `--force`. The
   row now takes the hash of the bytes it was indexed from; a cross-parser rename whose second read
   differs keeps the row marked to be read again on the next event or run, as does a cross-parser
