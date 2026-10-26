@@ -3803,7 +3803,7 @@ pub fn rename_single_file(
     )
 }
 
-/// The reparse [`rename_single_file`] ends with, once the row has moved to `entry.rel` and the
+/// The reparse [`rename_single_file`] ends with, once the row has moved to the entry's [`DiskEntry::rel`] and the
 /// first read's bytes and hash are in `entry`: [`index_single_disk_entry`] in `mode`, the
 /// settlement of a rename that crossed a parser ([`settle_cross_parser_rename`]), and the
 /// outcome that says what became of the row. A function of its own so that a test can hand it
@@ -9116,7 +9116,7 @@ mod tests {
     const SCANNED_BYTES: &[u8] = b"# Gamma\n\nThe one section the scan read.\n";
 
     /// #544 PR-2: [`index_single_disk_entry`] on `entry` in `mode`, under Off mode with no
-    /// declared fields, through `embedder`, with `row_dropped_unless_updated` as the caller
+    /// declared fields, through the embedder it is handed, with `row_dropped_unless_updated` as the caller
     /// passes it. [`reindex`] with the two arguments it fixes left to the test.
     fn reindex_with(
         db: &Database,

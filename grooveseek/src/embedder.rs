@@ -1537,8 +1537,9 @@ impl Reranker {
 }
 
 /// (#544 PR-2, J1) A provider that answers every input in process with one fixed vector of its
-/// dimension, for the lib's unit tests of writes that embed: `Reindex::Force` reads no stored
-/// vectors and embeds every chunk, which the closed-port embedder of the indexer's tests cannot.
+/// dimension, for the lib's unit tests of writes that embed:
+/// [`crate::indexer::Reindex::Force`] reads no stored vectors and embeds every chunk, which the
+/// closed-port embedder of the indexer's tests cannot.
 #[cfg(test)]
 struct FixedVectorProvider {
     dimension: usize,
@@ -1567,7 +1568,7 @@ impl EmbeddingProvider for FixedVectorProvider {
 #[cfg(test)]
 impl Embedder {
     /// (#544 PR-2, J1) An embedder that uses no network and answers each input with the same
-    /// `dimension`-long vector, under the identity `test-model` the indexer's test databases
+    /// vector, as long as the dimension it is given, under the identity `test-model` the indexer's test databases
     /// declare. Its counts move as the real ones do: [`Embedder::embed_texts`] is the same code.
     pub(crate) fn stub_for_tests(dimension: usize) -> Self {
         Self::from_provider(

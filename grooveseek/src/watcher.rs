@@ -2496,7 +2496,7 @@ fn log_rename_failed(old_rel: &str, new_rel: &str, e: &anyhow::Error) {
 ///
 /// (#544 Review Focus 4) A rename whose indexer's rename moved the source's row but whose
 /// reparse wrote nothing ([`indexer::RenameOutcome::RenamedButNotReindexed`]), with the file
-/// still at `new_rel` on the second look: `new_rel` is read again, once, by `reindex`, and its
+/// still at `new_rel` on the second look: `new_rel` is read again, once, by the caller's reindex closure, and its
 /// result alone decides the row. This holds for a plain [`RenamePlan::Rename`] as well as for
 /// [`RenamePlan::ClearDestinationThenRename`]: Windows delivers an overwriting rename as a
 /// removal of the destination followed by a plain rename, and a plain rename whose bytes left
@@ -6547,7 +6547,7 @@ mod tests {
 
     /// The rename a test hands [`finish_rename_locked`] for an indexer's rename whose reparse
     /// wrote nothing: the source's row moves to `new_rel` with its old content, as
-    /// `rename_single_file` leaves it.
+    /// [`crate::indexer::rename_single_file`] leaves it.
     fn move_row_unreindexed(
         db: &Database,
         old_rel: &str,
