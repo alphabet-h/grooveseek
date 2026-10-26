@@ -39,8 +39,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   content under the new path, and a rename whose destination could not be looked at moved the row
   into another parser without reading it, so the old parser's chunks stayed until `--force`. The
   row now takes the hash of the bytes it was indexed from; a cross-parser rename whose second read
-  differs keeps the row marked to be read again on the next event or run, as does a cross-parser
-  rename whose destination cannot be looked at; and a watcher rename whose reindex wrote nothing
+  differs keeps the row, reads the file once more in the same watcher event or index run, and
+  leaves the row marked to be read again on the next event or run when that read cannot index it
+  either, as does a cross-parser rename whose destination cannot be looked at; and a watcher rename whose reindex wrote nothing
   reads the destination again, so moved content with nothing to index drops the row, as for a file
   emptied in place. The last point applies to renames the watcher handles only: the Rust
   library's `rename_single_file` still returns `RenamedButNotReindexed` and keeps the old content
