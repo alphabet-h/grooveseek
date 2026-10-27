@@ -1900,14 +1900,14 @@ dependencies = [
 
 [[package]]
 name = "groove-grammar-abi"
-version = "1.21.2"
+version = "1.21.3"
 dependencies = [
  "tree-sitter-language",
 ]
 
 [[package]]
 name = "groove-grammar-php"
-version = "1.21.2"
+version = "1.21.3"
 dependencies = [
  "groove-grammar-abi",
  "tree-sitter-php",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "groove-grammar-python"
-version = "1.21.2"
+version = "1.21.3"
 dependencies = [
  "groove-grammar-abi",
  "tree-sitter-python",
@@ -1923,11 +1923,11 @@ dependencies = [
 
 [[package]]
 name = "groove-svc"
-version = "1.21.2"
+version = "1.21.3"
 
 [[package]]
 name = "groove-tray"
-version = "1.21.2"
+version = "1.21.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "grooveseek"
-version = "1.21.2"
+version = "1.21.3"
 dependencies = [
  "anyhow",
  "axum",
