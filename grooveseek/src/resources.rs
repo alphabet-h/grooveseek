@@ -183,6 +183,16 @@ pub fn doc_is_addressable(rel: &str) -> bool {
         && !rel.split('/').any(|seg| seg.is_empty() || seg == ".")
 }
 
+/// (ADR-0023) Whether a relative path is one the index can hold, so nothing
+/// turns it away for its name: [`doc_is_addressable`], except that the empty
+/// string passes too. The empty string is the knowledge base itself, which is
+/// no document name and is left to the callers' other checks rather than
+/// refused here. The index walk, the watcher's write gate and its removal gate
+/// all ask this one question through this one function.
+pub(crate) fn rel_is_indexable_name(rel: &str) -> bool {
+    rel.is_empty() || doc_is_addressable(rel)
+}
+
 /// A decoded path may be used against the knowledge base only if it stays
 /// inside it and names something on this side of the OS's path syntax.
 ///
@@ -721,6 +731,41 @@ mod tests {
                 "{rel:?}"
             );
         }
+    }
+
+    /// (kuriya 548, GitHub Codex r2) [`rel_is_indexable_name`] gives the answer each
+    /// caller used to work out by hand: the index walk's leave-out test, the watcher's
+    /// write-gate name test and its removal gate's early pass, the last two the negation.
+    /// The empty string passes; everything else follows [`doc_is_addressable`].
+    #[test]
+    fn i548_a_path_is_an_indexable_name_exactly_when_it_is_addressable_or_the_root() {
+        let mut names = vec![
+            "",
+            "notes/a.md",
+            "日本語/メモ.md",
+            "a b/c#d.md",
+            "../a.md",
+            "a/../b.md",
+            "/abs.md",
+            "a\\..\\b.md",
+            "C:/note.md",
+            "./a.md",
+            "a//b.md",
+            "a/",
+            ".",
+        ];
+        if cfg!(windows) {
+            names.extend(["b.md.", "dir./x.md", "a<b.md", "a.b.md"]);
+        }
+        for rel in names {
+            let left_out_by_walk = !rel.is_empty() && !doc_is_addressable(rel);
+            let write_gate_holds = rel.is_empty() || doc_is_addressable(rel);
+            assert_eq!(rel_is_indexable_name(rel), write_gate_holds, "{rel:?}");
+            assert_eq!(rel_is_indexable_name(rel), !left_out_by_walk, "{rel:?}");
+        }
+        assert!(rel_is_indexable_name(""));
+        assert!(!doc_is_addressable(""));
+        assert!(!rel_is_indexable_name("a//b.md"));
     }
 
     /// (ADR-0023, AW-42) A `.` segment or an empty one is another spelling of

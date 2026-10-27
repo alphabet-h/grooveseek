@@ -874,6 +874,10 @@ fn removal_outcome_for(
 
 /// The action of [`removal_outcome`] once the disk has been looked at, split out so a test can hand it an
 /// [`OnDisk::Unknown`] that no file system makes on demand.
+///
+/// The reindex asks [`crate::resources::doc_is_addressable`], not
+/// [`crate::resources::rel_is_indexable_name`]: whether `rel` may be written as a row is a
+/// different question, and the empty key (the knowledge base itself) never can be.
 fn removal_decision_for(
     rel: &str,
     full: &Path,
@@ -882,7 +886,6 @@ fn removal_decision_for(
     on_disk: OnDisk,
 ) -> RemovalAction {
     if on_disk == OnDisk::Present
-        && !rel.is_empty()
         && crate::resources::doc_is_addressable(rel)
         && should_process_parts(rel, full, registry, rules)
     {
@@ -938,7 +941,7 @@ fn removal_dispatch(
 /// [`Gate::Removal`], and [`removal_dispatch`] calls it to skip the look inside the locks, so
 /// the two answer from one test; the empty key (the knowledge base itself) is not one.
 fn removal_gate_passes_by_name(rel: &str) -> bool {
-    !rel.is_empty() && !crate::resources::doc_is_addressable(rel)
+    !crate::resources::rel_is_indexable_name(rel)
 }
 
 /// What [`decide_removal_in_locks`] did.
@@ -1722,7 +1725,7 @@ fn gate_parts(
 /// this relativizing. The empty string is the knowledge base itself, which is
 /// no document name and is turned away elsewhere.
 fn name_is_addressable(rel: &str, full: &Path, is_dir: bool) -> bool {
-    if rel.is_empty() || crate::resources::doc_is_addressable(rel) {
+    if crate::resources::rel_is_indexable_name(rel) {
         return true;
     }
     wdiag!(
