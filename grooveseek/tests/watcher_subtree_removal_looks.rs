@@ -85,7 +85,7 @@ fn wait_for_line(guard: &ServerGuard, needle: &str) -> (bool, Vec<String>) {
     (seen, stderr_lines(guard))
 }
 
-/// The `path` of every hit `groove search` returns for `query`.
+/// The document path of every hit `groove search` returns for `query`.
 fn hit_paths(fx: &Fixture, query: &str) -> Vec<String> {
     let hits = fx.search_json(query);
     hits.get("results")
