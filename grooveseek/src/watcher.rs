@@ -1877,11 +1877,13 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 /// handled as one that found the path gone: the rows go, no reindex runs, and one line names
 /// why the look failed.
 ///
-/// (#543, GitHub codex r1 P2) This path keeps the rows, where a plain removal drops them, only
-/// when the file is there under the exact spelling ([`OnDisk::Present`]) **and** the reindex
-/// says the rows now hold it ([`settle_removal_reindex`]). Every other answer of the reindex
-/// -- a skip whatever its reason, a refusal, an error -- drops the rows as a removal does,
-/// whatever the disk shows afterwards.
+/// (kuriya 549) After the reindex, [`settle_removal_reindex_looked`] decides. A result that
+/// settles the row (written, unchanged, or dropped by the indexer, as for an empty file or a
+/// frontmatter-only stub) is taken as it is. Any other answer -- a skip whatever its reason,
+/// a refusal, an error -- is looked at again: the rows go as a removal drops them only when the
+/// path is gone by then, and stay as they were while the file is there or the look cannot
+/// tell, as a write and `groove index` keep them. Before kuriya 549 (#543, GitHub codex r1 P2)
+/// every such answer dropped the rows whatever the disk showed afterwards.
 ///
 /// Only the remove path calls this. (#544) A create, modify or rename-to looks at the disk
 /// inside the locks too, with its own answers ([`ReindexOrigin::Write`]).
@@ -1917,22 +1919,35 @@ fn reindex_after_removal_locked(
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    match settle_removal_reindex(db, &state.kb_path, rel, &result) {
-        RemovalReindexSettled::Kept => {
+    let settled = settle_removal_reindex_looked(db, &state.kb_path, rel, &result, || {
+        removed_path_on_disk(&state.kb_path, rel)
+    });
+    match settled {
+        RemovalSettled::Settled(RemovalReindexSettled::Kept) => {
             log_reindex_result(rel, result, texts_before, embedder);
             sweep_legacy_row(db, &state.kb_path, rel, true);
         }
-        RemovalReindexSettled::IndexerDeindexed(folded) => {
+        RemovalSettled::Settled(RemovalReindexSettled::IndexerDeindexed(folded)) => {
             log_reindex_result(rel, result, texts_before, embedder);
             log_folded_sweep(rel, folded);
         }
-        RemovalReindexSettled::Deindexed { reason, outcome } => {
+        RemovalSettled::Settled(RemovalReindexSettled::Deindexed { reason, outcome }) => {
             log_replacement_not_indexed(rel, &reason, outcome);
+        }
+        RemovalSettled::LeftIndexed {
+            reason,
+            unknown,
+            held_row,
+            folded,
+        } => {
+            log_replacement_left_indexed(rel, &reason, unknown, held_row);
+            log_folded_sweep(rel, folded);
         }
     }
 }
 
-/// What [`settle_removal_reindex`] did after the reindex a remove event ran.
+/// What [`settle_removal_reindex`] did after the reindex a remove event ran. (kuriya 549) The
+/// dispatch gets it inside [`RemovalSettled::Settled`].
 #[derive(Debug)]
 enum RemovalReindexSettled {
     /// The rows now hold what is on disk: nothing more was done.
@@ -1951,13 +1966,18 @@ enum RemovalReindexSettled {
 
 /// (#543, GitHub codex r1 P2) After [`dispatch_reindex_after_removal`]'s reindex: the rows are
 /// left only when the reindex says they now hold the file on disk (`Updated`, `Unchanged`,
-/// `MetadataRefreshed`). Any other answer -- a skip for whatever reason (an empty file, a
-/// frontmatter-only stub), a refusal, an error -- would leave the old document's rows
-/// standing, since a skipped reindex does not delete them and the `Create` that follows takes
-/// the same skip; so they go here, as the remove event dropped them before #543. A result whose
-/// row the indexer already dropped only has its folded row swept, so no second line names it.
-/// An error's reason goes through [`crate::embedder::body_free_message`], so no document text
-/// reaches the log.
+/// `MetadataRefreshed`). Any other answer -- a skip whatever its reason, a refusal, an error --
+/// drops them, as the remove event dropped them before #543. A result whose row the indexer
+/// already dropped only has its folded row swept, so no second line names it. An error's
+/// reason goes through [`crate::embedder::body_free_message`], so no document text reaches the
+/// log.
+///
+/// (kuriya 549) The dispatch calls this through [`settle_removal_reindex_looked`], only for a
+/// result that settled the row, and for one that did not once a second look found the path
+/// gone. A skip, refusal or error with the file still there (or a look that cannot tell) no
+/// longer reaches it: the row stays, as `groove index` keeps it. The examples the r1 P2 named,
+/// an empty file and a frontmatter-only stub, come back as
+/// [`indexer::SingleResult::NothingToIndex`], a settled result, and are still dropped here.
 ///
 /// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
 fn settle_removal_reindex(
@@ -2000,6 +2020,113 @@ fn settle_removal_reindex(
             reason: format!("reindex failed: {}", crate::embedder::body_free_message(e)),
             outcome: deindex_removed_path(db, kb_path, rel),
         },
+    }
+}
+
+/// What [`settle_removal_reindex_looked`] did after the reindex a remove event ran.
+#[derive(Debug)]
+enum RemovalSettled {
+    /// The reindex settled the row, or it did not and the second look found the path gone:
+    /// what [`settle_removal_reindex`] did.
+    Settled(RemovalReindexSettled),
+    /// The reindex did not settle the row and the second look did not find the path gone:
+    /// the row was left as it was. The reason field says why the file was not indexed, with no
+    /// document text in it; `unknown` holds the kind of the failed look when the look could not
+    /// tell, and is `None` when it found the file there. `held_row` says whether a row was
+    /// under `rel` to keep. `folded` is the folded-row sweep's result, run in the write form
+    /// (only when the real key holds a row), as after a write that left the row
+    /// ([`WriteReindexSettled::LeftAsIs`]): never the removal form, which would drop a folded
+    /// row that is all the index holds for a file still there.
+    LeftIndexed {
+        reason: String,
+        unknown: Option<std::io::ErrorKind>,
+        held_row: Result<bool>,
+        folded: Result<bool>,
+    },
+}
+
+/// (kuriya 549) After [`dispatch_reindex_after_removal`]'s reindex: a result that settled the
+/// row ([`write_reindex_settled_the_row`]) goes to [`settle_removal_reindex`] with no second
+/// look. One that did not -- a skip whatever its reason, a refusal, an error -- is looked at
+/// again (`relook`), as [`settle_write_reindex`] does for a write: a path gone by then drops
+/// its rows through [`settle_removal_reindex`], as before; a file still there, or a look that
+/// cannot tell, leaves the row as it was, as `groove index` does when it skips a file (a size
+/// cap, a read or parse failure, an embedding refusal or error); only the folded row is swept
+/// then, in the write form. Split out of the dispatch so a test can run it with no
+/// [`crate::embedder::Embedder`].
+fn settle_removal_reindex_looked(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    result: &Result<indexer::SingleResult>,
+    relook: impl FnOnce() -> OnDisk,
+) -> RemovalSettled {
+    if write_reindex_settled_the_row(result) {
+        return RemovalSettled::Settled(settle_removal_reindex(db, kb_path, rel, result));
+    }
+    let unknown = match relook() {
+        OnDisk::Gone => {
+            return RemovalSettled::Settled(settle_removal_reindex(db, kb_path, rel, result));
+        }
+        OnDisk::Present => None,
+        OnDisk::Unknown(kind) => Some(kind),
+    };
+    let held_row = db.get_document_hash(rel).map(|hash| hash.is_some());
+    RemovalSettled::LeftIndexed {
+        reason: unsettled_reindex_reason(result),
+        unknown,
+        held_row,
+        folded: indexer::sweep_legacy_folded_row(db, kb_path, rel, true),
+    }
+}
+
+/// Why a reindex left the row as it was, in the words [`settle_removal_reindex`] uses for the
+/// same result: the skip's reason, `refused`, or the error with no document text in it
+/// ([`crate::embedder::body_free_message`]). Only called for a result
+/// [`write_reindex_settled_the_row`] answered false for; a settled one has no such reason and
+/// gets an empty string.
+fn unsettled_reindex_reason(result: &Result<indexer::SingleResult>) -> String {
+    match result {
+        Ok(indexer::SingleResult::Skipped { reason, .. }) => (*reason).to_string(),
+        Ok(indexer::SingleResult::Refused) => "refused".to_string(),
+        Err(e) => format!("reindex failed: {}", crate::embedder::body_free_message(e)),
+        // Each named, not a catch-all, so a new variant stays a compile error (#251's way).
+        Ok(
+            indexer::SingleResult::Updated { .. }
+            | indexer::SingleResult::Unchanged
+            | indexer::SingleResult::MetadataRefreshed { .. }
+            | indexer::SingleResult::NothingToIndex { .. }
+            | indexer::SingleResult::OutsideKnowledgeBaseDeindexed,
+        ) => String::new(),
+    }
+}
+
+/// (kuriya 549) The line [`dispatch_reindex_after_removal`] prints when the replacement was not
+/// indexed and the row was left as it was ([`RemovalSettled::LeftIndexed`]). Worded apart from
+/// [`log_replacement_not_indexed`]'s, which says the row went.
+fn left_indexed_message(rel: &str, reason: &str, unknown: Option<std::io::ErrorKind>) -> String {
+    match unknown {
+        None => format!(
+            "watcher: {rel} was removed and written again, but the new file was not indexed ({reason}); the index keeps its previous text"
+        ),
+        Some(kind) => format!(
+            "watcher: {rel} was removed and written again, but the new file was not indexed ({reason}); could not tell whether {rel} is still there ({kind}), so the index keeps its previous text"
+        ),
+    }
+}
+
+/// What [`dispatch_reindex_after_removal`] says for [`RemovalSettled::LeftIndexed`]. When no
+/// row was there, only the skip is reported, as [`log_replacement_not_indexed`] does; a row
+/// count that failed reads as a row kept, since nothing was deleted either way.
+fn log_replacement_left_indexed(
+    rel: &str,
+    reason: &str,
+    unknown: Option<std::io::ErrorKind>,
+    held_row: Result<bool>,
+) {
+    match held_row {
+        Ok(false) => wdiag!("watcher: skipped {rel} ({reason})"),
+        Ok(true) | Err(_) => wdiag!("{}", left_indexed_message(rel, reason, unknown)),
     }
 }
 
@@ -4977,6 +5104,313 @@ mod tests {
                 vec!["other.md".to_string()]
             );
         }
+    }
+
+    /// A temp KB holding `doc.md`, removed on drop. The disk is not what the settle tests
+    /// decide on (the relook closure is), but the file is there as it is when they run.
+    struct I549Kb(std::path::PathBuf);
+    impl Drop for I549Kb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn i549_kb(prefix: &str) -> I549Kb {
+        let kb = crate::test_support::unique_temp_path(prefix);
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("doc.md"), "# doc\n\nbody\n").unwrap();
+        I549Kb(kb)
+    }
+
+    /// The results of a reindex that did not settle the row (S4-S12 of the plan's table S),
+    /// each with a part of the reason the line names.
+    fn i549_unsettled_results() -> Vec<(Result<indexer::SingleResult>, &'static str)> {
+        let skipped = |reason: &'static str| {
+            (
+                Ok(indexer::SingleResult::Skipped {
+                    reason,
+                    frontmatter_unparsed: false,
+                }),
+                reason,
+            )
+        };
+        vec![
+            skipped("file no longer exists"),
+            skipped("file too large"),
+            skipped("read failed"),
+            skipped("parse failed"),
+            skipped("changed between scan and read"),
+            skipped("embedding endpoint rejected the input"),
+            skipped("a reason added later"),
+            (Ok(indexer::SingleResult::Refused), "refused"),
+            (
+                Err(anyhow::anyhow!("embedding endpoint returned HTTP 503")),
+                "reindex failed: embedding endpoint returned HTTP 503",
+            ),
+        ]
+    }
+
+    /// (kuriya 549) A removal reindex that did not settle the row, with the file still there
+    /// at the second look, leaves the row (and every other row) as it was and says why, in the
+    /// words the deindexing settle uses for the same result.
+    #[test]
+    fn i549_an_unsettled_removal_reindex_keeps_the_row_while_the_file_is_there() {
+        let kb = i549_kb("groove-watcher-i549-present");
+        for (result, reason_part) in &i549_unsettled_results() {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let mut looked = 0;
+            let settled = settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, || {
+                looked += 1;
+                OnDisk::Present
+            });
+            assert_eq!(looked, 1, "{result:?}: looked at again once");
+            match &settled {
+                RemovalSettled::LeftIndexed {
+                    reason,
+                    unknown: None,
+                    held_row: Ok(true),
+                    folded: Ok(false),
+                } => assert!(reason.contains(reason_part), "{result:?}: {reason}"),
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+
+        // No row under `rel`: still left (nothing to delete), and the outcome says so.
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "doc.md",
+            &Ok(indexer::SingleResult::Refused),
+            || OnDisk::Present,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::LeftIndexed {
+                    held_row: Ok(false),
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+    }
+
+    /// (kuriya 549) The same results, once the second look finds the path gone, go to
+    /// `settle_removal_reindex` as before: the row under `rel` is dropped, the others stay, and
+    /// the reason is the one the kept branch would have named.
+    #[test]
+    fn i549_an_unsettled_removal_reindex_drops_the_row_once_the_path_is_gone() {
+        let kb = i549_kb("groove-watcher-i549-gone");
+        for (result, reason_part) in &i549_unsettled_results() {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled =
+                settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, || OnDisk::Gone);
+            match &settled {
+                RemovalSettled::Settled(RemovalReindexSettled::Deindexed {
+                    reason,
+                    outcome: Ok(true),
+                }) => {
+                    assert!(reason.contains(reason_part), "{result:?}: {reason}");
+                    assert_eq!(reason, &unsettled_reindex_reason(result), "{result:?}");
+                }
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()],
+                "{result:?}"
+            );
+        }
+    }
+
+    /// (kuriya 549) A second look that cannot tell keeps the row as a write's does (U1 of the
+    /// plan), and the outcome carries the kind for the line.
+    #[test]
+    fn i549_an_unsettled_removal_reindex_keeps_the_row_when_the_relook_cannot_tell() {
+        let kb = i549_kb("groove-watcher-i549-unknown");
+        for (result, reason_part) in &i549_unsettled_results() {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled = settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, || {
+                OnDisk::Unknown(std::io::ErrorKind::PermissionDenied)
+            });
+            match &settled {
+                RemovalSettled::LeftIndexed {
+                    reason,
+                    unknown: Some(std::io::ErrorKind::PermissionDenied),
+                    held_row: Ok(true),
+                    folded: Ok(false),
+                } => assert!(reason.contains(reason_part), "{result:?}: {reason}"),
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+    }
+
+    /// (kuriya 549) A result that settled the row is not looked at again: it gets what
+    /// `settle_removal_reindex` gives it, the empty-file skip (`NothingToIndex`) still dropped.
+    #[test]
+    fn i549_a_settled_removal_reindex_is_not_looked_at_again() {
+        let kb = i549_kb("groove-watcher-i549-settled");
+        let no_look = || -> OnDisk { panic!("a settled result must not be looked at again") };
+
+        let kept: [Result<indexer::SingleResult>; 3] = [
+            Ok(indexer::SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Unchanged),
+            Ok(indexer::SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: false,
+            }),
+        ];
+        for result in &kept {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled = settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, no_look);
+            assert!(
+                matches!(
+                    settled,
+                    RemovalSettled::Settled(RemovalReindexSettled::Kept)
+                ),
+                "{result:?}: {settled:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+
+        // The indexer dropped the row of an emptied file: settled, still a deindex.
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "doc.md",
+            &Ok(indexer::SingleResult::NothingToIndex {
+                deindexed: true,
+                frontmatter_unparsed: false,
+            }),
+            no_look,
+        );
+        match &settled {
+            RemovalSettled::Settled(RemovalReindexSettled::Deindexed {
+                reason,
+                outcome: Ok(true),
+            }) => assert_eq!(reason, indexer::SKIPPED_NO_CHUNKS),
+            other => panic!("{other:?}"),
+        }
+
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "doc.md",
+            &Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed),
+            no_look,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::Settled(RemovalReindexSettled::IndexerDeindexed(Ok(false)))
+            ),
+            "{settled:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 549) A row left as it was keeps the folded row an older version stored while the
+    /// real key holds none (the folded row is then all the index holds for the file), and drops
+    /// it once the real key holds a row: the write form of the sweep, never the removal form.
+    /// Unix only: a folded spelling exists only where `\` is not a separator.
+    #[cfg(unix)]
+    #[test]
+    fn i549_a_row_left_indexed_keeps_a_folded_row_whose_real_key_holds_none() {
+        let kb = i549_kb("groove-watcher-i549-folded");
+        std::fs::write(kb.0.join("secret\\pay.md"), "# pay").unwrap();
+        let has = |db: &Database, path: &str| db.get_document_hash(path).unwrap().is_some();
+
+        // Only the folded row: it stays.
+        let db = dir_rename_db(&["secret/pay.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "secret\\pay.md",
+            &Ok(indexer::SingleResult::Refused),
+            || OnDisk::Present,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::LeftIndexed {
+                    held_row: Ok(false),
+                    folded: Ok(false),
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+        assert!(has(&db, "secret/pay.md"), "the folded row is all there is");
+
+        // The real key holds a row too: the duplicate goes, the real key stays.
+        let db = dir_rename_db(&["secret/pay.md", "secret\\pay.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "secret\\pay.md",
+            &Ok(indexer::SingleResult::Refused),
+            || OnDisk::Present,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::LeftIndexed {
+                    held_row: Ok(true),
+                    folded: Ok(true),
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+        assert!(has(&db, "secret\\pay.md"));
+        assert!(!has(&db, "secret/pay.md"));
+    }
+
+    /// (kuriya 549) The line for a row left as it was must not read as the line for a row
+    /// dropped: `tests/watcher_remove_then_write.rs` waits for "was removed and its
+    /// replacement was not indexed" as the drop. Both forms still start with "was removed and",
+    /// which `tests/watcher_removal_keeps_rows.rs` waits for.
+    #[test]
+    fn i549_the_left_indexed_line_is_not_the_deindexed_line() {
+        for unknown in [None, Some(std::io::ErrorKind::PermissionDenied)] {
+            let line = left_indexed_message("doc.md", "file too large", unknown);
+            assert!(
+                !line.contains("doc.md was removed and its replacement was not indexed"),
+                "{line}"
+            );
+            assert!(line.contains("doc.md was removed and"), "{line}");
+            assert!(line.contains("(file too large)"), "{line}");
+            assert!(line.is_ascii(), "{line}");
+        }
+        assert!(
+            left_indexed_message(
+                "doc.md",
+                "read failed",
+                Some(std::io::ErrorKind::PermissionDenied)
+            )
+            .contains("could not tell whether doc.md is still there (permission denied)")
+        );
     }
 
     /// (#543) The line a create or modify prints when the file it had indexed now holds
