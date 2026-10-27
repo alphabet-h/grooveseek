@@ -2807,10 +2807,9 @@ enum RenamePlan {
 /// (kuriya 560) A file at the old end by the time the rename is handled is another file. Its own
 /// create is queued apart from the rename (the debouncer moves the source's queue to the
 /// destination) and comes after it in time order, so its event writes its row. A look here could
-/// not keep the old row either: that row holds the text of the file that left. Integration tests
-/// of the watcher pin this for a file rename and a directory rename
-/// (`a_file_renamed_then_written_again_under_its_old_name_keeps_both`,
-/// `a_directory_renamed_then_created_again_with_a_file_indexes_the_new_file`). A third test moves
+/// not keep the old row either: that row holds the text of the file that left. The watcher's
+/// integration tests pin this for a file rename and for a directory rename, each followed by a
+/// new file written at the old end before the rename is handled. A third test moves
 /// a file into an excluded directory, which drops the old row without reaching this plan. Only on
 /// Linux does it see the old row dropped without a look (by the paired rename or an unpaired
 /// rename-from, which print the same line); on Windows the move arrives as a removal and an add,
