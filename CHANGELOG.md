@@ -14,6 +14,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rename into another parser that fails partway is read again on the next run.** When
+  `groove index`, MCP `rebuild_index` or the live watcher had moved a document to a name another
+  parser reads (`.txt` to `.md`, say) and then failed after the move -- the embedding endpoint
+  down or answering with a server error, a database error, or, in the watcher, a failed read at
+  the new name -- the row stayed under the new name with the previous parser's chunks
+  and the hash of the unchanged bytes, so every later `groove index` and watcher event took it
+  as up to date and only `groove index --force` replaced it. Such a rename now marks the row to
+  be read again before it moves it, so the next run or event reads it with the new parser, and
+  the watcher tries once more while it still holds the index. (#398)
+
 ## [1.21.2] - 2026-10-26
 
 ### Fixed

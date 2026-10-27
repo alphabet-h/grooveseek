@@ -2397,21 +2397,25 @@ fn unread_move_crosses_a_parser(
 /// ([`unread_move_crosses_a_parser`]), the hash written by [`await_reparse_after_unread_move`]
 /// and its line. Whether [`finish_rename_locked`] reads the destination again follows the
 /// move, not the write: a row whose hash could not be written is read again all the same.
+/// (#552) Wrapped in a [`DispatchStart`] that says whether the rename crosses a parser.
 fn rename_start(
     db: &Database,
     registry: &Registry,
     (old_rel, new_rel): (&str, &str),
     plan: RenamePlan,
     before: Result<bool>,
-) -> RenameStart {
+) -> DispatchStart {
     let awaits = await_reparse_after_unread_move(db, registry, old_rel, new_rel, &plan, &before);
     log_await_reparse_after_unread_move(old_rel, new_rel, &awaits);
     let unread_move_awaits =
         unread_move_crosses_a_parser(registry, old_rel, new_rel, &plan, &before);
-    RenameStart {
-        plan,
-        before,
-        unread_move_awaits,
+    DispatchStart {
+        start: RenameStart {
+            plan,
+            before,
+            unread_move_awaits,
+        },
+        crosses_a_parser: indexer::rename_crosses_a_parser(registry, old_rel, new_rel),
     }
 }
 
@@ -2538,6 +2542,31 @@ impl From<(RenamePlan, Result<bool>)> for RenameStart {
             before,
             unread_move_awaits: false,
         }
+    }
+}
+
+/// (#552) What [`finish_rename_locked`] starts from: a [`RenameStart`], and whether the rename
+/// crosses a parser ([`indexer::rename_crosses_a_parser`]), which decides whether an indexer's
+/// rename that failed after it moved the row is read again in the same dispatch. A
+/// [`RenameStart`] or a `(plan, before)` pair converts to one that crosses no parser.
+#[derive(Debug)]
+struct DispatchStart {
+    start: RenameStart,
+    crosses_a_parser: bool,
+}
+
+impl From<RenameStart> for DispatchStart {
+    fn from(start: RenameStart) -> Self {
+        Self {
+            start,
+            crosses_a_parser: false,
+        }
+    }
+}
+
+impl From<(RenamePlan, Result<bool>)> for DispatchStart {
+    fn from(pair: (RenamePlan, Result<bool>)) -> Self {
+        RenameStart::from(pair).into()
     }
 }
 
@@ -2753,6 +2782,18 @@ fn read_again_settles_the_row(result: &Result<indexer::SingleResult>) -> bool {
 /// verified bytes the new parser cannot index drops it, as the rename's first read would
 /// ([`read_awaiting_destination_again`]); only bytes that changed again keep the mark.
 ///
+/// (#552) The same read, once, when an indexer's rename across a parser
+/// ([`DispatchStart::crosses_a_parser`]) returned an error and the row at the destination holds
+/// [`indexer::HASH_AWAITING_REPARSE`]: such a rename marks the row before it moves it, so the
+/// error came after the move, and the row holds the old parser's chunks. It is read as a row
+/// kept awaiting is, and for an overwriting rename the settlement of a failed overwrite
+/// ([`settle_cleared_rename`]), which would find the moved row in place and do nothing, is
+/// skipped so that the read can run. Whichever event marked it -- this rename, or an earlier
+/// one that left a sentinel row there before this rename failed without moving anything (its
+/// source row already gone) -- a destination row still under the sentinel after a failed
+/// crossed rename is read once, checked. A failed crossed rename that leaves no sentinel row at
+/// the destination, and one within a parser, is not read again.
+///
 /// `reindex` here takes no flag: it is [`finish_rename_locked_checked`] with a reindex that
 /// ignores whether it was asked to check its bytes before parsing. Only the tests call this
 /// form; [`dispatch_rename`] calls the checked one.
@@ -2763,7 +2804,7 @@ fn finish_rename_locked<C, R>(
     kb_path: &Path,
     pair: (&str, &str),
     look: WriteLook,
-    start: impl Into<RenameStart>,
+    start: impl Into<DispatchStart>,
     ctx: &mut C,
     rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
     reindex: R,
@@ -2794,17 +2835,21 @@ fn finish_rename_locked_checked<C, R>(
     kb_path: &Path,
     (old_rel, new_rel): (&str, &str),
     look: WriteLook,
-    start: impl Into<RenameStart>,
+    start: impl Into<DispatchStart>,
     ctx: &mut C,
     rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
     reindex: R,
 ) where
     R: FnOnce(&mut C, bool) -> Result<indexer::SingleResult>,
 {
-    let RenameStart {
-        plan,
-        before,
-        unread_move_awaits,
+    let DispatchStart {
+        start:
+            RenameStart {
+                plan,
+                before,
+                unread_move_awaits,
+            },
+        crosses_a_parser,
     } = start.into();
     let cleared = plan == RenamePlan::ClearDestinationThenRename;
     // Taken by the settlement of a failed overwrite or by the destination's second read
@@ -2850,11 +2895,22 @@ fn finish_rename_locked_checked<C, R>(
     }
     let outcome = rename(ctx);
     let failed = outcome.is_err();
+    // (#552) A rename across a parser marks the row awaiting a reparse before it moves it, so a
+    // failure that leaves such a row at the destination came after the move.
+    let crossed_err = crosses_a_parser && failed && awaits_reparse_at(db, new_rel);
     let settled = rename_outcome_is_settled(&outcome);
-    let kept = kept_row(&outcome);
+    let kept = if crossed_err {
+        Some(KeptRow::AwaitingReparse)
+    } else {
+        kept_row(&outcome)
+    };
     log_rename_outcome(old_rel, new_rel, outcome);
+    if crossed_err {
+        log_crossed_rename_failed_after_the_move(old_rel, new_rel);
+    }
     if cleared
         && failed
+        && !crossed_err
         && let Some(reindex) = reindex.take()
     {
         settle_cleared(ctx, reindex);
@@ -2882,6 +2938,30 @@ fn finish_rename_locked_checked<C, R>(
     // nothing to embed sweeps it as a removal ([`sweep_requires_real_key`]).
     sweep_legacy_row(db, kb_path, old_rel, false);
     sweep_legacy_row(db, kb_path, new_rel, new_requires_real_key);
+}
+
+/// (#552) Whether the row at `rel` holds [`indexer::HASH_AWAITING_REPARSE`]. A failed read of
+/// the row is logged and answers false: the dispatch then goes on as it did before #552.
+fn awaits_reparse_at(db: &Database, rel: &str) -> bool {
+    match db.get_document_hash(rel) {
+        Ok(hash) => hash.as_deref() == Some(indexer::HASH_AWAITING_REPARSE),
+        Err(e) => {
+            wdiag!(
+                "watcher: could not read the stored hash of {rel}: {}",
+                crate::embedder::body_free_message(&e)
+            );
+            false
+        }
+    }
+}
+
+/// (#552) The line [`finish_rename_locked`] prints when an indexer's rename across a parser
+/// failed after it moved the row, before it looks at the destination again: the look reads it,
+/// or drops the row unread when the file is gone.
+fn log_crossed_rename_failed_after_the_move(old_rel: &str, new_rel: &str) {
+    wdiag!(
+        "watcher: rename {old_rel} -> {new_rel} failed after the row moved; look at {new_rel} again"
+    );
 }
 
 /// (#544 Review Focus 4) The line [`finish_rename_locked`] prints after it read the destination
@@ -7449,6 +7529,201 @@ mod tests {
             },
         );
         assert_eq!(reindexed, 0);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (#552) The rename a test hands [`finish_rename_locked_checked`] for an indexer's rename
+    /// across a parser that failed after it moved the row: the row moves to `new_rel` under
+    /// [`indexer::HASH_AWAITING_REPARSE`], as [`crate::indexer::rename_single_file`] marks it
+    /// before the move, and the rename returns an error.
+    fn move_row_awaiting_then_fail(
+        db: &Database,
+        old_rel: &str,
+        new_rel: &str,
+    ) -> Result<indexer::RenameOutcome> {
+        db.overwrite_content_hash(&[old_rel], indexer::HASH_AWAITING_REPARSE)?;
+        db.rename_document(old_rel, new_rel, crate::db::FrontmatterTopic::Unread)?;
+        Err(anyhow::anyhow!("injected failure after the move"))
+    }
+
+    /// (#552) The reindex a test hands [`finish_rename_locked_checked`]: counts the reads in
+    /// `n`, records the flag it was given, and writes a row at `a.md` with hash `fresh`.
+    fn count_and_write_fresh(
+        db: &Database,
+        (n, flag): &mut (usize, Option<bool>),
+        checked: bool,
+    ) -> Result<indexer::SingleResult> {
+        *n += 1;
+        *flag = Some(checked);
+        write_fresh_row(db, "a.md")
+    }
+
+    /// (#552 D1) A rename across a parser (`b.txt` to `a.md`) whose indexer's rename failed after
+    /// it moved the row, marked awaiting a reparse: `a.md` is read again inside the same locks,
+    /// once, checked before parsing, and that read rewrites the row.
+    #[test]
+    fn i552_a_crossed_rename_that_failed_after_moving_is_read_again_checked() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i552-crossed-err");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        assert!(matches!(before, Ok(true)), "{before:?}");
+        let start = rename_start(&db, &reg, ("b.txt", "a.md"), plan, before);
+        assert!(start.crosses_a_parser, "b.txt to a.md crosses a parser");
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            start,
+            &mut seen,
+            |_| move_row_awaiting_then_fail(&db, "b.txt", "a.md"),
+            |seen, checked| count_and_write_fresh(&db, seen, checked),
+        );
+        assert_eq!(seen, (1, Some(true)));
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some("fresh")
+        );
+        assert_eq!(db.get_document_hash("b.txt").unwrap(), None);
+    }
+
+    /// (#552 D2) The same failure for an overwriting rename across a parser
+    /// ([`RenamePlan::ClearDestinationThenRename`]): the moved row at `a.md` is not left in place
+    /// by the settlement of a failed overwrite ([`settle_cleared_rename`]), which would take the
+    /// reindex and do nothing; it is read again, once, checked before parsing.
+    #[test]
+    fn i552_an_overwriting_crossed_rename_that_failed_after_moving_is_read_again() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i552-crossed-overwrite-err");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::ClearDestinationThenRename);
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        assert!(matches!(before, Ok(true)), "{before:?}");
+        let start = rename_start(&db, &reg, ("b.txt", "a.md"), plan, before);
+        assert!(start.crosses_a_parser, "b.txt to a.md crosses a parser");
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            start,
+            &mut seen,
+            |_| move_row_awaiting_then_fail(&db, "b.txt", "a.md"),
+            |seen, checked| count_and_write_fresh(&db, seen, checked),
+        );
+        assert_eq!(seen, (1, Some(true)));
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some("fresh")
+        );
+        assert_eq!(db.get_document_hash("b.txt").unwrap(), None);
+    }
+
+    /// (#552) A rename across a parser whose indexer's rename failed before it moved the row:
+    /// no row is at `a.md`, so nothing there is read again, and the source's row stays as it was.
+    #[test]
+    fn i552_a_rename_that_failed_before_moving_is_not_read_again() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i552-crossed-err-before");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        let start = rename_start(&db, &reg, ("b.txt", "a.md"), plan, before);
+        assert!(start.crosses_a_parser, "b.txt to a.md crosses a parser");
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            start,
+            &mut seen,
+            |_| Err(anyhow::anyhow!("injected failure before the move")),
+            |seen, checked| count_and_write_fresh(&db, seen, checked),
+        );
+        assert_eq!(seen, (0, None));
+        assert_eq!(db.get_document_hash("a.md").unwrap(), None);
+        assert_eq!(
+            db.get_document_hash("b.txt").unwrap().as_deref(),
+            Some("hb")
+        );
+    }
+
+    /// (#552) The same failure after the move, for a start that does not cross a parser (a
+    /// `(plan, before)` pair): the failed rename is not read again, and the row stays awaiting
+    /// for the next event or run.
+    #[test]
+    fn i552_a_failed_rename_not_crossing_a_parser_is_not_read_again() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i552-uncrossed-err");
+        std::fs::write(kb.join("a.md"), "# a\n").unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        let start = DispatchStart::from((plan, before));
+        assert!(!start.crosses_a_parser);
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            start,
+            &mut seen,
+            |_| move_row_awaiting_then_fail(&db, "b.txt", "a.md"),
+            |seen, checked| count_and_write_fresh(&db, seen, checked),
+        );
+        assert_eq!(seen, (0, None));
+        assert_eq!(
+            db.get_document_hash("a.md").unwrap().as_deref(),
+            Some(indexer::HASH_AWAITING_REPARSE)
+        );
+    }
+
+    /// (#552) The same failure after the move across a parser, with `a.md` gone by the second
+    /// look: the moved row goes, and `a.md` is not read.
+    #[test]
+    fn i552_a_crossed_rename_that_failed_with_the_destination_gone_drops_the_row_unread() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i552-crossed-err-gone");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        db.upsert_document("b.txt", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let plan = rename_plan(&db, "b.txt", "a.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "b.txt", "a.md", &plan);
+        let start = rename_start(&db, &reg, ("b.txt", "a.md"), plan, before);
+        assert!(start.crosses_a_parser, "b.txt to a.md crosses a parser");
+        let mut seen = (0, None);
+        finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("b.txt", "a.md"),
+            WriteLook::Spelled,
+            start,
+            &mut seen,
+            |_| move_row_awaiting_then_fail(&db, "b.txt", "a.md"),
+            |seen, checked| count_and_write_fresh(&db, seen, checked),
+        );
+        assert_eq!(seen, (0, None));
         assert_eq!(
             db.all_document_paths().unwrap(),
             vec!["other.md".to_string()]
