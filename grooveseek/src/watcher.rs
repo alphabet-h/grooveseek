@@ -1963,6 +1963,7 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
             return;
         }
     };
+    hand_on_rows_the_walk_left_behind(state, rel, &found);
     if found.is_empty() {
         return;
     }
@@ -2023,6 +2024,71 @@ fn new_directory_entries(
                 .map(|r| (r, f))
         })
         .collect())
+}
+
+/// (kuriya 566 #16 / #17) The rows under an arrived directory that its walk did not collect:
+/// `held` (the keys under `rel/`) minus every `rel` the walk found, split into the keys to hand
+/// to the removal path and the number of keys left alone because they may be lossy
+/// ([`key_may_be_lossy`]: no look can reach such a key, so handing it on would read a file
+/// still there as gone).
+fn rows_the_walk_left_behind(
+    held: Vec<String>,
+    found: &[(String, PathBuf)],
+) -> (Vec<String>, usize) {
+    let found: std::collections::HashSet<&str> = found.iter().map(|(r, _)| r.as_str()).collect();
+    let (lossy, rest): (Vec<String>, Vec<String>) = held
+        .into_iter()
+        .filter(|key| !found.contains(key.as_str()))
+        .partition(|key| key_may_be_lossy(key));
+    (rest, lossy.len())
+}
+
+/// (kuriya 566 #16 / #17) What [`dispatch_new_directory`] does with the rows under `rel/` its
+/// walk did not collect: each goes through [`handle_removed_path`], as if its own removal had
+/// been reported, so the removal path decides it (a link where the file was: the row goes; a
+/// file there the write gate takes: it is reindexed; an excluded path: it stays). The walk
+/// collects no link (a symlink, a junction, a hard link), so a row whose file is now a link is
+/// one of these, and with no removal of the old directory delivered (folded away, or made while
+/// no watcher ran) nothing else would reach it. A directory that just arrived usually holds no
+/// row, so the cost is the listing.
+///
+/// The db lock is held for the listing only, then released before any row is handed on: each
+/// takes the locks it needs, the embedder lock never while the db lock is held (as
+/// [`dispatch_subtree_removal`] does).
+fn hand_on_rows_the_walk_left_behind(
+    state: &WatcherState,
+    rel: &str,
+    found: &[(String, PathBuf)],
+) {
+    if rel.is_empty() {
+        return;
+    }
+    let held = {
+        let db = recover_db(state.db.lock());
+        db.document_paths_under(rel)
+        // `db` is dropped here, before any row is handed on.
+    };
+    let held = match held {
+        Ok(held) => held,
+        Err(e) => {
+            wdiag!("watcher: listing the documents under {rel}/ failed: {e}");
+            return;
+        }
+    };
+    let (left, lossy) = rows_the_walk_left_behind(held, found);
+    if lossy > 0 {
+        wdiag!(
+            "watcher: left {lossy} documents under {rel}/ indexed: their names hold U+FFFD, \
+             so they cannot be looked at one by one"
+        );
+    }
+    for child in left {
+        let mut full = state.kb_path.clone();
+        for segment in child.split('/') {
+            full.push(segment);
+        }
+        handle_removed_path(state, &child, &full);
+    }
 }
 
 /// The `rel`s alone of [`new_directory_entries`], which is how the tests written before the
@@ -10097,6 +10163,30 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(db.all_document_paths().unwrap(), vec!["other.md".to_string()]);
+    }
+
+    /// (kuriya 566 #16 / #17) The rows an arrived directory's walk did not collect are the
+    /// held keys minus the walk's, and a key that may be lossy is counted and kept, never
+    /// handed on.
+    #[test]
+    fn i566_rows_the_walk_left_behind_are_the_held_keys_it_did_not_find() {
+        let found = vec![
+            ("d/b.md".to_string(), PathBuf::from("d/b.md")),
+            ("d/new.md".to_string(), PathBuf::from("d/new.md")),
+        ];
+        let held = vec![
+            "d/a.md".to_string(),
+            "d/b.md".to_string(),
+            format!("d/{}.md", char::REPLACEMENT_CHARACTER),
+            "d/sub/c.md".to_string(),
+        ];
+        let (left, lossy) = rows_the_walk_left_behind(held, &found);
+        assert_eq!(left, vec!["d/a.md".to_string(), "d/sub/c.md".to_string()]);
+        assert_eq!(lossy, 1);
+
+        let (left, lossy) = rows_the_walk_left_behind(Vec::new(), &found);
+        assert!(left.is_empty());
+        assert_eq!(lossy, 0);
     }
 
     /// (kuriya 566) A rename away from a path that is now a hard link moves the row: the old
