@@ -675,15 +675,13 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 for p in paths {
                     if let Some(rel) = to_rel(&state.kb_path, p) {
                         // (#543) What is at the path now decides, not the event kind alone.
-                        match removal_outcome(&rel, p, &state.registry, &state.rules) {
-                            (RemovalAction::Reindex, _) => {
-                                dispatch_reindex_after_removal(state, &rel)
-                            }
-                            (RemovalAction::Deindex, Some(kind)) => {
-                                dispatch_deindex_unknown(state, &rel, kind)
-                            }
-                            (RemovalAction::Deindex, None) => dispatch_deindex(state, &rel),
-                            (RemovalAction::Skip, _) => {}
+                        match removal_dispatch(
+                            &rel,
+                            removal_outcome(&rel, p, &state.registry, &state.rules),
+                        ) {
+                            RemovalDispatch::DecideInLocks => dispatch_removal(state, &rel, p),
+                            RemovalDispatch::Deindex => dispatch_deindex(state, &rel),
+                            RemovalDispatch::Skip => {}
                         }
                     }
                     // (feature-67) Always, whatever the gate above said: a
@@ -801,13 +799,29 @@ enum RemovalAction {
 ///
 /// (#543, local Codex r3, medium) Only a file found under the exact spelling
 /// ([`OnDisk::Present`]) is reindexed. A look that cannot tell ([`OnDisk::Unknown`]: the stat
-/// or the listing failed with anything but "not there") takes the removal gate, as every
-/// remove event did before: keeping the row on an unknown would leave it for good when the
-/// file is in fact gone, since no later event comes to drop it.
+/// or the listing failed with anything but "not there") takes the removal gate.
 ///
-/// (local Codex r7, medium) The look is taken once ([`removal_look`]) and its answer decides
-/// both the action and, for an unknown that ends in a deindex, the kind the line names
-/// ([`removal_outcome_for`]).
+/// (kuriya 548) What the event loop does with that answer is [`removal_dispatch`]'s: an
+/// unknown that ends in [`RemovalAction::Deindex`] no longer drops the row here. It is looked
+/// at again with both locks held ([`dispatch_reindex_after_removal`]), and a look there that
+/// still cannot tell leaves the row as it was and says why, as a write does (D3) and as
+/// `groove index` does (a stat that fails is a skip, a directory that cannot be listed stops
+/// the run before its sweep). kuriya 543 r3 dropped it, since no later event may come to drop the
+/// row of a file that is in fact gone; such a row now stays until the path's next event or a
+/// `groove index` run that can see the file is gone.
+///
+/// The same holds for a look outside that found the path gone: that deindex too is looked at
+/// again inside the locks ([`removal_dispatch`]), so a file written there again in between
+/// keeps its row. Only a name the index cannot hold is dropped without that second look. A path
+/// still gone on the second look is dropped under the database lock alone, with no embedder
+/// lock ([`dispatch_removal`]).
+///
+/// (local Codex r7, medium) The look is taken once ([`removal_look`]) and
+/// [`removal_outcome_for`] returns its answer with the action: the kind of an unknown that
+/// ends in a deindex. (kuriya 548) That kind no longer reaches any line: [`removal_dispatch`]
+/// reads only whether one is there (`Some(_)`) as the cue to look again inside the locks, and
+/// the kind a line names is the one of the look taken there ([`decide_removal_in_locks`],
+/// [`log_removed_path_left_indexed`]).
 fn removal_outcome(
     rel: &str,
     full: &Path,
@@ -839,10 +853,10 @@ fn removal_look(rel: &str, full: &Path) -> OnDisk {
 }
 
 /// (#543, local Codex r7, medium) [`removal_decision_for`], plus the kind of the failed look
-/// when an [`OnDisk::Unknown`] ends in [`RemovalAction::Deindex`]. The event loop hands that
-/// kind to [`dispatch_deindex_unknown`], so the line says the row went because the look failed
-/// ([`log_removed_path_unknown`], the line the look inside the locks prints too), not as a
-/// plain removal. `None` for every other answer.
+/// when an [`OnDisk::Unknown`] ends in [`RemovalAction::Deindex`]. `None` for every other
+/// answer. (kuriya 548) The event loop reads a kind as "look again inside the locks"
+/// ([`removal_dispatch`]) rather than as a deindex; the line names the kind of the look taken
+/// there.
 fn removal_outcome_for(
     rel: &str,
     full: &Path,
@@ -860,6 +874,10 @@ fn removal_outcome_for(
 
 /// The action of [`removal_outcome`] once the disk has been looked at, split out so a test can hand it an
 /// [`OnDisk::Unknown`] that no file system makes on demand.
+///
+/// The reindex asks [`crate::resources::doc_is_addressable`], not
+/// [`crate::resources::rel_is_indexable_name`]: whether `rel` may be written as a row is a
+/// different question, and the empty key (the knowledge base itself) never can be.
 fn removal_decision_for(
     rel: &str,
     full: &Path,
@@ -868,7 +886,6 @@ fn removal_decision_for(
     on_disk: OnDisk,
 ) -> RemovalAction {
     if on_disk == OnDisk::Present
-        && !rel.is_empty()
         && crate::resources::doc_is_addressable(rel)
         && should_process_parts(rel, full, registry, rules)
     {
@@ -878,6 +895,195 @@ fn removal_decision_for(
         RemovalAction::Deindex
     } else {
         RemovalAction::Skip
+    }
+}
+
+/// What the event loop does with a remove event's path, given [`removal_outcome`]'s answer.
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalDispatch {
+    /// Look at the path again and decide on that look ([`dispatch_removal`]): under the
+    /// database lock alone while it is still gone, with both locks once a file is there or the
+    /// look cannot tell ([`dispatch_reindex_after_removal`]).
+    DecideInLocks,
+    /// A name the index cannot hold (for example `a//doc.md`), which the removal gate passes
+    /// early whatever is on disk (ADR-0023): drop the row ([`dispatch_deindex`]) without
+    /// looking again. A path found gone outside the locks is not this: it goes inside them.
+    Deindex,
+    /// The path is not one the index tracks.
+    Skip,
+}
+
+/// (kuriya 548) The event loop's reading of [`removal_outcome`] for `rel`. A reindex and a
+/// deindex both go inside the locks ([`dispatch_removal`]), where the path is looked at again
+/// and [`removal_decision_for`] is asked again on that look ([`decide_removal_in_locks`]): a look
+/// outside that could not tell (the kind is there), and as much a look outside that found the
+/// path gone, since a file written there again before the locks are taken (its create folded
+/// away by the debouncer) would otherwise lose its row until the next full index. Only a
+/// deindex of a name the index cannot hold is settled here ([`removal_gate_passes_by_name`]):
+/// the removal gate passes it early whatever is on disk (ADR-0023), so a second look could not
+/// change the answer. A path the removal gate turned away is a skip. Split out so a test can
+/// pin that no look outside the locks reaches [`dispatch_deindex`].
+fn removal_dispatch(
+    rel: &str,
+    outcome: (RemovalAction, Option<std::io::ErrorKind>),
+) -> RemovalDispatch {
+    match outcome {
+        (RemovalAction::Deindex, None) if removal_gate_passes_by_name(rel) => {
+            RemovalDispatch::Deindex
+        }
+        (RemovalAction::Reindex | RemovalAction::Deindex, _) => RemovalDispatch::DecideInLocks,
+        (RemovalAction::Skip, _) => RemovalDispatch::Skip,
+    }
+}
+
+/// (ADR-0023) Whether the removal gate passes `rel` on its name alone, before it looks at
+/// the disk: a name the index cannot hold. [`gate_parts`] calls this first for
+/// [`Gate::Removal`], and [`removal_dispatch`] calls it to skip the look inside the locks, so
+/// the two answer from one test; the empty key (the knowledge base itself) is not one.
+fn removal_gate_passes_by_name(rel: &str) -> bool {
+    !crate::resources::rel_is_indexable_name(rel)
+}
+
+/// What [`decide_removal_in_locks`] did.
+#[derive(Debug)]
+enum RemovalInLocks {
+    /// An indexable file is at the path and the write gate takes it: the reindex goes ahead.
+    Reindex,
+    /// The path is gone, or holds a file under a name the index cannot hold: the row under
+    /// `rel` and its folded legacy row were deleted, and the result says whether either was
+    /// there.
+    Deindexed(Result<bool>),
+    /// The look could not tell: nothing was touched, not even the folded row (nothing is known
+    /// about the file). `held_row` says whether a row was under `rel` to keep.
+    LeftIndexed {
+        kind: std::io::ErrorKind,
+        held_row: Result<bool>,
+    },
+    /// The removal gate turns the path away: nothing to do.
+    Skip,
+}
+
+/// (kuriya 548) What a remove event does with its path once both locks are held and the disk
+/// has been looked at there (`on_disk`): [`removal_decision_for`] asked again on that look, so
+/// a file found inside the locks is reindexed only when the write gate takes it, whatever the
+/// look outside found. Then:
+///
+/// - a reindex is [`RemovalInLocks::Reindex`]
+/// - a deindex on [`OnDisk::Gone`], or on [`OnDisk::Present`] (a file under a name the index
+///   cannot hold, which the removal gate passes early, ADR-0023), drops the rows
+///   ([`deindex_removed_path`])
+/// - a deindex on [`OnDisk::Unknown`] leaves the rows as they were, as a write keeps them (D3)
+///   and as `groove index` keeps them; before kuriya 548 they went
+/// - a skip (the removal gate turns the path away: an excluded path, a hard link) does nothing
+///
+/// (local Codex r2, medium) [`remove_if_still_gone`] calls this too, under the database lock
+/// alone, for a look that found the path gone: then only the deindex or the skip can come
+/// back, and neither needs the embedder.
+///
+/// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`] and an
+/// [`OnDisk::Unknown`] that no file system makes on demand.
+fn decide_removal_in_locks(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> RemovalInLocks {
+    match removal_decision_for(rel, full, registry, rules, on_disk) {
+        RemovalAction::Reindex => RemovalInLocks::Reindex,
+        RemovalAction::Skip => RemovalInLocks::Skip,
+        RemovalAction::Deindex => match on_disk {
+            OnDisk::Unknown(kind) => RemovalInLocks::LeftIndexed {
+                kind,
+                held_row: db.get_document_hash(rel).map(|hash| hash.is_some()),
+            },
+            OnDisk::Gone | OnDisk::Present => {
+                RemovalInLocks::Deindexed(deindex_removed_path(db, kb_path, rel))
+            }
+        },
+    }
+}
+
+/// What [`remove_if_still_gone`] did under the database lock alone.
+#[derive(Debug)]
+enum RemovalUnderDatabaseLock {
+    /// The path is still gone: the row under `rel` and its folded legacy row were deleted, and
+    /// the result says whether either was there.
+    Deindexed(Result<bool>),
+    /// The path is still gone and the removal gate turns it away: nothing to do.
+    Skip,
+    /// A file is at the path or the look could not tell: nothing was touched, and the removal
+    /// is decided again with both locks held ([`dispatch_reindex_after_removal`]).
+    NeedsBothLocks,
+}
+
+/// (local Codex r2, medium) The part of a removal that needs no embedder, for a caller holding
+/// the database lock and nothing else. `on_disk` is the look taken under that lock, right before
+/// the delete. A path still gone is settled here by [`decide_removal_in_locks`] (its rows go, or
+/// the removal gate turns it away); a file there or a look that cannot tell may need a reindex,
+/// so it is handed on untouched.
+///
+/// The look that decides a delete is the one taken under the database lock: every writer of a
+/// document's rows (a reindex, a rename, another deindex) writes under that lock, so nothing
+/// writes the row between the look and the delete. The embedder lock adds nothing to that, and
+/// taking it first made a deletion wait for a search's embedding. [`sweep_source_if_gone`] takes
+/// the same shape.
+///
+/// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
+fn remove_if_still_gone(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> RemovalUnderDatabaseLock {
+    if on_disk != OnDisk::Gone {
+        return RemovalUnderDatabaseLock::NeedsBothLocks;
+    }
+    match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk) {
+        RemovalInLocks::Deindexed(outcome) => RemovalUnderDatabaseLock::Deindexed(outcome),
+        RemovalInLocks::Skip => RemovalUnderDatabaseLock::Skip,
+        // A gone path is never reindexed nor left on an unknown look; named rather than
+        // caught so a new variant stays a compile error.
+        RemovalInLocks::Reindex | RemovalInLocks::LeftIndexed { .. } => {
+            RemovalUnderDatabaseLock::NeedsBothLocks
+        }
+    }
+}
+
+/// (local Codex r2, medium) What the event loop does for [`RemovalDispatch::DecideInLocks`].
+/// First the database lock alone: the path is looked at again under it
+/// ([`removed_path_on_disk`]) and, while it is still gone, its rows go there
+/// ([`remove_if_still_gone`]), so an ordinary deletion never waits on the embedder lock that a
+/// search holds through a slow embedding. Only when the look finds a file or cannot tell is
+/// that lock released and both locks taken, embedder first and database second as everywhere
+/// else ([`dispatch_reindex_after_removal`]), where the path is looked at once more and the
+/// decision asked again. Never the embedder lock while holding the database lock: that order
+/// would deadlock against every other reindex.
+fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path) {
+    let under_db = {
+        let db = recover_db(state.db.lock());
+        remove_if_still_gone(
+            &db,
+            &state.kb_path,
+            rel,
+            full,
+            &state.registry,
+            &state.rules,
+            removed_path_on_disk(&state.kb_path, rel),
+        )
+        // `db` is dropped here, before the embedder lock can be taken.
+    };
+    match under_db {
+        RemovalUnderDatabaseLock::Deindexed(outcome) => log_removed_path_deindexed(rel, outcome),
+        RemovalUnderDatabaseLock::Skip => {}
+        RemovalUnderDatabaseLock::NeedsBothLocks => {
+            dispatch_reindex_after_removal(state, rel, full)
+        }
     }
 }
 
@@ -891,8 +1097,8 @@ enum OnDisk {
     /// under another case of its name or of a directory on the way.
     Gone,
     /// The look failed in a way that does not say the file is gone (access denied, an I/O
-    /// error). (local Codex r3, medium) Treated as a removal all the same, as before the
-    /// look existed; the kind is kept for the line that says why.
+    /// error). (kuriya 548) A remove event leaves the row as it was on this answer, as a write
+    /// does ([`decide_removal_in_locks`]); the kind is kept for the line that says why.
     Unknown(std::io::ErrorKind),
 }
 
@@ -1026,6 +1232,7 @@ fn removed_path_on_disk(kb_path: &Path, rel: &str) -> OnDisk {
 }
 
 /// What [`check_removed_path`] did.
+#[cfg(test)]
 #[derive(Debug)]
 enum RemovedPathCheck {
     /// The path is gone: the rows were deleted, and the result says whether either was there.
@@ -1042,6 +1249,9 @@ enum RemovedPathCheck {
 /// ([`OnDisk::Present`], [`removed_path_on_disk`]), the row under `rel` and its folded legacy
 /// row ([`indexer::sweep_legacy_folded_row`] as a removal) are deleted. Split out so a test
 /// can run it with no [`crate::embedder::Embedder`].
+///
+/// (kuriya 548) Test only now: the dispatch asks [`decide_removal_in_locks`] instead.
+#[cfg(test)]
 fn check_removed_path(db: &Database, kb_path: &Path, rel: &str) -> RemovedPathCheck {
     act_on_removed_path(db, kb_path, rel, removed_path_on_disk(kb_path, rel))
 }
@@ -1050,6 +1260,11 @@ fn check_removed_path(db: &Database, kb_path: &Path, rel: &str) -> RemovedPathCh
 /// [`OnDisk::Unknown`]. (local Codex r3, medium) Anything but [`OnDisk::Present`] deletes the
 /// rows, an unknown look included: the remove event is the only signal the file is going, and
 /// the removal it carried before this look existed is what it falls back to.
+///
+/// (kuriya 548) The event loop no longer hands this an unknown look, nor calls it at all:
+/// [`decide_removal_in_locks`] leaves the row on an unknown. The unknown arm is what a removal
+/// did before kuriya 548, kept with its contract for the tests that pin it.
+#[cfg(test)]
 fn act_on_removed_path(
     db: &Database,
     kb_path: &Path,
@@ -1065,8 +1280,8 @@ fn act_on_removed_path(
     }
 }
 
-/// The deletion [`act_on_removed_path`] runs for a path not found there: the row under `rel`
-/// and its folded legacy row. `Ok(true)` when either was there.
+/// The deletion a remove event runs for a path not found there ([`decide_removal_in_locks`]):
+/// the row under `rel` and its folded legacy row. `Ok(true)` when either was there.
 fn deindex_removed_path(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
     indexer::deindex_single_file(db, rel).and_then(|exact| {
         let folded = indexer::sweep_legacy_folded_row(db, kb_path, rel, false)?;
@@ -1158,8 +1373,9 @@ enum WrittenPathCheck {
 ///
 /// - [`OnDisk::Present`]: go ahead
 /// - [`OnDisk::Unknown`]: go ahead and keep the rows. A write is not a signal that the file is
-///   going (unlike a remove event, [`act_on_removed_path`]), and an editor holding the file
-///   while it saves must not cost the document its row
+///   going, and an editor holding the file while it saves must not cost the document its row.
+///   (kuriya 548) A remove event, which is such a signal, now keeps the rows on this answer
+///   too ([`decide_removal_in_locks`])
 /// - [`OnDisk::Gone`]: the row under `rel` and its folded legacy row go
 ///   ([`deindex_removed_path`]), since the event's path is no longer one the index can hold
 ///   (deleted since, a directory now, or there only under another case). Unless `lossy`
@@ -1410,8 +1626,10 @@ fn gate_parts(
     gate: Gate,
 ) -> bool {
     // (ADR-0023) See [`Gate::Removal`]. The empty key is the knowledge base
-    // itself, which names no row and takes the ordinary path.
-    if gate == Gate::Removal && !rel.is_empty() && !crate::resources::doc_is_addressable(rel) {
+    // itself, which names no row and takes the ordinary path. The name test is
+    // the one [`removal_dispatch`] asks too ([`removal_gate_passes_by_name`]),
+    // so the gate and the dispatcher cannot drift apart.
+    if gate == Gate::Removal && removal_gate_passes_by_name(rel) {
         return true;
     }
     // 1 回の stat を 2 つの判定で使い回す: ディレクトリかどうか (末尾スラッシュ
@@ -1507,7 +1725,7 @@ fn gate_parts(
 /// this relativizing. The empty string is the knowledge base itself, which is
 /// no document name and is turned away elsewhere.
 fn name_is_addressable(rel: &str, full: &Path, is_dir: bool) -> bool {
-    if rel.is_empty() || crate::resources::doc_is_addressable(rel) {
+    if crate::resources::rel_is_indexable_name(rel) {
         return true;
     }
     wdiag!(
@@ -1702,9 +1920,11 @@ fn dispatch_reindex(state: &WatcherState, rel: &str, raw: &Path) {
 /// path that is not there.
 #[derive(Debug, Clone, Copy)]
 enum ReindexOrigin<'a> {
-    /// A remove event found a file at the path again ([`RemovalAction::Reindex`]):
-    /// [`check_removed_path`] and [`settle_removal_reindex`], as #543 made them.
-    Removal,
+    /// A remove event found a file at the path again ([`RemovalAction::Reindex`]), or could not
+    /// tell whether it is there (kuriya 548): [`decide_removal_in_locks`] and
+    /// [`settle_removal_reindex_looked`]. `full` is the path the event named, which the gates
+    /// judge when asked again inside the locks.
+    Removal { full: &'a Path },
     /// A create, modify or rename-to: [`act_on_written_path`] and [`settle_write_reindex`].
     /// `raw` is the path the event named, when the caller has it ([`rel_is_lossy`]); `look` is
     /// how `rel` is looked at ([`written_path_on_disk`]).
@@ -1723,7 +1943,9 @@ fn dispatch_reindex_from(state: &WatcherState, rel: &str, origin: ReindexOrigin<
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
     match origin {
-        ReindexOrigin::Removal => reindex_after_removal_locked(state, &db, &mut embedder, rel),
+        ReindexOrigin::Removal { full } => {
+            reindex_after_removal_locked(state, &db, &mut embedder, rel, full)
+        }
         ReindexOrigin::Write { raw, look } => {
             reindex_after_write_locked(state, &db, &mut embedder, rel, raw, look)
         }
@@ -1871,22 +2093,31 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 /// are held, no later event will drop the row. So the path is looked at again inside the same
 /// embedder + database region as the write, before the reindex, and the row goes in that
 /// region when the file is no longer there under the exact spelling of `rel`, directories on
-/// the way included ([`check_removed_path`]).
+/// the way included ([`removed_path_on_disk`]).
 ///
-/// (local Codex r3, medium) A look that cannot tell ([`RemovedPathCheck::Unknown`]) is
-/// handled as one that found the path gone: the rows go, no reindex runs, and one line names
-/// why the look failed.
+/// (kuriya 548) A remove event whose look outside the locks could not tell, or found the path
+/// gone, comes here too ([`removal_dispatch`]), and `full`, the path the event named, comes
+/// with both. (local Codex r2, medium) It comes only once a look under the database lock alone
+/// found a file there or could not tell; a path still gone on that look has its rows dropped
+/// there, with no embedder lock ([`dispatch_removal`]). Inside the
+/// locks [`decide_removal_in_locks`] asks [`removal_decision_for`] again on the look taken
+/// there, so a file is reindexed only when the write gate takes it, the rows go when the path
+/// is gone or holds what the index cannot keep, and a look that still cannot tell leaves the
+/// rows as they were and names why. Before kuriya 548 (local Codex r3, medium) such a look,
+/// outside the locks or inside them, dropped the rows as a removal.
 ///
-/// (#543, GitHub codex r1 P2) This path keeps the rows, where a plain removal drops them, only
-/// when the file is there under the exact spelling ([`OnDisk::Present`]) **and** the reindex
-/// says the rows now hold it ([`settle_removal_reindex`]). Every other answer of the reindex
-/// -- a skip whatever its reason, a refusal, an error -- drops the rows as a removal does,
-/// whatever the disk shows afterwards.
+/// (kuriya 549) After the reindex, [`settle_removal_reindex_looked`] decides. A result that
+/// settles the row (written, unchanged, or dropped by the indexer, as for an empty file or a
+/// frontmatter-only stub) is taken as it is. Any other answer -- a skip whatever its reason,
+/// a refusal, an error -- is looked at again: the rows go as a removal drops them only when the
+/// path is gone by then, and stay as they were while the file is there or the look cannot
+/// tell, as a write and `groove index` keep them. Before kuriya 549 (kuriya 543, GitHub codex
+/// r1 P2) every such answer dropped the rows whatever the disk showed afterwards.
 ///
 /// Only the remove path calls this. (#544) A create, modify or rename-to looks at the disk
 /// inside the locks too, with its own answers ([`ReindexOrigin::Write`]).
-fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str) {
-    dispatch_reindex_from(state, rel, ReindexOrigin::Removal);
+fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str, full: &Path) {
+    dispatch_reindex_from(state, rel, ReindexOrigin::Removal { full });
 }
 
 /// The removal half of [`dispatch_reindex_from`] ([`dispatch_reindex_after_removal`]'s body),
@@ -1896,17 +2127,28 @@ fn reindex_after_removal_locked(
     db: &Database,
     embedder: &mut Embedder,
     rel: &str,
+    full: &Path,
 ) {
-    match check_removed_path(db, &state.kb_path, rel) {
-        RemovedPathCheck::Deindexed(outcome) => {
+    let look = removed_path_on_disk(&state.kb_path, rel);
+    match decide_removal_in_locks(
+        db,
+        &state.kb_path,
+        rel,
+        full,
+        &state.registry,
+        &state.rules,
+        look,
+    ) {
+        RemovalInLocks::Reindex => {}
+        RemovalInLocks::Deindexed(outcome) => {
             log_removed_path_deindexed(rel, outcome);
             return;
         }
-        RemovedPathCheck::Unknown(kind, outcome) => {
-            log_removed_path_unknown(rel, kind, outcome);
+        RemovalInLocks::LeftIndexed { kind, held_row } => {
+            log_removed_path_left_indexed(rel, kind, held_row);
             return;
         }
-        RemovedPathCheck::StillThere => {}
+        RemovalInLocks::Skip => return,
     }
     let texts_before = embedder.texts_embedded();
     let result = indexer::reindex_single_file(
@@ -1917,22 +2159,35 @@ fn reindex_after_removal_locked(
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    match settle_removal_reindex(db, &state.kb_path, rel, &result) {
-        RemovalReindexSettled::Kept => {
+    let settled = settle_removal_reindex_looked(db, &state.kb_path, rel, &result, || {
+        removed_path_on_disk(&state.kb_path, rel)
+    });
+    match settled {
+        RemovalSettled::Settled(RemovalReindexSettled::Kept) => {
             log_reindex_result(rel, result, texts_before, embedder);
             sweep_legacy_row(db, &state.kb_path, rel, true);
         }
-        RemovalReindexSettled::IndexerDeindexed(folded) => {
+        RemovalSettled::Settled(RemovalReindexSettled::IndexerDeindexed(folded)) => {
             log_reindex_result(rel, result, texts_before, embedder);
             log_folded_sweep(rel, folded);
         }
-        RemovalReindexSettled::Deindexed { reason, outcome } => {
+        RemovalSettled::Settled(RemovalReindexSettled::Deindexed { reason, outcome }) => {
             log_replacement_not_indexed(rel, &reason, outcome);
+        }
+        RemovalSettled::LeftIndexed {
+            reason,
+            unknown,
+            held_row,
+            folded,
+        } => {
+            log_replacement_left_indexed(rel, &reason, unknown, held_row);
+            log_folded_sweep(rel, folded);
         }
     }
 }
 
-/// What [`settle_removal_reindex`] did after the reindex a remove event ran.
+/// What [`settle_removal_reindex`] did after the reindex a remove event ran. (kuriya 549) The
+/// dispatch gets it inside [`RemovalSettled::Settled`].
 #[derive(Debug)]
 enum RemovalReindexSettled {
     /// The rows now hold what is on disk: nothing more was done.
@@ -1951,13 +2206,18 @@ enum RemovalReindexSettled {
 
 /// (#543, GitHub codex r1 P2) After [`dispatch_reindex_after_removal`]'s reindex: the rows are
 /// left only when the reindex says they now hold the file on disk (`Updated`, `Unchanged`,
-/// `MetadataRefreshed`). Any other answer -- a skip for whatever reason (an empty file, a
-/// frontmatter-only stub), a refusal, an error -- would leave the old document's rows
-/// standing, since a skipped reindex does not delete them and the `Create` that follows takes
-/// the same skip; so they go here, as the remove event dropped them before #543. A result whose
-/// row the indexer already dropped only has its folded row swept, so no second line names it.
-/// An error's reason goes through [`crate::embedder::body_free_message`], so no document text
-/// reaches the log.
+/// `MetadataRefreshed`). Any other answer -- a skip whatever its reason, a refusal, an error --
+/// drops them, as the remove event dropped them before #543. A result whose row the indexer
+/// already dropped only has its folded row swept, so no second line names it. The reason for a
+/// skip, refusal or error comes from [`unsettled_reindex_reason`]; an error's goes through
+/// [`crate::embedder::body_free_message`] there, so no document text reaches the log.
+///
+/// (kuriya 549) The dispatch calls this through [`settle_removal_reindex_looked`], only for a
+/// result that settled the row, and for one that did not once a second look found the path
+/// gone. A skip, refusal or error with the file still there (or a look that cannot tell) no
+/// longer reaches it: the row stays, as `groove index` keeps it. The examples the r1 P2 named,
+/// an empty file and a frontmatter-only stub, come back as
+/// [`indexer::SingleResult::NothingToIndex`], a settled result, and are still dropped here.
 ///
 /// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
 fn settle_removal_reindex(
@@ -1978,11 +2238,15 @@ fn settle_removal_reindex(
             ))
         }
         // Each named, not a catch-all, so a new variant stays a compile error (#251's way);
-        // the reason is only for the line, never branched on.
-        Ok(indexer::SingleResult::Skipped { reason, .. }) => RemovalReindexSettled::Deindexed {
-            reason: (*reason).to_string(),
-            outcome: deindex_removed_path(db, kb_path, rel),
-        },
+        // the reason is only for the line, never branched on. Worded by the one mapping the
+        // left-indexed line uses too ([`unsettled_reindex_reason`]), so a row dropped and a
+        // row kept name the same result alike.
+        Ok(indexer::SingleResult::Skipped { .. } | indexer::SingleResult::Refused) | Err(_) => {
+            RemovalReindexSettled::Deindexed {
+                reason: unsettled_reindex_reason(result),
+                outcome: deindex_removed_path(db, kb_path, rel),
+            }
+        }
         // (#543) The skip of a file with nothing to embed, whose row the indexer has already
         // dropped: settled as that skip is, and the line counts that row as one the removal
         // dropped, so it reads as it did before the indexer took the row itself.
@@ -1992,14 +2256,115 @@ fn settle_removal_reindex(
                 outcome: deindex_removed_path(db, kb_path, rel).map(|swept| swept || *deindexed),
             }
         }
-        Ok(indexer::SingleResult::Refused) => RemovalReindexSettled::Deindexed {
-            reason: "refused".to_string(),
-            outcome: deindex_removed_path(db, kb_path, rel),
-        },
-        Err(e) => RemovalReindexSettled::Deindexed {
-            reason: format!("reindex failed: {}", crate::embedder::body_free_message(e)),
-            outcome: deindex_removed_path(db, kb_path, rel),
-        },
+    }
+}
+
+/// What [`settle_removal_reindex_looked`] did after the reindex a remove event ran.
+#[derive(Debug)]
+enum RemovalSettled {
+    /// The reindex settled the row, or it did not and the second look found the path gone:
+    /// what [`settle_removal_reindex`] did.
+    Settled(RemovalReindexSettled),
+    /// The reindex did not settle the row and the second look did not find the path gone:
+    /// the row was left as it was. The reason field says why the file was not indexed, with no
+    /// document text in it; `unknown` holds the kind of the failed look when the look could not
+    /// tell, and is `None` when it found the file there. `held_row` says whether a row was
+    /// under `rel` to keep. `folded` is the folded-row sweep's result, run in the write form
+    /// (only when the real key holds a row), as after a write that left the row
+    /// ([`WriteReindexSettled::LeftAsIs`]): never the removal form, which would drop a folded
+    /// row that is all the index holds for a file still there.
+    LeftIndexed {
+        reason: String,
+        unknown: Option<std::io::ErrorKind>,
+        held_row: Result<bool>,
+        folded: Result<bool>,
+    },
+}
+
+/// (kuriya 549) After [`dispatch_reindex_after_removal`]'s reindex: a result that settled the
+/// row ([`write_reindex_settled_the_row`]) goes to [`settle_removal_reindex`] with no second
+/// look. One that did not -- a skip whatever its reason, a refusal, an error -- is looked at
+/// again (`relook`), as [`settle_write_reindex`] does for a write: a path gone by then drops
+/// its rows through [`settle_removal_reindex`], as before; a file still there, or a look that
+/// cannot tell, leaves the row as it was, as `groove index` does when it skips a file (a size
+/// cap, a read or parse failure, an embedding refusal or error); only the folded row is swept
+/// then, in the write form. Split out of the dispatch so a test can run it with no
+/// [`crate::embedder::Embedder`].
+fn settle_removal_reindex_looked(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    result: &Result<indexer::SingleResult>,
+    relook: impl FnOnce() -> OnDisk,
+) -> RemovalSettled {
+    if write_reindex_settled_the_row(result) {
+        return RemovalSettled::Settled(settle_removal_reindex(db, kb_path, rel, result));
+    }
+    let unknown = match relook() {
+        OnDisk::Gone => {
+            return RemovalSettled::Settled(settle_removal_reindex(db, kb_path, rel, result));
+        }
+        OnDisk::Present => None,
+        OnDisk::Unknown(kind) => Some(kind),
+    };
+    let held_row = db.get_document_hash(rel).map(|hash| hash.is_some());
+    RemovalSettled::LeftIndexed {
+        reason: unsettled_reindex_reason(result),
+        unknown,
+        held_row,
+        folded: indexer::sweep_legacy_folded_row(db, kb_path, rel, true),
+    }
+}
+
+/// Why a reindex left the row as it was: the skip's reason, `refused`, or the error with no
+/// document text in it ([`crate::embedder::body_free_message`]). The one mapping for both
+/// lines that name such a result after a remove event, the one that says the row went
+/// ([`settle_removal_reindex`]) and the one that says it was kept
+/// ([`settle_removal_reindex_looked`]), so the two cannot word the same result apart. Only
+/// called for a result [`write_reindex_settled_the_row`] answered false for; a settled one has
+/// no such reason and gets an empty string.
+fn unsettled_reindex_reason(result: &Result<indexer::SingleResult>) -> String {
+    match result {
+        Ok(indexer::SingleResult::Skipped { reason, .. }) => (*reason).to_string(),
+        Ok(indexer::SingleResult::Refused) => "refused".to_string(),
+        Err(e) => format!("reindex failed: {}", crate::embedder::body_free_message(e)),
+        // Each named, not a catch-all, so a new variant stays a compile error (#251's way).
+        Ok(
+            indexer::SingleResult::Updated { .. }
+            | indexer::SingleResult::Unchanged
+            | indexer::SingleResult::MetadataRefreshed { .. }
+            | indexer::SingleResult::NothingToIndex { .. }
+            | indexer::SingleResult::OutsideKnowledgeBaseDeindexed,
+        ) => String::new(),
+    }
+}
+
+/// (kuriya 549) The line [`dispatch_reindex_after_removal`] prints when the replacement was not
+/// indexed and the row was left as it was ([`RemovalSettled::LeftIndexed`]). Worded apart from
+/// [`log_replacement_not_indexed`]'s, which says the row went.
+fn left_indexed_message(rel: &str, reason: &str, unknown: Option<std::io::ErrorKind>) -> String {
+    match unknown {
+        None => format!(
+            "watcher: {rel} was removed and written again, but the new file was not indexed ({reason}); the index keeps its previous text"
+        ),
+        Some(kind) => format!(
+            "watcher: {rel} was removed and written again, but the new file was not indexed ({reason}); could not tell whether {rel} is still there ({kind}), so the index keeps its previous text"
+        ),
+    }
+}
+
+/// What [`dispatch_reindex_after_removal`] says for [`RemovalSettled::LeftIndexed`]. When no
+/// row was there, only the skip is reported, as [`log_replacement_not_indexed`] does; a row
+/// count that failed reads as a row kept, since nothing was deleted either way.
+fn log_replacement_left_indexed(
+    rel: &str,
+    reason: &str,
+    unknown: Option<std::io::ErrorKind>,
+    held_row: Result<bool>,
+) {
+    match held_row {
+        Ok(false) => wdiag!("watcher: skipped {rel} ({reason})"),
+        Ok(true) | Err(_) => wdiag!("{}", left_indexed_message(rel, reason, unknown)),
     }
 }
 
@@ -2028,19 +2393,20 @@ fn log_folded_sweep(rel: &str, outcome: Result<bool>) {
     }
 }
 
-/// What [`dispatch_reindex_after_removal`] says when it could not tell whether the path is
-/// still there and dropped its rows as a removal. Silent, like [`log_removed_path_deindexed`],
-/// when no row was there. [`dispatch_deindex_unknown`] says the same when the look outside the
-/// locks is the one that could not tell.
-fn log_removed_path_unknown(rel: &str, kind: std::io::ErrorKind, outcome: Result<bool>) {
-    match outcome {
-        Ok(true) => wdiag!(
-            "watcher: could not tell whether {rel} is still there ({kind}); deindexed it as a removal"
-        ),
+/// (kuriya 548) The line [`dispatch_reindex_after_removal`] prints when the look inside the
+/// locks could not tell whether the path is still there and the row was left as it was
+/// ([`RemovalInLocks::LeftIndexed`]). Before kuriya 548 the line said the row was deindexed.
+fn unknown_left_indexed_message(rel: &str, kind: std::io::ErrorKind) -> String {
+    format!("watcher: could not tell whether {rel} is still there ({kind}); left it indexed")
+}
+
+/// What [`dispatch_reindex_after_removal`] says for [`RemovalInLocks::LeftIndexed`]. Silent,
+/// like [`log_removed_path_deindexed`], when no row was there; a row count that failed reads as
+/// a row kept, since nothing was deleted either way.
+fn log_removed_path_left_indexed(rel: &str, kind: std::io::ErrorKind, held_row: Result<bool>) {
+    match held_row {
         Ok(false) => { /* no-op: not in DB */ }
-        Err(e) => wdiag!(
-            "watcher: could not tell whether {rel} is still there ({kind}); deindex failed: {e}"
-        ),
+        Ok(true) | Err(_) => wdiag!("{}", unknown_left_indexed_message(rel, kind)),
     }
 }
 
@@ -2119,16 +2485,6 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
         Ok(false) => { /* no-op: not in DB */ }
         Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
-    sweep_legacy_row(&db, &state.kb_path, rel, false);
-}
-
-/// (#543, local Codex r7, medium) [`dispatch_deindex`] for a remove event whose look outside
-/// the locks could not tell whether the path is still there ([`removal_outcome_for`]). The row
-/// goes all the same; the line is [`log_removed_path_unknown`]'s, so a document dropped on an
-/// access or I/O failure can be told apart from a plain removal in the log.
-fn dispatch_deindex_unknown(state: &WatcherState, rel: &str, kind: std::io::ErrorKind) {
-    let db = recover_db(state.db.lock());
-    log_removed_path_unknown(rel, kind, indexer::deindex_single_file(&db, rel));
     sweep_legacy_row(&db, &state.kb_path, rel, false);
 }
 
@@ -4977,6 +5333,858 @@ mod tests {
                 vec!["other.md".to_string()]
             );
         }
+    }
+
+    /// A temp KB holding `doc.md`, removed on drop. The disk is not what the settle tests
+    /// decide on (the relook closure is), but the file is there as it is when they run.
+    struct I549Kb(std::path::PathBuf);
+    impl Drop for I549Kb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn i549_kb(prefix: &str) -> I549Kb {
+        let kb = crate::test_support::unique_temp_path(prefix);
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("doc.md"), "# doc\n\nbody\n").unwrap();
+        I549Kb(kb)
+    }
+
+    /// The results of a reindex that did not settle the row (S4-S12 of the plan's table S),
+    /// each with a part of the reason the line names.
+    fn i549_unsettled_results() -> Vec<(Result<indexer::SingleResult>, &'static str)> {
+        let skipped = |reason: &'static str| {
+            (
+                Ok(indexer::SingleResult::Skipped {
+                    reason,
+                    frontmatter_unparsed: false,
+                }),
+                reason,
+            )
+        };
+        vec![
+            skipped("file no longer exists"),
+            skipped("file too large"),
+            skipped("read failed"),
+            skipped("parse failed"),
+            skipped("changed between scan and read"),
+            skipped("embedding endpoint rejected the input"),
+            skipped("a reason added later"),
+            (Ok(indexer::SingleResult::Refused), "refused"),
+            (
+                Err(anyhow::anyhow!("embedding endpoint returned HTTP 503")),
+                "reindex failed: embedding endpoint returned HTTP 503",
+            ),
+        ]
+    }
+
+    /// (kuriya 549) A removal reindex that did not settle the row, with the file still there
+    /// at the second look, leaves the row (and every other row) as it was and says why, in the
+    /// words the deindexing settle uses for the same result.
+    #[test]
+    fn i549_an_unsettled_removal_reindex_keeps_the_row_while_the_file_is_there() {
+        let kb = i549_kb("groove-watcher-i549-present");
+        for (result, reason_part) in &i549_unsettled_results() {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let mut looked = 0;
+            let settled = settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, || {
+                looked += 1;
+                OnDisk::Present
+            });
+            assert_eq!(looked, 1, "{result:?}: looked at again once");
+            match &settled {
+                RemovalSettled::LeftIndexed {
+                    reason,
+                    unknown: None,
+                    held_row: Ok(true),
+                    folded: Ok(false),
+                } => assert!(reason.contains(reason_part), "{result:?}: {reason}"),
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+
+        // No row under `rel`: still left (nothing to delete), and the outcome says so.
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "doc.md",
+            &Ok(indexer::SingleResult::Refused),
+            || OnDisk::Present,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::LeftIndexed {
+                    held_row: Ok(false),
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+    }
+
+    /// (kuriya 549) The same results, once the second look finds the path gone, go to
+    /// [`settle_removal_reindex`] as before: the row under `rel` is dropped, the others stay, and
+    /// the reason is the one the kept branch would have named.
+    #[test]
+    fn i549_an_unsettled_removal_reindex_drops_the_row_once_the_path_is_gone() {
+        let kb = i549_kb("groove-watcher-i549-gone");
+        for (result, reason_part) in &i549_unsettled_results() {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled =
+                settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, || OnDisk::Gone);
+            match &settled {
+                RemovalSettled::Settled(RemovalReindexSettled::Deindexed {
+                    reason,
+                    outcome: Ok(true),
+                }) => {
+                    assert!(reason.contains(reason_part), "{result:?}: {reason}");
+                    assert_eq!(reason, &unsettled_reindex_reason(result), "{result:?}");
+                }
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["other.md".to_string()],
+                "{result:?}"
+            );
+        }
+    }
+
+    /// (kuriya 549) A second look that cannot tell keeps the row as a write's does (U1 of the
+    /// plan), and the outcome carries the kind for the line.
+    #[test]
+    fn i549_an_unsettled_removal_reindex_keeps_the_row_when_the_relook_cannot_tell() {
+        let kb = i549_kb("groove-watcher-i549-unknown");
+        for (result, reason_part) in &i549_unsettled_results() {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled = settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, || {
+                OnDisk::Unknown(std::io::ErrorKind::PermissionDenied)
+            });
+            match &settled {
+                RemovalSettled::LeftIndexed {
+                    reason,
+                    unknown: Some(std::io::ErrorKind::PermissionDenied),
+                    held_row: Ok(true),
+                    folded: Ok(false),
+                } => assert!(reason.contains(reason_part), "{result:?}: {reason}"),
+                other => panic!("{result:?}: {other:?}"),
+            }
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+    }
+
+    /// (kuriya 549, GitHub codex r3 P1) The same unsettled result gets the same reason
+    /// whether the second look drops the row ([`settle_removal_reindex`]) or keeps it: both
+    /// take it from [`unsettled_reindex_reason`], so the skip's words, `refused`, the error's
+    /// format and the cut of a response body cannot drift apart between the two lines.
+    #[test]
+    fn i549_a_dropped_and_a_kept_row_name_an_unsettled_reindex_alike() {
+        let kb = i549_kb("groove-watcher-i549-alike");
+        let reason_of = |settled: &RemovalSettled| match settled {
+            RemovalSettled::Settled(RemovalReindexSettled::Deindexed { reason, .. })
+            | RemovalSettled::LeftIndexed { reason, .. } => reason.clone(),
+            other => panic!("no reason: {other:?}"),
+        };
+        // An error whose chain quotes a response body: the cut must be the same on both sides.
+        let body = serde_json::from_str::<serde_json::Value>("{\"body\": secret text")
+            .expect_err("not JSON");
+        let mut results = i549_unsettled_results();
+        results.push((
+            Err(anyhow::Error::new(body).context("failed to embed chunks for doc.md")),
+            "reindex failed: failed to embed chunks for doc.md: malformed JSON (syntax)",
+        ));
+        for (result, expected) in &results {
+            let dropped_db = dir_rename_db(&["doc.md", "other.md"]);
+            let dropped =
+                settle_removal_reindex_looked(&dropped_db, &kb.0, "doc.md", result, || {
+                    OnDisk::Gone
+                });
+            let kept_db = dir_rename_db(&["doc.md", "other.md"]);
+            let kept = settle_removal_reindex_looked(&kept_db, &kb.0, "doc.md", result, || {
+                OnDisk::Present
+            });
+            assert!(
+                matches!(
+                    dropped,
+                    RemovalSettled::Settled(RemovalReindexSettled::Deindexed { .. })
+                ),
+                "{result:?}: {dropped:?}"
+            );
+            assert!(
+                matches!(kept, RemovalSettled::LeftIndexed { .. }),
+                "{result:?}: {kept:?}"
+            );
+            let (dropped, kept) = (reason_of(&dropped), reason_of(&kept));
+            assert_eq!(dropped, kept, "{result:?}");
+            assert_eq!(&dropped, expected, "{result:?}");
+            assert!(!dropped.contains("secret"), "{dropped}");
+        }
+    }
+
+    /// (kuriya 549) A result that settled the row is not looked at again: it gets what
+    /// [`settle_removal_reindex`] gives it, the empty-file skip (`NothingToIndex`) still dropped.
+    #[test]
+    fn i549_a_settled_removal_reindex_is_not_looked_at_again() {
+        let kb = i549_kb("groove-watcher-i549-settled");
+        let no_look = || -> OnDisk { panic!("a settled result must not be looked at again") };
+
+        let kept: [Result<indexer::SingleResult>; 3] = [
+            Ok(indexer::SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            }),
+            Ok(indexer::SingleResult::Unchanged),
+            Ok(indexer::SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: false,
+            }),
+        ];
+        for result in &kept {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let settled = settle_removal_reindex_looked(&db, &kb.0, "doc.md", result, no_look);
+            assert!(
+                matches!(
+                    settled,
+                    RemovalSettled::Settled(RemovalReindexSettled::Kept)
+                ),
+                "{result:?}: {settled:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{result:?}"
+            );
+        }
+
+        // The indexer dropped the row of an emptied file: settled, still a deindex.
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "doc.md",
+            &Ok(indexer::SingleResult::NothingToIndex {
+                deindexed: true,
+                frontmatter_unparsed: false,
+            }),
+            no_look,
+        );
+        match &settled {
+            RemovalSettled::Settled(RemovalReindexSettled::Deindexed {
+                reason,
+                outcome: Ok(true),
+            }) => assert_eq!(reason, indexer::SKIPPED_NO_CHUNKS),
+            other => panic!("{other:?}"),
+        }
+
+        let db = dir_rename_db(&["other.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "doc.md",
+            &Ok(indexer::SingleResult::OutsideKnowledgeBaseDeindexed),
+            no_look,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::Settled(RemovalReindexSettled::IndexerDeindexed(Ok(false)))
+            ),
+            "{settled:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 549) A row left as it was keeps the folded row an older version stored while the
+    /// real key holds none (the folded row is then all the index holds for the file), and drops
+    /// it once the real key holds a row: the write form of the sweep, never the removal form.
+    /// Unix only: a folded spelling exists only where `\` is not a separator.
+    #[cfg(unix)]
+    #[test]
+    fn i549_a_row_left_indexed_keeps_a_folded_row_whose_real_key_holds_none() {
+        let kb = i549_kb("groove-watcher-i549-folded");
+        std::fs::write(kb.0.join("secret\\pay.md"), "# pay").unwrap();
+        let has = |db: &Database, path: &str| db.get_document_hash(path).unwrap().is_some();
+
+        // Only the folded row: it stays.
+        let db = dir_rename_db(&["secret/pay.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "secret\\pay.md",
+            &Ok(indexer::SingleResult::Refused),
+            || OnDisk::Present,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::LeftIndexed {
+                    held_row: Ok(false),
+                    folded: Ok(false),
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+        assert!(has(&db, "secret/pay.md"), "the folded row is all there is");
+
+        // The real key holds a row too: the duplicate goes, the real key stays.
+        let db = dir_rename_db(&["secret/pay.md", "secret\\pay.md"]);
+        let settled = settle_removal_reindex_looked(
+            &db,
+            &kb.0,
+            "secret\\pay.md",
+            &Ok(indexer::SingleResult::Refused),
+            || OnDisk::Present,
+        );
+        assert!(
+            matches!(
+                settled,
+                RemovalSettled::LeftIndexed {
+                    held_row: Ok(true),
+                    folded: Ok(true),
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+        assert!(has(&db, "secret\\pay.md"));
+        assert!(!has(&db, "secret/pay.md"));
+    }
+
+    /// (kuriya 549) The line for a row left as it was must not read as the line for a row
+    /// dropped: the remove-then-write end-to-end tests wait for "was removed and its
+    /// replacement was not indexed" as the drop. Both forms still start with "was removed and",
+    /// which the end-to-end tests that pin this fix wait for.
+    #[test]
+    fn i549_the_left_indexed_line_is_not_the_deindexed_line() {
+        for unknown in [None, Some(std::io::ErrorKind::PermissionDenied)] {
+            let line = left_indexed_message("doc.md", "file too large", unknown);
+            assert!(
+                !line.contains("doc.md was removed and its replacement was not indexed"),
+                "{line}"
+            );
+            assert!(line.contains("doc.md was removed and"), "{line}");
+            assert!(line.contains("(file too large)"), "{line}");
+            assert!(line.is_ascii(), "{line}");
+        }
+        assert!(
+            left_indexed_message(
+                "doc.md",
+                "read failed",
+                Some(std::io::ErrorKind::PermissionDenied)
+            )
+            .contains("could not tell whether doc.md is still there (permission denied)")
+        );
+    }
+
+    /// (kuriya 548) Inside the locks, a look that could not tell leaves the row under `rel`,
+    /// its folded legacy row and every other row as they were, and keeps the kind for the
+    /// line; a missing row is reported as missing. The line says the row was left, not
+    /// deindexed, and is the one the end-to-end tests that pin this fix wait for.
+    #[test]
+    fn i548_an_unknown_look_inside_the_locks_leaves_the_row() {
+        let kb = i549_kb("groove-watcher-i548-unknown");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let unknown = OnDisk::Unknown(std::io::ErrorKind::PermissionDenied);
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let decided = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &kb.0.join("doc.md"),
+            &reg,
+            &rules,
+            unknown,
+        );
+        assert!(
+            matches!(
+                decided,
+                RemovalInLocks::LeftIndexed {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    held_row: Ok(true),
+                }
+            ),
+            "{decided:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["doc.md".to_string(), "other.md".to_string()]
+        );
+
+        let db = dir_rename_db(&["other.md"]);
+        let decided = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &kb.0.join("doc.md"),
+            &reg,
+            &rules,
+            unknown,
+        );
+        assert!(
+            matches!(
+                decided,
+                RemovalInLocks::LeftIndexed {
+                    held_row: Ok(false),
+                    ..
+                }
+            ),
+            "{decided:?}"
+        );
+
+        // The folded legacy row stays too: no sweep runs on an unknown, in either form. Unix
+        // only: a folded spelling exists only where `\` is not a separator.
+        #[cfg(unix)]
+        {
+            std::fs::write(kb.0.join("secret\\pay.md"), "# pay").unwrap();
+            let db = dir_rename_db(&["secret/pay.md", "secret\\pay.md"]);
+            let decided = decide_removal_in_locks(
+                &db,
+                &kb.0,
+                "secret\\pay.md",
+                &kb.0.join("secret\\pay.md"),
+                &reg,
+                &rules,
+                unknown,
+            );
+            assert!(
+                matches!(
+                    decided,
+                    RemovalInLocks::LeftIndexed {
+                        held_row: Ok(true),
+                        ..
+                    }
+                ),
+                "{decided:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["secret/pay.md".to_string(), "secret\\pay.md".to_string()]
+            );
+        }
+
+        let line = unknown_left_indexed_message("sub/a.md", std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            line,
+            "watcher: could not tell whether sub/a.md is still there (permission denied); left it indexed"
+        );
+        assert!(!line.contains("deindexed"), "{line}");
+        assert!(line.is_ascii(), "{line}");
+    }
+
+    /// (kuriya 548) Inside the locks, the look taken there decides through the removal
+    /// decision asked again: a path gone drops its row (and only its row), a file the write
+    /// gate takes is reindexed, an excluded path is skipped, and a look that cannot tell keeps
+    /// the row. The answer the look outside gave plays no part.
+    #[test]
+    fn i548_a_removal_looked_at_again_inside_the_locks_decides_on_that_look() {
+        let kb = i549_kb("groove-watcher-i548-decide");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("doc.md");
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let gone = decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Gone);
+        assert!(
+            matches!(gone, RemovalInLocks::Deindexed(Ok(true))),
+            "{gone:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let present =
+            decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Present);
+        assert!(matches!(present, RemovalInLocks::Reindex), "{present:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["doc.md".to_string(), "other.md".to_string()]
+        );
+
+        let excluded_full = kb.0.join(".obsidian").join("x.md");
+        std::fs::create_dir_all(excluded_full.parent().unwrap()).unwrap();
+        std::fs::write(&excluded_full, "# x").unwrap();
+        for look in [
+            OnDisk::Present,
+            OnDisk::Gone,
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        ] {
+            let db = dir_rename_db(&[".obsidian/x.md"]);
+            let skipped = decide_removal_in_locks(
+                &db,
+                &kb.0,
+                ".obsidian/x.md",
+                &excluded_full,
+                &reg,
+                &rules,
+                look,
+            );
+            assert!(
+                matches!(skipped, RemovalInLocks::Skip),
+                "{look:?}: {skipped:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec![".obsidian/x.md".to_string()],
+                "{look:?}"
+            );
+        }
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let unknown = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &full,
+            &reg,
+            &rules,
+            OnDisk::Unknown(std::io::ErrorKind::Other),
+        );
+        assert!(
+            matches!(
+                unknown,
+                RemovalInLocks::LeftIndexed {
+                    kind: std::io::ErrorKind::Other,
+                    held_row: Ok(true),
+                }
+            ),
+            "{unknown:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["doc.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 548) A file found inside the locks that the write gate refuses is never
+    /// reindexed there, whatever the look outside found. A hard link fails the removal gate
+    /// too, so it is skipped and its row left, as the removal decided before kuriya 543
+    /// ([`a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path`] pins the same
+    /// answer outside the locks). A key the index cannot hold passes the removal gate early
+    /// (ADR-0023), so a file there has its row dropped rather than reindexed.
+    #[test]
+    fn i548_a_file_the_write_gate_refuses_inside_the_locks_is_not_reindexed() {
+        let kb = i549_kb("groove-watcher-i548-gate");
+        std::fs::hard_link(kb.0.join("doc.md"), kb.0.join("twin.md")).unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let linked = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &kb.0.join("doc.md"),
+            &reg,
+            &rules,
+            OnDisk::Present,
+        );
+        assert!(matches!(linked, RemovalInLocks::Skip), "{linked:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["doc.md".to_string(), "other.md".to_string()]
+        );
+
+        // An empty segment: a spelling no document name may take, on every platform.
+        let db = dir_rename_db(&["a//doc.md", "other.md"]);
+        let unaddressable = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "a//doc.md",
+            &kb.0.join("doc.md"),
+            &reg,
+            &rules,
+            OnDisk::Present,
+        );
+        assert!(
+            matches!(unaddressable, RemovalInLocks::Deindexed(Ok(true))),
+            "{unaddressable:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 548) The event loop's reading of the outside look: an unknown that ends in a
+    /// deindex goes inside the locks to be looked at again, never straight to the deindex; so
+    /// does a path found gone (see
+    /// [`i548_a_removal_found_gone_outside_the_locks_is_looked_at_again_inside_them`]), and the
+    /// rest is as before.
+    #[test]
+    fn i548_the_event_loop_does_not_drop_a_row_on_an_unknown_look() {
+        assert_eq!(
+            removal_dispatch(
+                "doc.md",
+                (
+                    RemovalAction::Deindex,
+                    Some(std::io::ErrorKind::PermissionDenied)
+                )
+            ),
+            RemovalDispatch::DecideInLocks
+        );
+        assert_eq!(
+            removal_dispatch("doc.md", (RemovalAction::Reindex, None)),
+            RemovalDispatch::DecideInLocks
+        );
+        assert_eq!(
+            removal_dispatch("doc.md", (RemovalAction::Deindex, None)),
+            RemovalDispatch::DecideInLocks
+        );
+        assert_eq!(
+            removal_dispatch("doc.md", (RemovalAction::Skip, None)),
+            RemovalDispatch::Skip
+        );
+        assert_eq!(
+            removal_dispatch(
+                "doc.md",
+                (
+                    RemovalAction::Skip,
+                    Some(std::io::ErrorKind::PermissionDenied)
+                )
+            ),
+            RemovalDispatch::Skip
+        );
+    }
+
+    /// (kuriya 548, local Codex r1, high) A deindex the look outside the locks reached on a
+    /// path it found gone is not settled there: it goes inside the locks to be looked at
+    /// again, as the empty key does. Only a name the index cannot hold, which the removal gate
+    /// passes early whatever is on disk (ADR-0023), is dropped without a second look.
+    #[test]
+    fn i548_a_removal_found_gone_outside_the_locks_is_looked_at_again_inside_them() {
+        let kb = i549_kb("groove-watcher-i548-gone-outside");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("gone.md");
+
+        let outside = removal_outcome("gone.md", &full, &reg, &rules);
+        assert_eq!(outside, (RemovalAction::Deindex, None));
+        assert_eq!(
+            removal_dispatch("gone.md", outside),
+            RemovalDispatch::DecideInLocks
+        );
+        for rel in ["doc.md", "sub/doc.md", ""] {
+            assert_eq!(
+                removal_dispatch(rel, (RemovalAction::Deindex, None)),
+                RemovalDispatch::DecideInLocks,
+                "{rel:?}"
+            );
+        }
+
+        // An empty segment: a spelling no document name may take, on every platform.
+        assert!(removal_gate_passes_by_name("a//doc.md"));
+        assert_eq!(
+            removal_dispatch("a//doc.md", (RemovalAction::Deindex, None)),
+            RemovalDispatch::Deindex
+        );
+        assert!(!removal_gate_passes_by_name("doc.md"));
+        assert!(!removal_gate_passes_by_name(""));
+    }
+
+    /// (kuriya 548, GitHub Codex r2) The removal gate's early pass and the name test
+    /// [`removal_dispatch`] reads are one test: for every name, [`gate_parts`] with
+    /// [`Gate::Removal`] passes on the name alone exactly when [`removal_gate_passes_by_name`]
+    /// says so. The full path does not exist and has an extension no parser takes, so a name
+    /// that misses the early pass is turned away by the extension filter below it, and only
+    /// the early pass can answer yes.
+    #[test]
+    fn i548_the_removal_gate_and_the_dispatcher_share_one_name_test() {
+        let kb = i549_kb("groove-watcher-i548-one-name-test");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("nowhere.unparsed-ext");
+        assert!(!full.exists());
+
+        let mut names = vec![
+            "doc.md",
+            "sub/doc.md",
+            "",
+            "a//doc.md",
+            "./a.md",
+            "a/./b.md",
+            "a/",
+            ".",
+            "../a.md",
+            "/abs.md",
+            "a\\..\\b.md",
+            "C:/note.md",
+        ];
+        if cfg!(windows) {
+            names.extend(["b.md.", "dir./x.md", "a<b.md", "a/b?.md", "a.b.md"]);
+        }
+        let mut passed = 0;
+        for rel in names {
+            let by_name = removal_gate_passes_by_name(rel);
+            assert_eq!(
+                gate_parts(rel, &full, &reg, &rules, Gate::Removal),
+                by_name,
+                "{rel:?}"
+            );
+            passed += usize::from(by_name);
+        }
+        // Both answers are exercised: some names pass early and some do not.
+        assert!(passed > 0);
+        assert!(!removal_gate_passes_by_name("doc.md"));
+    }
+
+    /// (kuriya 548, local Codex r1, high) The case the second look is for: the look outside
+    /// the locks found the path gone, and the file was written again before the locks were
+    /// taken (its create folded away by the debouncer). The look inside finds it, and the
+    /// row is kept and handed to the reindex rather than dropped until the next full index.
+    #[test]
+    fn i548_a_file_written_again_before_the_locks_keeps_its_row() {
+        let kb = i549_kb("groove-watcher-i548-written-again");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("doc.md");
+        std::fs::remove_file(&full).unwrap();
+
+        let outside = removal_outcome("doc.md", &full, &reg, &rules);
+        assert_eq!(outside, (RemovalAction::Deindex, None));
+        assert_eq!(
+            removal_dispatch("doc.md", outside),
+            RemovalDispatch::DecideInLocks
+        );
+
+        std::fs::write(&full, "# doc\n\nwritten again\n").unwrap();
+        let look = removed_path_on_disk(&kb.0, "doc.md");
+        assert_eq!(look, OnDisk::Present);
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let decided = decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, look);
+        assert!(matches!(decided, RemovalInLocks::Reindex), "{decided:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["doc.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 548, local Codex r2, medium) Under the database lock alone, a path still gone
+    /// has its row (and only its row) dropped, or is skipped when the removal gate turns it
+    /// away; a file there or a look that cannot tell touches nothing and is handed on to the
+    /// path that takes both locks.
+    #[test]
+    fn i548_a_removal_still_gone_is_settled_under_the_database_lock_alone() {
+        let kb = i549_kb("groove-watcher-i548-db-lock-only");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("doc.md");
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let gone = remove_if_still_gone(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Gone);
+        assert!(
+            matches!(gone, RemovalUnderDatabaseLock::Deindexed(Ok(true))),
+            "{gone:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+
+        let excluded_full = kb.0.join(".obsidian").join("x.md");
+        let db = dir_rename_db(&[".obsidian/x.md"]);
+        let skipped = remove_if_still_gone(
+            &db,
+            &kb.0,
+            ".obsidian/x.md",
+            &excluded_full,
+            &reg,
+            &rules,
+            OnDisk::Gone,
+        );
+        assert!(
+            matches!(skipped, RemovalUnderDatabaseLock::Skip),
+            "{skipped:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![".obsidian/x.md".to_string()]
+        );
+
+        for look in [
+            OnDisk::Present,
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        ] {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let handed_on = remove_if_still_gone(&db, &kb.0, "doc.md", &full, &reg, &rules, look);
+            assert!(
+                matches!(handed_on, RemovalUnderDatabaseLock::NeedsBothLocks),
+                "{look:?}: {handed_on:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{look:?}"
+            );
+        }
+    }
+
+    /// (kuriya 548, local Codex r2, medium) A remove event whose path is still gone is handled
+    /// through the event loop while the embedder lock is held elsewhere (a search embedding a
+    /// query on a slow endpoint): the row goes and the batch finishes without waiting for that
+    /// lock. Taking both locks for it, as the event loop did for a moment, would block here
+    /// until the lock is let go.
+    #[test]
+    fn i548_a_removal_still_gone_does_not_wait_for_the_embedder_lock() {
+        let kb = i549_kb("groove-watcher-i548-no-embedder-wait");
+        let full = kb.0.join("doc.md");
+        std::fs::remove_file(&full).unwrap();
+        let db = Arc::new(Mutex::new(dir_rename_db(&["doc.md", "other.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = WatcherState {
+            kb_path: kb.0.clone(),
+            db: Arc::clone(&db),
+            embedder: Arc::clone(&embedder),
+            registry: Arc::new(Registry::defaults()),
+            exclude_headings: None,
+            rules: crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs()),
+            config: WatchConfig::default(),
+            watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let events = [mk_evt(
+            EventKind::Remove(notify_debouncer_full::notify::event::RemoveKind::File),
+            vec![full.clone()],
+        )];
+
+        let held = embedder.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let finished = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_events(&mut state, &events);
+                let _ = done_tx.send(());
+            });
+            // Generous: the deletion takes milliseconds; the wait only runs out when the
+            // removal is blocked on the held lock.
+            let finished = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+            // Let a blocked removal go so the scope can join it either way.
+            drop(held);
+            finished
+        });
+        assert!(
+            finished,
+            "a removal of a path still gone waited for the embedder lock"
+        );
+        assert_eq!(
+            db.lock().unwrap().all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// (#543) The line a create or modify prints when the file it had indexed now holds

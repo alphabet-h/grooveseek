@@ -4292,8 +4292,7 @@ pub(crate) fn collect_source_files_under(
 /// Those are left to the watcher's own relativizing. The root relativizes to
 /// the empty string, which is no document name and must not be pruned.
 fn name_is_left_out(kb_path: &Path, path: &Path) -> bool {
-    index_rel_path(kb_path, path)
-        .is_some_and(|r| !r.is_empty() && !crate::resources::doc_is_addressable(&r))
+    index_rel_path(kb_path, path).is_some_and(|r| !crate::resources::rel_is_indexable_name(&r))
 }
 
 /// What [`collect_source_files_counted`] collected, and how many entries it

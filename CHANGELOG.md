@@ -16,6 +16,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **The live watcher no longer drops a document when a deletion turns out to leave a file it
+  cannot index or cannot look at.** When a file was deleted and written again (an editor that
+  saves that way, a script that replaces the file), the watcher re-indexes it in place; if that
+  re-index did not index the new file -- it was over a size cap, could not be read or parsed, the
+  embedding endpoint refused it or was down -- the document was dropped, although `groove index`
+  keeps it in the same case. And when the watcher could not tell whether a deleted path was still
+  there (access denied, an I/O error), it dropped the document as well. Both now leave the
+  document indexed with its previous text and say why on stderr, so the watcher and
+  `groove index` agree; the file's next event or the next `groove index` run reads it again, and
+  one that is in fact gone is removed once the watcher or `groove index` can see that. (#399)
 - **A rename into another parser that fails partway is read again on the next run.** When
   `groove index`, MCP `rebuild_index` or the live watcher had moved a document to a name another
   parser reads (`.txt` to `.md`, say) and then failed after the move -- the embedding endpoint
