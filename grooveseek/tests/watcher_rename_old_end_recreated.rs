@@ -204,12 +204,14 @@ fn a_file_renamed_then_written_again_under_its_old_name_keeps_both() {
 /// Pins the row N1 of the table in kuriya 560 (type E). `keep.txt` is there only so that the
 /// directory exists before the server starts; its extension keeps it out of the index.
 ///
-/// Only Linux pairs this rename, and only there is the paired path asserted (through the line
-/// of the dropped row). On Windows the watcher saw no paired rename when this was written: the
-/// stderr held only the reindex of `a.md`, so the old name went through the removal that looks
-/// at the path. The reading (not checked) is that Windows reports a move between directories
-/// as a removal and an addition rather than as the two names of a rename. The end state is the
-/// same, and is asserted on both.
+/// On Linux the test also asserts the line of the dropped row. That line is printed by the paired
+/// rename and by an unpaired rename-from event alike, and neither looks at the old name, so it
+/// pins that the old name went through a drop that does not look; it does not tell which of the
+/// two it was. On Windows the watcher printed no such line when this was written: the stderr held
+/// only the reindex of `a.md`, so the old name went through the removal that looks at the path.
+/// The reading (not checked) is that Windows reports a move between directories as a removal and
+/// an addition rather than as the two names of a rename. The end state is the same, and is
+/// asserted on both.
 #[test]
 fn a_file_moved_into_an_excluded_directory_then_written_again_is_indexed() {
     let (fx, guard) = served(
@@ -243,7 +245,7 @@ fn a_file_moved_into_an_excluded_directory_then_written_again_is_indexed() {
         let lines = stderr_lines(&guard);
         assert!(
             lines.iter().any(|l| l.contains("watcher: deindexed a.md")),
-            "the end state was reached without the paired rename path; stderr:\n{}",
+            "the end state was reached without a drop of a.md that does not look; stderr:\n{}",
             lines.join("\n")
         );
     }

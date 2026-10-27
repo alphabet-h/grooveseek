@@ -2811,9 +2811,10 @@ enum RenamePlan {
 /// of the watcher pin this for a file rename and a directory rename
 /// (`a_file_renamed_then_written_again_under_its_old_name_keeps_both`,
 /// `a_directory_renamed_then_created_again_with_a_file_indexes_the_new_file`). A third test moves
-/// a file into an excluded directory, which drops the old row without reaching this plan; only on
-/// Linux does it check that the move arrived as a paired rename. Windows reports that move as a
-/// removal and an add, so there the test checks only the end state, through the unpaired removal.
+/// a file into an excluded directory, which drops the old row without reaching this plan. Only on
+/// Linux does it see the old row dropped without a look (by the paired rename or an unpaired
+/// rename-from, which print the same line); on Windows the move arrives as a removal and an add,
+/// so there it checks only the end state, reached through the removal that looks.
 fn rename_plan(db: &Database, old_rel: &str, new_rel: &str, dest: OnDisk) -> Result<RenamePlan> {
     let has_row = |rel: &str| -> Result<bool> { Ok(db.get_document_hash(rel)?.is_some()) };
     Ok(match dest {
