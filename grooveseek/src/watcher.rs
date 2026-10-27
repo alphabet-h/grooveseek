@@ -5295,7 +5295,8 @@ mod tests {
     /// 作り直された普通の旧 key は removal gate を通らない」を固定していた。
     /// removal gate が symlink と同じく hard link も通すことにした (index は link に
     /// 文書を持たない。full index の walk も hard link を集めず削除 pass が行を消す)
-    /// ので、`deindex_passes` は true、rename は旧行を新端へ移す `Rename` に反転した。
+    /// ので、[`deindex_passes`] は true、rename は旧行を新端へ移す
+    /// [`RenameAction::Rename`] に反転した。
     #[cfg(windows)]
     #[test]
     fn an_addressable_key_keeps_every_removal_gate() {

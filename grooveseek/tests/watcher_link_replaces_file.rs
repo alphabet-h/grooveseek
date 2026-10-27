@@ -9,7 +9,7 @@
 //!
 //! Not on macOS: FSEvents does not say which end of a rename a path is, and the debouncer drops
 //! removals and renames when flags pile up on a path (kuriya trap 525). The decisions these tests
-//! reach are pinned by unit tests in `watcher.rs` on all three platforms.
+//! reach are pinned by unit tests in [`grooveseek::watcher`] on all three platforms.
 #![cfg(not(target_os = "macos"))]
 
 mod common;
