@@ -993,11 +993,13 @@ enum RemovalInLocks {
 ///
 /// - a reindex is [`RemovalInLocks::Reindex`]
 /// - a deindex on [`OnDisk::Gone`], or on [`OnDisk::Present`] (a file under a name the index
-///   cannot hold, which the removal gate passes early, ADR-0023), drops the rows
+///   cannot hold, which the removal gate passes early, ADR-0023; or, kuriya 566, a hard link,
+///   which the write gate refuses and the removal gate passes), drops the rows
 ///   ([`deindex_removed_path`])
 /// - a deindex on [`OnDisk::Unknown`] leaves the rows as they were, as a write keeps them (D3)
 ///   and as `groove index` keeps them; before kuriya 548 they went
-/// - a skip (the removal gate turns the path away: an excluded path, a hard link) does nothing
+/// - a skip (the removal gate turns the path away: an excluded path, a wrong extension) does
+///   nothing
 ///
 /// (local Codex r2, medium) [`remove_if_still_gone`] calls this too, under the database lock
 /// alone, for a look that found the path gone: then only the deindex or the skip can come
@@ -1626,8 +1628,10 @@ enum Gate {
     /// checks: no such row can be one this version wrote, so moving or
     /// dropping it is always right, whatever sits at the path now (a file
     /// recreated there as a link, say). Every other key goes through all of
-    /// those checks as before, except that (kuriya 557) a symlink (a junction
-    /// on Windows) at the path passes: no document is held at a link.
+    /// those checks as before, except that a link at the path passes: a
+    /// symlink (a junction on Windows) since kuriya 557, a hard link since
+    /// kuriya 566 (U1). No document is held at a link, so this answer is the
+    /// one place that decides whether the row of a path now a link goes.
     Removal,
 }
 
@@ -1857,7 +1861,7 @@ fn gate_given(
     // passes the extension filter (`x.md`) was read here as a hard link, so a
     // removal of `x.md` that found a directory there kept its row on Linux and
     // macOS and dropped it on Windows (which cannot open a directory for the
-    // count).
+    // count). The removal gate now asks no count at all (kuriya 566, below).
     //
     // The write gate keeps the answer it gave a directory before #550, from the
     // raw count: a refusal on Linux and macOS, a pass on Windows. Whether the
@@ -1866,13 +1870,20 @@ fn gate_given(
     //
     // Same fail-open rule as the symlink check above: a vanished file has no
     // link count, and this function gates deindexing as well as indexing.
-    let linked = match gate {
-        Gate::Removal => facts.is_multiply_linked(),
-        Gate::Write => {
-            facts.is_multiply_linked()
-                || (facts.is_dir() && facts.link_count().is_some_and(|count| count > 1))
-        }
-    };
+    //
+    // (kuriya 566 U1, 2026-10-28) A hard link is refused as a write only, as a
+    // symlink is. As a removal it passes without its count being read: the
+    // index holds no document at a hard link either (the full walk does not
+    // collect one and its deletion pass drops the row), so a file replaced by
+    // a hard link, or given a second name, loses its row rather than keeping
+    // text the index would no longer read. Every watcher path that meets a
+    // link hands it to this answer ([`handle_removed_path`],
+    // [`decide_removal_in_locks`]) rather than judging the link itself.
+    if gate == Gate::Removal {
+        return true;
+    }
+    let linked = facts.is_multiply_linked()
+        || (facts.is_dir() && facts.link_count().is_some_and(|count| count > 1));
     if linked {
         wdiag!("watcher: {}", crate::links::refusal_reason(full));
         return false;
@@ -10045,6 +10056,55 @@ mod tests {
         assert_eq!(
             removal_decision_given("doc.md", &plain, &reg, &rules, OnDisk::Present),
             RemovalAction::Reindex
+        );
+    }
+
+    /// (kuriya 566) A removal whose path is now a hard link drops the row, as the full index
+    /// does (its walk does not collect a hard link, and its deletion pass drops the row): the
+    /// index holds no document at a link, a symlink's or a hard link's alike. The other row stays.
+    #[test]
+    fn i566_a_removal_drops_the_row_of_a_path_now_a_hard_link() {
+        let kb = i549_kb("groove-watcher-i566-removal");
+        std::fs::hard_link(kb.0.join("doc.md"), kb.0.join("twin.md")).unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+
+        let db = dir_rename_db(&["twin.md", "other.md"]);
+        let outcome = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "twin.md",
+            &kb.0.join("twin.md"),
+            &reg,
+            &rules,
+            OnDisk::Present,
+        );
+        assert!(
+            matches!(outcome, RemovalInLocks::Deindexed(Ok(true))),
+            "{outcome:?}"
+        );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["other.md".to_string()]);
+    }
+
+    /// (kuriya 566) A rename away from a path that is now a hard link moves the row: the old
+    /// end passes the removal gate whatever is at it, and only the new end is judged as a write.
+    #[test]
+    fn i566_a_rename_away_from_a_hard_link_moves_the_row() {
+        let kb = i549_kb("groove-watcher-i566-rename");
+        std::fs::hard_link(kb.0.join("doc.md"), kb.0.join("old.md")).unwrap();
+        std::fs::write(kb.0.join("good.md"), "# good\n").unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        assert_eq!(
+            rename_decision(
+                "old.md",
+                &kb.0.join("old.md"),
+                "good.md",
+                &kb.0.join("good.md"),
+                &reg,
+                &rules
+            ),
+            RenameAction::Rename
         );
     }
 }
