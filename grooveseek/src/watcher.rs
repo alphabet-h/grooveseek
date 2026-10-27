@@ -934,8 +934,9 @@ fn removal_dispatch(
 }
 
 /// (ADR-0023) Whether the removal gate passes `rel` on its name alone, before it looks at
-/// the disk: a name the index cannot hold. The same test as the first one [`gate_parts`] runs
-/// for [`Gate::Removal`]; the empty key (the knowledge base itself) is not one.
+/// the disk: a name the index cannot hold. [`gate_parts`] calls this first for
+/// [`Gate::Removal`], and [`removal_dispatch`] calls it to skip the look inside the locks, so
+/// the two answer from one test; the empty key (the knowledge base itself) is not one.
 fn removal_gate_passes_by_name(rel: &str) -> bool {
     !rel.is_empty() && !crate::resources::doc_is_addressable(rel)
 }
@@ -1622,8 +1623,10 @@ fn gate_parts(
     gate: Gate,
 ) -> bool {
     // (ADR-0023) See [`Gate::Removal`]. The empty key is the knowledge base
-    // itself, which names no row and takes the ordinary path.
-    if gate == Gate::Removal && !rel.is_empty() && !crate::resources::doc_is_addressable(rel) {
+    // itself, which names no row and takes the ordinary path. The name test is
+    // the one [`removal_dispatch`] asks too ([`removal_gate_passes_by_name`]),
+    // so the gate and the dispatcher cannot drift apart.
+    if gate == Gate::Removal && removal_gate_passes_by_name(rel) {
         return true;
     }
     // 1 回の stat を 2 つの判定で使い回す: ディレクトリかどうか (末尾スラッシュ
@@ -5945,6 +5948,52 @@ mod tests {
         );
         assert!(!removal_gate_passes_by_name("doc.md"));
         assert!(!removal_gate_passes_by_name(""));
+    }
+
+    /// (kuriya 548, GitHub Codex r2) The removal gate's early pass and the name test
+    /// [`removal_dispatch`] reads are one test: for every name, [`gate_parts`] with
+    /// [`Gate::Removal`] passes on the name alone exactly when [`removal_gate_passes_by_name`]
+    /// says so. The full path does not exist and has an extension no parser takes, so a name
+    /// that misses the early pass is turned away by the extension filter below it, and only
+    /// the early pass can answer yes.
+    #[test]
+    fn i548_the_removal_gate_and_the_dispatcher_share_one_name_test() {
+        let kb = i549_kb("groove-watcher-i548-one-name-test");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("nowhere.unparsed-ext");
+        assert!(!full.exists());
+
+        let mut names = vec![
+            "doc.md",
+            "sub/doc.md",
+            "",
+            "a//doc.md",
+            "./a.md",
+            "a/./b.md",
+            "a/",
+            ".",
+            "../a.md",
+            "/abs.md",
+            "a\\..\\b.md",
+            "C:/note.md",
+        ];
+        if cfg!(windows) {
+            names.extend(["b.md.", "dir./x.md", "a<b.md", "a/b?.md", "a.b.md"]);
+        }
+        let mut passed = 0;
+        for rel in names {
+            let by_name = removal_gate_passes_by_name(rel);
+            assert_eq!(
+                gate_parts(rel, &full, &reg, &rules, Gate::Removal),
+                by_name,
+                "{rel:?}"
+            );
+            passed += usize::from(by_name);
+        }
+        // Both answers are exercised: some names pass early and some do not.
+        assert!(passed > 0);
+        assert!(!removal_gate_passes_by_name("doc.md"));
     }
 
     /// (kuriya 548, local Codex r1, high) The case the second look is for: the look outside
