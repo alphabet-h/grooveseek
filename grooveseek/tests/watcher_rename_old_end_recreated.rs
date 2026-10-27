@@ -106,7 +106,8 @@ fn wait_for_paths(
 }
 
 /// Require the index to reach exactly `want` (with `holds` true of it) and to keep it for
-/// [`HOLD`].
+/// [`HOLD`], checked over and over through it, so a row that goes stale for a moment and is put
+/// back by a later event fails too.
 fn assert_settles_on(
     fx: &Fixture,
     guard: &ServerGuard,
@@ -120,13 +121,16 @@ fn assert_settles_on(
         "{what}: the index never held exactly {want:?}; last seen {last:?}\nstderr:\n{}",
         stderr_lines(guard).join("\n")
     );
-    std::thread::sleep(HOLD);
-    let later = paths(fx);
-    assert!(
-        later == want && holds(fx),
-        "{what}: the index held {want:?}, then {later:?}\nstderr:\n{}",
-        stderr_lines(guard).join("\n")
-    );
+    let until = std::time::Instant::now() + HOLD;
+    while std::time::Instant::now() < until {
+        let later = paths(fx);
+        assert!(
+            later == want && holds(fx),
+            "{what}: the index held {want:?}, then {later:?}\nstderr:\n{}",
+            stderr_lines(guard).join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// `std::fs::rename`, retried while it fails with `PermissionDenied` only, then panics with the
@@ -162,7 +166,9 @@ fn rename_retrying(from: &Path, to: &Path) {
 /// writes its row. Pins the old end of the rows N1, N2 and N7 of the table in kuriya 560 (type E).
 ///
 /// The paired path is asserted through its stderr line: green through an unpaired removal of
-/// `a.md` would pin nothing about the rename.
+/// `a.md` would pin nothing about the rename. What is pinned is that the end state is right
+/// while the old end is not looked at, not that it must never be: a look added there later would
+/// keep this green, and would not be wrong.
 #[test]
 fn a_file_renamed_then_written_again_under_its_old_name_keeps_both() {
     let (fx, guard) = served("i560-file", &[("a.md", &note("Alpha", "alphamarker"))]);
@@ -255,8 +261,9 @@ fn a_file_moved_into_an_excluded_directory_then_written_again_is_indexed() {
 /// (E3) A directory renamed and then created again with a regular file in it: the moved rows
 /// stay under the new name, and the file in the recreated directory is indexed.
 ///
-/// The directory rename drops the listed rows from the old prefix without looking at it. The
-/// recreated `docs/a.md` is another file; the arrival scan of `docs` or its own create writes
+/// The directory rename moves the listed rows off the old prefix without reading the files now
+/// under it. The directory itself is statted before any sweep of the old prefix, so a recreated
+/// directory is not swept. The recreated `docs/a.md` is another file; the arrival scan of `docs` or its own create writes
 /// its row. Pins the rows D1, D3 and D6 of the table in kuriya 560 (type E). The watcher end-to-end
 /// test that recreates the source with a hard link checks only that the old rows go; this one
 /// checks that a regular file there comes back.
