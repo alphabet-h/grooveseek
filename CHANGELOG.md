@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.21.3] - 2026-10-27
+
 ### Fixed
 
 - **The live watcher no longer drops a document when a deletion turns out to leave a file it
@@ -6438,7 +6440,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.2...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.3...HEAD
+[1.21.3]: https://github.com/alphabet-h/grooveseek/compare/v1.21.2...v1.21.3
 [1.21.2]: https://github.com/alphabet-h/grooveseek/compare/v1.21.1...v1.21.2
 [1.21.1]: https://github.com/alphabet-h/grooveseek/compare/v1.21.0...v1.21.1
 [1.21.0]: https://github.com/alphabet-h/grooveseek/compare/v1.20.4...v1.21.0

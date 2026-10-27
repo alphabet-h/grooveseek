@@ -1,6 +1,6 @@
 [package]
 name = "groove-svc"
-version = "1.21.2"
+version = "1.21.3"
 edition = "2024"
 description = "Windows hidden-console launcher for groove.exe serve"
 authors = ["koshian"]
