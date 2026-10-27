@@ -162,6 +162,79 @@ fn a_directory_removed_and_recreated_in_one_window_keeps_the_rows_of_files_still
     );
 }
 
+/// A file name the index can only spell lossily: on Unix bytes that are not UTF-8, on Windows
+/// an unpaired surrogate. `groove index` keys its row with U+FFFD in their place.
+fn lossy_name() -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"caf\xe9.md".to_vec())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = "caf".encode_utf16().collect();
+        wide.push(0xD800);
+        wide.extend(".md".encode_utf16());
+        std::ffi::OsString::from_wide(&wide)
+    }
+}
+
+/// (kuriya 557, local Codex r1 F2) A directory removed and created again within one debounce
+/// window keeps the row of a file under it whose name is not valid Unicode. Its key holds
+/// U+FFFD in place of the name's other bytes, so no path built from the key reaches the file:
+/// handing the row on as its own removal would find nothing there and drop a file that is still
+/// on disk. The watcher leaves such a row as it is and says so.
+///
+/// As in the test above, the end state is one document either way, so the test reads the
+/// requests the embedding endpoint saw.
+#[test]
+fn a_recreated_directory_keeps_the_row_of_a_file_whose_name_is_spelled_lossily() {
+    let body = note_with("Lossy", A_MARKER);
+    let fx = fixture("i557-lossy", &[], WATCH_TOML);
+    let sub = fx.kb().join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    std::fs::write(sub.join(lossy_name()), &body).expect("write the lossy-named file");
+    let guard = serve(&fx);
+    assert_eq!(
+        fx.documents(),
+        1,
+        "groove index left out the lossy-named file"
+    );
+    let before = fx.mock.requests().len();
+
+    std::fs::remove_dir_all(&sub).expect("remove sub");
+    std::fs::create_dir(&sub).expect("create sub again");
+    std::fs::write(sub.join(lossy_name()), &body).expect("write the lossy-named file again");
+
+    let arrived = "a new directory arrived";
+    let (seen, lines) = wait_for_line(&guard, arrived);
+    assert!(seen, "no line holding `{arrived}`:\n{}", lines.join("\n"));
+    // Leave the trailing events of the window time to land.
+    std::thread::sleep(Duration::from_millis(1500));
+    let lines = stderr_lines(&guard);
+    drop(guard);
+    let embedded = fx
+        .requests_since(before)
+        .iter()
+        .filter(|r| r.inputs().iter().any(|i| i.contains(A_MARKER)))
+        .count();
+    assert_eq!(fx.documents(), 1, "{}", lines.join("\n"));
+    assert_eq!(
+        embedded,
+        0,
+        "the lossy-named file is on disk with the same text, yet it was embedded again \
+         ({embedded} requests): its row was dropped by the directory's removal:\n{}",
+        lines.join("\n")
+    );
+    let kept = "watcher: left 1 documents under sub/ indexed";
+    assert!(
+        lines.iter().any(|l| l.contains(kept)),
+        "no line holding `{kept}`:\n{}",
+        lines.join("\n")
+    );
+}
+
 /// (kuriya 557) A directory removed and created again within one debounce window whose parent
 /// has lost the search permission by the time the removal is handled keeps the rows under it:
 /// the watcher cannot tell the directory is gone.

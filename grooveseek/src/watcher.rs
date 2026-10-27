@@ -1364,6 +1364,15 @@ fn rel_is_lossy(kb_path: &Path, raw: Option<&Path>) -> bool {
         .unwrap_or(true)
 }
 
+/// (kuriya 557, local Codex r1 F2 on PR #401) Whether a stored key may be the lossy spelling of
+/// a name that is not valid Unicode: it holds U+FFFD, which [`indexer::index_rel_path`] puts in
+/// place of such a name's other bytes. Asked where only the key is at hand, with no event path
+/// to ask [`rel_is_lossy`] of; a name holding a real U+FFFD gets the same yes, since the key
+/// alone cannot tell the two apart.
+fn key_may_be_lossy(key: &str) -> bool {
+    key.contains(char::REPLACEMENT_CHARACTER)
+}
+
 /// What [`act_on_written_path`] did before a write's reindex.
 #[derive(Debug)]
 enum WrittenPathCheck {
@@ -2650,7 +2659,9 @@ fn subtree_removal_under_lock(
 /// the rows under it go, as before. There again: the lock is released, then each row under it
 /// goes through [`handle_removed_path`], as if its own removal had been reported; each one
 /// looks at its own file and takes the locks it needs (the embedder lock is never taken while
-/// the db lock is held). Unknown: nothing is touched, and one line says why.
+/// the db lock is held), except a row whose key may be lossy ([`key_may_be_lossy`]), which
+/// stays as it is with one line saying how many. Unknown: nothing is touched, and one line says
+/// why.
 fn dispatch_subtree_removal(state: &WatcherState, p: &Path) {
     let decided = {
         let db = recover_db(state.db.lock());
@@ -2663,6 +2674,17 @@ fn dispatch_subtree_removal(state: &WatcherState, p: &Path) {
     match removal {
         SubtreeRemoval::Swept(outcome) => log_subtree_deindex(&rel, outcome),
         SubtreeRemoval::StillThere(Ok(held)) => {
+            // (local Codex r1 F2 on PR #401) A key that may be a lossy spelling names no path
+            // the look can reach, so handing it on would read a file still there as gone.
+            let (kept, held): (Vec<String>, Vec<String>) =
+                held.into_iter().partition(|key| key_may_be_lossy(key));
+            if !kept.is_empty() {
+                wdiag!(
+                    "watcher: left {} documents under {rel}/ indexed: their names hold U+FFFD, \
+                     so they cannot be looked at one by one",
+                    kept.len()
+                );
+            }
             for child in held {
                 let mut full = state.kb_path.clone();
                 for segment in child.split('/') {
@@ -9650,6 +9672,14 @@ mod tests {
         assert_eq!(subtree_rel(&kb, &kb), None);
         assert_eq!(subtree_rel(&kb, &kb.join("sub")).as_deref(), Some("sub"));
         assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
+    }
+
+    /// (kuriya 557, local Codex r1 F2) Only a key holding U+FFFD may be a lossy spelling.
+    #[test]
+    fn i557_only_a_key_holding_the_replacement_character_may_be_lossy() {
+        assert!(key_may_be_lossy("sub/caf\u{FFFD}.md"));
+        assert!(!key_may_be_lossy("sub/café.md"));
+        assert!(!key_may_be_lossy("sub/a.md"));
     }
 
     /// (kuriya 557) What replaced a removed directory decides the look the subtree removal
