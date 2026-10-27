@@ -675,12 +675,10 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 for p in paths {
                     if let Some(rel) = to_rel(&state.kb_path, p) {
                         // (#543) What is at the path now decides, not the event kind alone.
-                        match removal_dispatch(removal_outcome(
+                        match removal_dispatch(
                             &rel,
-                            p,
-                            &state.registry,
-                            &state.rules,
-                        )) {
+                            removal_outcome(&rel, p, &state.registry, &state.rules),
+                        ) {
                             RemovalDispatch::DecideInLocks => {
                                 dispatch_reindex_after_removal(state, &rel, p)
                             }
@@ -814,6 +812,10 @@ enum RemovalAction {
 /// row of a file that is in fact gone; such a row now stays until the path's next event or a
 /// `groove index` run that can see the file is gone.
 ///
+/// The same holds for a look outside that found the path gone: that deindex too is looked at
+/// again inside the locks ([`removal_dispatch`]), so a file written there again in between
+/// keeps its row. Only a name the index cannot hold is dropped without that second look.
+///
 /// (local Codex r7, medium) The look is taken once ([`removal_look`]) and
 /// [`removal_outcome_for`] returns its answer with the action: the kind of an unknown that
 /// ends in a deindex. (kuriya 548) That kind no longer reaches any line: [`removal_dispatch`]
@@ -899,29 +901,42 @@ enum RemovalDispatch {
     /// Take both locks, look at the path again and decide there
     /// ([`dispatch_reindex_after_removal`]).
     DecideInLocks,
-    /// The path was found gone outside the locks: drop the row ([`dispatch_deindex`]). So is a
-    /// path the look found present under a name the index cannot hold (for example `a//doc.md`),
-    /// which the removal gate passes early (ADR-0023).
+    /// A name the index cannot hold (for example `a//doc.md`), which the removal gate passes
+    /// early whatever is on disk (ADR-0023): drop the row ([`dispatch_deindex`]) without
+    /// looking again. A path found gone outside the locks is not this: it goes inside them.
     Deindex,
     /// The path is not one the index tracks.
     Skip,
 }
 
-/// (kuriya 548) The event loop's reading of [`removal_outcome`]. A reindex, and a deindex that
-/// came from a look that could not tell (the kind is there), both go inside the locks, where
-/// the path is looked at again and [`removal_decision_for`] is asked again on that look
-/// ([`decide_removal_in_locks`]). Only a deindex with no kind is settled here: a path the look
-/// outside found gone, or one found present under a name the index cannot hold, which the
-/// removal gate passes early (ADR-0023). A path the removal gate turned away is a skip. Split
-/// out so a test can pin that an unknown look never reaches [`dispatch_deindex`].
-fn removal_dispatch(outcome: (RemovalAction, Option<std::io::ErrorKind>)) -> RemovalDispatch {
+/// (kuriya 548) The event loop's reading of [`removal_outcome`] for `rel`. A reindex and a
+/// deindex both go inside the locks, where the path is looked at again and
+/// [`removal_decision_for`] is asked again on that look ([`decide_removal_in_locks`]): a look
+/// outside that could not tell (the kind is there), and as much a look outside that found the
+/// path gone, since a file written there again before the locks are taken (its create folded
+/// away by the debouncer) would otherwise lose its row until the next full index. Only a
+/// deindex of a name the index cannot hold is settled here ([`removal_gate_passes_by_name`]):
+/// the removal gate passes it early whatever is on disk (ADR-0023), so a second look could not
+/// change the answer. A path the removal gate turned away is a skip. Split out so a test can
+/// pin that no look outside the locks reaches [`dispatch_deindex`].
+fn removal_dispatch(
+    rel: &str,
+    outcome: (RemovalAction, Option<std::io::ErrorKind>),
+) -> RemovalDispatch {
     match outcome {
-        (RemovalAction::Reindex, _) | (RemovalAction::Deindex, Some(_)) => {
-            RemovalDispatch::DecideInLocks
+        (RemovalAction::Deindex, None) if removal_gate_passes_by_name(rel) => {
+            RemovalDispatch::Deindex
         }
-        (RemovalAction::Deindex, None) => RemovalDispatch::Deindex,
+        (RemovalAction::Reindex | RemovalAction::Deindex, _) => RemovalDispatch::DecideInLocks,
         (RemovalAction::Skip, _) => RemovalDispatch::Skip,
     }
+}
+
+/// (ADR-0023) Whether the removal gate passes `rel` on its name alone, before it looks at
+/// the disk: a name the index cannot hold. The same test as the first one [`gate_parts`] runs
+/// for [`Gate::Removal`]; the empty key (the knowledge base itself) is not one.
+fn removal_gate_passes_by_name(rel: &str) -> bool {
+    !rel.is_empty() && !crate::resources::doc_is_addressable(rel)
 }
 
 /// What [`decide_removal_in_locks`] did.
@@ -1988,8 +2003,9 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 /// region when the file is no longer there under the exact spelling of `rel`, directories on
 /// the way included ([`removed_path_on_disk`]).
 ///
-/// (kuriya 548) A remove event whose look outside the locks could not tell comes here too
-/// ([`removal_dispatch`]), and `full`, the path the event named, comes with both. Inside the
+/// (kuriya 548) A remove event whose look outside the locks could not tell, or found the path
+/// gone, comes here too ([`removal_dispatch`]), and `full`, the path the event named, comes
+/// with both. Inside the
 /// locks [`decide_removal_in_locks`] asks [`removal_decision_for`] again on the look taken
 /// there, so a file is reindexed only when the write gate takes it, the rows go when the path
 /// is gone or holds what the index cannot keep, and a look that still cannot tell leaves the
@@ -5768,35 +5784,109 @@ mod tests {
     }
 
     /// (kuriya 548) The event loop's reading of the outside look: an unknown that ends in a
-    /// deindex goes inside the locks to be looked at again, never straight to the deindex; a
-    /// path found gone is dropped there and then, and the rest is as before.
+    /// deindex goes inside the locks to be looked at again, never straight to the deindex; so
+    /// does a path found gone (see
+    /// [`i548_a_removal_found_gone_outside_the_locks_is_looked_at_again_inside_them`]), and the
+    /// rest is as before.
     #[test]
     fn i548_the_event_loop_does_not_drop_a_row_on_an_unknown_look() {
         assert_eq!(
-            removal_dispatch((
-                RemovalAction::Deindex,
-                Some(std::io::ErrorKind::PermissionDenied)
-            )),
+            removal_dispatch(
+                "doc.md",
+                (
+                    RemovalAction::Deindex,
+                    Some(std::io::ErrorKind::PermissionDenied)
+                )
+            ),
             RemovalDispatch::DecideInLocks
         );
         assert_eq!(
-            removal_dispatch((RemovalAction::Reindex, None)),
+            removal_dispatch("doc.md", (RemovalAction::Reindex, None)),
             RemovalDispatch::DecideInLocks
         );
         assert_eq!(
-            removal_dispatch((RemovalAction::Deindex, None)),
+            removal_dispatch("doc.md", (RemovalAction::Deindex, None)),
+            RemovalDispatch::DecideInLocks
+        );
+        assert_eq!(
+            removal_dispatch("doc.md", (RemovalAction::Skip, None)),
+            RemovalDispatch::Skip
+        );
+        assert_eq!(
+            removal_dispatch(
+                "doc.md",
+                (
+                    RemovalAction::Skip,
+                    Some(std::io::ErrorKind::PermissionDenied)
+                )
+            ),
+            RemovalDispatch::Skip
+        );
+    }
+
+    /// (kuriya 548, local Codex r1, high) A deindex the look outside the locks reached on a
+    /// path it found gone is not settled there: it goes inside the locks to be looked at
+    /// again, as the empty key does. Only a name the index cannot hold, which the removal gate
+    /// passes early whatever is on disk (ADR-0023), is dropped without a second look.
+    #[test]
+    fn i548_a_removal_found_gone_outside_the_locks_is_looked_at_again_inside_them() {
+        let kb = i549_kb("groove-watcher-i548-gone-outside");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("gone.md");
+
+        let outside = removal_outcome("gone.md", &full, &reg, &rules);
+        assert_eq!(outside, (RemovalAction::Deindex, None));
+        assert_eq!(
+            removal_dispatch("gone.md", outside),
+            RemovalDispatch::DecideInLocks
+        );
+        for rel in ["doc.md", "sub/doc.md", ""] {
+            assert_eq!(
+                removal_dispatch(rel, (RemovalAction::Deindex, None)),
+                RemovalDispatch::DecideInLocks,
+                "{rel:?}"
+            );
+        }
+
+        // An empty segment: a spelling no document name may take, on every platform.
+        assert!(removal_gate_passes_by_name("a//doc.md"));
+        assert_eq!(
+            removal_dispatch("a//doc.md", (RemovalAction::Deindex, None)),
             RemovalDispatch::Deindex
         );
+        assert!(!removal_gate_passes_by_name("doc.md"));
+        assert!(!removal_gate_passes_by_name(""));
+    }
+
+    /// (kuriya 548, local Codex r1, high) The case the second look is for: the look outside
+    /// the locks found the path gone, and the file was written again before the locks were
+    /// taken (its create folded away by the debouncer). The look inside finds it, and the
+    /// row is kept and handed to the reindex rather than dropped until the next full index.
+    #[test]
+    fn i548_a_file_written_again_before_the_locks_keeps_its_row() {
+        let kb = i549_kb("groove-watcher-i548-written-again");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("doc.md");
+        std::fs::remove_file(&full).unwrap();
+
+        let outside = removal_outcome("doc.md", &full, &reg, &rules);
+        assert_eq!(outside, (RemovalAction::Deindex, None));
         assert_eq!(
-            removal_dispatch((RemovalAction::Skip, None)),
-            RemovalDispatch::Skip
+            removal_dispatch("doc.md", outside),
+            RemovalDispatch::DecideInLocks
         );
+
+        std::fs::write(&full, "# doc\n\nwritten again\n").unwrap();
+        let look = removed_path_on_disk(&kb.0, "doc.md");
+        assert_eq!(look, OnDisk::Present);
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let decided = decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, look);
+        assert!(matches!(decided, RemovalInLocks::Reindex), "{decided:?}");
         assert_eq!(
-            removal_dispatch((
-                RemovalAction::Skip,
-                Some(std::io::ErrorKind::PermissionDenied)
-            )),
-            RemovalDispatch::Skip
+            db.all_document_paths().unwrap(),
+            vec!["doc.md".to_string(), "other.md".to_string()]
         );
     }
 
