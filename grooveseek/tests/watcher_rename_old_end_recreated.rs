@@ -24,8 +24,8 @@ use common::ansi::strip_ansi;
 use common::embed_cli::{Fixture, fixture};
 use common::embed_mock::{hermetic, wait_until};
 use common::mcp::{ServerGuard, spawn_serve_with};
+use common::rename::rename_retrying;
 use grooveseek::db::Database;
-use std::path::Path;
 use std::time::Duration;
 
 /// How long a test waits for the watcher to reach the rows it expects.
@@ -130,31 +130,6 @@ fn assert_settles_on(
             stderr_lines(guard).join("\n")
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// `std::fs::rename`, retried while it fails with `PermissionDenied` only, then panics with the
-/// last error. Copied from the watcher end-to-end tests: a directory written into a moment ago
-/// can be held open briefly by another process on Windows (a scanner is the suspect,
-/// unconfirmed), which refuses to rename a directory something holds (trap 23 of the skill
-/// `windows-quirks`). Any other error fails at once.
-fn rename_retrying(from: &Path, to: &Path) {
-    const ATTEMPTS: u32 = 20;
-    const INTERVAL: Duration = Duration::from_millis(100);
-    let mut attempt = 1;
-    loop {
-        match std::fs::rename(from, to) {
-            Ok(()) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(INTERVAL);
-            }
-            Err(e) => panic!(
-                "rename {} -> {} failed after {attempt} attempt(s): {e}",
-                from.display(),
-                to.display()
-            ),
-        }
     }
 }
 

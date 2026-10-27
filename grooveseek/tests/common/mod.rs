@@ -49,6 +49,9 @@
 //!   Used by the AX-01 rename tests; the older private copies in the
 //!   size-cap, chunk-reuse and table-policy tests stay because existing tests
 //!   are not edited.
+//! - [`crate::common::rename`] — `std::fs::rename` retried while Windows
+//!   briefly refuses it. Shared by the watcher tests that rename a directory
+//!   under a running watcher.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -64,6 +67,7 @@ pub mod embed_mock;
 pub mod eval_gate;
 pub mod in_process;
 pub mod mcp;
+pub mod rename;
 pub mod source;
 pub mod temp;
 pub mod workflow;
