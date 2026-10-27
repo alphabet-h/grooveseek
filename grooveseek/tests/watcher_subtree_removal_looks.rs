@@ -133,6 +133,12 @@ fn a_directory_removed_and_recreated_in_one_window_keeps_the_rows_of_files_still
     std::thread::sleep(Duration::from_millis(1500));
     let lines = stderr_lines(&guard);
     drop(guard);
+    // Counted before any search below: a query for the marker is a request holding it too.
+    let embedded_a = fx
+        .requests_since(before)
+        .iter()
+        .filter(|r| r.inputs().iter().any(|i| i.contains(A_MARKER)))
+        .count();
     assert!(
         settled,
         "the index did not settle on one document:\n{}",
@@ -147,11 +153,6 @@ fn a_directory_removed_and_recreated_in_one_window_keeps_the_rows_of_files_still
         !hit_paths(&fx, B_MARKER).iter().any(|p| p == "sub/b.md"),
         "sub/b.md is not on disk any more but is still indexed"
     );
-    let embedded_a = fx
-        .requests_since(before)
-        .iter()
-        .filter(|r| r.inputs().iter().any(|i| i.contains(A_MARKER)))
-        .count();
     assert_eq!(
         embedded_a,
         0,
