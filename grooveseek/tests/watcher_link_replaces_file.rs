@@ -171,3 +171,106 @@ fn a_directory_that_arrives_with_a_link_in_place_of_a_file_drops_its_row() {
     );
     drop(guard);
 }
+
+/// (kuriya 566 #3 / #22) An indexed file removed and made again under the same name as a hard
+/// link to another file of the knowledge base loses its row.
+///
+/// The other name is `other.txt`, an extension no parser takes, so it holds no row of its own
+/// and the end state does not hang on whether its own name sees an event. The row can go
+/// through the removal of `a.md` (the removal gate passes a hard link) or through its create
+/// (the write gate refuses a hard link and hands it to the removal path); both are right, and
+/// the stderr printed at the end says which ran.
+#[test]
+fn a_file_replaced_by_a_hard_link_loses_its_row() {
+    let (fx, guard) = served(
+        "i566-replaced",
+        &[
+            ("a.md", &note("Alpha", "alphamarker566r")),
+            ("keep.md", &note("Keep", "keepmarker566r")),
+            ("other.txt", "the other name of the file"),
+        ],
+    );
+    assert_eq!(paths(&fx), ["a.md", "keep.md"]);
+
+    std::fs::remove_file(fx.kb().join("a.md")).expect("remove a.md");
+    std::fs::hard_link(fx.kb().join("other.txt"), fx.kb().join("a.md"))
+        .expect("hard links need no privilege");
+
+    assert_settles_on(&fx, &guard, &["keep.md"], "a.md replaced by a hard link");
+    eprintln!(
+        "a_file_replaced_by_a_hard_link_loses_its_row stderr:\n{}",
+        stderr_lines(&guard).join("\n")
+    );
+    drop(guard);
+}
+
+/// (kuriya 566 #22) A write to an indexed path that is now a hard link drops its row: the write
+/// gate refuses the hard link, and the path is handed to the removal path rather than left.
+///
+/// `a.md` is replaced by a hard link to a file outside the knowledge base before the server
+/// starts, so no removal of it reaches the watcher; the only event is the write through `a.md`
+/// itself.
+#[test]
+fn a_write_to_a_path_now_a_hard_link_drops_its_row() {
+    let (fx, guard) = served_after(
+        "i566-written",
+        &[
+            ("a.md", &note("Alpha", "alphamarker566w")),
+            ("keep.md", &note("Keep", "keepmarker566w")),
+        ],
+        |fx| {
+            let target = fx.layout.root().join("target.md");
+            std::fs::write(&target, note("Target", "targetmarker566w")).expect("write target");
+            std::fs::remove_file(fx.kb().join("a.md")).expect("remove a.md");
+            std::fs::hard_link(&target, fx.kb().join("a.md"))
+                .expect("hard links need no privilege");
+        },
+    );
+    assert_eq!(paths(&fx), ["a.md", "keep.md"]);
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(fx.kb().join("a.md"))
+            .expect("open a.md to append");
+        f.write_all(b"\nOne more line.\n").expect("append to a.md");
+    }
+
+    assert_settles_on(&fx, &guard, &["keep.md"], "a write to a.md, a hard link");
+    drop(guard);
+}
+
+/// (kuriya 566 #22) An indexed file given a second name outside the knowledge base loses its
+/// row, as the full index drops it (its walk collects no file with more than one name). `a.md`
+/// itself is not written: the row goes on the event its own name sees for the change of its
+/// link count, if one comes. On Linux inotify reports a change of link count as `IN_ATTRIB`
+/// (inotify(7)), which reaches the watcher as a metadata change of `a.md` (not run on Linux
+/// when this was written; CI is the first run).
+///
+/// Not on Windows: there `ReadDirectoryChangesW` reported nothing at all for `a.md` when a
+/// second name was made for it outside the watched tree (seen 2026-10-28 on Windows 11, NTFS:
+/// the server's stderr held only its `watching` line, and the row stayed for the full 30 s),
+/// so no watcher path can reach the row; the next `groove index` drops it (kuriya 566 plan,
+/// S4).
+#[cfg(not(windows))]
+#[test]
+fn a_file_given_a_second_name_loses_its_row() {
+    let (fx, guard) = served(
+        "i566-second-name",
+        &[
+            ("a.md", &note("Alpha", "alphamarker566s")),
+            ("keep.md", &note("Keep", "keepmarker566s")),
+        ],
+    );
+    assert_eq!(paths(&fx), ["a.md", "keep.md"]);
+
+    std::fs::hard_link(
+        fx.kb().join("a.md"),
+        fx.layout.root().join("second-name.md"),
+    )
+    .expect("hard links need no privilege");
+
+    assert_settles_on(&fx, &guard, &["keep.md"], "a.md given a second name");
+    drop(guard);
+}

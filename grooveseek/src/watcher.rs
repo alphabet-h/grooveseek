@@ -614,8 +614,9 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // directory, whatever the index holds under it is reached through the
                     // link now, and the full index (which does not follow links) drops it.
                     // The removal that should have done so can be folded away by the
-                    // debouncer when the link is made in the same window. Nothing else to do
-                    // for a link: `should_process` refuses it below. The db is locked only for
+                    // debouncer when the link is made in the same window. Anything else about a
+                    // link is decided below: `should_process` refuses it, and (kuriya 566) the
+                    // removal path decides its own row. The db is locked only for
                     // a link, so an ordinary event costs one `symlink_metadata` and no lock.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
                         let handled = {
@@ -666,8 +667,16 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                         // `should_process` rejects it on the extension filter.
                         continue;
                     }
-                    if should_process(&rel, p, state) {
+                    let facts = PathFacts::of(p);
+                    if should_process(&rel, &facts, state) {
                         dispatch_reindex(state, &rel, p);
+                    } else if facts.is_symlink() || facts.is_multiply_linked() {
+                        // (kuriya 566 #22) A link the write gate refused: its row, if any, is
+                        // decided by the removal path, as if the path's removal had been
+                        // reported. The removal gate passes a link, so a file replaced by a
+                        // hard link (or given a second name) loses its row here, as the full
+                        // index drops it. A symlink is mostly taken by the check above.
+                        handle_removed_path(state, &rel, p);
                     }
                 }
             }
@@ -748,8 +757,8 @@ fn rename_decision(
     rules: &crate::exclusion::ExclusionRules,
 ) -> RenameAction {
     rename_action(
-        gate_parts(old_rel, from, registry, rules, Gate::Removal),
-        gate_parts(new_rel, to, registry, rules, Gate::Write),
+        deindex_passes(old_rel, from, registry, rules),
+        should_process_parts(new_rel, to, registry, rules),
     )
 }
 
@@ -1640,8 +1649,11 @@ enum Gate {
 /// `WatcherState` のうち `registry` / `rules` しか見ないので、判定本体は
 /// [`should_process_parts`] に切り出してある (test から `Database` / `Embedder`
 /// のダミー構築なしに **本番と同一のロジック** を叩けるようにするため)。
-fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
-    should_process_parts(rel, full, &state.registry, &state.rules)
+///
+/// (kuriya 566) Asked of facts already taken, so the event loop can ask the same look whether
+/// a refused path is a link ([`PathFacts`]).
+fn should_process(rel: &str, facts: &PathFacts<'_>, state: &WatcherState) -> bool {
+    gate_given(rel, facts, &state.registry, &state.rules, Gate::Write)
 }
 
 /// [`should_process`] の判定本体 ([`Gate::Write`] としての [`gate_parts`])。
@@ -2231,9 +2243,32 @@ fn reindex_after_write_locked(
         state.exclude_headings.as_deref(),
         &state.registry,
     );
-    match settle_write_reindex(db, kb_path, rel, &result, lossy, || {
+    let settled = settle_write_reindex(db, kb_path, rel, &result, lossy, || {
         written_path_on_disk(kb_path, rel, look)
-    }) {
+    });
+    // (kuriya 566 #19 / #23) The indexer refused a file still there: when it is a link now (a
+    // hard link made since the gate outside the locks passed it), the removal decision on a look
+    // taken here drops the row, as a remove event would.
+    if matches!(settled, WriteReindexSettled::LeftAsIs)
+        && matches!(result, Ok(indexer::SingleResult::Refused))
+    {
+        let full = raw.map_or_else(|| kb_path.join(rel), Path::to_path_buf);
+        if let Some(outcome) = refused_row_in_locks(
+            db,
+            kb_path,
+            rel,
+            &full,
+            &state.registry,
+            &state.rules,
+            written_path_on_disk(kb_path, rel, look),
+        ) {
+            log_reindex_result(rel, result, texts_before, embedder);
+            // `deindex_removed_path` already swept the folded row as a removal.
+            log_refused_link_deindexed(rel, outcome);
+            return;
+        }
+    }
+    match settled {
         WriteReindexSettled::Kept | WriteReindexSettled::LeftAsIs => {
             let require_real_key = sweep_requires_real_key(&result);
             log_reindex_result(rel, result, texts_before, embedder);
@@ -2283,6 +2318,48 @@ fn settle_write_reindex(
             WriteReindexSettled::Deindexed(deindex_removed_path(db, kb_path, rel))
         }
         OnDisk::Gone | OnDisk::Present | OnDisk::Unknown(_) => WriteReindexSettled::LeftAsIs,
+    }
+}
+
+/// (kuriya 566 #19 / #23 / #28) What happens to the row of `rel` when the indexer refused the
+/// file at it ([`indexer::SingleResult::Refused`], or a rename's
+/// [`indexer::RenameOutcome::RenamedButRefused`]) and a look taken with both locks held
+/// (`on_disk`) still finds it there: [`decide_removal_in_locks`] on that look, so the removal
+/// gate alone decides whether the row of a path now a link goes. `Some` with the deindex's
+/// outcome when the rows went; `None` when nothing was touched: the look did not find the
+/// file (the caller's own relook decides that), or the write gate takes the file (refused for
+/// another reason, such as its size measured on the handle, and the row stays as it was), or
+/// the removal gate turns the path away.
+///
+/// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
+fn refused_row_in_locks(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> Option<Result<bool>> {
+    if on_disk != OnDisk::Present {
+        return None;
+    }
+    match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk) {
+        RemovalInLocks::Deindexed(outcome) => Some(outcome),
+        RemovalInLocks::Reindex | RemovalInLocks::Skip | RemovalInLocks::LeftIndexed { .. } => {
+            None
+        }
+    }
+}
+
+/// What a write or a rename says when the file the indexer refused turned out to be one the
+/// index holds no row for (a link, as a rule) and its rows went ([`refused_row_in_locks`]).
+/// Silent when no row was there.
+fn log_refused_link_deindexed(rel: &str, outcome: Result<bool>) {
+    match outcome {
+        Ok(true) => wdiag!("watcher: {rel} is not a file the index holds now; deindexed it"),
+        Ok(false) => { /* no-op: not in DB */ }
+        Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
 }
 
@@ -10187,6 +10264,44 @@ mod tests {
         let (left, lossy) = rows_the_walk_left_behind(Vec::new(), &found);
         assert!(left.is_empty());
         assert_eq!(lossy, 0);
+    }
+
+    /// (kuriya 566 #19 / #23 / #28) A file the indexer refused inside the locks loses its row
+    /// when it is a hard link there; a plain file refused for another reason (its size measured
+    /// on the handle, say) keeps it, and so does a path the look did not find, which the
+    /// caller's own relook decides.
+    #[test]
+    fn i566_a_refused_hard_link_loses_its_row_and_a_refused_plain_file_keeps_it() {
+        let kb = i549_kb("groove-watcher-i566-refused");
+        std::fs::write(kb.0.join("big.md"), "# big\n").unwrap();
+        std::fs::hard_link(kb.0.join("doc.md"), kb.0.join("twin.md")).unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let db = dir_rename_db(&["twin.md", "big.md", "other.md"]);
+        let refused = |rel: &str, on_disk: OnDisk| {
+            refused_row_in_locks(&db, &kb.0, rel, &kb.0.join(rel), &reg, &rules, on_disk)
+        };
+
+        assert!(refused("big.md", OnDisk::Present).is_none());
+        assert!(refused("twin.md", OnDisk::Gone).is_none());
+        assert!(refused("twin.md", OnDisk::Unknown(std::io::ErrorKind::Other)).is_none());
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![
+                "big.md".to_string(),
+                "other.md".to_string(),
+                "twin.md".to_string()
+            ]
+        );
+
+        assert!(matches!(
+            refused("twin.md", OnDisk::Present),
+            Some(Ok(true))
+        ));
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["big.md".to_string(), "other.md".to_string()]
+        );
     }
 
     /// (kuriya 566) A rename away from a path that is now a hard link moves the row: the old
