@@ -2070,11 +2070,7 @@ fn rows_the_walk_left_behind(
 /// The db lock is held for the listing only, then released before any row is handed on: each
 /// takes the locks it needs, the embedder lock never while the db lock is held (as
 /// [`dispatch_subtree_removal`] does).
-fn hand_on_rows_the_walk_left_behind(
-    state: &WatcherState,
-    rel: &str,
-    found: &[(String, PathBuf)],
-) {
+fn hand_on_rows_the_walk_left_behind(state: &WatcherState, rel: &str, found: &[(String, PathBuf)]) {
     if rel.is_empty() {
         return;
     }
@@ -2349,9 +2345,7 @@ fn refused_row_in_locks(
     }
     match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk) {
         RemovalInLocks::Deindexed(outcome) => Some(outcome),
-        RemovalInLocks::Reindex | RemovalInLocks::Skip | RemovalInLocks::LeftIndexed { .. } => {
-            None
-        }
+        RemovalInLocks::Reindex | RemovalInLocks::Skip | RemovalInLocks::LeftIndexed { .. } => None,
     }
 }
 
@@ -6434,7 +6428,10 @@ mod tests {
             matches!(linked, RemovalInLocks::Deindexed(Ok(true))),
             "{linked:?}"
         );
-        assert_eq!(db.all_document_paths().unwrap(), vec!["other.md".to_string()]);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
 
         // An empty segment: a spelling no document name may take, on every platform.
         let db = dir_rename_db(&["a//doc.md", "other.md"]);
@@ -10294,7 +10291,10 @@ mod tests {
             matches!(outcome, RemovalInLocks::Deindexed(Ok(true))),
             "{outcome:?}"
         );
-        assert_eq!(db.all_document_paths().unwrap(), vec!["other.md".to_string()]);
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// (kuriya 566 #16 / #17) The rows an arrived directory's walk did not collect are the
