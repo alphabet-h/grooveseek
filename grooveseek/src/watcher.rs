@@ -674,24 +674,32 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
             Classified::Deindex(paths) => {
                 for p in paths {
                     if let Some(rel) = to_rel(&state.kb_path, p) {
-                        // (#543) What is at the path now decides, not the event kind alone.
-                        match removal_dispatch(
-                            &rel,
-                            removal_outcome(&rel, p, &state.registry, &state.rules),
-                        ) {
-                            RemovalDispatch::DecideInLocks => dispatch_removal(state, &rel, p),
-                            RemovalDispatch::Deindex => dispatch_deindex(state, &rel),
-                            RemovalDispatch::Skip => {}
-                        }
+                        handle_removed_path(state, &rel, p);
                     }
                     // (feature-67) Always, whatever the gate above said: a
                     // removed directory carries no extension, and its files'
                     // own events may have been folded into this one.
-                    dispatch_deindex_subtree(state, p);
+                    // (kuriya 557) It looks at the directory before it drops anything.
+                    dispatch_subtree_removal(state, p);
                 }
             }
             Classified::Ignore => {}
         }
+    }
+}
+
+/// (#543) What a remove event does for the path `rel` (the event's path `full`): what is at the
+/// path now decides, not the event kind alone. The event loop calls it for each removed path,
+/// and (kuriya 557) [`dispatch_subtree_removal`] for each row under a removed directory that is
+/// there again, as if that row's own removal had been reported.
+fn handle_removed_path(state: &WatcherState, rel: &str, full: &Path) {
+    match removal_dispatch(
+        rel,
+        removal_outcome(rel, full, &state.registry, &state.rules),
+    ) {
+        RemovalDispatch::DecideInLocks => dispatch_removal(state, rel, full),
+        RemovalDispatch::Deindex => dispatch_deindex(state, rel),
+        RemovalDispatch::Skip => {}
     }
 }
 
@@ -1356,6 +1364,15 @@ fn rel_is_lossy(kb_path: &Path, raw: Option<&Path>) -> bool {
         .unwrap_or(true)
 }
 
+/// (kuriya 557, local Codex r1 F2 on PR #401) Whether a stored key may be the lossy spelling of
+/// a name that is not valid Unicode: it holds U+FFFD, which [`indexer::index_rel_path`] puts in
+/// place of such a name's other bytes. Asked where only the key is at hand, with no event path
+/// to ask [`rel_is_lossy`] of; a name holding a real U+FFFD gets the same yes, since the key
+/// alone cannot tell the two apart.
+fn key_may_be_lossy(key: &str) -> bool {
+    key.contains(char::REPLACEMENT_CHARACTER)
+}
+
 /// What [`act_on_written_path`] did before a write's reindex.
 #[derive(Debug)]
 enum WrittenPathCheck {
@@ -1594,7 +1611,8 @@ enum Gate {
     /// checks: no such row can be one this version wrote, so moving or
     /// dropping it is always right, whatever sits at the path now (a file
     /// recreated there as a link, say). Every other key goes through all of
-    /// those checks as before.
+    /// those checks as before, except that (kuriya 557) a symlink (a junction
+    /// on Windows) at the path passes: no document is held at a link.
     Removal,
 }
 
@@ -1668,8 +1686,16 @@ fn gate_parts(
     // `symlink_metadata` が失敗した場合は**通す**。削除イベントではファイルが
     // 既に無く、ここで弾くと deindex が動かなくなるため (この関数は
     // Reindex / Deindex の両方を gate している)。上で取った 1 回ぶんを使う。
+    //
+    // (kuriya 557, GitHub codex r1 P2 on PR #401) A link is refused as a write
+    // only. As a removal it passes: the index holds no document at a link (the
+    // full walk skips it, and a write at one drops the row,
+    // [`deindex_under_a_link_parts`]), so a file replaced by a link loses its
+    // row rather than keeping its old text. The caller decides the delete on a
+    // look taken under the database lock ([`decide_removal_in_locks`]), and this
+    // function stats the path again there.
     if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-        return false;
+        return gate == Gate::Removal;
     }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
     // (フル re-index) と同じ判定で skip する。放置すると Office ファイルを
@@ -2488,33 +2514,43 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
     sweep_legacy_row(&db, &state.kb_path, rel, false);
 }
 
-/// (feature-67) The decision behind [`dispatch_deindex_subtree`], split out so
-/// a test can run it with no [`crate::embedder::Embedder`] (as [`should_process_parts`] is).
+/// (feature-67) The range delete under a directory, for a caller holding the db
+/// lock that has already decided the directory is gone from disk: the source of
+/// a directory rename ([`sweep_source_if_gone`]), a path that is now a link
+/// ([`deindex_under_a_link_parts`]). (kuriya 557) A removed directory runs the
+/// same delete in [`subtree_removal_for`], once its look says it is gone.
+/// Split out so a test can run it with no [`crate::embedder::Embedder`] (as
+/// [`should_process_parts`] is).
 ///
-/// `None` when `p` is not under the KB or is the KB root itself: an empty
-/// prefix would name the whole KB (the helper refuses it too). Otherwise the
-/// rows under `rel/` are deleted, and `rel` is returned with the outcome so the
-/// caller logs the same spelling it deleted by. The subtree path stats nothing
-/// of its own and asks no exclusion / extension / link gate: a removed
-/// directory cannot be stat'ed, and whatever the store still holds under it is
-/// gone from disk. Relativisation is the existing [`to_rel`], shared with the
-/// single-file path, whose canonicalize fallback returns `None` for a path that
-/// no longer exists.
-///
-/// Known limitation: on Unix a non-UTF-8 directory name is spelled lossily
-/// (U+FFFD) by [`indexer::index_rel_path`], so two sibling directories whose
-/// names collapse to the same spelling share a prefix and both fall in the range.
+/// `None` when `p` names no subtree ([`subtree_rel`]). Otherwise the rows under
+/// `rel/` are deleted, and `rel` is returned with the outcome so the caller
+/// logs the same spelling it deleted by. It stats nothing of its own and asks
+/// no exclusion / extension / link gate: whatever the store still holds under
+/// a directory that is not there is gone from disk. (kuriya 557) The look that
+/// says the directory is not there is the caller's, taken under the same db
+/// lock.
 fn deindex_subtree_parts(
     db: &Database,
     kb_path: &Path,
     p: &Path,
 ) -> Option<(String, Result<Vec<String>>)> {
-    let rel = to_rel(kb_path, p)?;
-    if rel.is_empty() {
-        return None;
-    }
+    let rel = subtree_rel(kb_path, p)?;
     let outcome = indexer::deindex_subtree(db, &rel);
     Some((rel, outcome))
+}
+
+/// (feature-67, kuriya 557) The prefix whose rows an event path `p` names as a subtree: its
+/// `rel`, or `None` when `p` is not under the KB or is the KB root itself (an empty prefix
+/// would name the whole KB, and [`indexer::deindex_subtree`] refuses it too). Every subtree
+/// delete and listing asks this one question. Relativisation is the existing [`to_rel`],
+/// shared with the single-file path, whose canonicalize fallback returns `None` for a path
+/// that no longer exists.
+///
+/// Known limitation: on Unix a non-UTF-8 directory name is spelled lossily
+/// (U+FFFD) by [`indexer::index_rel_path`], so two sibling directories whose
+/// names collapse to the same spelling share a prefix and both fall in the range.
+fn subtree_rel(kb_path: &Path, p: &Path) -> Option<String> {
+    to_rel(kb_path, p).filter(|rel| !rel.is_empty())
 }
 
 /// (local Codex r3 on AX-02) [`deindex_subtree_parts`] for an event path that is now a link (a
@@ -2547,15 +2583,141 @@ fn deindex_under_a_link_parts(
     Some((rel, outcome))
 }
 
-/// (feature-67, kuriya issue #479) Delete what the store holds under a removed
-/// path. The debouncer drops a child's Remove when its directory's Remove lands
-/// in the same window, so the directory event is the only one that arrives.
-fn dispatch_deindex_subtree(state: &WatcherState, p: &Path) {
-    let db = recover_db(state.db.lock());
-    let Some((rel, outcome)) = deindex_subtree_parts(&db, &state.kb_path, p) else {
+/// (kuriya 557) What [`subtree_removal_for`] did with the rows under a removed path.
+#[derive(Debug)]
+enum SubtreeRemoval {
+    /// The directory is gone (or is now a file, a link, or there only under another case): the
+    /// rows under it were deleted, and the result lists them.
+    Swept(Result<Vec<String>>),
+    /// The directory is there under its exact spelling: nothing deleted. The rows under it are
+    /// listed, each to be handled as its own removal once the db lock is released.
+    StillThere(Result<Vec<String>>),
+    /// The look could not tell: nothing deleted, and the rows under it are listed for the line
+    /// that says why.
+    LeftIndexed {
+        kind: std::io::ErrorKind,
+        held: Result<Vec<String>>,
+    },
+}
+
+/// (kuriya 557) [`subtree_removal_looked`] with a look a test hands in, in place of the one
+/// the watcher takes ([`subtree_removal_under_lock`]).
+#[cfg(test)]
+fn decide_subtree_removal(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+    look: OnDisk,
+) -> Option<(String, SubtreeRemoval)> {
+    subtree_removal_looked(db, kb_path, p, |_| look)
+}
+
+/// (kuriya 557) What a remove event does with the rows under its path `p`, for a caller
+/// holding the db lock: `None` when `p` names no subtree ([`subtree_rel`]), otherwise `rel`
+/// with [`subtree_removal_for`] given `look(rel)`. `rel` is taken once, so the look, the delete
+/// and the line use the same spelling.
+fn subtree_removal_looked(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+    look: impl FnOnce(&str) -> OnDisk,
+) -> Option<(String, SubtreeRemoval)> {
+    let rel = subtree_rel(kb_path, p)?;
+    let removal = subtree_removal_for(db, &rel, look(&rel));
+    Some((rel, removal))
+}
+
+/// (kuriya 557) What a remove event does with the rows under `rel/` (not empty), for a caller
+/// holding the db lock, given the look at the directory taken under that lock
+/// ([`arrived_directory_on_disk`]).
+///
+/// [`OnDisk::Gone`] deletes the rows under `rel/` as feature-67 always did: no document can be
+/// under a directory that is not there. [`OnDisk::Present`] and [`OnDisk::Unknown`] delete
+/// nothing and list the rows under it: a removed directory there again (removed and created
+/// within one debounce window) may hold the same files, and one that cannot be looked at may
+/// still hold them.
+fn subtree_removal_for(db: &Database, rel: &str, look: OnDisk) -> SubtreeRemoval {
+    match look {
+        OnDisk::Gone => SubtreeRemoval::Swept(indexer::deindex_subtree(db, rel)),
+        OnDisk::Present => SubtreeRemoval::StillThere(db.document_paths_under(rel)),
+        OnDisk::Unknown(kind) => SubtreeRemoval::LeftIndexed {
+            kind,
+            held: db.document_paths_under(rel),
+        },
+    }
+}
+
+/// (kuriya 557) [`subtree_removal_looked`] with the look at the directory taken here
+/// ([`arrived_directory_on_disk`]), for a caller holding the db lock: the look and the delete
+/// it decides sit in the same lock region, so no write of this process lands between them.
+fn subtree_removal_under_lock(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+) -> Option<(String, SubtreeRemoval)> {
+    subtree_removal_looked(db, kb_path, p, |rel| {
+        arrived_directory_on_disk(kb_path, rel, p)
+    })
+}
+
+/// (feature-67, kuriya issue #479, kuriya 557) What the store holds under a removed path. The
+/// debouncer drops a child's Remove when its directory's Remove lands in the same window, so
+/// the directory event is the only one that arrives.
+///
+/// The directory is looked at under the db lock first ([`subtree_removal_under_lock`]). Gone:
+/// the rows under it go, as before. There again: the lock is released, then each row under it
+/// goes through [`handle_removed_path`], as if its own removal had been reported; each one
+/// looks at its own file and takes the locks it needs (the embedder lock is never taken while
+/// the db lock is held), except a row whose key may be lossy ([`key_may_be_lossy`]), which
+/// stays as it is with one line saying how many. Unknown: nothing is touched, and one line says
+/// why.
+fn dispatch_subtree_removal(state: &WatcherState, p: &Path) {
+    let decided = {
+        let db = recover_db(state.db.lock());
+        subtree_removal_under_lock(&db, &state.kb_path, p)
+        // `db` is dropped here, before any row under the directory is handled.
+    };
+    let Some((rel, removal)) = decided else {
         return;
     };
-    log_subtree_deindex(&rel, outcome);
+    match removal {
+        SubtreeRemoval::Swept(outcome) => log_subtree_deindex(&rel, outcome),
+        SubtreeRemoval::StillThere(Ok(held)) => {
+            // (local Codex r1 F2 on PR #401) A key that may be a lossy spelling names no path
+            // the look can reach, so handing it on would read a file still there as gone.
+            let (kept, held): (Vec<String>, Vec<String>) =
+                held.into_iter().partition(|key| key_may_be_lossy(key));
+            if !kept.is_empty() {
+                wdiag!(
+                    "watcher: left {} documents under {rel}/ indexed: their names hold U+FFFD, \
+                     so they cannot be looked at one by one",
+                    kept.len()
+                );
+            }
+            for child in held {
+                let mut full = state.kb_path.clone();
+                for segment in child.split('/') {
+                    full.push(segment);
+                }
+                handle_removed_path(state, &child, &full);
+            }
+        }
+        SubtreeRemoval::StillThere(Err(e)) => {
+            wdiag!("watcher: listing the documents under {rel}/ failed: {e}")
+        }
+        SubtreeRemoval::LeftIndexed { kind, held } => match held {
+            Ok(held) if held.is_empty() => {}
+            Ok(held) => wdiag!(
+                "watcher: could not tell whether the directory {rel} is still there ({kind:?}); \
+                 left the {} documents under it indexed",
+                held.len()
+            ),
+            Err(e) => wdiag!(
+                "watcher: could not tell whether the directory {rel} is still there ({kind:?}); \
+                 listing the documents under it failed: {e}"
+            ),
+        },
+    }
 }
 
 /// The line for a range delete under `rel/` already run ([`deindex_subtree_parts`]).
@@ -9425,5 +9587,237 @@ mod tests {
                 "a Debug value leaked: {line}"
             );
         }
+    }
+
+    /// (kuriya 557) The rows the store holds for the 557 decisions: two under `sub/`, one under
+    /// a sibling sharing `sub` as a prefix, and one at a file named after it.
+    const I557_ROWS: [&str; 4] = ["sub/a.md", "sub/deep/b.md", "sub-other/c.md", "sub.md"];
+
+    fn i557_under_sub() -> Vec<String> {
+        vec!["sub/a.md".to_string(), "sub/deep/b.md".to_string()]
+    }
+
+    fn i557_all_rows() -> Vec<String> {
+        // `all_document_paths` lists in byte order.
+        let mut rows: Vec<String> = I557_ROWS.iter().map(|s| s.to_string()).collect();
+        rows.sort();
+        rows
+    }
+
+    /// (kuriya 557) A removed directory that is still gone drops every row under it, and
+    /// nothing under a sibling sharing its name as a prefix or at a file named after it.
+    #[test]
+    fn i557_a_directory_still_gone_drops_every_row_under_it() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i557-gone");
+        let db = dir_rename_db(&I557_ROWS);
+        match decide_subtree_removal(&db, &kb, &kb.join("sub"), OnDisk::Gone) {
+            Some((rel, SubtreeRemoval::Swept(Ok(deleted)))) => {
+                assert_eq!(rel, "sub");
+                assert_eq!(deleted, i557_under_sub());
+            }
+            got => panic!("a gone directory must be swept: {got:?}"),
+        }
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["sub-other/c.md".to_string(), "sub.md".to_string()]
+        );
+    }
+
+    /// (kuriya 557) A removed directory that is there again (deleted and created within one
+    /// window) drops no row: the rows under it are handed on, each to be decided as its own
+    /// removal.
+    #[test]
+    fn i557_a_directory_still_there_hands_its_rows_on_and_drops_none() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i557-there");
+        let db = dir_rename_db(&I557_ROWS);
+        match decide_subtree_removal(&db, &kb, &kb.join("sub"), OnDisk::Present) {
+            Some((rel, SubtreeRemoval::StillThere(Ok(held)))) => {
+                assert_eq!(rel, "sub");
+                assert_eq!(held, i557_under_sub());
+            }
+            got => panic!("a directory still there must hand its rows on: {got:?}"),
+        }
+        assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
+    }
+
+    /// (kuriya 557) A removed directory the watcher cannot look at keeps every row under it,
+    /// and says how many and why.
+    #[test]
+    fn i557_a_directory_that_cannot_be_looked_at_keeps_its_rows() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i557-unknown");
+        let db = dir_rename_db(&I557_ROWS);
+        let look = OnDisk::Unknown(std::io::ErrorKind::PermissionDenied);
+        match decide_subtree_removal(&db, &kb, &kb.join("sub"), look) {
+            Some((
+                rel,
+                SubtreeRemoval::LeftIndexed {
+                    kind,
+                    held: Ok(held),
+                },
+            )) => {
+                assert_eq!(rel, "sub");
+                assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+                assert_eq!(held, i557_under_sub());
+            }
+            got => panic!("an unknown look must leave the rows: {got:?}"),
+        }
+        assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
+    }
+
+    /// (kuriya 557) The knowledge base itself and a path outside it name no subtree, whatever
+    /// the look says.
+    #[test]
+    fn i557_the_kb_root_and_a_path_outside_name_no_subtree() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-i557-root");
+        let outside = crate::test_support::unique_temp_path("groove-watcher-i557-outside");
+        let db = dir_rename_db(&I557_ROWS);
+        for look in [OnDisk::Gone, OnDisk::Present] {
+            assert!(decide_subtree_removal(&db, &kb, &kb, look).is_none());
+            assert!(decide_subtree_removal(&db, &kb, &outside.join("sub"), look).is_none());
+        }
+        // The watcher's own entry, which takes the look itself, asks the same question.
+        assert!(subtree_removal_under_lock(&db, &kb, &kb).is_none());
+        assert!(subtree_removal_under_lock(&db, &kb, &outside.join("sub")).is_none());
+        assert_eq!(subtree_rel(&kb, &kb), None);
+        assert_eq!(subtree_rel(&kb, &kb.join("sub")).as_deref(), Some("sub"));
+        assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
+    }
+
+    /// (kuriya 557, GitHub codex r1 P2 on PR #401) A removed file replaced by a link (a symlink
+    /// on Unix, a junction on Windows, where neither needs a privilege): the index holds no
+    /// document at a link (the full walk skips it, a write at it drops the row), so the
+    /// removal drops the row. The look outside the locks hands it inside them, and the look
+    /// taken there, under the database lock, is the one that deletes.
+    #[test]
+    fn i557_a_removed_file_replaced_by_a_link_drops_its_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i557-link");
+        let target = kb.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = kb.join("a.md");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        {
+            std::fs::write(target.join("t.md"), "# t\n").unwrap();
+            std::os::unix::fs::symlink(target.join("t.md"), &link).unwrap();
+        }
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        let outcome = removal_outcome("a.md", &link, &reg, &rules);
+        assert_eq!(outcome, (RemovalAction::Deindex, None));
+        assert_eq!(
+            removal_dispatch("a.md", outcome),
+            RemovalDispatch::DecideInLocks
+        );
+
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let look = removed_path_on_disk(&kb, "a.md");
+        assert_eq!(look, OnDisk::Gone);
+        let removed = remove_if_still_gone(&db, &kb, "a.md", &link, &reg, &rules, look);
+        assert!(
+            matches!(removed, RemovalUnderDatabaseLock::Deindexed(Ok(true))),
+            "{removed:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 557, local Codex r1 F2) Only a key holding U+FFFD may be a lossy spelling.
+    #[test]
+    fn i557_only_a_key_holding_the_replacement_character_may_be_lossy() {
+        assert!(key_may_be_lossy("sub/caf\u{FFFD}.md"));
+        assert!(!key_may_be_lossy("sub/café.md"));
+        assert!(!key_may_be_lossy("sub/a.md"));
+    }
+
+    /// (kuriya 557) What replaced a removed directory decides the look the subtree removal
+    /// takes ([`arrived_directory_on_disk`]): nothing, a file, a link, or the directory under
+    /// another case is gone; the directory under its exact spelling is there. The existing
+    /// function is pinned here because the subtree removal relies on these answers.
+    #[test]
+    fn i557_what_replaced_a_removed_directory_decides_its_look() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i557-look");
+        let sub = kb.join("sub");
+        assert_eq!(arrived_directory_on_disk(&kb, "sub", &sub), OnDisk::Gone);
+
+        std::fs::write(&sub, "x").unwrap();
+        assert_eq!(arrived_directory_on_disk(&kb, "sub", &sub), OnDisk::Gone);
+        std::fs::remove_file(&sub).unwrap();
+
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(arrived_directory_on_disk(&kb, "sub", &sub), OnDisk::Present);
+        #[cfg(any(windows, target_os = "macos"))]
+        assert_eq!(
+            arrived_directory_on_disk(&kb, "Sub", &kb.join("Sub")),
+            OnDisk::Gone,
+            "the directory under another case is not there under that spelling"
+        );
+        std::fs::remove_dir(&sub).unwrap();
+
+        let target = kb.join("target");
+        std::fs::create_dir(&target).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &sub.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &sub).unwrap();
+        assert_eq!(
+            arrived_directory_on_disk(&kb, "sub", &sub),
+            OnDisk::Gone,
+            "a link where the directory was is not the directory"
+        );
+    }
+
+    /// (kuriya 557) The subtree removal takes its look from [`arrived_directory_on_disk`] under
+    /// the caller's database lock: a directory replaced by a file of the same name is swept,
+    /// though something is at the path; the directory there again keeps its rows.
+    #[test]
+    fn i557_the_subtree_removal_looks_at_the_directory_itself() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i557-caller");
+        let sub = kb.join("sub");
+
+        std::fs::write(&sub, "x").unwrap();
+        let db = dir_rename_db(&I557_ROWS);
+        match subtree_removal_under_lock(&db, &kb, &sub) {
+            Some((_, SubtreeRemoval::Swept(Ok(deleted)))) => {
+                assert_eq!(deleted, i557_under_sub())
+            }
+            got => panic!("a file where the directory was must sweep: {got:?}"),
+        }
+        std::fs::remove_file(&sub).unwrap();
+
+        std::fs::create_dir(&sub).unwrap();
+        let db = dir_rename_db(&I557_ROWS);
+        match subtree_removal_under_lock(&db, &kb, &sub) {
+            Some((_, SubtreeRemoval::StillThere(Ok(held)))) => assert_eq!(held, i557_under_sub()),
+            got => panic!("the directory there again must keep its rows: {got:?}"),
+        }
+        assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
     }
 }
