@@ -1611,7 +1611,8 @@ enum Gate {
     /// checks: no such row can be one this version wrote, so moving or
     /// dropping it is always right, whatever sits at the path now (a file
     /// recreated there as a link, say). Every other key goes through all of
-    /// those checks as before.
+    /// those checks as before, except that (kuriya 557) a symlink (a junction
+    /// on Windows) at the path passes: no document is held at a link.
     Removal,
 }
 
@@ -1685,8 +1686,16 @@ fn gate_parts(
     // `symlink_metadata` が失敗した場合は**通す**。削除イベントではファイルが
     // 既に無く、ここで弾くと deindex が動かなくなるため (この関数は
     // Reindex / Deindex の両方を gate している)。上で取った 1 回ぶんを使う。
+    //
+    // (kuriya 557, GitHub codex r1 P2 on PR #401) A link is refused as a write
+    // only. As a removal it passes: the index holds no document at a link (the
+    // full walk skips it, and a write at one drops the row,
+    // [`deindex_under_a_link_parts`]), so a file replaced by a link loses its
+    // row rather than keeping its old text. The caller decides the delete on a
+    // look taken under the database lock ([`decide_removal_in_locks`]), and this
+    // function stats the path again there.
     if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-        return false;
+        return gate == Gate::Removal;
     }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
     // (フル re-index) と同じ判定で skip する。放置すると Office ファイルを
@@ -9672,6 +9681,60 @@ mod tests {
         assert_eq!(subtree_rel(&kb, &kb), None);
         assert_eq!(subtree_rel(&kb, &kb.join("sub")).as_deref(), Some("sub"));
         assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
+    }
+
+    /// (kuriya 557, GitHub codex r1 P2 on PR #401) A removed file replaced by a link (a symlink
+    /// on Unix, a junction on Windows, where neither needs a privilege): the index holds no
+    /// document at a link (the full walk skips it, a write at it drops the row), so the
+    /// removal drops the row. The look outside the locks hands it inside them, and the look
+    /// taken there, under the database lock, is the one that deletes.
+    #[test]
+    fn i557_a_removed_file_replaced_by_a_link_drops_its_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-i557-link");
+        let target = kb.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = kb.join("a.md");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+        #[cfg(unix)]
+        {
+            std::fs::write(target.join("t.md"), "# t\n").unwrap();
+            std::os::unix::fs::symlink(target.join("t.md"), &link).unwrap();
+        }
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        let outcome = removal_outcome("a.md", &link, &reg, &rules);
+        assert_eq!(outcome, (RemovalAction::Deindex, None));
+        assert_eq!(
+            removal_dispatch("a.md", outcome),
+            RemovalDispatch::DecideInLocks
+        );
+
+        let db = dir_rename_db(&["a.md", "other.md"]);
+        let look = removed_path_on_disk(&kb, "a.md");
+        assert_eq!(look, OnDisk::Gone);
+        let removed = remove_if_still_gone(&db, &kb, "a.md", &link, &reg, &rules, look);
+        assert!(
+            matches!(removed, RemovalUnderDatabaseLock::Deindexed(Ok(true))),
+            "{removed:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 
     /// (kuriya 557, local Codex r1 F2) Only a key holding U+FFFD may be a lossy spelling.

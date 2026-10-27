@@ -162,6 +162,55 @@ fn a_directory_removed_and_recreated_in_one_window_keeps_the_rows_of_files_still
     );
 }
 
+/// (kuriya 557, GitHub codex r1 P2 on PR #401) A directory removed and created again within one
+/// debounce window, with one of its files back as a symlink, drops that file's row: the index
+/// holds no document at a link, and on Linux the file's own event inside the new directory is
+/// not delivered, so the directory's removal is the only event that can drop it.
+///
+/// Unix only (a symlink to a file needs a privilege on Windows); the unit tests in the watcher
+/// cover the decision with a junction there.
+#[test]
+#[cfg(unix)]
+fn a_recreated_directory_drops_the_row_of_a_file_now_a_symlink() {
+    let fx = fixture(
+        "i557-symlink",
+        &[
+            ("sub/a.md", &note_with("Alpha", A_MARKER)),
+            ("sub/b.md", &note_with("Beta", B_MARKER)),
+        ],
+        WATCH_TOML,
+    );
+    let outside = fx.layout.root().join("outside.md");
+    std::fs::write(&outside, note_with("Alpha", A_MARKER)).expect("write the link target");
+    let guard = serve(&fx);
+    assert_eq!(fx.documents(), 2);
+
+    let sub = fx.kb().join("sub");
+    std::fs::remove_dir_all(&sub).expect("remove sub");
+    std::fs::create_dir(&sub).expect("create sub again");
+    fx.layout.write("sub/b.md", &note_with("Beta", B_MARKER));
+    std::os::unix::fs::symlink(&outside, sub.join("a.md")).expect("link sub/a.md");
+
+    let settled = wait_until(Duration::from_secs(30), || fx.documents() == 1);
+    // Leave the trailing events of the window time to land.
+    std::thread::sleep(Duration::from_millis(1500));
+    let lines = stderr_lines(&guard);
+    drop(guard);
+    assert!(
+        settled,
+        "the row of sub/a.md, now a symlink, stayed:\n{}",
+        lines.join("\n")
+    );
+    assert_eq!(fx.documents(), 1, "{}", lines.join("\n"));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("sub/a.md") && l.contains("deindexed")),
+        "no line dropping sub/a.md:\n{}",
+        lines.join("\n")
+    );
+}
+
 /// A file name the index can only spell lossily: on Unix bytes that are not UTF-8, on Windows
 /// an unpaired surrogate. `groove index` keys its row with U+FFFD in their place.
 fn lossy_name() -> std::ffi::OsString {

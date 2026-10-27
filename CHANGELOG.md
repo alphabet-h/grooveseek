@@ -29,7 +29,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   full `groove index`. A document whose stored name holds U+FFFD under a directory that is there
   again keeps its row as it is, also when its file is gone: a name that is not valid Unicode is
   stored with U+FFFD in its place, so the stored name cannot be told from a name that holds the
-  character itself, and cannot be looked at; the next full `groove index` settles it. (#401)
+  character itself, and cannot be looked at; the next full `groove index` settles it. A file
+  deleted and replaced by a symlink (a junction on Windows), on its own or under a directory
+  that is there again, now has its row dropped, as `groove index` drops it, rather than keeping
+  its old text searchable. (#401)
 
 ## [1.21.3] - 2026-10-27
 
