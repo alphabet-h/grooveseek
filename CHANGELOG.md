@@ -26,9 +26,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   as if its own deletion had been reported, so a file still there keeps its row and its
   vectors; one that cannot be looked at (access denied, an I/O error) keeps them and says why
   on stderr, so if it is in fact gone, its documents stay until the next event under it or a
-  full `groove index`. A document whose name is not valid Unicode (stored with U+FFFD) under a
-  directory that is there again keeps its row as it is, since its stored name cannot be looked
-  at; the next full `groove index` settles it. (#401)
+  full `groove index`. A document whose stored name holds U+FFFD under a directory that is there
+  again keeps its row as it is, also when its file is gone: a name that is not valid Unicode is
+  stored with U+FFFD in its place, so the stored name cannot be told from a name that holds the
+  character itself, and cannot be looked at; the next full `groove index` settles it. (#401)
 
 ## [1.21.3] - 2026-10-27
 
