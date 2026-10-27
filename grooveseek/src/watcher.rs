@@ -2504,31 +2504,35 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
 /// Split out so a test can run it with no [`crate::embedder::Embedder`] (as
 /// [`should_process_parts`] is).
 ///
-/// `None` when `p` is not under the KB or is the KB root itself: an empty
-/// prefix would name the whole KB (the helper refuses it too). Otherwise the
-/// rows under `rel/` are deleted, and `rel` is returned with the outcome so the
-/// caller logs the same spelling it deleted by. It stats nothing of its own and
-/// asks no exclusion / extension / link gate: whatever the store still holds
-/// under a directory that is not there is gone from disk. (kuriya 557) The
-/// look that says the directory is not there is the caller's, taken under the
-/// same db lock. Relativisation is the existing [`to_rel`], shared with the
-/// single-file path, whose canonicalize fallback returns `None` for a path that
-/// no longer exists.
-///
-/// Known limitation: on Unix a non-UTF-8 directory name is spelled lossily
-/// (U+FFFD) by [`indexer::index_rel_path`], so two sibling directories whose
-/// names collapse to the same spelling share a prefix and both fall in the range.
+/// `None` when `p` names no subtree ([`subtree_rel`]). Otherwise the rows under
+/// `rel/` are deleted, and `rel` is returned with the outcome so the caller
+/// logs the same spelling it deleted by. It stats nothing of its own and asks
+/// no exclusion / extension / link gate: whatever the store still holds under
+/// a directory that is not there is gone from disk. (kuriya 557) The look that
+/// says the directory is not there is the caller's, taken under the same db
+/// lock.
 fn deindex_subtree_parts(
     db: &Database,
     kb_path: &Path,
     p: &Path,
 ) -> Option<(String, Result<Vec<String>>)> {
-    let rel = to_rel(kb_path, p)?;
-    if rel.is_empty() {
-        return None;
-    }
+    let rel = subtree_rel(kb_path, p)?;
     let outcome = indexer::deindex_subtree(db, &rel);
     Some((rel, outcome))
+}
+
+/// (feature-67, kuriya 557) The prefix whose rows an event path `p` names as a subtree: its
+/// `rel`, or `None` when `p` is not under the KB or is the KB root itself (an empty prefix
+/// would name the whole KB, and [`indexer::deindex_subtree`] refuses it too). Every subtree
+/// delete and listing asks this one question. Relativisation is the existing [`to_rel`],
+/// shared with the single-file path, whose canonicalize fallback returns `None` for a path
+/// that no longer exists.
+///
+/// Known limitation: on Unix a non-UTF-8 directory name is spelled lossily
+/// (U+FFFD) by [`indexer::index_rel_path`], so two sibling directories whose
+/// names collapse to the same spelling share a prefix and both fall in the range.
+fn subtree_rel(kb_path: &Path, p: &Path) -> Option<String> {
+    to_rel(kb_path, p).filter(|rel| !rel.is_empty())
 }
 
 /// (local Codex r3 on AX-02) [`deindex_subtree_parts`] for an event path that is now a link (a
@@ -2578,9 +2582,8 @@ enum SubtreeRemoval {
     },
 }
 
-/// (kuriya 557) [`subtree_removal_for`] for an event path `p` and a look a test hands in; `None`
-/// when `p` is not under the KB or is the KB root itself (as [`deindex_subtree_parts`]). The
-/// watcher takes its look itself ([`subtree_removal_under_lock`]).
+/// (kuriya 557) [`subtree_removal_looked`] with a look a test hands in, in place of the one
+/// the watcher takes ([`subtree_removal_under_lock`]).
 #[cfg(test)]
 fn decide_subtree_removal(
     db: &Database,
@@ -2588,11 +2591,21 @@ fn decide_subtree_removal(
     p: &Path,
     look: OnDisk,
 ) -> Option<(String, SubtreeRemoval)> {
-    let rel = to_rel(kb_path, p)?;
-    if rel.is_empty() {
-        return None;
-    }
-    let removal = subtree_removal_for(db, &rel, look);
+    subtree_removal_looked(db, kb_path, p, |_| look)
+}
+
+/// (kuriya 557) What a remove event does with the rows under its path `p`, for a caller
+/// holding the db lock: `None` when `p` names no subtree ([`subtree_rel`]), otherwise `rel`
+/// with [`subtree_removal_for`] given `look(rel)`. `rel` is taken once, so the look, the delete
+/// and the line use the same spelling.
+fn subtree_removal_looked(
+    db: &Database,
+    kb_path: &Path,
+    p: &Path,
+    look: impl FnOnce(&str) -> OnDisk,
+) -> Option<(String, SubtreeRemoval)> {
+    let rel = subtree_rel(kb_path, p)?;
+    let removal = subtree_removal_for(db, &rel, look(&rel));
     Some((rel, removal))
 }
 
@@ -2616,23 +2629,17 @@ fn subtree_removal_for(db: &Database, rel: &str, look: OnDisk) -> SubtreeRemoval
     }
 }
 
-/// (kuriya 557) [`subtree_removal_for`] with the look at the directory taken here, for a
-/// caller holding the db lock: the look and the delete it decides sit in the same lock region,
-/// so no write of this process lands between them. `None` when `p` is not under the KB or is
-/// the KB root itself (as [`deindex_subtree_parts`]). `rel` is taken once ([`to_rel`]), so the
-/// look, the delete and the line use the same spelling.
+/// (kuriya 557) [`subtree_removal_looked`] with the look at the directory taken here
+/// ([`arrived_directory_on_disk`]), for a caller holding the db lock: the look and the delete
+/// it decides sit in the same lock region, so no write of this process lands between them.
 fn subtree_removal_under_lock(
     db: &Database,
     kb_path: &Path,
     p: &Path,
 ) -> Option<(String, SubtreeRemoval)> {
-    let rel = to_rel(kb_path, p)?;
-    if rel.is_empty() {
-        return None;
-    }
-    let look = arrived_directory_on_disk(kb_path, &rel, p);
-    let removal = subtree_removal_for(db, &rel, look);
-    Some((rel, removal))
+    subtree_removal_looked(db, kb_path, p, |rel| {
+        arrived_directory_on_disk(kb_path, rel, p)
+    })
 }
 
 /// (feature-67, kuriya issue #479, kuriya 557) What the store holds under a removed path. The
@@ -9637,6 +9644,11 @@ mod tests {
             assert!(decide_subtree_removal(&db, &kb, &kb, look).is_none());
             assert!(decide_subtree_removal(&db, &kb, &outside.join("sub"), look).is_none());
         }
+        // The watcher's own entry, which takes the look itself, asks the same question.
+        assert!(subtree_removal_under_lock(&db, &kb, &kb).is_none());
+        assert!(subtree_removal_under_lock(&db, &kb, &outside.join("sub")).is_none());
+        assert_eq!(subtree_rel(&kb, &kb), None);
+        assert_eq!(subtree_rel(&kb, &kb.join("sub")).as_deref(), Some("sub"));
         assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
     }
 

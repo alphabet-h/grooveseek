@@ -204,14 +204,16 @@ fn a_removed_directory_that_cannot_be_looked_at_keeps_the_rows_under_it() {
         return;
     }
 
-    // The line the watcher prints for the directory's removal: before the fix
-    // `deindexed 1 documents under outer/sub/`, after it the one saying it could not tell.
-    let (reported, lines) = wait_for_line(&guard, "outer/sub");
+    // The line the watcher prints for the directory's removal it could not look at (before the
+    // fix it printed `deindexed 1 documents under outer/sub/` instead).
+    const UNKNOWN_LINE: &str = "watcher: could not tell whether the directory outer/sub is still \
+                                there (PermissionDenied); left the 1 documents under it indexed";
+    let (reported, lines) = wait_for_line(&guard, UNKNOWN_LINE);
     drop(restore);
     drop(guard);
     assert!(
         reported,
-        "no watcher line naming outer/sub:\n{}",
+        "no line holding `{UNKNOWN_LINE}`:\n{}",
         lines.join("\n")
     );
     assert_eq!(
