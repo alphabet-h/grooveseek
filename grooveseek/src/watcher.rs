@@ -810,13 +810,16 @@ enum RemovalAction {
 /// at again with both locks held ([`dispatch_reindex_after_removal`]), and a look there that
 /// still cannot tell leaves the row as it was and says why, as a write does (D3) and as
 /// `groove index` does (a stat that fails is a skip, a directory that cannot be listed stops
-/// the run before its sweep). #543 r3 dropped it, since no later event may come to drop the
+/// the run before its sweep). kuriya 543 r3 dropped it, since no later event may come to drop the
 /// row of a file that is in fact gone; such a row now stays until the path's next event or a
 /// `groove index` run that can see the file is gone.
 ///
-/// (local Codex r7, medium) The look is taken once ([`removal_look`]) and its answer decides
-/// both the action and, for an unknown that ends in a deindex, the kind the line names
-/// ([`removal_outcome_for`]).
+/// (local Codex r7, medium) The look is taken once ([`removal_look`]) and
+/// [`removal_outcome_for`] returns its answer with the action: the kind of an unknown that
+/// ends in a deindex. (kuriya 548) That kind no longer reaches any line: [`removal_dispatch`]
+/// reads only whether one is there (`Some(_)`) as the cue to look again inside the locks, and
+/// the kind a line names is the one of the look taken there ([`decide_removal_in_locks`],
+/// [`log_removed_path_left_indexed`]).
 fn removal_outcome(
     rel: &str,
     full: &Path,
@@ -896,7 +899,9 @@ enum RemovalDispatch {
     /// Take both locks, look at the path again and decide there
     /// ([`dispatch_reindex_after_removal`]).
     DecideInLocks,
-    /// The path was found gone outside the locks: drop the row ([`dispatch_deindex`]).
+    /// The path was found gone outside the locks: drop the row ([`dispatch_deindex`]). So is a
+    /// path the look found present under a name the index cannot hold (for example `a//doc.md`),
+    /// which the removal gate passes early (ADR-0023).
     Deindex,
     /// The path is not one the index tracks.
     Skip,
@@ -905,9 +910,10 @@ enum RemovalDispatch {
 /// (kuriya 548) The event loop's reading of [`removal_outcome`]. A reindex, and a deindex that
 /// came from a look that could not tell (the kind is there), both go inside the locks, where
 /// the path is looked at again and [`removal_decision_for`] is asked again on that look
-/// ([`decide_removal_in_locks`]). Only a path the look outside found gone, or one the
-/// removal gate turned away, is settled here. Split out so a test can pin that an unknown look
-/// never reaches [`dispatch_deindex`].
+/// ([`decide_removal_in_locks`]). Only a deindex with no kind is settled here: a path the look
+/// outside found gone, or one found present under a name the index cannot hold, which the
+/// removal gate passes early (ADR-0023). A path the removal gate turned away is a skip. Split
+/// out so a test can pin that an unknown look never reaches [`dispatch_deindex`].
 fn removal_dispatch(outcome: (RemovalAction, Option<std::io::ErrorKind>)) -> RemovalDispatch {
     match outcome {
         (RemovalAction::Reindex, _) | (RemovalAction::Deindex, Some(_)) => {
@@ -1810,7 +1816,7 @@ enum ReindexOrigin<'a> {
     /// A remove event found a file at the path again ([`RemovalAction::Reindex`]), or could not
     /// tell whether it is there (kuriya 548): [`decide_removal_in_locks`] and
     /// [`settle_removal_reindex_looked`]. `full` is the path the event named, which the gates
-    /// asked again inside the locks judge.
+    /// judge when asked again inside the locks.
     Removal { full: &'a Path },
     /// A create, modify or rename-to: [`act_on_written_path`] and [`settle_write_reindex`].
     /// `raw` is the path the event named, when the caller has it ([`rel_is_lossy`]); `look` is
@@ -1995,8 +2001,8 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 /// frontmatter-only stub) is taken as it is. Any other answer -- a skip whatever its reason,
 /// a refusal, an error -- is looked at again: the rows go as a removal drops them only when the
 /// path is gone by then, and stay as they were while the file is there or the look cannot
-/// tell, as a write and `groove index` keep them. Before kuriya 549 (#543, GitHub codex r1 P2)
-/// every such answer dropped the rows whatever the disk showed afterwards.
+/// tell, as a write and `groove index` keep them. Before kuriya 549 (kuriya 543, GitHub codex
+/// r1 P2) every such answer dropped the rows whatever the disk showed afterwards.
 ///
 /// Only the remove path calls this. (#544) A create, modify or rename-to looks at the disk
 /// inside the locks too, with its own answers ([`ReindexOrigin::Write`]).
@@ -5713,7 +5719,7 @@ mod tests {
 
     /// (kuriya 548) A file found inside the locks that the write gate refuses is never
     /// reindexed there, whatever the look outside found. A hard link fails the removal gate
-    /// too, so it is skipped and its row left, as the removal decided before #543
+    /// too, so it is skipped and its row left, as the removal decided before kuriya 543
     /// (`a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path` pins the same
     /// answer outside the locks). A key the index cannot hold passes the removal gate early
     /// (ADR-0023), so a file there has its row dropped rather than reindexed.
