@@ -679,9 +679,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                             &rel,
                             removal_outcome(&rel, p, &state.registry, &state.rules),
                         ) {
-                            RemovalDispatch::DecideInLocks => {
-                                dispatch_reindex_after_removal(state, &rel, p)
-                            }
+                            RemovalDispatch::DecideInLocks => dispatch_removal(state, &rel, p),
                             RemovalDispatch::Deindex => dispatch_deindex(state, &rel),
                             RemovalDispatch::Skip => {}
                         }
@@ -814,7 +812,9 @@ enum RemovalAction {
 ///
 /// The same holds for a look outside that found the path gone: that deindex too is looked at
 /// again inside the locks ([`removal_dispatch`]), so a file written there again in between
-/// keeps its row. Only a name the index cannot hold is dropped without that second look.
+/// keeps its row. Only a name the index cannot hold is dropped without that second look. A path
+/// still gone on the second look is dropped under the database lock alone, with no embedder
+/// lock ([`dispatch_removal`]).
 ///
 /// (local Codex r7, medium) The look is taken once ([`removal_look`]) and
 /// [`removal_outcome_for`] returns its answer with the action: the kind of an unknown that
@@ -898,8 +898,9 @@ fn removal_decision_for(
 /// What the event loop does with a remove event's path, given [`removal_outcome`]'s answer.
 #[derive(Debug, PartialEq, Eq)]
 enum RemovalDispatch {
-    /// Take both locks, look at the path again and decide there
-    /// ([`dispatch_reindex_after_removal`]).
+    /// Look at the path again and decide on that look ([`dispatch_removal`]): under the
+    /// database lock alone while it is still gone, with both locks once a file is there or the
+    /// look cannot tell ([`dispatch_reindex_after_removal`]).
     DecideInLocks,
     /// A name the index cannot hold (for example `a//doc.md`), which the removal gate passes
     /// early whatever is on disk (ADR-0023): drop the row ([`dispatch_deindex`]) without
@@ -910,8 +911,8 @@ enum RemovalDispatch {
 }
 
 /// (kuriya 548) The event loop's reading of [`removal_outcome`] for `rel`. A reindex and a
-/// deindex both go inside the locks, where the path is looked at again and
-/// [`removal_decision_for`] is asked again on that look ([`decide_removal_in_locks`]): a look
+/// deindex both go inside the locks ([`dispatch_removal`]), where the path is looked at again
+/// and [`removal_decision_for`] is asked again on that look ([`decide_removal_in_locks`]): a look
 /// outside that could not tell (the kind is there), and as much a look outside that found the
 /// path gone, since a file written there again before the locks are taken (its create folded
 /// away by the debouncer) would otherwise lose its row until the next full index. Only a
@@ -971,6 +972,10 @@ enum RemovalInLocks {
 ///   and as `groove index` keeps them; before kuriya 548 they went
 /// - a skip (the removal gate turns the path away: an excluded path, a hard link) does nothing
 ///
+/// (local Codex r2, medium) [`remove_if_still_gone`] calls this too, under the database lock
+/// alone, for a look that found the path gone: then only the deindex or the skip can come
+/// back, and neither needs the embedder.
+///
 /// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`] and an
 /// [`OnDisk::Unknown`] that no file system makes on demand.
 fn decide_removal_in_locks(
@@ -994,6 +999,87 @@ fn decide_removal_in_locks(
                 RemovalInLocks::Deindexed(deindex_removed_path(db, kb_path, rel))
             }
         },
+    }
+}
+
+/// What [`remove_if_still_gone`] did under the database lock alone.
+#[derive(Debug)]
+enum RemovalUnderDatabaseLock {
+    /// The path is still gone: the row under `rel` and its folded legacy row were deleted, and
+    /// the result says whether either was there.
+    Deindexed(Result<bool>),
+    /// The path is still gone and the removal gate turns it away: nothing to do.
+    Skip,
+    /// A file is at the path or the look could not tell: nothing was touched, and the removal
+    /// is decided again with both locks held ([`dispatch_reindex_after_removal`]).
+    NeedsBothLocks,
+}
+
+/// (local Codex r2, medium) The part of a removal that needs no embedder, for a caller holding
+/// the database lock and nothing else. `on_disk` is the look taken under that lock, right before
+/// the delete. A path still gone is settled here by [`decide_removal_in_locks`] (its rows go, or
+/// the removal gate turns it away); a file there or a look that cannot tell may need a reindex,
+/// so it is handed on untouched.
+///
+/// The look that decides a delete is the one taken under the database lock: every writer of a
+/// document's rows (a reindex, a rename, another deindex) writes under that lock, so nothing
+/// writes the row between the look and the delete. The embedder lock adds nothing to that, and
+/// taking it first made a deletion wait for a search's embedding. [`sweep_source_if_gone`] takes
+/// the same shape.
+///
+/// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
+fn remove_if_still_gone(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> RemovalUnderDatabaseLock {
+    if on_disk != OnDisk::Gone {
+        return RemovalUnderDatabaseLock::NeedsBothLocks;
+    }
+    match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk) {
+        RemovalInLocks::Deindexed(outcome) => RemovalUnderDatabaseLock::Deindexed(outcome),
+        RemovalInLocks::Skip => RemovalUnderDatabaseLock::Skip,
+        // A gone path is never reindexed nor left on an unknown look; named rather than
+        // caught so a new variant stays a compile error.
+        RemovalInLocks::Reindex | RemovalInLocks::LeftIndexed { .. } => {
+            RemovalUnderDatabaseLock::NeedsBothLocks
+        }
+    }
+}
+
+/// (local Codex r2, medium) What the event loop does for [`RemovalDispatch::DecideInLocks`].
+/// First the database lock alone: the path is looked at again under it
+/// ([`removed_path_on_disk`]) and, while it is still gone, its rows go there
+/// ([`remove_if_still_gone`]), so an ordinary deletion never waits on the embedder lock that a
+/// search holds through a slow embedding. Only when the look finds a file or cannot tell is
+/// that lock released and both locks taken, embedder first and database second as everywhere
+/// else ([`dispatch_reindex_after_removal`]), where the path is looked at once more and the
+/// decision asked again. Never the embedder lock while holding the database lock: that order
+/// would deadlock against every other reindex.
+fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path) {
+    let under_db = {
+        let db = recover_db(state.db.lock());
+        remove_if_still_gone(
+            &db,
+            &state.kb_path,
+            rel,
+            full,
+            &state.registry,
+            &state.rules,
+            removed_path_on_disk(&state.kb_path, rel),
+        )
+        // `db` is dropped here, before the embedder lock can be taken.
+    };
+    match under_db {
+        RemovalUnderDatabaseLock::Deindexed(outcome) => log_removed_path_deindexed(rel, outcome),
+        RemovalUnderDatabaseLock::Skip => {}
+        RemovalUnderDatabaseLock::NeedsBothLocks => {
+            dispatch_reindex_after_removal(state, rel, full)
+        }
     }
 }
 
@@ -2005,7 +2091,9 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 ///
 /// (kuriya 548) A remove event whose look outside the locks could not tell, or found the path
 /// gone, comes here too ([`removal_dispatch`]), and `full`, the path the event named, comes
-/// with both. Inside the
+/// with both. (local Codex r2, medium) It comes only once a look under the database lock alone
+/// found a file there or could not tell; a path still gone on that look has its rows dropped
+/// there, with no embedder lock ([`dispatch_removal`]). Inside the
 /// locks [`decide_removal_in_locks`] asks [`removal_decision_for`] again on the look taken
 /// there, so a file is reindexed only when the write gate takes it, the rows go when the path
 /// is gone or holds what the index cannot keep, and a look that still cannot tell leaves the
@@ -5887,6 +5975,117 @@ mod tests {
         assert_eq!(
             db.all_document_paths().unwrap(),
             vec!["doc.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 548, local Codex r2, medium) Under the database lock alone, a path still gone
+    /// has its row (and only its row) dropped, or is skipped when the removal gate turns it
+    /// away; a file there or a look that cannot tell touches nothing and is handed on to the
+    /// path that takes both locks.
+    #[test]
+    fn i548_a_removal_still_gone_is_settled_under_the_database_lock_alone() {
+        let kb = i549_kb("groove-watcher-i548-db-lock-only");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("doc.md");
+
+        let db = dir_rename_db(&["doc.md", "other.md"]);
+        let gone = remove_if_still_gone(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Gone);
+        assert!(
+            matches!(gone, RemovalUnderDatabaseLock::Deindexed(Ok(true))),
+            "{gone:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+
+        let excluded_full = kb.0.join(".obsidian").join("x.md");
+        let db = dir_rename_db(&[".obsidian/x.md"]);
+        let skipped = remove_if_still_gone(
+            &db,
+            &kb.0,
+            ".obsidian/x.md",
+            &excluded_full,
+            &reg,
+            &rules,
+            OnDisk::Gone,
+        );
+        assert!(
+            matches!(skipped, RemovalUnderDatabaseLock::Skip),
+            "{skipped:?}"
+        );
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![".obsidian/x.md".to_string()]
+        );
+
+        for look in [
+            OnDisk::Present,
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        ] {
+            let db = dir_rename_db(&["doc.md", "other.md"]);
+            let handed_on = remove_if_still_gone(&db, &kb.0, "doc.md", &full, &reg, &rules, look);
+            assert!(
+                matches!(handed_on, RemovalUnderDatabaseLock::NeedsBothLocks),
+                "{look:?}: {handed_on:?}"
+            );
+            assert_eq!(
+                db.all_document_paths().unwrap(),
+                vec!["doc.md".to_string(), "other.md".to_string()],
+                "{look:?}"
+            );
+        }
+    }
+
+    /// (kuriya 548, local Codex r2, medium) A remove event whose path is still gone is handled
+    /// through the event loop while the embedder lock is held elsewhere (a search embedding a
+    /// query on a slow endpoint): the row goes and the batch finishes without waiting for that
+    /// lock. Taking both locks for it, as the event loop did for a moment, would block here
+    /// until the lock is let go.
+    #[test]
+    fn i548_a_removal_still_gone_does_not_wait_for_the_embedder_lock() {
+        let kb = i549_kb("groove-watcher-i548-no-embedder-wait");
+        let full = kb.0.join("doc.md");
+        std::fs::remove_file(&full).unwrap();
+        let db = Arc::new(Mutex::new(dir_rename_db(&["doc.md", "other.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = WatcherState {
+            kb_path: kb.0.clone(),
+            db: Arc::clone(&db),
+            embedder: Arc::clone(&embedder),
+            registry: Arc::new(Registry::defaults()),
+            exclude_headings: None,
+            rules: crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs()),
+            config: WatchConfig::default(),
+            watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let events = [mk_evt(
+            EventKind::Remove(notify_debouncer_full::notify::event::RemoveKind::File),
+            vec![full.clone()],
+        )];
+
+        let held = embedder.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let finished = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_events(&mut state, &events);
+                let _ = done_tx.send(());
+            });
+            // Generous: the deletion takes milliseconds; the wait only runs out when the
+            // removal is blocked on the held lock.
+            let finished = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+            // Let a blocked removal go so the scope can join it either way.
+            drop(held);
+            finished
+        });
+        assert!(
+            finished,
+            "a removal of a path still gone waited for the embedder lock"
+        );
+        assert_eq!(
+            db.lock().unwrap().all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
         );
     }
 
