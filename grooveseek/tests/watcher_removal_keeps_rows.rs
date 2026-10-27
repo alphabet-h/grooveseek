@@ -11,11 +11,11 @@
 //!   rows went as for a removal as well.
 //!
 //! Each test drives `groove serve` with the watcher on against the mock endpoint of
-//! `tests/common/embed_cli.rs`, so nothing downloads a model.
+//! `common::embed_cli`, so nothing downloads a model.
 //!
 //! Not on macOS: there FSEvents folds the removal and the write into one change (kuriya trap
 //! 525), so the watcher never sees a removal and these paths are not taken
-//! (`tests/watcher_remove_then_write.rs` says the same for its removal tests).
+//! (the remove-then-write end-to-end tests say the same for their removal tests).
 #![cfg(not(target_os = "macos"))]
 
 mod common;
@@ -108,7 +108,7 @@ fn hit_contents(fx: &Fixture, query: &str) -> Vec<String> {
 }
 
 /// (kuriya 549) A file removed and written again over `[index].max_text_file_size` keeps its
-/// previous rows, as `groove index` keeps them for a file over the cap (`docs/behavior.md`:
+/// previous rows, as `groove index` keeps them for a file over the cap (the behavior docs:
 /// "an edit that leaves the file over the cap keeps the old text searchable").
 #[test]
 fn a_removal_replaced_by_a_file_over_the_cap_keeps_the_row() {

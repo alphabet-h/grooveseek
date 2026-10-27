@@ -5322,7 +5322,7 @@ mod tests {
     }
 
     /// (kuriya 549) The same results, once the second look finds the path gone, go to
-    /// `settle_removal_reindex` as before: the row under `rel` is dropped, the others stay, and
+    /// [`settle_removal_reindex`] as before: the row under `rel` is dropped, the others stay, and
     /// the reason is the one the kept branch would have named.
     #[test]
     fn i549_an_unsettled_removal_reindex_drops_the_row_once_the_path_is_gone() {
@@ -5377,7 +5377,7 @@ mod tests {
     }
 
     /// (kuriya 549) A result that settled the row is not looked at again: it gets what
-    /// `settle_removal_reindex` gives it, the empty-file skip (`NothingToIndex`) still dropped.
+    /// [`settle_removal_reindex`] gives it, the empty-file skip (`NothingToIndex`) still dropped.
     #[test]
     fn i549_a_settled_removal_reindex_is_not_looked_at_again() {
         let kb = i549_kb("groove-watcher-i549-settled");
@@ -5509,9 +5509,9 @@ mod tests {
     }
 
     /// (kuriya 549) The line for a row left as it was must not read as the line for a row
-    /// dropped: `tests/watcher_remove_then_write.rs` waits for "was removed and its
+    /// dropped: the remove-then-write end-to-end tests wait for "was removed and its
     /// replacement was not indexed" as the drop. Both forms still start with "was removed and",
-    /// which `tests/watcher_removal_keeps_rows.rs` waits for.
+    /// which the end-to-end tests that pin this fix wait for.
     #[test]
     fn i549_the_left_indexed_line_is_not_the_deindexed_line() {
         for unknown in [None, Some(std::io::ErrorKind::PermissionDenied)] {
@@ -5537,7 +5537,7 @@ mod tests {
     /// (kuriya 548) Inside the locks, a look that could not tell leaves the row under `rel`,
     /// its folded legacy row and every other row as they were, and keeps the kind for the
     /// line; a missing row is reported as missing. The line says the row was left, not
-    /// deindexed, and is the one `tests/watcher_removal_keeps_rows.rs` waits for.
+    /// deindexed, and is the one the end-to-end tests that pin this fix wait for.
     #[test]
     fn i548_an_unknown_look_inside_the_locks_leaves_the_row() {
         let kb = i549_kb("groove-watcher-i548-unknown");
@@ -5720,7 +5720,7 @@ mod tests {
     /// (kuriya 548) A file found inside the locks that the write gate refuses is never
     /// reindexed there, whatever the look outside found. A hard link fails the removal gate
     /// too, so it is skipped and its row left, as the removal decided before kuriya 543
-    /// (`a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path` pins the same
+    /// ([`a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path`] pins the same
     /// answer outside the locks). A key the index cannot hold passes the removal gate early
     /// (ADR-0023), so a file there has its row dropped rather than reindexed.
     #[test]
