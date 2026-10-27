@@ -26,7 +26,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   as if its own deletion had been reported, so a file still there keeps its row and its
   vectors; one that cannot be looked at (access denied, an I/O error) keeps them and says why
   on stderr, so if it is in fact gone, its documents stay until the next event under it or a
-  full `groove index`. (#NNN)
+  full `groove index`. (#401)
 
 ## [1.21.3] - 2026-10-27
 
