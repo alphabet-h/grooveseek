@@ -2208,9 +2208,9 @@ enum RemovalReindexSettled {
 /// left only when the reindex says they now hold the file on disk (`Updated`, `Unchanged`,
 /// `MetadataRefreshed`). Any other answer -- a skip whatever its reason, a refusal, an error --
 /// drops them, as the remove event dropped them before #543. A result whose row the indexer
-/// already dropped only has its folded row swept, so no second line names it. An error's
-/// reason goes through [`crate::embedder::body_free_message`], so no document text reaches the
-/// log.
+/// already dropped only has its folded row swept, so no second line names it. The reason for a
+/// skip, refusal or error comes from [`unsettled_reindex_reason`]; an error's goes through
+/// [`crate::embedder::body_free_message`] there, so no document text reaches the log.
 ///
 /// (kuriya 549) The dispatch calls this through [`settle_removal_reindex_looked`], only for a
 /// result that settled the row, and for one that did not once a second look found the path
@@ -2238,11 +2238,15 @@ fn settle_removal_reindex(
             ))
         }
         // Each named, not a catch-all, so a new variant stays a compile error (#251's way);
-        // the reason is only for the line, never branched on.
-        Ok(indexer::SingleResult::Skipped { reason, .. }) => RemovalReindexSettled::Deindexed {
-            reason: (*reason).to_string(),
-            outcome: deindex_removed_path(db, kb_path, rel),
-        },
+        // the reason is only for the line, never branched on. Worded by the one mapping the
+        // left-indexed line uses too ([`unsettled_reindex_reason`]), so a row dropped and a
+        // row kept name the same result alike.
+        Ok(indexer::SingleResult::Skipped { .. } | indexer::SingleResult::Refused) | Err(_) => {
+            RemovalReindexSettled::Deindexed {
+                reason: unsettled_reindex_reason(result),
+                outcome: deindex_removed_path(db, kb_path, rel),
+            }
+        }
         // (#543) The skip of a file with nothing to embed, whose row the indexer has already
         // dropped: settled as that skip is, and the line counts that row as one the removal
         // dropped, so it reads as it did before the indexer took the row itself.
@@ -2252,14 +2256,6 @@ fn settle_removal_reindex(
                 outcome: deindex_removed_path(db, kb_path, rel).map(|swept| swept || *deindexed),
             }
         }
-        Ok(indexer::SingleResult::Refused) => RemovalReindexSettled::Deindexed {
-            reason: "refused".to_string(),
-            outcome: deindex_removed_path(db, kb_path, rel),
-        },
-        Err(e) => RemovalReindexSettled::Deindexed {
-            reason: format!("reindex failed: {}", crate::embedder::body_free_message(e)),
-            outcome: deindex_removed_path(db, kb_path, rel),
-        },
     }
 }
 
@@ -2320,11 +2316,13 @@ fn settle_removal_reindex_looked(
     }
 }
 
-/// Why a reindex left the row as it was, in the words [`settle_removal_reindex`] uses for the
-/// same result: the skip's reason, `refused`, or the error with no document text in it
-/// ([`crate::embedder::body_free_message`]). Only called for a result
-/// [`write_reindex_settled_the_row`] answered false for; a settled one has no such reason and
-/// gets an empty string.
+/// Why a reindex left the row as it was: the skip's reason, `refused`, or the error with no
+/// document text in it ([`crate::embedder::body_free_message`]). The one mapping for both
+/// lines that name such a result after a remove event, the one that says the row went
+/// ([`settle_removal_reindex`]) and the one that says it was kept
+/// ([`settle_removal_reindex_looked`]), so the two cannot word the same result apart. Only
+/// called for a result [`write_reindex_settled_the_row`] answered false for; a settled one has
+/// no such reason and gets an empty string.
 fn unsettled_reindex_reason(result: &Result<indexer::SingleResult>) -> String {
     match result {
         Ok(indexer::SingleResult::Skipped { reason, .. }) => (*reason).to_string(),
@@ -5483,6 +5481,54 @@ mod tests {
                 vec!["doc.md".to_string(), "other.md".to_string()],
                 "{result:?}"
             );
+        }
+    }
+
+    /// (kuriya 549, GitHub codex r3 P1) The same unsettled result gets the same reason
+    /// whether the second look drops the row ([`settle_removal_reindex`]) or keeps it: both
+    /// take it from [`unsettled_reindex_reason`], so the skip's words, `refused`, the error's
+    /// format and the cut of a response body cannot drift apart between the two lines.
+    #[test]
+    fn i549_a_dropped_and_a_kept_row_name_an_unsettled_reindex_alike() {
+        let kb = i549_kb("groove-watcher-i549-alike");
+        let reason_of = |settled: &RemovalSettled| match settled {
+            RemovalSettled::Settled(RemovalReindexSettled::Deindexed { reason, .. })
+            | RemovalSettled::LeftIndexed { reason, .. } => reason.clone(),
+            other => panic!("no reason: {other:?}"),
+        };
+        // An error whose chain quotes a response body: the cut must be the same on both sides.
+        let body = serde_json::from_str::<serde_json::Value>("{\"body\": secret text")
+            .expect_err("not JSON");
+        let mut results = i549_unsettled_results();
+        results.push((
+            Err(anyhow::Error::new(body).context("failed to embed chunks for doc.md")),
+            "reindex failed: failed to embed chunks for doc.md: malformed JSON (syntax)",
+        ));
+        for (result, expected) in &results {
+            let dropped_db = dir_rename_db(&["doc.md", "other.md"]);
+            let dropped =
+                settle_removal_reindex_looked(&dropped_db, &kb.0, "doc.md", result, || {
+                    OnDisk::Gone
+                });
+            let kept_db = dir_rename_db(&["doc.md", "other.md"]);
+            let kept = settle_removal_reindex_looked(&kept_db, &kb.0, "doc.md", result, || {
+                OnDisk::Present
+            });
+            assert!(
+                matches!(
+                    dropped,
+                    RemovalSettled::Settled(RemovalReindexSettled::Deindexed { .. })
+                ),
+                "{result:?}: {dropped:?}"
+            );
+            assert!(
+                matches!(kept, RemovalSettled::LeftIndexed { .. }),
+                "{result:?}: {kept:?}"
+            );
+            let (dropped, kept) = (reason_of(&dropped), reason_of(&kept));
+            assert_eq!(dropped, kept, "{result:?}");
+            assert_eq!(&dropped, expected, "{result:?}");
+            assert!(!dropped.contains("secret"), "{dropped}");
         }
     }
 

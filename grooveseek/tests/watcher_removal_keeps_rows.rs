@@ -11,7 +11,7 @@
 //!   rows went as for a removal as well.
 //!
 //! Each test drives `groove serve` with the watcher on against the mock endpoint of
-//! `common::embed_cli`, so nothing downloads a model.
+//! [`crate::common::embed_cli`], so nothing downloads a model.
 //!
 //! Not on macOS: there FSEvents folds the removal and the write into one change (kuriya trap
 //! 525), so the watcher never sees a removal and these paths are not taken
