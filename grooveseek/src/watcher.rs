@@ -5097,8 +5097,13 @@ mod tests {
     }
 
     /// (ADR-0023) The early pass is for keys the index cannot hold only: an
-    /// ordinary old key recreated as a hard link still fails the removal gate,
-    /// exactly as before.
+    /// ordinary old key goes through every other removal check.
+    ///
+    /// **契約変更 (kuriya #566 U1、2026-10-28 user 承認)**: 以前ここは「hard link に
+    /// 作り直された普通の旧 key は removal gate を通らない」を固定していた。
+    /// removal gate が symlink と同じく hard link も通すことにした (index は link に
+    /// 文書を持たない。full index の walk も hard link を集めず削除 pass が行を消す)
+    /// ので、`deindex_passes` は true、rename は旧行を新端へ移す `Rename` に反転した。
     #[cfg(windows)]
     #[test]
     fn an_addressable_key_keeps_every_removal_gate() {
@@ -5109,7 +5114,7 @@ mod tests {
         let other = kb.join("other.md");
         std::fs::write(&other, "# other\n").unwrap();
         std::fs::hard_link(&other, kb.join("old.md")).unwrap();
-        assert!(!deindex_passes("old.md", &kb.join("old.md"), &reg, &rules));
+        assert!(deindex_passes("old.md", &kb.join("old.md"), &reg, &rules));
         assert_eq!(
             rename_decision(
                 "old.md",
@@ -5119,7 +5124,7 @@ mod tests {
                 &reg,
                 &rules
             ),
-            RenameAction::Reindex
+            RenameAction::Rename
         );
     }
 
@@ -5174,7 +5179,11 @@ mod tests {
     }
 
     /// (#543) Only a regular file the reindex gate takes is reindexed from a remove event: a
-    /// directory or a hard link put at the path keeps the old decision.
+    /// directory or a hard link put at the path is not.
+    ///
+    /// **契約変更 (kuriya #566 U1、2026-10-28 user 承認)**: hard link の期待値は以前
+    /// `Skip` (#543 以前の removal gate と同じ答え) だった。removal gate が hard link を
+    /// 通すことにしたので `Deindex` に反転した (link に置き換わった path の行は消す)。
     #[test]
     fn a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path() {
         let kb = crate::test_support::unique_temp_path("groove-watcher-i543-nf");
@@ -5202,8 +5211,8 @@ mod tests {
         std::fs::hard_link(&other, kb.join("linked.md")).unwrap();
         assert_eq!(
             removal_decision("linked.md", &kb.join("linked.md"), &reg, &rules),
-            RemovalAction::Skip,
-            "same as the removal gate decided before #543"
+            RemovalAction::Deindex,
+            "a hard link at the path drops the row (contract change, kuriya #566 U1, user-approved 2026-10-28)"
         );
     }
 
@@ -6197,11 +6206,15 @@ mod tests {
     }
 
     /// (kuriya 548) A file found inside the locks that the write gate refuses is never
-    /// reindexed there, whatever the look outside found. A hard link fails the removal gate
-    /// too, so it is skipped and its row left, as the removal decided before kuriya 543
+    /// reindexed there, whatever the look outside found. A hard link passes the removal gate,
+    /// so its row is dropped
     /// ([`a_removal_is_not_reindexed_for_a_directory_or_a_hard_link_at_the_path`] pins the same
     /// answer outside the locks). A key the index cannot hold passes the removal gate early
     /// (ADR-0023), so a file there has its row dropped rather than reindexed.
+    ///
+    /// **契約変更 (kuriya #566 U1、2026-10-28 user 承認)**: hard link は以前 removal gate も
+    /// 通らず `Skip` で行が残った (kuriya 543 以前の removal と同じ答え)。removal gate が
+    /// hard link を通すことにしたので `Deindexed(Ok(true))`、残る行は `other.md` だけに反転した。
     #[test]
     fn i548_a_file_the_write_gate_refuses_inside_the_locks_is_not_reindexed() {
         let kb = i549_kb("groove-watcher-i548-gate");
@@ -6219,11 +6232,11 @@ mod tests {
             &rules,
             OnDisk::Present,
         );
-        assert!(matches!(linked, RemovalInLocks::Skip), "{linked:?}");
-        assert_eq!(
-            db.all_document_paths().unwrap(),
-            vec!["doc.md".to_string(), "other.md".to_string()]
+        assert!(
+            matches!(linked, RemovalInLocks::Deindexed(Ok(true))),
+            "{linked:?}"
         );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["other.md".to_string()]);
 
         // An empty segment: a spelling no document name may take, on every platform.
         let db = dir_rename_db(&["a//doc.md", "other.md"]);
