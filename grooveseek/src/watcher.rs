@@ -886,6 +886,9 @@ fn removal_outcome_for(
 /// The reindex asks [`crate::resources::doc_is_addressable`], not
 /// [`crate::resources::rel_is_indexable_name`]: whether `rel` may be written as a row is a
 /// different question, and the empty key (the knowledge base itself) never can be.
+///
+/// (kuriya 566 R7) The path is looked at once ([`PathFacts::of`]) and both gates are asked of
+/// that one look ([`removal_decision_given`]).
 fn removal_decision_for(
     rel: &str,
     full: &Path,
@@ -893,13 +896,25 @@ fn removal_decision_for(
     rules: &crate::exclusion::ExclusionRules,
     on_disk: OnDisk,
 ) -> RemovalAction {
+    removal_decision_given(rel, &PathFacts::of(full), registry, rules, on_disk)
+}
+
+/// [`removal_decision_for`] on facts already taken: the write gate and the removal gate read
+/// the same look, so they cannot disagree about what is at the path (R7).
+fn removal_decision_given(
+    rel: &str,
+    facts: &PathFacts<'_>,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    on_disk: OnDisk,
+) -> RemovalAction {
     if on_disk == OnDisk::Present
         && crate::resources::doc_is_addressable(rel)
-        && should_process_parts(rel, full, registry, rules)
+        && gate_given(rel, facts, registry, rules, Gate::Write)
     {
         return RemovalAction::Reindex;
     }
-    if deindex_passes(rel, full, registry, rules) {
+    if gate_given(rel, facts, registry, rules, Gate::Removal) {
         RemovalAction::Deindex
     } else {
         RemovalAction::Skip
@@ -1635,7 +1650,103 @@ fn should_process_parts(
     gate_parts(rel, full, registry, rules, Gate::Write)
 }
 
-/// [`should_process_parts`] / [`deindex_passes`] / [`rename_decision`] の判定本体。
+/// What kind of entry one look at a path found ([`PathFacts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathKind {
+    /// `symlink_metadata` failed: nothing there, as a rule a removal.
+    Missing,
+    Dir,
+    /// A symlink, or on Windows any name surrogate (a junction among them).
+    Symlink,
+    /// A regular file, or anything else that is neither of the above.
+    Other,
+}
+
+/// (kuriya 566 R7 / #550) What one look at `full` found, for every gate asked of it in one
+/// decision: one `symlink_metadata`, and the link count read at most once, only when a gate
+/// asks for it. [`removal_decision_for`] asks the write gate and the removal gate of the same
+/// facts, so the two cannot see two different files at the path (R7: one saw a hard link, the
+/// other a regular file, and a file there kept by neither lost its row).
+struct PathFacts<'a> {
+    full: &'a Path,
+    kind: PathKind,
+    meta: Option<std::fs::Metadata>,
+    links: std::cell::OnceCell<Option<u64>>,
+}
+
+impl<'a> PathFacts<'a> {
+    /// One `symlink_metadata` of `full`, links not followed.
+    fn of(full: &'a Path) -> Self {
+        #[cfg(test)]
+        FACTS_TAKEN.with(|n| n.set(n.get() + 1));
+        let meta = std::fs::symlink_metadata(full).ok();
+        let kind = match &meta {
+            None => PathKind::Missing,
+            Some(m) if m.file_type().is_dir() => PathKind::Dir,
+            Some(m) if m.file_type().is_symlink() => PathKind::Symlink,
+            Some(_) => PathKind::Other,
+        };
+        Self {
+            full,
+            kind,
+            meta,
+            links: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Facts handed in rather than read from the disk, for a test that needs what no file
+    /// system here makes on demand (a directory with a link count of 3 on Windows, say).
+    #[cfg(test)]
+    fn given(full: &'a Path, kind: PathKind, links: Option<u64>) -> Self {
+        let cell = std::cell::OnceCell::new();
+        let _ = cell.set(links);
+        Self {
+            full,
+            kind,
+            meta: None,
+            links: cell,
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        self.kind == PathKind::Dir
+    }
+
+    fn is_symlink(&self) -> bool {
+        self.kind == PathKind::Symlink
+    }
+
+    /// The link count, read once ([`crate::links::link_count_given`]: from the metadata on
+    /// Unix, from one open on Windows). `None` when it cannot be read, nothing there included.
+    fn link_count(&self) -> Option<u64> {
+        *self.links.get_or_init(|| {
+            self.meta
+                .as_ref()
+                .and_then(|m| crate::links::link_count_given(m, self.full))
+        })
+    }
+
+    /// (#550) Whether the file at the path has more than one name. Never for a directory or a
+    /// symlink: every directory on Linux and macOS counts `.` and its subdirectories' `..` as
+    /// links, which says nothing about a second name, and a symlink is judged as a link on its
+    /// own. Fail-open as [`crate::links::is_multiply_linked`] is: no count is no.
+    fn is_multiply_linked(&self) -> bool {
+        match self.kind {
+            PathKind::Dir | PathKind::Symlink | PathKind::Missing => false,
+            PathKind::Other => self.link_count().is_some_and(|count| count > 1),
+        }
+    }
+}
+
+// (kuriya 566 R7) How many times [`PathFacts::of`] looked at a path on this thread, for the
+// test that pins one look per removal decision. Per thread, as `LISTINGS` is.
+#[cfg(test)]
+thread_local! {
+    static FACTS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`should_process_parts`] / [`deindex_passes`] / [`rename_decision`] の判定本体:
+/// path を 1 度見て ([`PathFacts::of`]) [`gate_given`] に聞く。
 fn gate_parts(
     rel: &str,
     full: &Path,
@@ -1643,6 +1754,19 @@ fn gate_parts(
     rules: &crate::exclusion::ExclusionRules,
     gate: Gate,
 ) -> bool {
+    gate_given(rel, &PathFacts::of(full), registry, rules, gate)
+}
+
+/// [`gate_parts`] on facts already taken, so one decision that asks both gates
+/// ([`removal_decision_for`]) reads the path once (kuriya 566 R7).
+fn gate_given(
+    rel: &str,
+    facts: &PathFacts<'_>,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    gate: Gate,
+) -> bool {
+    let full = facts.full;
     // (ADR-0023) See [`Gate::Removal`]. The empty key is the knowledge base
     // itself, which names no row and takes the ordinary path. The name test is
     // the one [`removal_dispatch`] asks too ([`removal_gate_passes_by_name`]),
@@ -1650,12 +1774,11 @@ fn gate_parts(
     if gate == Gate::Removal && removal_gate_passes_by_name(rel) {
         return true;
     }
-    // 1 回の stat を 2 つの判定で使い回す: ディレクトリかどうか (末尾スラッシュ
-    // の `.grooveignore` パターンの効き方が変わる) と、symlink かどうか。
+    // 1 回の look ([`PathFacts`]) を全部の判定で使い回す: ディレクトリかどうか (末尾
+    // スラッシュの `.grooveignore` パターンの効き方が変わる)、symlink かどうか、link 数。
     // `symlink_metadata` が失敗するのは対象が既に無い時 = 削除イベントで、
-    // 下の 2 つはどちらもその場合 **通す** (この関数は deindex も gate する)。
-    let meta = std::fs::symlink_metadata(full).ok();
-    let is_dir = meta.as_ref().is_some_and(|m| m.file_type().is_dir());
+    // 下の判定はどれもその場合 **通す** (この関数は deindex も gate する)。
+    let is_dir = facts.is_dir();
 
     // (feature-49) 除外の 3 層 — hardcoded denylist (`.git` / `node_modules`) /
     // user `exclude_dirs` / `.grooveignore` — をここで 1 回だけ判定する。
@@ -1692,9 +1815,9 @@ fn gate_parts(
     // full walk skips it, and a write at one drops the row,
     // [`deindex_under_a_link_parts`]), so a file replaced by a link loses its
     // row rather than keeping its old text. The caller decides the delete on a
-    // look taken under the database lock ([`decide_removal_in_locks`]), and this
-    // function stats the path again there.
-    if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+    // look taken under the database lock ([`decide_removal_in_locks`]), and the
+    // decision there takes its own look ([`removal_decision_for`]).
+    if facts.is_symlink() {
         return gate == Gate::Removal;
     }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
@@ -1725,15 +1848,32 @@ fn gate_parts(
     // name for a file that may live outside the KB, creatable without read
     // access to it and without any privilege on Windows.
     //
-    // Last, for two reasons. On Windows the link count needs the file opened,
-    // and there is no point opening what the extension filter already rejected.
-    // On Linux every *directory* has a link count of at least two (`.` and
-    // `..`), so checking earlier would refuse directory events on one platform
-    // and not the other.
+    // Last: on Windows the link count needs the file opened, and there is no
+    // point opening what the extension filter already rejected.
+    //
+    // (#550) A directory or a symlink is never asked its link count
+    // ([`PathFacts::is_multiply_linked`]): every directory on Linux and macOS
+    // has a count of at least two (`.` and `..`), and a directory whose name
+    // passes the extension filter (`x.md`) was read here as a hard link, so a
+    // removal of `x.md` that found a directory there kept its row on Linux and
+    // macOS and dropped it on Windows (which cannot open a directory for the
+    // count).
+    //
+    // The write gate keeps the answer it gave a directory before #550, from the
+    // raw count: a refusal on Linux and macOS, a pass on Windows. Whether the
+    // write gate should refuse a directory outright is not this change's call
+    // (kuriya 566 plan, S3).
     //
     // Same fail-open rule as the symlink check above: a vanished file has no
     // link count, and this function gates deindexing as well as indexing.
-    if crate::links::is_multiply_linked(full) {
+    let linked = match gate {
+        Gate::Removal => facts.is_multiply_linked(),
+        Gate::Write => {
+            facts.is_multiply_linked()
+                || (facts.is_dir() && facts.link_count().is_some_and(|count| count > 1))
+        }
+    };
+    if linked {
         wdiag!("watcher: {}", crate::links::refusal_reason(full));
         return false;
     }
@@ -9829,5 +9969,82 @@ mod tests {
             got => panic!("the directory there again must keep its rows: {got:?}"),
         }
         assert_eq!(db.all_document_paths().unwrap(), i557_all_rows());
+    }
+
+    /// (#550) A directory is never read as a hard link: every directory on Linux and macOS
+    /// has a link count of two or more, and a directory whose name passes the extension filter
+    /// (`dir.md`) used to fail the removal gate there, so its row was kept on Linux and macOS
+    /// and dropped on Windows. The facts are handed in so Windows, where a directory's count
+    /// cannot be read, runs the same case.
+    ///
+    /// The write gate keeps its answer from before #550 (the raw count refuses), recorded here
+    /// so a change to it is a decision rather than a side effect (kuriya 566 plan, S3).
+    #[test]
+    fn i550_a_directory_is_never_read_as_a_hard_link() {
+        let kb = i549_kb("groove-watcher-i550");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let full = kb.0.join("dir.md");
+
+        let dir = PathFacts::given(&full, PathKind::Dir, Some(3));
+        assert!(!dir.is_multiply_linked());
+        assert!(gate_given("dir.md", &dir, &reg, &rules, Gate::Removal));
+        assert!(!gate_given("dir.md", &dir, &reg, &rules, Gate::Write));
+
+        let symlink = PathFacts::given(&full, PathKind::Symlink, Some(2));
+        assert!(!symlink.is_multiply_linked());
+
+        // A file with the same count is a hard link.
+        let file = PathFacts::given(&full, PathKind::Other, Some(3));
+        assert!(file.is_multiply_linked());
+        let single = PathFacts::given(&full, PathKind::Other, Some(1));
+        assert!(!single.is_multiply_linked());
+    }
+
+    /// (#550) The same on disk: a directory named `dir.md` with a subdirectory in it (a count
+    /// of three on ext4 and APFS) passes the removal gate. Unix only: Windows never read a
+    /// directory's count, so it passed there before the fix too.
+    #[cfg(unix)]
+    #[test]
+    fn i550_a_directory_on_disk_passes_the_removal_gate() {
+        let kb = i549_kb("groove-watcher-i550-disk");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        std::fs::create_dir_all(kb.0.join("dir.md").join("sub")).unwrap();
+        assert!(deindex_passes("dir.md", &kb.0.join("dir.md"), &reg, &rules));
+    }
+
+    /// (kuriya 566 R7) One removal decision looks at the path once, and both gates read that
+    /// look: a path read as a link by one gate and as a plain file by the other was a row
+    /// dropped for a file there that neither would keep.
+    #[test]
+    fn r7_one_removal_decision_reads_the_path_once() {
+        let kb = i549_kb("groove-watcher-r7");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        // A hard link, so the write gate refuses it and the removal gate is asked too.
+        std::fs::hard_link(kb.0.join("doc.md"), kb.0.join("twin.md")).unwrap();
+
+        FACTS_TAKEN.with(|n| n.set(0));
+        let _ = removal_decision_for(
+            "twin.md",
+            &kb.0.join("twin.md"),
+            &reg,
+            &rules,
+            OnDisk::Present,
+        );
+        assert_eq!(FACTS_TAKEN.with(|n| n.get()), 1);
+
+        let full = kb.0.join("doc.md");
+        let link = PathFacts::given(&full, PathKind::Symlink, None);
+        assert_eq!(
+            removal_decision_given("doc.md", &link, &reg, &rules, OnDisk::Present),
+            RemovalAction::Deindex
+        );
+        let plain = PathFacts::given(&full, PathKind::Other, Some(1));
+        assert_eq!(
+            removal_decision_given("doc.md", &plain, &reg, &rules, OnDisk::Present),
+            RemovalAction::Reindex
+        );
     }
 }
