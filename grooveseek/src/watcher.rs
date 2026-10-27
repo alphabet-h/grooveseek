@@ -2804,6 +2804,14 @@ enum RenamePlan {
 ///   destination's row is kept: the indexer reindexes it in place and reuses its vectors
 ///
 /// The old end is not looked at: its row is only moved or dropped, and nothing is written there.
+/// (kuriya 560) A file at the old end by the time the rename is handled is another file. Its own
+/// create is queued apart from the rename (the debouncer moves the source's queue to the
+/// destination) and comes after it in time order, so its event writes its row. A look here could
+/// not keep the old row either: that row holds the text of the file that left. Integration tests
+/// of the watcher pin this for a file rename and a directory rename
+/// (`a_file_renamed_then_written_again_under_its_old_name_keeps_both`,
+/// `a_directory_renamed_then_created_again_with_a_file_indexes_the_new_file`), and the same for a
+/// rename into an excluded directory, which drops the old row without reaching this plan.
 fn rename_plan(db: &Database, old_rel: &str, new_rel: &str, dest: OnDisk) -> Result<RenamePlan> {
     let has_row = |rel: &str| -> Result<bool> { Ok(db.get_document_hash(rel)?.is_some()) };
     Ok(match dest {
