@@ -274,3 +274,35 @@ fn a_file_given_a_second_name_loses_its_row() {
     assert_settles_on(&fx, &guard, &["keep.md"], "a.md given a second name");
     drop(guard);
 }
+
+/// (kuriya 566 #25 / #27) A link renamed over an indexed file drops that file's row: the
+/// destination now holds a link, so the text its row kept is no longer in the knowledge base.
+///
+/// `tmp.md` is a link to a file outside the knowledge base (a symlink on Unix, a hard link on
+/// Windows) and is renamed onto `a.md`. The new end is refused as a write; before #566 only
+/// the old end was dealt with and the row of `a.md` kept the overwritten text. The stderr
+/// printed at the end shows which path dropped the row: on Windows (2026-10-28) the test was
+/// already green with the write path of #22 alone, so there it pins the end state only.
+#[test]
+fn an_overwriting_rename_of_a_link_drops_the_destination_row() {
+    let (fx, guard) = served(
+        "i566-rename-over",
+        &[
+            ("a.md", &note("Alpha", "alphamarker566o")),
+            ("keep.md", &note("Keep", "keepmarker566o")),
+        ],
+    );
+    assert_eq!(paths(&fx), ["a.md", "keep.md"]);
+
+    let target = fx.layout.root().join("target.md");
+    std::fs::write(&target, note("Target", "targetmarker566o")).expect("write the link target");
+    link_file(&target, &fx.kb().join("tmp.md"));
+    rename_retrying(&fx.kb().join("tmp.md"), &fx.kb().join("a.md"));
+
+    assert_settles_on(&fx, &guard, &["keep.md"], "a link renamed over a.md");
+    eprintln!(
+        "an_overwriting_rename_of_a_link_drops_the_destination_row stderr:\n{}",
+        stderr_lines(&guard).join("\n")
+    );
+    drop(guard);
+}

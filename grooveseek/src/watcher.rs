@@ -593,9 +593,12 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     RenameAction::Rename => {
                         dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
                     }
-                    RenameAction::Deindex => dispatch_deindex(state, &old_rel),
+                    RenameAction::Deindex => {
+                        dispatch_deindex(state, &old_rel);
+                        hand_on_a_link_destination(state, &new_rel, to);
+                    }
                     RenameAction::Reindex => dispatch_reindex(state, &new_rel, to),
-                    RenameAction::Skip => continue,
+                    RenameAction::Skip => hand_on_a_link_destination(state, &new_rel, to),
                 }
             }
             Classified::Reindex(paths) => {
@@ -3335,6 +3338,58 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
             )
         },
     );
+    // (kuriya 566 #28) Still under both locks: a destination that became a hard link before
+    // they were taken left the moved row there (the indexer refused the file and kept it).
+    if let Some(outcome) =
+        link_destination_in_locks(&db, kb_path, new_rel, &state.registry, &state.rules, look)
+    {
+        log_refused_link_deindexed(new_rel, outcome);
+    }
+}
+
+/// (kuriya 566 #28) After a rename with both locks held: when the destination `new_rel` is a
+/// link and a look taken here finds a file there, the removal decision on that look decides its
+/// row ([`refused_row_in_locks`]), as for a reindex the indexer refused. A rename onto a hard
+/// link moves the row and then has the indexer refuse the file
+/// ([`indexer::RenameOutcome::RenamedButRefused`]); without this the row kept the moved text
+/// at a path the index holds no document at. A destination that is not a link costs one
+/// `symlink_metadata`, and its row is not touched. Split out so a test can run it with no
+/// [`crate::embedder::Embedder`].
+fn link_destination_in_locks(
+    db: &Database,
+    kb_path: &Path,
+    new_rel: &str,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    look: WriteLook,
+) -> Option<Result<bool>> {
+    let mut full = kb_path.to_path_buf();
+    for segment in new_rel.split('/') {
+        full.push(segment);
+    }
+    let facts = PathFacts::of(&full);
+    if !(facts.is_symlink() || facts.is_multiply_linked()) {
+        return None;
+    }
+    refused_row_in_locks(
+        db,
+        kb_path,
+        new_rel,
+        &full,
+        registry,
+        rules,
+        written_path_on_disk(kb_path, new_rel, look),
+    )
+}
+
+/// (kuriya 566 #25 / #27) A rename whose new end the write gate refused: when that end is a
+/// link now, its own row (the text of the file the rename overwrote) is decided by the removal
+/// path, as if its removal had been reported. Called after the old end was dealt with.
+fn hand_on_a_link_destination(state: &WatcherState, new_rel: &str, to: &Path) {
+    let facts = PathFacts::of(to);
+    if facts.is_symlink() || facts.is_multiply_linked() {
+        handle_removed_path(state, new_rel, to);
+    }
 }
 
 /// The line a rename prints when it failed before the indexer's rename returned.
@@ -10296,6 +10351,32 @@ mod tests {
 
         assert!(matches!(
             refused("twin.md", OnDisk::Present),
+            Some(Ok(true))
+        ));
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec!["big.md".to_string(), "other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 566 #28) After a rename under both locks, a destination that is a hard link
+    /// loses the row the rename moved there; a plain file at the destination (one the indexer
+    /// refused for its size, say) keeps it.
+    #[test]
+    fn i566_a_rename_destination_now_a_hard_link_loses_its_row() {
+        let kb = i549_kb("groove-watcher-i566-dest");
+        std::fs::write(kb.0.join("big.md"), "# big\n").unwrap();
+        std::fs::hard_link(kb.0.join("doc.md"), kb.0.join("twin.md")).unwrap();
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let db = dir_rename_db(&["twin.md", "big.md", "other.md"]);
+
+        assert!(
+            link_destination_in_locks(&db, &kb.0, "big.md", &reg, &rules, WriteLook::Spelled)
+                .is_none()
+        );
+        assert!(matches!(
+            link_destination_in_locks(&db, &kb.0, "twin.md", &reg, &rules, WriteLook::Spelled),
             Some(Ok(true))
         ));
         assert_eq!(
