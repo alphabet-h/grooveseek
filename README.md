@@ -67,6 +67,8 @@ ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs 
 cargo build --release
 ```
 
+Building needs Rust 1.89 or later (the index's writer lock uses `std::fs::File::try_lock`, stable since Rust 1.89).
+
 The binary is produced at `target/release/groove` (or `groove.exe` on Windows).
 
 ## Quick start

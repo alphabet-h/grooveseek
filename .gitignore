@@ -27,6 +27,8 @@ groove.toml
 # Generated SQLite DB files (one per kb_path.parent()). Bench fixtures under
 # tests/fixtures/kb-bench/ generate `.groove.db` next to them when indexed.
 **/.groove.db
+**/.groove.db.writer-lock
+**/.groove.db.writer.json*
 
 # Deployment recipe templates under grooveseek/examples/deployments/ are meant to be
 # committed (they are example artifacts, not user-local runtime files).

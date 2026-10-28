@@ -106,6 +106,9 @@ loopback origin** である。
   歩いて、受け付ける long フラグが `docs/` にも README にも出てこなければ
   落ちるテストがある。**凍る集合が「たまたま書かれたかどうか」で決まらない**ようにするため
 - **exit code**
+
+  `groove index` は、他の groove process が索引に書いている時、または `--wait` の期限が
+  切れた時に `3` で終わる (v1.22.0+)。
 - **stdout と stderr の責務分離**: コマンドが**結果**を出すなら、結果は stdout、
   診断は stderr。パイプラインが依存するので凍結する。
 
@@ -352,6 +355,7 @@ snake_case で、配列は複数形。よって `--path-glob` と `path_globs` �
 | | |
 |---|---|
 | 索引 DB | `.groove.db`（`kb_path` の**親ディレクトリ内**） |
+| writer lock (v1.22.0+) | DB の隣の `.groove.db.writer-lock` (消さない。`groove service uninstall --purge` も消すのは `.groove.db` だけで、これは残る)、process が索引に書いている間の `.groove.db.writer.json`、およびそれを置き換える一時ファイル `.groove.db.writer.json.tmp-<pid>` (置き換えに失敗すると残ることがある) |
 | 設定 | `groove.toml` |
 | 除外ファイル | `.grooveignore` |
 | 評価セット / 履歴 | `.groove-eval.yml` / `.groove-eval-history.json` |

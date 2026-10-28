@@ -14,6 +14,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- `groove index --wait <SECONDS>`, and exit code 3 for `groove index`.
+
+### Changed
+
+- **Only one `groove index` writes an index at a time** (kuriya #259, ADR-0031). A run takes an
+  operating-system lock on `.groove.db.writer-lock` beside the database before it touches the
+  database or the embedding model; a second run on the same index stops with exit code 3 and
+  names the holder (from `.groove.db.writer.json`, which can be stale) instead of writing beside
+  it. `--wait <SECONDS>` waits for the holder first.
+- **Read-only commands open the index read-only.** `status`, `search`, `graph`, `doctor`, `eval`
+  and `tune` open the database with `PRAGMA query_only`. When an index still needs a schema upgrade
+  or its embedding model recorded, they take the lock for that one write; if another process holds
+  it, they stop and name it instead of writing beside it.
+- Building from source needs Rust 1.89 or later.
+
 ## [1.21.5] - 2026-10-28
 
 ### Fixed

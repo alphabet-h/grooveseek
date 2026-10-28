@@ -82,6 +82,7 @@ Architecture Decision Record — 何を選び、どの代替案を退け、そ�
 | 28. 既存索引の docx は一度だけ読み直し、行ごとに決着させる | [en](decisions/0028-reread-unchanged-docx-once-per-index.md) | [ja](decisions/0028-reread-unchanged-docx-once-per-index.ja.md) |
 | 29. 変わっていない文書は、形式ごとの policy key で一度だけ読み直す | [en](decisions/0029-reread-unchanged-documents-once-per-format.md) | [ja](decisions/0029-reread-unchanged-documents-once-per-format.ja.md) |
 | 30. 表の行の位置は chunk ごとの NULL 可の列に持ち、追いつきは形式ごとの key で行う | [en](decisions/0030-mark-table-rows-per-chunk.md) | [ja](decisions/0030-mark-table-rows-per-chunk.ja.md) |
+| 31. 1 つの索引に書く process は OS の lock で 1 つに限る | [en](decisions/0031-one-writer-per-index-by-an-os-lock.md) | [ja](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md) |
 
 ADR-0003 のファイル名は今も `kb-mcpignore` のままです。そこで説明されているファイルは
 現在 `.grooveignore` ですが、**ADR は merge 後に編集しません**。2026-08-17 より前の

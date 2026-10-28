@@ -112,6 +112,9 @@ Breaking any of these requires a major version.
   README, so the frozen set cannot be decided by which flags happened to get
   written about.
 - **Exit codes**.
+
+  `groove index` exits `3` (v1.22.0+) when another groove process is writing
+  the index, or when `--wait` runs out.
 - **The split between stdout and stderr**: where a command produces a *result*,
   the result goes to stdout and diagnostics go to stderr. Pipelines depend on
   this, so it is frozen.
@@ -381,6 +384,7 @@ These are the reason the project renamed itself before 1.0.0 rather than after:
 | | |
 |---|---|
 | index database | `.groove.db`, in the parent directory of `kb_path` |
+| writer lock (v1.22.0+) | `.groove.db.writer-lock` beside the database (never deleted; `groove service uninstall --purge` removes `.groove.db` only and leaves it), `.groove.db.writer.json` while a process writes the index, and `.groove.db.writer.json.tmp-<pid>`, the temporary file that replaces it, which a failed replacement can leave behind |
 | configuration | `groove.toml` |
 | exclusion file | `.grooveignore` |
 | evaluation set / history | `.groove-eval.yml` / `.groove-eval-history.json` |
