@@ -45,6 +45,8 @@ pub mod test_support;
 pub mod transport;
 pub mod tune;
 pub mod watcher;
+/// One writer per index: an operating-system lock on `<db>.writer-lock` (kuriya #259, ADR-0031).
+pub mod writer_lease;
 
 use std::path::{Path, PathBuf};
 
