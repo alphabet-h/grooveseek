@@ -1415,7 +1415,7 @@ mod tests {
         println!("test_delete_document: OK");
     }
 
-    /// #551: a `delete_document` whose statement fails midway leaves every table as it
+    /// #551: a [`Database::delete_document`] whose statement fails midway leaves every table as it
     /// was. Red before the fix: the statements before the failing one were each their own
     /// autocommit transaction, so the document row stayed with its chunks, vectors, FTS
     /// rows and fields already gone (or, failing at `chunks`, with the vectors gone).
@@ -1592,8 +1592,8 @@ mod tests {
         assert_eq!(db.document_count().unwrap(), 2, "rows came back");
     }
 
-    /// #551: inside a caller's transaction `delete_document` opens none of its own (SQLite
-    /// would refuse a nested BEGIN, which `sweep_legacy_folded_row` in the indexer relies
+    /// #551: inside a caller's transaction [`Database::delete_document`] opens none of its own (SQLite
+    /// would refuse a nested BEGIN, which [`crate::indexer::sweep_legacy_folded_row`] relies
     /// on not happening): the deletes ride the caller's transaction and go with its rollback.
     /// On `Err` the caller's transaction stays open and the caller rolls it back.
     #[test]
