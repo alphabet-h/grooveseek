@@ -271,6 +271,82 @@ pub fn holder_relation(holder: Option<&HolderInfo>, own_kb: &Path) -> HolderRela
     }
 }
 
+/// The refusal `groove index` prints when another process holds the writer
+/// lease (ADR-0031); the last line is dropped when the holder is unknown.
+pub fn index_busy_message(
+    db_path: &Path,
+    holder: Option<&HolderInfo>,
+    own_kb: &Path,
+    waited_secs: Option<u64>,
+) -> String {
+    let info_path = WriterLease::info_path_for(db_path);
+    let waited = waited_secs.map_or(String::new(), |n| format!("waited {n}s; "));
+    let who = match holder {
+        Some(h) => format!(
+            "pid {} per {}, which can be stale ({}, since {}, kb {})",
+            h.pid,
+            info_path.display(),
+            h.role.as_str(),
+            h.started_at,
+            h.kb_path
+        ),
+        None => format!("pid unknown (no {})", info_path.display()),
+    };
+    let relation = holder_relation(holder, own_kb);
+    let what_now = match &relation {
+        HolderRelation::WatchingSameKb => "  A `groove serve` with its watcher on keeps this index current; to rebuild now, call its MCP tool `rebuild_index`.".to_string(),
+        HolderRelation::OneOffRun(role) => format!(
+            "  That writer is a one-off {} run, not a server watching files; wait for it with --wait (below), or run this again after it exits.",
+            role.as_str()
+        ),
+        HolderRelation::OtherKb(kb) => format!(
+            "  That writer works on a different knowledge base (kb {kb}) that shares this index file; its rebuild_index would remove this knowledge base's rows, so do not use it to rebuild this one."
+        ),
+        HolderRelation::Unknown => "  If the writer is a groove serve watching this same knowledge base, it keeps this index current and its MCP tool rebuild_index rebuilds it now.".to_string(),
+    };
+    let other_model = match &relation {
+        HolderRelation::WatchingSameKb | HolderRelation::Unknown => {
+            "  A rebuild with a different model (`--force --model ...`) needs that writer stopped first: a server's `rebuild_index` keeps the model it started with."
+        }
+        HolderRelation::OneOffRun(_) => {
+            "  A rebuild with a different model (`--force --model ...`) can run once that run exits; --wait (below) waits for it."
+        }
+        HolderRelation::OtherKb(_) => {
+            "  A rebuild with a different model (`--force --model ...`) needs that writer stopped first."
+        }
+    };
+    let mut lines = vec![
+        format!(
+            "error: {waited}another groove process is writing the index at {}: {who}.",
+            db_path.display()
+        ),
+        what_now,
+        "  To wait for the writer instead, run `groove index --wait <SECONDS>`.".to_string(),
+        other_model.to_string(),
+        "  If the writer is no longer making progress, stopping it releases the lock (the operating system drops it with the process).".to_string(),
+    ];
+    if let Some(h) = holder {
+        lines.push(format!(
+            "  Before stopping pid {}, confirm it is groove: check the process name, or `writer.held_since` in the server's /api/admin/status.",
+            h.pid
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The line `groove index --wait` prints before it waits for the holder, e.g.
+/// `waiting for the writer of <db> (pid <pid> per writer.json) up to <N>s`.
+pub fn index_waiting_line(db_path: &Path, holder: Option<&HolderInfo>, wait_secs: u64) -> String {
+    let pid = match holder {
+        Some(h) => format!("pid {} per writer.json", h.pid),
+        None => "pid unknown".to_string(),
+    };
+    format!(
+        "waiting for the writer of {} ({pid}) up to {wait_secs}s",
+        db_path.display()
+    )
+}
+
 /// `db_path` with `suffix` appended to its file name.
 fn suffixed(db_path: &Path, suffix: &str) -> PathBuf {
     let mut s = db_path.as_os_str().to_os_string();
@@ -649,6 +725,136 @@ mod tests {
         let gone = holder(Role::Serve, &missing.display().to_string());
         assert!(missing.is_absolute());
         assert_eq!(holder_relation(Some(&gone), &kb), HolderRelation::Unknown);
+    }
+
+    /// `<tmp>/kb` and `<tmp>/other` (both created) and the `<tmp>/.groove.db` path (not created).
+    fn message_layout(prefix: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = TempDir::new(prefix);
+        let kb = dir.path().join("kb");
+        let sibling_kb = dir.path().join("other");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&sibling_kb).unwrap();
+        let db = dir.path().join(".groove.db");
+        (dir, db, kb, sibling_kb)
+    }
+
+    /// A holder for this process whose `kb_path` is the canonical form of an existing `kb`.
+    fn holder_on(role: Role, kb: &Path) -> HolderInfo {
+        let canonical = std::fs::canonicalize(kb).unwrap().display().to_string();
+        HolderInfo {
+            pid: std::process::id(),
+            ..holder(role, &canonical)
+        }
+    }
+
+    #[test]
+    fn busy_message_for_a_server_on_this_kb_points_to_its_rebuild_index() {
+        let (_dir, db, kb, _sibling) = message_layout("msg-serve");
+        let h = holder_on(Role::Serve, &kb);
+        let m = index_busy_message(&db, Some(&h), &kb, None);
+        assert!(m.starts_with("error: another groove process is writing the index at "));
+        assert!(m.contains(&format!("pid {} per ", h.pid)) && m.contains("which can be stale"));
+        assert!(m.contains("call its MCP tool `rebuild_index`"));
+        assert!(m.contains("a server's `rebuild_index` keeps the model it started with"));
+        assert!(m.contains("groove index --wait <SECONDS>"));
+        assert!(m.contains(&format!("Before stopping pid {}", h.pid)));
+        assert!(m.contains(&WriterLease::info_path_for(&db).display().to_string()));
+    }
+
+    #[test]
+    fn busy_message_for_a_one_off_run_never_names_rebuild_index() {
+        let (_dir, db, kb, _sibling) = message_layout("msg-oneoff");
+        let m = index_busy_message(&db, Some(&holder_on(Role::Index, &kb)), &kb, None);
+        assert!(m.contains("That writer is a one-off index run, not a server watching files"));
+        assert!(m.contains("can run once that run exits; --wait (below) waits for it."));
+        assert!(!m.contains("rebuild_index"));
+    }
+
+    #[test]
+    fn busy_message_for_another_kb_warns_against_its_rebuild_index() {
+        let (_dir, db, kb, sibling_kb) = message_layout("msg-other");
+        let m = index_busy_message(&db, Some(&holder_on(Role::Serve, &sibling_kb)), &kb, None);
+        assert!(
+            m.contains("works on a different knowledge base")
+                && m.contains("would remove this knowledge base's rows")
+        );
+        assert!(m.contains(
+            "A rebuild with a different model (`--force --model ...`) needs that writer stopped first."
+        ));
+        assert!(!m.contains("a server's `rebuild_index` keeps the model"));
+    }
+
+    #[test]
+    fn busy_message_without_a_holder_says_pid_unknown_and_drops_the_last_line() {
+        let (_dir, db, kb, _sibling) = message_layout("msg-none");
+        let m = index_busy_message(&db, None, &kb, None);
+        assert!(
+            m.contains("pid unknown (no ")
+                && m.contains("If the writer is a groove serve watching this same knowledge base")
+        );
+        assert!(!m.contains("Before stopping pid"));
+    }
+
+    #[test]
+    fn busy_message_after_waiting_says_how_long() {
+        let (_dir, db, kb, _sibling) = message_layout("msg-waited");
+        assert!(
+            index_busy_message(&db, None, &kb, Some(10))
+                .starts_with("error: waited 10s; another groove process")
+        );
+    }
+
+    #[test]
+    fn busy_message_and_waiting_line_are_ascii_for_ascii_paths() {
+        let (dir, db, kb, sibling_kb) = message_layout("msg-ascii");
+        let tmp = dir.path();
+        assert!(
+            tmp.to_string_lossy().is_ascii(),
+            "the temp path itself must be ASCII for this test to mean anything: {}",
+            tmp.display()
+        );
+        let missing = tmp.join("missing");
+        let holders = [
+            Some(holder_on(Role::Serve, &kb)),
+            Some(holder_on(Role::Index, &kb)),
+            Some(holder_on(Role::Serve, &sibling_kb)),
+            Some(holder(Role::Serve, &missing.display().to_string())),
+            None,
+        ];
+        for h in &holders {
+            for waited in [None, Some(5)] {
+                let m = index_busy_message(&db, h.as_ref(), &kb, waited);
+                assert!(m.is_ascii(), "non-ASCII busy message: {m}");
+            }
+            let w = index_waiting_line(&db, h.as_ref(), 30);
+            assert!(w.is_ascii(), "non-ASCII waiting line: {w}");
+        }
+    }
+
+    #[test]
+    fn busy_message_renders_a_non_ascii_kb_path() {
+        let (dir, db, _kb, _sibling) = message_layout("msg-nonascii");
+        let kb = dir.path().join("ノート");
+        std::fs::create_dir_all(&kb).unwrap();
+        let h = holder_on(Role::Index, &kb);
+        let m = index_busy_message(&db, Some(&h), &kb, None);
+        assert!(m.contains(&h.kb_path), "{m}");
+        assert!(m.contains("one-off index run"), "{m}");
+    }
+
+    #[test]
+    fn waiting_line_names_the_pid_or_says_unknown() {
+        let (_dir, db, kb, _sibling) = message_layout("msg-waitline");
+        let h = holder_on(Role::Index, &kb);
+        assert_eq!(
+            index_waiting_line(&db, Some(&h), 30),
+            format!(
+                "waiting for the writer of {} (pid {} per writer.json) up to 30s",
+                db.display(),
+                h.pid
+            )
+        );
+        assert!(index_waiting_line(&db, None, 30).contains("(pid unknown)"));
     }
 
     #[test]
