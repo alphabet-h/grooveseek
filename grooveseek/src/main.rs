@@ -1061,7 +1061,8 @@ fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
+            let db =
+                grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), &kb_path)?;
             let total_docs = db.document_count()?;
             let total_chunks = db.chunk_count()?;
             let tags_failures = db.tags_parse_failure_count();
@@ -1180,7 +1181,8 @@ fn main() -> anyhow::Result<()> {
                 cli_should_rerank(reranker_explicit, reranker_choice, cfg.rerank_by_default);
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
-            let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
+            let db =
+                grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), &kb_path)?;
             // (codex P2 round 11 on PR #291) A field filter the index cannot answer yet
             // (its declared set is pending) is refused here, on the opened database and
             // before `Embedder::with_settings` below -- the search legs refuse it too, but
@@ -1188,7 +1190,7 @@ fn main() -> anyhow::Result<()> {
             // argument as `--field` bounds above and the schema read in `Commands::Index`.
             db.refuse_field_filters_while_pending(Some(&fields), Some(&fields_not))?;
             let dim = embedding.dimension() as u32;
-            db.verify_embedding_meta(embedding.model_id(), dim)?;
+            db.verify_embedding_meta_or_record(&db_path, &kb_path, embedding.model_id(), dim)?;
 
             let mut embedder = grooveseek::embedder::Embedder::with_settings(embedding)?;
             let query_embedding = embedder.embed_single(parsed.positive_text())?;
@@ -1334,8 +1336,14 @@ fn main() -> anyhow::Result<()> {
                     kb_path.display()
                 );
             }
-            let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
-            db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
+            let db =
+                grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), &kb_path)?;
+            db.verify_embedding_meta_or_record(
+                &db_path,
+                &kb_path,
+                embedding.model_id(),
+                embedding.dimension() as u32,
+            )?;
 
             let opts = grooveseek::graph::GraphOptions {
                 depth: depth.min(grooveseek::graph::MAX_DEPTH),
@@ -1872,7 +1880,7 @@ fn run_doctor(
         // keeps a doomed run from applying migrations to the file (D-19; the same
         // "cheap checks first" order `Commands::Index` uses).
         let schema = grooveseek::indexer::load_declared_schema(kb_path)?;
-        let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
+        let db = grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), kb_path)?;
         let registry = cfg.build_parser_registry(kb_path)?;
         grooveseek::doctor::run(&db, &registry, schema.as_ref())
     })();

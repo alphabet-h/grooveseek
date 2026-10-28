@@ -1479,9 +1479,14 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             opts.kb_path.display()
         );
     }
-    let db = crate::db::Database::open(&db_path.to_string_lossy())?;
+    let db = crate::db::Database::open_read_only(&db_path.to_string_lossy(), &opts.kb_path)?;
     let embedding_model_id = opts.embedding.model_id().to_string();
-    db.verify_embedding_meta(&embedding_model_id, opts.embedding.dimension() as u32)?;
+    db.verify_embedding_meta_or_record(
+        &db_path,
+        &opts.kb_path,
+        &embedding_model_id,
+        opts.embedding.dimension() as u32,
+    )?;
     let mut embedder = crate::embedder::Embedder::with_settings(opts.embedding.clone())?;
     let mut reranker = if opts.reranker_choice.is_enabled() {
         crate::embedder::Reranker::try_new(opts.reranker_choice)?

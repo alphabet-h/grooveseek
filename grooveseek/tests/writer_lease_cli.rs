@@ -446,3 +446,95 @@ fn fn_ranges_ends_at_the_matching_indent() {
     );
     assert_eq!(fn_ranges(src, "fn target("), vec![(2, 5), (7, 9)]);
 }
+
+/// Run `groove <args> --kb-path <kb>` hermetically and return its exit code,
+/// stdout and stderr (ANSI stripped).
+fn run_groove(kb: &TempKbLayout, cache: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(grooveseek_bin());
+    cmd.args(args).arg("--kb-path").arg(kb.kb());
+    hermetic(&mut cmd, cache);
+    let out = cmd.output().expect("spawn groove");
+    assert_dir_empty(cache);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        strip_ansi(&String::from_utf8_lossy(&out.stderr)),
+    )
+}
+
+#[test]
+fn search_on_a_corrupt_index_still_reports_it_as_corrupt() {
+    let kb = layout("groove-lease-corrupt-search");
+    let cache = TempRoot::new("groove-lease-corrupt-search-cache");
+    std::fs::write(db_of(&kb), b"not a sqlite database").expect("write garbage db");
+    let (code, stdout, stderr) = run_groove(&kb, cache.path(), &["search", "anything"]);
+    assert_ne!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("is not a usable SQLite database") && !stderr.contains("schema upgrade"),
+        "a corrupt file is named as corrupt, not as one waiting for an upgrade: {stderr}"
+    );
+}
+
+#[test]
+fn status_and_doctor_answer_while_another_process_holds_the_lease() {
+    let kb = layout("groove-lease-readers");
+    let cache = TempRoot::new("groove-lease-readers-cache");
+    {
+        let db = Database::open(&db_of(&kb).to_string_lossy()).expect("open the db");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("record the model");
+        db.upsert_document("note.md", Some("Note"), None, None, None, &[], None, "h", 0)
+            .expect("insert a document");
+    }
+    let _lease = hold(&kb, Role::Serve, kb.kb());
+
+    let (code, stdout, stderr) = run_groove(&kb, cache.path(), &["status"]);
+    assert_eq!(code, 0, "status reads past the lease: {stderr}");
+    assert!(
+        stdout.contains("Documents: 1"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run_groove(&kb, cache.path(), &["doctor"]);
+    assert_ne!(
+        code, 2,
+        "doctor could look while the lease was held: stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn status_on_a_legacy_index_fails_naming_the_writer_that_holds_the_lease() {
+    let kb = layout("groove-lease-legacy");
+    let cache = TempRoot::new("groove-lease-legacy-cache");
+    let db = db_of(&kb);
+    {
+        let opened = Database::open(&db.to_string_lossy()).expect("open the db");
+        opened
+            .verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("record the model");
+    }
+    {
+        // `ALTER TABLE documents DROP COLUMN size_bytes` fails on this schema
+        // (the comment inside its CREATE statement), so rebuild the table
+        // without the column, as `make_legacy_db` in src/db/lease.rs does.
+        let conn = rusqlite::Connection::open(&db).expect("open the db raw");
+        conn.execute_batch(
+            "DROP TABLE documents;
+             CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,
+                title TEXT, topic TEXT, category TEXT, depth TEXT, tags TEXT,
+                date TEXT, content_hash TEXT NOT NULL, last_indexed TEXT NOT NULL
+             );",
+        )
+        .expect("rebuild documents without size_bytes");
+    }
+    let _lease = hold(&kb, Role::Index, kb.kb());
+
+    let (code, stdout, stderr) = run_groove(&kb, cache.path(), &["status"]);
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("needs a schema upgrade")
+            && stderr.contains(&format!("pid {} per", std::process::id())),
+        "the upgrade and the writer holding it are named: {stderr}"
+    );
+}
