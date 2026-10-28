@@ -257,7 +257,7 @@ fn a_write_to_a_path_now_a_hard_link_drops_its_row() {
 #[cfg(not(windows))]
 #[test]
 #[ignore = "no watcher event for a second name made outside the knowledge base (kuriya 569)"]
-fn a_file_given_a_second_name_loses_its_row() {
+fn a_second_name_would_drop_the_row_only_if_an_event_reached_the_watcher() {
     let (fx, guard) = served(
         "i566-second-name",
         &[
