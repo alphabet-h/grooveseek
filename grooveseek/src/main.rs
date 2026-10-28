@@ -228,9 +228,9 @@ enum Commands {
         /// Mutually exclusive with `--quiet`.
         #[arg(long, default_value_t = false)]
         progress: bool,
-        /// Seconds to wait for another groove process that is writing this index
-        /// (a `groove serve` with its watcher on, another `groove index`, or an MCP
-        /// `rebuild_index`). 0 does not wait: if another writer holds the index,
+        /// Seconds to wait for another groove process that holds this index's
+        /// writer lock (another `groove index`, or a read-only command making a
+        /// one-time write). 0 does not wait: if another process holds the lock,
         /// exit with code 3.
         #[arg(long, default_value_t = 0, value_name = "SECONDS")]
         wait: u64,
