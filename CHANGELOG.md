@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.21.5] - 2026-10-28
+
 ### Fixed
 
 - **The live watcher drops the row of a document whose path now holds a link**, as
@@ -6485,7 +6487,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.4...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.5...HEAD
+[1.21.5]: https://github.com/alphabet-h/grooveseek/compare/v1.21.4...v1.21.5
 [1.21.4]: https://github.com/alphabet-h/grooveseek/compare/v1.21.3...v1.21.4
 [1.21.3]: https://github.com/alphabet-h/grooveseek/compare/v1.21.2...v1.21.3
 [1.21.2]: https://github.com/alphabet-h/grooveseek/compare/v1.21.1...v1.21.2
