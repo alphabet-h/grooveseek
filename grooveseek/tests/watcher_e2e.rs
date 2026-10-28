@@ -632,15 +632,22 @@ fn watcher_indexes_files_written_into_a_directory_renamed_within_the_window() {
 /// Right after `docs/` is renamed to `notes/`, `docs/` is created again and
 /// `docs/a.md` is made a hard link of `notes/a.md` (no privilege needed on
 /// Windows). By the time the paired rename is handled, both ends of `a.md` are
-/// multiply linked, so the watcher's gate refuses both and the file rename of
-/// that row is a skip; `b.md` is moved as usual. The old directory exists
-/// again, so the sweep of the old prefix does not run. Without dropping every
-/// listed old row after the per-file pass, the `docs/a.md` row survives as a
-/// hit for a file the index would refuse. The recreated `docs/a.md` produces
-/// its own Create, which the same gate refuses, so nothing puts the row back.
+/// multiply linked; `b.md` is moved as usual. The old directory exists again,
+/// so the sweep of the old prefix does not run.
 ///
-/// Red without that step on Windows (the rename is paired as in the moves test
-/// above). The paired path is asserted through its stderr line, as there.
+/// Before kuriya #566 (U1, user-approved 2026-10-28) the watcher's gate
+/// refused both ends, the file rename of that row was a skip, and only the
+/// step that drops every listed old row after the per-file pass kept the
+/// `docs/a.md` row from surviving as a hit for a file the index would refuse.
+/// Since #566 the removal gate passes a hard link, so the old end passes, the
+/// new end is still refused as a write, and the file rename of that row
+/// already drops it (a deindex). The recreated `docs/a.md` produces its own
+/// Create, which hands a hard link to the removal path, so nothing puts the
+/// row back.
+///
+/// Red without that step on Windows before #566 (the rename is paired as in
+/// the moves test above). The paired path is asserted through its stderr
+/// line, as there.
 ///
 /// Not run on macOS: FSEvents does not say which end of a rename a path is,
 /// and the debouncer guesses from whether the path exists. With `docs/`

@@ -120,7 +120,10 @@
 //! is gone, and the gate in [`crate::watcher`] covers deindexing as well as
 //! indexing -- `should_process_parts`, private to that module and so nameable
 //! from here only in prose. Refusing what we cannot stat would leave deleted
-//! documents in the index forever. The rule does not extend to
+//! documents in the index forever. (kuriya 566) The watcher's removal side no
+//! longer asks the count at all: a hard link at a removed path drops the row,
+//! as the full index drops it, so only a write is refused here. The rule does
+//! not extend to
 //! [`crate::links::read_checked`], where a file that cannot be opened yields no
 //! bytes either way.
 
@@ -214,6 +217,25 @@ pub(crate) fn hard_link_count(path: &Path) -> Option<u64> {
         .ok()?;
     let meta = file.metadata().ok()?;
     handle_link_count(&meta, &file)
+}
+
+/// The link count of the entry `meta` was taken from (by `symlink_metadata` of `path`),
+/// with no second lookup where the metadata carries it: on Unix it is `meta.nlink()`, the
+/// same stat. On Windows the metadata from a path has no count, so `path` is opened once
+/// ([`hard_link_count`]). `None` when it cannot be determined.
+#[cfg(unix)]
+pub(crate) fn link_count_given(meta: &std::fs::Metadata, _path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.nlink())
+}
+
+/// The link count of the entry `meta` was taken from (by `symlink_metadata` of `path`),
+/// with no second lookup where the metadata carries it: on Unix it is `meta.nlink()`, the
+/// same stat. On Windows the metadata from a path has no count, so `path` is opened once
+/// ([`hard_link_count`]). `None` when it cannot be determined.
+#[cfg(windows)]
+pub(crate) fn link_count_given(_meta: &std::fs::Metadata, path: &Path) -> Option<u64> {
+    hard_link_count(path)
 }
 
 /// Whether `path` is reachable under more than one name.
@@ -957,5 +979,31 @@ mod tests {
                 "and so must the line a client sees"
             );
         }
+    }
+
+    /// (kuriya 566 R7) The count read from metadata already taken agrees with the count read
+    /// by path, for a file with one name and for one with two.
+    #[test]
+    fn the_count_given_the_metadata_is_the_count_by_path() {
+        let dir = crate::test_support::unique_temp_path("groove-links-given");
+        std::fs::create_dir_all(&dir).unwrap();
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(dir.clone());
+
+        let one = dir.join("one.md");
+        std::fs::write(&one, b"# one\n").unwrap();
+        let meta = std::fs::symlink_metadata(&one).unwrap();
+        assert_eq!(link_count_given(&meta, &one), Some(1));
+
+        let twin = dir.join("twin.md");
+        std::fs::hard_link(&one, &twin).expect("hard links need no privilege");
+        let meta = std::fs::symlink_metadata(&twin).unwrap();
+        assert_eq!(link_count_given(&meta, &twin), Some(2));
+        assert_eq!(link_count_given(&meta, &twin), hard_link_count(&twin));
     }
 }
