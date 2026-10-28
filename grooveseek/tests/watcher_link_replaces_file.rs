@@ -244,17 +244,18 @@ fn a_write_to_a_path_now_a_hard_link_drops_its_row() {
 /// (kuriya 566 #22) An indexed file given a second name outside the knowledge base loses its
 /// row, as the full index drops it (its walk collects no file with more than one name). `a.md`
 /// itself is not written: the row goes on the event its own name sees for the change of its
-/// link count, if one comes. On Linux inotify reports a change of link count as `IN_ATTRIB`
-/// (inotify(7)), which reaches the watcher as a metadata change of `a.md` (not run on Linux
-/// when this was written; CI is the first run).
+/// link count, if one comes.
 ///
-/// Not on Windows: there `ReadDirectoryChangesW` reported nothing at all for `a.md` when a
-/// second name was made for it outside the watched tree (seen 2026-10-28 on Windows 11, NTFS:
-/// the server's stderr held only its `watching` line, and the row stayed for the full 30 s),
-/// so no watcher path can reach the row; the next `groove index` drops it (kuriya 566 plan,
-/// S4).
+/// Ignored: no such event reaches the watcher, so the row stays until the next `groove index`
+/// (kuriya 569, a user decision to leave this case out of the watcher). On Windows 11 / NTFS
+/// `ReadDirectoryChangesW` reported nothing at all for `a.md` (seen 2026-10-28: the server's
+/// stderr held only its `watching` line, and the row stayed for the full 30 s). On Linux CI
+/// (run 40580940410) the row stayed the same way, though inotify(7) says a change of link count
+/// is reported as `IN_ATTRIB`; where it is lost is not known. Kept to be run by hand
+/// (`--ignored`) when that is looked into.
 #[cfg(not(windows))]
 #[test]
+#[ignore = "no watcher event for a second name made outside the knowledge base (kuriya 569)"]
 fn a_file_given_a_second_name_loses_its_row() {
     let (fx, guard) = served(
         "i566-second-name",
