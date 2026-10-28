@@ -1440,7 +1440,11 @@ mod tests {
                 .expect_err("the trigger was meant to fail it");
             assert!(format!("{err:#}").contains("injected"), "{table}: {err:#}");
             assert!(db.conn.is_autocommit(), "{table}: no transaction left open");
-            assert_eq!(db.document_count().unwrap(), 1, "{table}: document row kept");
+            assert_eq!(
+                db.document_count().unwrap(),
+                1,
+                "{table}: document row kept"
+            );
             assert_eq!(table_count(&db, "chunks"), 1, "{table}: chunk kept");
             assert_eq!(table_count(&db, "vec_chunks"), 1, "{table}: vector kept");
             assert_eq!(fts_count(&db), 1, "{table}: fts row kept");
