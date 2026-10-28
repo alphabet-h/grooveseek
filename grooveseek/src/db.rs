@@ -1415,6 +1415,43 @@ mod tests {
         println!("test_delete_document: OK");
     }
 
+    /// #551: a `delete_document` whose statement fails midway leaves every table as it
+    /// was. Red before the fix: the statements before the failing one were each their own
+    /// autocommit transaction, so the document row stayed with its chunks, vectors, FTS
+    /// rows and fields already gone (or, failing at `chunks`, with the vectors gone).
+    #[test]
+    fn a_delete_document_that_fails_midway_leaves_the_document_whole() {
+        // The trigger fails the 5th statement (documents) and the 4th (chunks).
+        for table in ["documents", "chunks"] {
+            let db = db_with_384();
+            let id = upsert_bare(&db, "a.md");
+            db.insert_chunk(id, 0, None, None, "body", None, &dummy_embedding(0.4), 1.0)
+                .unwrap();
+            db.replace_document_fields("a.md", &[("status".into(), "active".into())])
+                .unwrap();
+            db.execute_for_test(&format!(
+                "CREATE TRIGGER inject_delete_failure BEFORE DELETE ON {table} {}",
+                "BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;"
+            ))
+            .unwrap();
+
+            let err = db
+                .delete_document("a.md")
+                .expect_err("the trigger was meant to fail it");
+            assert!(format!("{err:#}").contains("injected"), "{table}: {err:#}");
+            assert!(db.conn.is_autocommit(), "{table}: no transaction left open");
+            assert_eq!(db.document_count().unwrap(), 1, "{table}: document row kept");
+            assert_eq!(table_count(&db, "chunks"), 1, "{table}: chunk kept");
+            assert_eq!(table_count(&db, "vec_chunks"), 1, "{table}: vector kept");
+            assert_eq!(fts_count(&db), 1, "{table}: fts row kept");
+            assert_eq!(
+                table_count(&db, "document_fields"),
+                1,
+                "{table}: field kept"
+            );
+        }
+    }
+
     /// feature-67: insert a bare document row (no chunks) under the given path.
     fn upsert_bare(db: &Database, path: &str) -> i64 {
         db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
@@ -1549,6 +1586,49 @@ mod tests {
         }
         assert!(db.conn.is_autocommit());
         assert_eq!(db.document_count().unwrap(), 2, "rows came back");
+    }
+
+    /// #551: inside a caller's transaction `delete_document` opens none of its own (SQLite
+    /// would refuse a nested BEGIN, which `sweep_legacy_folded_row` in the indexer relies
+    /// on not happening): the deletes ride the caller's transaction and go with its rollback.
+    /// On `Err` the caller's transaction stays open and the caller rolls it back.
+    #[test]
+    fn delete_document_joins_the_callers_transaction() {
+        let db = db_with_384();
+        let id = upsert_bare(&db, "a.md");
+        db.insert_chunk(id, 0, None, None, "body", None, &dummy_embedding(0.4), 1.0)
+            .unwrap();
+        {
+            let _tx = db.begin_immediate_transaction().unwrap();
+            db.delete_document("a.md").unwrap();
+            assert!(!db.conn.is_autocommit(), "the caller's tx stays open");
+            assert_eq!(db.document_count().unwrap(), 0);
+        }
+        assert_eq!(
+            db.document_count().unwrap(),
+            1,
+            "rolled back with the caller's tx"
+        );
+        assert_eq!(table_count(&db, "vec_chunks"), 1);
+
+        db.execute_for_test(concat!(
+            "CREATE TRIGGER inject_delete_failure BEFORE DELETE ON documents ",
+            "BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;",
+        ))
+        .unwrap();
+        {
+            let _tx = db.begin_transaction().unwrap();
+            assert!(db.delete_document("a.md").is_err());
+            assert!(!db.conn.is_autocommit(), "left to the caller to roll back");
+        }
+        assert!(db.conn.is_autocommit());
+        assert_eq!(
+            table_count(&db, "chunks"),
+            1,
+            "the caller's rollback restored the chunk"
+        );
+        assert_eq!(table_count(&db, "vec_chunks"), 1);
+        assert_eq!(fts_count(&db), 1);
     }
 
     /// feature-67 (local Codex round 2): a writer holding an uncommitted row under
