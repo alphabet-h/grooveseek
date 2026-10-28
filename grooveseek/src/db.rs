@@ -22,6 +22,8 @@ mod storage;
 // outside this module as `grooveseek::db::parse_query`; `search.rs` reaches it
 // through `use super::*`.
 pub use fts_query::{ParsedQuery, parse_query};
+// (#259) A reader's one-time write that the writer lease stopped, and which one it was.
+pub use lease::{OneTimeWrite, OneTimeWriteBusy};
 pub use search::FIELD_FILTERS_PENDING;
 // (feature-56) The indexer names this when it hands a code chunk's line range and definition
 // kind to the storage layer; every other caller uses the constructor that defaults it away.
