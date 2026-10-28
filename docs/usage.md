@@ -11,6 +11,7 @@ Reference for the `groove` command line: `index`, `status`, `serve`, `search`,
 groove index --kb-path /path/to/knowledge-base
 groove index --kb-path /path/to/knowledge-base --force   # full re-index
 groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # switch to BGE-M3 (1024 dim, multilingual)
+groove index --kb-path /path/to/knowledge-base --wait 30   # wait up to 30 s for another writer
 ```
 
 Scans source files under the given directory, skipping the default `exclude_dirs` set (`.obsidian`, `.git`, `node_modules`, `target`, `.vscode`, `.idea` — see "Directory exclusion" in [docs/behavior.md](behavior.md)). By default only `.md` is picked up. Add `[parsers].enabled = ["md", "txt"]` to `groove.toml` to also index `.txt` files — their title is derived from the filename (`deep-dive-2026.txt` → `"deep dive 2026"`) and the whole body becomes a single chunk. Put that key in a `groove.toml` groove trusts — one named with `--config`, one beside the binary, or one `groove service install` placed; a config merely discovered next to a knowledge base has `[parsers]` reset to the default ([Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations)). Files whose content hash has not changed since the last run are skipped unless `--force` is passed.
@@ -22,6 +23,8 @@ Scans source files under the given directory, skipping the default `exclude_dirs
 - `bge-m3` — 1024 dim, multilingual (100+ languages incl. Japanese), ~2.3 GB first download. Recommended for Japanese-heavy knowledge bases.
 
 Switching models on an existing index requires `--force` (the DB records the model/dim in `index_meta` and rejects mismatched runtimes).
+
+One groove process at a time writes an index: it holds an operating-system lock on `.groove.db.writer-lock` beside the database. If another writer holds it, `groove index` exits with code 3 without touching the database or the embedding model, and prints on stderr who holds it (the pid comes from `.groove.db.writer.json` and can be stale) and what to do next. `--wait <SECONDS>` waits for the writer instead. If the writer is a `groove serve` with its watcher on, its MCP tool `rebuild_index` rebuilds the index; a rebuild with a different model (`--force --model ...`) needs that server stopped first. Exit codes: `0` success, `1` failure, `2` usage error (from the argument parser), `3` another groove process is writing the index, or `--wait` ran out. The one-writer guarantee holds only for a database on a local disk: on a network file system, whether the operating-system lock works depends on the file system.
 
 ### External OpenAI-compatible embeddings
 

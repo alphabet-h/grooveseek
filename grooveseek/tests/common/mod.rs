@@ -52,6 +52,11 @@
 //! - [`crate::common::rename`] — `std::fs::rename` retried while Windows
 //!   briefly refuses it. Shared by the watcher tests that rename a directory
 //!   under a running watcher.
+//! - [`crate::common::production`] — the production lines of a Rust source
+//!   file (inline `#[cfg(test)]` modules and comment lines dropped) and the
+//!   line range of a function. Shared by the scans that pin where the writer
+//!   opens of ADR-0031 may appear (`writer_lease_cli.rs` and the source scan
+//!   that follows it).
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -67,6 +72,7 @@ pub mod embed_mock;
 pub mod eval_gate;
 pub mod in_process;
 pub mod mcp;
+pub mod production;
 pub mod rename;
 pub mod source;
 pub mod temp;

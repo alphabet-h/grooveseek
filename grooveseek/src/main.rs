@@ -228,6 +228,12 @@ enum Commands {
         /// Mutually exclusive with `--quiet`.
         #[arg(long, default_value_t = false)]
         progress: bool,
+        /// Seconds to wait for another groove process that is writing this index
+        /// (a `groove serve` with its watcher on, another `groove index`, or an MCP
+        /// `rebuild_index`). 0 does not wait: if another writer holds the index,
+        /// exit with code 3.
+        #[arg(long, default_value_t = 0, value_name = "SECONDS")]
+        wait: u64,
     },
     /// Show index status and statistics
     Status {
@@ -957,6 +963,7 @@ fn main() -> anyhow::Result<()> {
             model,
             quiet,
             progress,
+            wait,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let embedding = cfg.resolve_embedding(model)?;
@@ -986,99 +993,62 @@ fn main() -> anyhow::Result<()> {
             let schema = grooveseek::indexer::load_declared_schema(&kb_path)?;
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
-            let db_path_str = db_path.to_string_lossy();
-            // `--force` is the one repair verb the command line offers, so it
-            // has to reach a database that cannot be opened (#253): the index
-            // is derived from the corpus, and "start over" is what the flag
-            // already means. Without the flag the file is left alone and the
-            // error names it and the remedy.
-            let db = if force {
-                let (db, replaced) =
-                    grooveseek::db::Database::open_or_replace_corrupt(&db_path_str)?;
-                if replaced {
-                    eprintln!(
-                        "warning: {} could not be opened as a SQLite database; \
-                         --force replaced it and the index is rebuilt from scratch",
-                        db_path.display()
-                    );
-                }
-                db
-            } else {
-                grooveseek::db::Database::open(&db_path_str)?
-            };
-            // モデル DL (BGE-M3 なら ~2.3 GB) の前に meta 整合性を先に確認する。
-            // そうしないと不整合時にユーザが不要な DL を待たされる。
-            let dim = embedding.dimension() as u32;
-            if !force {
-                db.verify_embedding_meta(embedding.model_id(), dim)?;
-            }
-            let mut embedder = grooveseek::embedder::Embedder::with_settings(embedding)?;
-            // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) `schema` was already read
-            // above, before any reset -- a malformed schema must fail before `--force` empties
-            // the index, not after. `rebuild_index` no longer reads the file itself (round 3):
-            // that snapshot is what it gets, so the file is read exactly once per run rather
-            // than once above and once more inside it. (codex P2 round 9) Moved above this
-            // `Embedder::with_settings` call too -- see `load_declared_schema`'s doc.
-            //
-            // (AW-03) No reset here: `rebuild_index` resets for `--force` itself, after it has
-            // heard from the embedding provider (ADR-0024). A reset in this arm would run
-            // before that probe and empty the index a failing endpoint then leaves empty.
-            eprintln!("Indexing {}...", kb_path.display());
-            let exclude_dirs = cfg.resolve_exclude_dirs();
-            let progress_reporter =
-                grooveseek::indexer::progress::ProgressReporter::from_cli_flags(quiet, progress);
-            let context_mode_desired =
-                if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
-                    grooveseek::db::ContextMode::Static
-                } else {
-                    grooveseek::db::ContextMode::Off
-                };
-            let result = grooveseek::indexer::rebuild_index(
-                &db,
-                &mut embedder,
+            // ADR-0031: take the writer lease before anything below touches the
+            // database or the model. Another writer means exit 3, not a wait,
+            // unless `--wait` asks for one.
+            let lease = match grooveseek::writer_lease::WriterLease::try_acquire(
+                &db_path,
+                grooveseek::writer_lease::Role::Index,
                 &kb_path,
-                schema,
-                force,
-                cfg.exclude_headings.as_deref(),
-                &exclude_dirs,
-                &registry,
-                progress_reporter,
-                context_mode_desired,
-            )?;
-            eprintln!("{}", result.summary_line());
-            // (AW-04) Checked before strictness: a run whose every embed was refused says
-            // more about the configuration than any frontmatter does.
-            if result.fails_all_inputs_rejected() {
-                anyhow::bail!(
-                    "{}",
-                    result.all_inputs_rejected_message(grooveseek::indexer::REJECTIONS_NAMED_ABOVE)
-                );
-            }
-            // (AW-04, codex P1 on PR #329) A forced rebuild emptied the index, so a refused
-            // file is a gap in it, not an old row kept: one refusal fails the run.
-            if result.fails_forced_rebuild_rejections() {
-                anyhow::bail!(
-                    "{}",
-                    result.forced_rebuild_rejections_message(
-                        grooveseek::indexer::REJECTIONS_NAMED_ABOVE
+            ) {
+                Err(grooveseek::writer_lease::LeaseError::Busy { holder, .. }) if wait > 0 => {
+                    eprintln!(
+                        "{}",
+                        grooveseek::writer_lease::index_waiting_line(
+                            &db_path,
+                            holder.as_ref(),
+                            wait
+                        )
+                    );
+                    grooveseek::writer_lease::WriterLease::acquire_with_wait(
+                        &db_path,
+                        grooveseek::writer_lease::Role::Index,
+                        &kb_path,
+                        std::time::Duration::from_secs(wait),
                     )
-                );
-            }
-            // (#251) Strictness changes the exit code, not the run: every file
-            // was indexed and every broken one named above, so the summary is
-            // printed first and one failure covers the whole corpus.
-            let strict = cfg
-                .index
-                .as_ref()
-                .is_some_and(|i| i.fail_on_frontmatter_error);
-            if result.fails_strict_frontmatter(strict) {
-                anyhow::bail!(
-                    "{} document(s) have YAML frontmatter that could not be parsed (see the warnings above); \
-                     [index].fail_on_frontmatter_error is set, so this run is reported as a failure. \
-                     The index was still written. Fix the files and run `groove index` again.",
-                    result.frontmatter_unparsed
-                );
-            }
+                }
+                other => other,
+            };
+            let lease = match lease {
+                Ok(lease) => lease,
+                Err(grooveseek::writer_lease::LeaseError::Busy { holder, .. }) => {
+                    eprintln!(
+                        "{}",
+                        grooveseek::writer_lease::index_busy_message(
+                            &db_path,
+                            holder.as_ref(),
+                            &kb_path,
+                            (wait > 0).then_some(wait)
+                        )
+                    );
+                    std::process::exit(3);
+                }
+                Err(e) => return Err(anyhow::Error::new(e)),
+            };
+            index_with_lease(
+                &lease,
+                &cfg,
+                IndexArgs {
+                    kb_path,
+                    db_path,
+                    embedding,
+                    registry,
+                    schema,
+                    force,
+                    quiet,
+                    progress,
+                },
+            )?;
         }
         Commands::Status { kb_path } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
@@ -1689,6 +1659,129 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// What [`index_with_lease`] needs from the `index` arm. Holds no `Database`:
+/// the index is opened inside, under the lease.
+struct IndexArgs {
+    kb_path: PathBuf,
+    db_path: PathBuf,
+    embedding: grooveseek::embedder::EmbeddingSettings,
+    registry: grooveseek::parser::Registry,
+    schema: Option<grooveseek::schema::Schema>,
+    force: bool,
+    quiet: bool,
+    progress: bool,
+}
+
+/// Runs the index under `lease`; `db` stays local so it drops before the lease
+/// (ADR-0031). Do not add `drop(lease)` to the arm.
+fn index_with_lease(
+    lease: &grooveseek::writer_lease::WriterLease,
+    cfg: &Config,
+    args: IndexArgs,
+) -> anyhow::Result<()> {
+    let IndexArgs {
+        kb_path,
+        db_path,
+        embedding,
+        registry,
+        schema,
+        force,
+        quiet,
+        progress,
+    } = args;
+    let db_path_str = db_path.to_string_lossy();
+    // `--force` is the one repair verb the command line offers, so it
+    // has to reach a database that cannot be opened (#253): the index
+    // is derived from the corpus, and "start over" is what the flag
+    // already means. Without the flag the file is left alone and the
+    // error names it and the remedy.
+    let db = if force {
+        let (db, replaced) =
+            grooveseek::db::Database::open_or_replace_corrupt_with(&db_path_str, lease)?;
+        if replaced {
+            eprintln!(
+                "warning: {} could not be opened as a SQLite database; \
+                 --force replaced it and the index is rebuilt from scratch",
+                db_path.display()
+            );
+        }
+        db
+    } else {
+        grooveseek::db::Database::open_writer(&db_path_str, lease)?
+    };
+    // モデル DL (BGE-M3 なら ~2.3 GB) の前に meta 整合性を先に確認する。
+    // そうしないと不整合時にユーザが不要な DL を待たされる。
+    let dim = embedding.dimension() as u32;
+    if !force {
+        db.verify_embedding_meta(embedding.model_id(), dim)?;
+    }
+    let mut embedder = grooveseek::embedder::Embedder::with_settings(embedding)?;
+    // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) `schema` was already read
+    // above, before any reset -- a malformed schema must fail before `--force` empties
+    // the index, not after. `rebuild_index` no longer reads the file itself (round 3):
+    // that snapshot is what it gets, so the file is read exactly once per run rather
+    // than once above and once more inside it. (codex P2 round 9) Moved above this
+    // `Embedder::with_settings` call too -- see `load_declared_schema`'s doc.
+    //
+    // (AW-03) No reset here: `rebuild_index` resets for `--force` itself, after it has
+    // heard from the embedding provider (ADR-0024). A reset in this arm would run
+    // before that probe and empty the index a failing endpoint then leaves empty.
+    eprintln!("Indexing {}...", kb_path.display());
+    let exclude_dirs = cfg.resolve_exclude_dirs();
+    let progress_reporter =
+        grooveseek::indexer::progress::ProgressReporter::from_cli_flags(quiet, progress);
+    let context_mode_desired = if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+        grooveseek::db::ContextMode::Static
+    } else {
+        grooveseek::db::ContextMode::Off
+    };
+    let result = grooveseek::indexer::rebuild_index(
+        &db,
+        &mut embedder,
+        &kb_path,
+        schema,
+        force,
+        cfg.exclude_headings.as_deref(),
+        &exclude_dirs,
+        &registry,
+        progress_reporter,
+        context_mode_desired,
+    )?;
+    eprintln!("{}", result.summary_line());
+    // (AW-04) Checked before strictness: a run whose every embed was refused says
+    // more about the configuration than any frontmatter does.
+    if result.fails_all_inputs_rejected() {
+        anyhow::bail!(
+            "{}",
+            result.all_inputs_rejected_message(grooveseek::indexer::REJECTIONS_NAMED_ABOVE)
+        );
+    }
+    // (AW-04, codex P1 on PR #329) A forced rebuild emptied the index, so a refused
+    // file is a gap in it, not an old row kept: one refusal fails the run.
+    if result.fails_forced_rebuild_rejections() {
+        anyhow::bail!(
+            "{}",
+            result.forced_rebuild_rejections_message(grooveseek::indexer::REJECTIONS_NAMED_ABOVE)
+        );
+    }
+    // (#251) Strictness changes the exit code, not the run: every file
+    // was indexed and every broken one named above, so the summary is
+    // printed first and one failure covers the whole corpus.
+    let strict = cfg
+        .index
+        .as_ref()
+        .is_some_and(|i| i.fail_on_frontmatter_error);
+    if result.fails_strict_frontmatter(strict) {
+        anyhow::bail!(
+            "{} document(s) have YAML frontmatter that could not be parsed (see the warnings above); \
+             [index].fail_on_frontmatter_error is set, so this run is reported as a failure. \
+             The index was still written. Fix the files and run `groove index` again.",
+            result.frontmatter_unparsed
+        );
+    }
     Ok(())
 }
 
@@ -2392,6 +2485,10 @@ mod naming_surface {
         (
             "progress",
             "same — the tool answers once, with the counts, when it is done",
+        ),
+        (
+            "wait",
+            "a tool call does not wait for another writer; it answers at once",
         ),
     ];
 
