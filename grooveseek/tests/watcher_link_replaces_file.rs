@@ -241,10 +241,11 @@ fn a_write_to_a_path_now_a_hard_link_drops_its_row() {
     drop(guard);
 }
 
-/// (kuriya 566 #22) An indexed file given a second name outside the knowledge base loses its
-/// row, as the full index drops it (its walk collects no file with more than one name). `a.md`
-/// itself is not written: the row goes on the event its own name sees for the change of its
-/// link count, if one comes.
+/// (kuriya 566 #22) What the watcher would do if an event for `a.md` came when an indexed file
+/// is given a second name outside the knowledge base: drop its row, as the full index does (its
+/// walk collects no file with more than one name). `a.md` itself is not written, so only an
+/// event for the change of its link count could reach the row. **The watcher does not do this
+/// today, and the contract does not promise it.**
 ///
 /// Ignored: no such event reaches the watcher, so the row stays until the next `groove index`
 /// (kuriya 569, a user decision to leave this case out of the watcher). On Windows 11 / NTFS

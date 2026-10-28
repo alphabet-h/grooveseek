@@ -22,7 +22,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   indexed file, and a rename onto a file that became a hard link before it was handled. Before,
   the watcher refused to read the link but kept the old row, so `search` went on returning text
   the index would no longer read. Only the watcher's removal decides whether such a row goes, so
-  every path agrees. A file that only gains a second name elsewhere, and stays where it is,
+  every path agrees. This is tested on Linux and Windows; on macOS FSEvents can drop removals
+  and renames, so run `groove index` if such a row lingers there. A file that only gains a second name elsewhere, and stays where it is,
   reaches the watcher as no event (seen on Windows and Linux); its row stays until the next
   `groove index` (kuriya #566, #569).
 - **The watcher no longer reads a directory as a hard link.** On Linux and macOS every
