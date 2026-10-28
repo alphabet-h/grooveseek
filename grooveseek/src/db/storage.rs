@@ -899,7 +899,20 @@ impl Database {
     }
 
     /// Delete a document and all associated chunks / vectors / FTS rows.
+    ///
+    /// (#551) The five deletes commit together. Called outside a transaction it opens its
+    /// own, so a statement that fails midway rolls back the ones before it (the store is
+    /// never left with a document row whose chunks / vectors are gone). Called inside a
+    /// caller's transaction ([`Database::begin_transaction`] /
+    /// [`Database::begin_immediate_transaction`]) it joins that one; on `Err` the deletes
+    /// that already ran stay in it and the caller must roll back, as for
+    /// [`Database::delete_documents_under`].
     pub fn delete_document(&self, path: &str) -> Result<()> {
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         // Delete vector entries first (no FK from virtual table)
         self.conn.execute(
             "DELETE FROM vec_chunks WHERE chunk_id IN \
@@ -928,6 +941,9 @@ impl Database {
         // Delete the document row
         self.conn
             .execute("DELETE FROM documents WHERE path = ?1", params![path])?;
+        if let Some(tx) = local_tx {
+            tx.commit()?;
+        }
         Ok(())
     }
 

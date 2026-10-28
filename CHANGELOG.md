@@ -31,6 +31,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   directory named like one (`notes.md/`) kept its row there and dropped it on Windows. The
   watcher now also reads a path once for both of its checks, so the two can no longer disagree
   about what is there (kuriya #550).
+- **A document delete that fails partway no longer leaves the document half removed.** The
+  five deletes behind it (vectors, full-text rows, fields, chunks, the document row) each
+  committed on their own, so a failure at the chunks or the document row left a document that
+  `search` could no longer find by its text or vectors. They now commit together, and inside a
+  caller's transaction they join it as before (kuriya #551).
 
 ## [1.21.4] - 2026-10-28
 
