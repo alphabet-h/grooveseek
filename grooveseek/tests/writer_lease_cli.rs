@@ -3,7 +3,7 @@
 //! naming the holder when another process holds it, waits with `--wait`, and
 //! lets the operating system release the lease when the process ends.
 //!
-//! Every child `groove` runs under [`common::embed_mock::hermetic`] with an
+//! Every child `groove` runs under [`crate::common::embed_mock::hermetic`] with an
 //! empty model cache that is checked after it exits: nothing here may
 //! download a model. Where a test needs to see that `groove index` got past
 //! the lease, the database already records another model, so the run stops
@@ -79,7 +79,7 @@ fn hold(kb: &TempKbLayout, role: Role, holder_kb: &Path) -> WriterLease {
     WriterLease::try_acquire(&db_of(kb), role, holder_kb).expect("take the lease in the test")
 }
 
-/// Poll `try_acquire` every 250 ms until it succeeds or `limit` passes.
+/// Poll [`grooveseek::writer_lease::WriterLease::try_acquire`] every 250 ms until it succeeds or `limit` passes.
 fn acquire_within(db: &Path, kb: &Path, limit: Duration) -> Option<WriterLease> {
     let deadline = Instant::now() + limit;
     loop {

@@ -13,7 +13,7 @@ const ONE_TIME_WRITE_WAIT: Duration = Duration::from_secs(2);
 /// The one-time writes a reader makes under a short lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OneTimeWrite {
-    /// A schema migration run by `init`.
+    /// A schema migration run by [`Database::init`].
     SchemaUpgrade,
     /// Recording the embedding model and dimension in `index_meta`.
     EmbeddingMeta,
@@ -69,14 +69,14 @@ impl std::error::Error for OneTimeWriteBusy {}
 
 /// How one reader open attempt failed.
 enum AttemptFailure {
-    /// `init` wanted to write and `query_only` refused it.
+    /// [`Database::init`] wanted to write and `query_only` refused it.
     Refusal,
     /// Anything else, worded as [`Database::open`] words it.
     Fail(anyhow::Error),
 }
 
-/// Sort a failed reader open attempt. `db` is `None` when the connection
-/// itself could not be opened; it is dropped here either way, so the
+/// Sort a failed reader open attempt. The database handle is `None` when the
+/// connection itself could not be opened; it is dropped here either way, so the
 /// connection is closed before anyone waits for the lease.
 fn classify_attempt_error(path: &str, db: Option<Database>, e: anyhow::Error) -> AttemptFailure {
     let Some(db) = db else {
@@ -94,10 +94,11 @@ fn classify_attempt_error(path: &str, db: Option<Database>, e: anyhow::Error) ->
 }
 
 impl Database {
-    /// Open (or create) the database at `path` as a reader: the connection
-    /// runs with `PRAGMA query_only` on. A schema upgrade `init` needs, or a
-    /// missing file, is written once under a short writer lease (2 s wait);
-    /// if a writer holds it, the error's root is [`OneTimeWriteBusy`].
+    /// Open (or create) the database at the given path as a reader: the
+    /// connection runs with `PRAGMA query_only` on. A schema upgrade
+    /// [`Self::init`] needs, or a missing file, is written once under a short
+    /// writer lease (2 s wait); if a writer holds it, the error's root is
+    /// [`OneTimeWriteBusy`].
     /// Why: ADR-0031.
     pub fn open_read_only(path: &str, kb_path: &Path) -> Result<Self> {
         Self::open_read_only_with(path, kb_path, &|| {})
@@ -150,7 +151,7 @@ impl Database {
         }
     }
 
-    /// One reader open attempt: connect, switch `query_only` on, then `init`.
+    /// One reader open attempt: connect, switch `query_only` on, then [`Self::init`].
     /// On failure the connection is handed back (when there is one) so the
     /// caller can tell a `query_only` refusal from anything else.
     #[allow(clippy::result_large_err)]
@@ -359,7 +360,7 @@ mod tests {
         (path, doc)
     }
 
-    /// A reader as Task 5's `open_read_only` will make it: opened, then
+    /// A reader as Task 5's [`Database::open_read_only`] will make it: opened, then
     /// switched to `query_only`.
     fn query_only(path: &str) -> Database {
         let r = Database::open(path).unwrap();
@@ -520,8 +521,8 @@ mod tests {
         dir.path().join(".groove.db").to_str().unwrap().to_string()
     }
 
-    /// A database as an older groove left it: meta recorded, but `documents`
-    /// lacks the `size_bytes` column that `init` adds.
+    /// A database as an older groove left it: meta recorded, but the documents
+    /// table lacks the `size_bytes` column that [`Database::init`] adds.
     fn make_legacy_db(path: &str) {
         let db = Database::open(path).unwrap();
         db.verify_embedding_meta(MODEL, DIM).unwrap();
@@ -564,7 +565,8 @@ mod tests {
             .unwrap()
     }
 
-    /// The error of an `open_read_only` that must fail (`Database` is not `Debug`).
+    /// The error of a [`Database::open_read_only`] that must fail ([`Database`]
+    /// is not `Debug`).
     fn open_read_only_err(path: &str, kb: &Path) -> anyhow::Error {
         match Database::open_read_only(path, kb) {
             Ok(_) => panic!("open_read_only({path}) succeeded"),

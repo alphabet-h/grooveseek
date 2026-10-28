@@ -238,7 +238,7 @@ impl Drop for WriterLease {
 /// How the holder named in `<db>.writer.json` relates to this process's knowledge base.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HolderRelation {
-    /// A `serve` on the same knowledge base: its watcher keeps the index current.
+    /// A `groove serve` on the same knowledge base: its watcher keeps the index current.
     WatchingSameKb,
     /// A one-off run on the same knowledge base, with this role.
     OneOffRun(Role),

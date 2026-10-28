@@ -820,7 +820,7 @@ impl Database {
     /// replaces it, and only `index --force` makes that call.
     ///
     /// Keeping to one writer is the caller's job. The binary opens through
-    /// [`Database::open_writer`] or `open_read_only` instead (ADR-0031).
+    /// [`Database::open_writer`] or [`Database::open_read_only`] instead (ADR-0031).
     pub fn open(path: &str) -> Result<Self> {
         ensure_vec_extension();
         let conn =

@@ -55,8 +55,8 @@
 //! - [`crate::common::production`] — the production lines of a Rust source
 //!   file (inline `#[cfg(test)]` modules and comment lines dropped) and the
 //!   line range of a function. Shared by the scans that pin where the writer
-//!   opens of ADR-0031 may appear (`writer_lease_cli.rs` and the source scan
-//!   that follows it).
+//!   opens of ADR-0031 may appear (the writer-lease CLI tests and the source
+//!   scan that follows them).
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same

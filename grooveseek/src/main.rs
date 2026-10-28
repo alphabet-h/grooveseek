@@ -1670,7 +1670,8 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What [`index_with_lease`] needs from the `index` arm. Holds no `Database`:
+/// What [`index_with_lease`] needs from the [`Commands::Index`] arm. Holds no
+/// [`grooveseek::db::Database`]:
 /// the index is opened inside, under the lease.
 struct IndexArgs {
     kb_path: PathBuf,
@@ -1683,7 +1684,7 @@ struct IndexArgs {
     progress: bool,
 }
 
-/// Runs the index under `lease`; `db` stays local so it drops before the lease
+/// Runs the index under `lease`; the database stays local so it drops before the lease
 /// (ADR-0031). Do not add `drop(lease)` to the arm.
 fn index_with_lease(
     lease: &grooveseek::writer_lease::WriterLease,

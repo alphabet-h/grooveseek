@@ -4,7 +4,7 @@
 //! (`cargo fmt --check` runs in CI), so a module or function ends on a line
 //! holding only `}` at the indentation it started at.
 
-/// The `(1-based line number, line)` pairs of `src` that are production code:
+/// The `(1-based line number, line)` pairs of the source that are production code:
 /// every line except
 /// - a `#[cfg(test)]` line followed by `mod <name> {` (also `pub mod` /
 ///   `pub(crate) mod`), through the line holding only `}` at that `mod`
@@ -38,9 +38,9 @@ pub fn production_lines(src: &str) -> Vec<(usize, &str)> {
     out
 }
 
-/// Every `(start, end)` (1-based, inclusive) where line `start` contains
-/// `needle` and line `end` is the first line after it holding only `}` at the
-/// indentation of line `start`. A match with no such line is left out.
+/// Every `(start, end)` (1-based, inclusive) where the start line contains
+/// `needle` and the end line is the first line after it holding only `}` at
+/// the indentation of the start line. A match with no such line is left out.
 pub fn fn_ranges(src: &str, needle: &str) -> Vec<(usize, usize)> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();

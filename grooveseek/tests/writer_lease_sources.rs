@@ -1,9 +1,11 @@
-//! The commands that only read the index -- `status`, `search`, `graph`,
-//! `doctor`, `eval` and `tune` -- open it as a reader (ADR-0031): in the
-//! production lines of `main.rs`, `tune.rs` and `eval.rs` there is no writer
-//! open, only `Database::open_read_only`. `groove index` opens its writer
-//! through `Database::open_writer` / `Database::open_or_replace_corrupt_with`,
-//! whose needles below do not match.
+//! The commands that only read the index -- `groove status`, `groove search`,
+//! `groove graph`, `groove doctor`, `groove eval` and `groove tune` -- open it
+//! as a reader (ADR-0031): in the production lines of the binary's crate root
+//! and of [`grooveseek::tune`] and [`grooveseek::eval`] there is no writer
+//! open, only [`grooveseek::db::Database::open_read_only`]. `groove index`
+//! opens its writer through [`grooveseek::db::Database::open_writer`] /
+//! [`grooveseek::db::Database::open_or_replace_corrupt_with`], whose needles
+//! below do not match.
 
 use std::path::Path;
 
