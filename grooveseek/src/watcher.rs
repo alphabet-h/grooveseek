@@ -677,8 +677,10 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                         // (kuriya 566 #22) A link the write gate refused: its row, if any, is
                         // decided by the removal path, as if the path's removal had been
                         // reported. The removal gate passes a link, so a file replaced by a
-                        // hard link (or given a second name) loses its row here, as the full
-                        // index drops it. A symlink is mostly taken by the check above.
+                        // hard link loses its row here, as the full index drops it. A file that
+                        // only gains a second name elsewhere sends no event for its own path
+                        // (kuriya 569), so its row waits for the full index. A symlink is mostly
+                        // taken by the check above.
                         handle_removed_path(state, &rel, p);
                     }
                 }
@@ -1890,8 +1892,10 @@ fn gate_given(
     // symlink is. As a removal it passes without its count being read: the
     // index holds no document at a hard link either (the full walk does not
     // collect one and its deletion pass drops the row), so a file replaced by
-    // a hard link, or given a second name, loses its row rather than keeping
-    // text the index would no longer read. Every watcher path that meets a
+    // a hard link loses its row rather than keeping text the index would no
+    // longer read. This answer runs only on an event for the path: a file that
+    // only gains a second name elsewhere sends none (kuriya 569), so its row
+    // waits for the full index. Every watcher path that meets a
     // link hands it to this answer ([`handle_removed_path`],
     // [`decide_removal_in_locks`]) rather than judging the link itself.
     if gate == Gate::Removal {
