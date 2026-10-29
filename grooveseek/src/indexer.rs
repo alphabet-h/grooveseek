@@ -1033,7 +1033,12 @@ fn documents_to_delete(
 /// (ADR-0031) Candidates per immediate transaction of the prune. Wide enough that a large
 /// prune takes the write lock a few times rather than once per row, and narrow enough that
 /// one batch holds it only briefly against another writer waiting on its busy timeout.
-pub(crate) const PRUNE_BATCH: usize = 256;
+///
+/// Measured over 10 000 candidates of 3 chunks each (debug build, Windows), the longest
+/// hold of one batch was 1015 ms at 64, 2084 ms at 128, 4738 ms at 256, 8584 ms at 512 and
+/// 18116 ms at 1024; the hold grows with the width, at about 8 ms a row. No width came
+/// under 100 ms, so this is the narrowest one measured.
+pub(crate) const PRUNE_BATCH: usize = 64;
 
 /// (ADR-0031) The prune of a completed run: `candidates` (sorted) in batches of `batch`,
 /// each through [`Database::delete_documents_if_unchanged`] against the `(id, content_hash)`
@@ -10951,6 +10956,84 @@ mod tests {
         );
         assert_eq!(result.deleted as usize, PRUNE_BATCH, "{result:?}");
         assert_eq!(result.kept_changed, 1, "{result:?}");
+    }
+
+    /// Measures the prune's immediate-transaction hold time over 10 000 candidates. Not a
+    /// check: prints one line per batch width and asserts only that every candidate went.
+    /// Runs only when `GROOVE_MEASURE_PRUNE_BATCH` is set and returns at once otherwise, so
+    /// the nightly `cargo test -- --include-ignored` does not spend minutes on it.
+    ///
+    /// A batch's hold is read off `on_deleted`, which [`prune_candidates`] calls after the
+    /// batch commits: batch k runs from the last report of batch k-1 (the call itself for
+    /// the first) to its own first report.
+    #[test]
+    #[ignore = "measurement: prints prune batch hold times; needs GROOVE_MEASURE_PRUNE_BATCH"]
+    fn measure_prune_batch_hold_times_for_10k_candidates() {
+        if std::env::var_os("GROOVE_MEASURE_PRUNE_BATCH").is_none() {
+            return;
+        }
+        const DOCS: usize = 10_000;
+        const CHUNKS: i32 = 3;
+        for width in [64_usize, 128, 256, 512, 1024] {
+            let tmp = mk_tmp(&format!("pr3-measure-{width}"));
+            let (db, _other) = two_connections(&tmp);
+            {
+                let tx = db.begin_transaction().unwrap();
+                for i in 0..DOCS {
+                    let rel = format!("gone-{i:05}.md");
+                    let id = db
+                        .upsert_document(&rel, None, None, None, None, &[], None, &rel, 1)
+                        .unwrap();
+                    for c in 0..CHUNKS {
+                        db.insert_chunk(
+                            id,
+                            c,
+                            Some("h"),
+                            Some(1),
+                            &format!("body {i} {c}"),
+                            None,
+                            &[0.6_f32, 0.8],
+                            1.0,
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            let snapshot = db.all_path_ids_hashes().unwrap();
+            let mut candidates: Vec<String> = snapshot.keys().cloned().collect();
+            candidates.sort();
+
+            let mut reports: Vec<std::time::Instant> = Vec::with_capacity(DOCS);
+            let start = std::time::Instant::now();
+            let done = prune_candidates(&db, &snapshot, &candidates, width, &mut |_| {
+                reports.push(std::time::Instant::now());
+            })
+            .unwrap();
+            assert_eq!(done.deleted.len(), DOCS);
+            assert_eq!(reports.len(), DOCS);
+
+            let mut holds: Vec<f64> = (0..DOCS)
+                .step_by(width)
+                .map(|first| {
+                    let from = if first == 0 {
+                        start
+                    } else {
+                        reports[first - 1]
+                    };
+                    (reports[first] - from).as_secs_f64() * 1000.0
+                })
+                .collect();
+            let total_ms = (*reports.last().unwrap() - start).as_secs_f64() * 1000.0;
+            holds.sort_by(f64::total_cmp);
+            println!(
+                "PRUNE-BATCH width={width} batches={} max_ms={:.1} p50_ms={:.1} total_ms={total_ms:.1}",
+                holds.len(),
+                holds.last().unwrap(),
+                holds[holds.len() / 2],
+            );
+            assert!(db.all_document_paths().unwrap().is_empty());
+        }
     }
 
     /// A forced run reads its snapshot too: a row written after it is not a candidate.
