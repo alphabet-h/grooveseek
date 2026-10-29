@@ -1050,8 +1050,9 @@ impl KbServer {
                 Ok(guard) => guard,
                 Err(e) => {
                     drop(slot);
+                    let reply = core.with_writer_notice(core.writer.rebuild_refusal(&e));
                     done.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return core.with_writer_notice(core.writer.rebuild_refusal(&e));
+                    return reply;
                 }
             };
             let reply = core.rebuild_index_blocking(params, slot, guard);
@@ -6638,7 +6639,9 @@ mod tests {
 
     /// T-L8: another process holds the lease, so the claim is refused before
     /// the embedder is touched.
-    #[tokio::test]
+    // Multi-thread, so a handler that took the embedder on the async worker
+    // fails the 2 s bound instead of hanging the runtime.
+    #[tokio::test(flavor = "multi_thread")]
     async fn rebuild_refuses_at_once_while_another_process_holds_the_lease() {
         let l = LeaseKb::new("rebuild-busy");
         let _other = l.hold_lease(crate::writer_lease::Role::Index, &l.kb);
@@ -6679,7 +6682,8 @@ mod tests {
 
     /// T-L8: a reader refuses without waiting for the embedder and without
     /// ever taking the lease, and says why in `writer_notice`.
-    #[tokio::test]
+    // Multi-thread for the same reason as the test above.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_reader_refuses_rebuild_at_once_and_never_takes_the_lease() {
         let l = LeaseKb::new("rebuild-reader");
         let slot = l.slot();
