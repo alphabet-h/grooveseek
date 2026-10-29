@@ -6621,12 +6621,17 @@ mod tests {
         // The bound is 2 s rather than 300 ms: the claim runs on the blocking
         // pool, and a slow CI runner can take longer than 300 ms to start one.
         // Answering at all while the embedder is held is what shows the
-        // refusal does not wait for it.
-        let answered =
-            tokio::time::timeout(std::time::Duration::from_secs(2), rebuild_json(shared)).await;
+        // refusal does not wait for it. The handler runs in a task of its own
+        // on a worker, so one that blocked its thread on the embedder cannot
+        // stop the timeout here from firing.
+        let shared = shared.clone();
+        let call = tokio::spawn(async move { rebuild_json(&shared).await });
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
         drop(go_tx);
         holder.join().unwrap();
-        answered.expect("the refusal waited for the embedder")
+        answered
+            .expect("the refusal waited for the embedder")
+            .expect("the handler task panicked")
     }
 
     fn watch_cause(kb: &std::path::Path) -> WatchErrorCause {
@@ -6639,8 +6644,8 @@ mod tests {
 
     /// T-L8: another process holds the lease, so the claim is refused before
     /// the embedder is touched.
-    // Multi-thread, so a handler that took the embedder on the async worker
-    // fails the 2 s bound instead of hanging the runtime.
+    // The handler is spawned as its own task on a worker, so a wrong handler
+    // that took the embedder on the async worker fails the 2 s bound.
     #[tokio::test(flavor = "multi_thread")]
     async fn rebuild_refuses_at_once_while_another_process_holds_the_lease() {
         let l = LeaseKb::new("rebuild-busy");
@@ -6682,7 +6687,8 @@ mod tests {
 
     /// T-L8: a reader refuses without waiting for the embedder and without
     /// ever taking the lease, and says why in `writer_notice`.
-    // Multi-thread for the same reason as the test above.
+    // Multi-thread for the same reason as the test above: the handler runs
+    // as its own task on a worker, so a blocked worker fails the 2 s bound.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reader_refuses_rebuild_at_once_and_never_takes_the_lease() {
         let l = LeaseKb::new("rebuild-reader");
