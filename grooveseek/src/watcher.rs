@@ -32,8 +32,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{LockResult, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
 use crate::poison::{recover, recover_db};
@@ -145,6 +145,24 @@ impl WatcherState {
     /// One second first, doubling up to thirty.
     pub const DEFAULT_WATCH_BACKOFF: (Duration, Duration) =
         (Duration::from_secs(1), Duration::from_secs(30));
+
+    /// Lock `m` (the embedder or the database) for batch handling. With a
+    /// [`WatcherState::batch_probe`] set, a lock held elsewhere is counted in
+    /// [`WatchBatchProbe::lock_waits`] before the wait; without one this is
+    /// `m.lock()`.
+    fn lock_for_batch<'a, T>(&self, m: &'a Mutex<T>) -> LockResult<MutexGuard<'a, T>> {
+        if let Some(p) = &self.batch_probe {
+            match m.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(poisoned)) => return Err(poisoned),
+                Err(TryLockError::WouldBlock) => {
+                    p.lock_waits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        m.lock()
+    }
 }
 
 /// Batch counters of one watch loop, for a caller that has to know whether a
@@ -161,47 +179,10 @@ pub struct WatchBatchProbe {
     pub finished: AtomicU64,
     /// The stop signal found a batch still waiting in the channel.
     pub stopped_with_queued: AtomicBool,
-}
-
-#[cfg(test)]
-impl WatchBatchProbe {
-    /// Wait until a batch has started past `started_before` and is still in
-    /// flight, with the counts unchanged for 500 ms: a batch that long in
-    /// handling is one blocked on a lock the test holds. Returns the started
-    /// and finished counts then, or `None` after `within`.
-    ///
-    /// Not "the first batch after `started_before` is in flight": on Linux a
-    /// write is an `IN_OPEN` before its `IN_MODIFY`, and when a debouncer tick
-    /// falls between them the `Access(Open)` comes as a batch of its own that
-    /// takes no lock and finishes at once, ahead of the batch that blocks.
-    pub(crate) async fn wait_for_a_blocked_batch(
-        &self,
-        started_before: u64,
-        within: Duration,
-    ) -> Option<(u64, u64)> {
-        use std::sync::atomic::Ordering::SeqCst;
-        let deadline = std::time::Instant::now() + within;
-        let mut last = None;
-        let mut since = std::time::Instant::now();
-        loop {
-            let now = (
-                self.emitted.load(SeqCst),
-                self.started.load(SeqCst),
-                self.finished.load(SeqCst),
-            );
-            let in_flight = now.1 > started_before && now.1 > now.2;
-            if !in_flight || last != Some(now) {
-                last = Some(now);
-                since = std::time::Instant::now();
-            } else if since.elapsed() >= Duration::from_millis(500) {
-                return Some((now.1, now.2));
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
+    /// Times batch handling found the embedder or database lock held
+    /// elsewhere, counted before it waits for that lock. A batch blocked on a
+    /// lock its caller holds has counted here once.
+    pub lock_waits: AtomicU64,
 }
 
 /// Watcher タスク本体。notify の裏スレッドから tokio channel 越しにイベントを
@@ -767,7 +748,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // a link, so an ordinary event costs one `symlink_metadata` and no lock.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
                         let handled = {
-                            let db = recover_db(state.db.lock());
+                            let db = recover_db(state.lock_for_batch(&state.db));
                             match deindex_under_a_link_parts(&db, &state.kb_path, p) {
                                 Some((under, outcome)) => {
                                     match outcome {
@@ -802,7 +783,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                         // ordinary directory Modify still costs no lock.
                         if arrived {
                             let arrival = {
-                                let db = recover_db(state.db.lock());
+                                let db = recover_db(state.lock_for_batch(&state.db));
                                 act_on_arrived_directory(&db, &state.kb_path, &rel, p)
                                 // `db` is dropped here, before the scan locks it again.
                             };
@@ -1249,7 +1230,7 @@ fn remove_if_still_gone(
 /// would deadlock against every other reindex.
 fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path) {
     let under_db = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         remove_if_still_gone(
             &db,
             &state.kb_path,
@@ -2223,7 +2204,7 @@ fn hand_on_rows_the_walk_left_behind(state: &WatcherState, rel: &str, found: &[(
         return;
     }
     let held = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         db.document_paths_under(rel)
         // `db` is dropped here, before any row is handed on.
     };
@@ -2342,8 +2323,8 @@ enum ReindexOrigin<'a> {
 /// the time the locks are held, is a directory, or is there only under another case of its
 /// name keeps no row under that spelling.
 fn dispatch_reindex_from(state: &WatcherState, rel: &str, origin: ReindexOrigin<'_>) {
-    let mut embedder = recover(state.embedder.lock(), "embedder");
-    let db = recover_db(state.db.lock());
+    let mut embedder = recover(state.lock_for_batch(&state.embedder), "embedder");
+    let db = recover_db(state.lock_for_batch(&state.db));
     match origin {
         ReindexOrigin::Removal { full } => {
             reindex_after_removal_locked(state, &db, &mut embedder, rel, full)
@@ -2944,7 +2925,7 @@ fn log_reindex_result(
 }
 
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
-    let db = recover_db(state.db.lock());
+    let db = recover_db(state.lock_for_batch(&state.db));
     match indexer::deindex_single_file(&db, rel) {
         Ok(true) => wdiag!("watcher: deindexed {rel}"),
         Ok(false) => { /* no-op: not in DB */ }
@@ -3112,7 +3093,7 @@ fn subtree_removal_under_lock(
 /// why.
 fn dispatch_subtree_removal(state: &WatcherState, p: &Path) {
     let decided = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         subtree_removal_under_lock(&db, &state.kb_path, p)
         // `db` is dropped here, before any row under the directory is handled.
     };
@@ -3436,8 +3417,8 @@ fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
 /// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
 /// is gone by then ([`finish_rename_locked`]).
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) {
-    let mut embedder = recover(state.embedder.lock(), "embedder");
-    let db = recover_db(state.db.lock());
+    let mut embedder = recover(state.lock_for_batch(&state.embedder), "embedder");
+    let db = recover_db(state.lock_for_batch(&state.db));
     let kb_path = &state.kb_path;
     let dest = written_path_on_disk(kb_path, new_rel, look);
     let plan = match rename_plan(&db, old_rel, new_rel, dest) {
@@ -4451,7 +4432,7 @@ fn dispatch_directory_rename(
     }
     let entry = match to_kind {
         ToState::Missing => {
-            let db = recover_db(state.db.lock());
+            let db = recover_db(state.lock_for_batch(&state.db));
             dir_rename_entry(to_kind, Some(&db), old_rel)
             // `db` is dropped here, before the outcome is acted on.
         }
@@ -4474,7 +4455,7 @@ fn dispatch_directory_rename(
     let mut moves = true;
     if entry == DirRenameEntry::ScanDestination {
         let (listed, to_spelled) = {
-            let db = recover_db(state.db.lock());
+            let db = recover_db(state.lock_for_batch(&state.db));
             (
                 db.document_paths_under(old_rel),
                 arrived_directory_on_disk(&state.kb_path, new_rel, to),
@@ -4553,7 +4534,7 @@ fn dispatch_directory_rename(
     // range delete share one db lock region; on the sweep-only path the delete
     // takes the listed rows too.
     let swept = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         sweep_source_if_gone(&db, &state.kb_path, from)
         // `db` is dropped here, before any `dispatch_*` locks it again.
     };
@@ -10786,14 +10767,22 @@ mod tests {
             let _ = release_rx.recv();
         });
         locked_rx.recv().unwrap();
+        let waits_before = probe.lock_waits.load(SeqCst);
 
         std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten mid batch\n").unwrap();
-        // On Linux the write's `Access(Open)` can come as a batch of its own
-        // that takes no lock and finishes first; wait for the one that blocks.
-        let (started, finished) = probe
-            .wait_for_a_blocked_batch(0, Duration::from_secs(10))
-            .await
-            .unwrap_or_else(|| panic!("no batch blocked within 10 s: {probe:?}"));
+        // Not "a batch is in flight": on Linux the write's `Access(Open)` can
+        // come as a batch of its own that takes no lock and finishes first.
+        // A rise in `lock_waits` says a batch has reached the held lock.
+        let reached = poll_until(Duration::from_secs(10), || {
+            probe.lock_waits.load(SeqCst) > waits_before
+        })
+        .await;
+        assert!(
+            reached,
+            "no batch reached the held lock within 10 s: {probe:?}"
+        );
+        // The loop handles one batch at a time, and this one is blocked.
+        let (started, finished) = (probe.started.load(SeqCst), probe.finished.load(SeqCst));
         stop_tx.send(true).unwrap();
         // The batch is blocked on the lock, so the loop must still be running.
         tokio::time::sleep(Duration::from_millis(200)).await;

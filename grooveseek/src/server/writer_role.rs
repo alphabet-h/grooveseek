@@ -1452,14 +1452,19 @@ mod tests {
         let n0_emitted = probe.emitted.load(SeqCst);
 
         let held = DbHolder::hold(Arc::clone(&ts.shared.db));
+        let waits_before = probe.lock_waits.load(SeqCst);
         (case.trigger)(&ts.kb.kb);
-        // Any batch in flight on the held db, not the first after `n0`: on
-        // Linux the write's `Access(Open)` can come as a batch of its own that
-        // takes no db and finishes ahead of the one that blocks.
-        let (s1, f1) = probe
-            .wait_for_a_blocked_batch(n0, WITHIN)
-            .await
-            .unwrap_or_else(|| panic!("a batch must block on the db within 10 s: {probe:?}"));
+        // Not "a batch after `n0` is in flight": on Linux the write's
+        // `Access(Open)` can come as a batch of its own that takes no db and
+        // finishes ahead of the one that blocks. A rise in `lock_waits` says a
+        // batch has reached the held db.
+        let reached = eventually(WITHIN, || probe.lock_waits.load(SeqCst) > waits_before).await;
+        assert!(
+            reached,
+            "a batch must reach the held db within 10 s: {probe:?}"
+        );
+        // The loop handles one batch at a time, and this one is blocked.
+        let (s1, f1) = (probe.started.load(SeqCst), probe.finished.load(SeqCst));
 
         let writer = Arc::clone(&ts.writer);
         let db = Arc::clone(&ts.shared.db);
