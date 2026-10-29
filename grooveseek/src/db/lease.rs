@@ -67,9 +67,14 @@ impl std::fmt::Display for OneTimeWriteBusy {
 
 impl std::error::Error for OneTimeWriteBusy {}
 
+/// How long a reader's connection waits on a SQLite lock, as [`Database::init`]
+/// sets it; set before [`Database::init`] so that its first statement waits too.
+const READER_BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
+
 /// How one reader open attempt failed.
 enum AttemptFailure {
-    /// [`Database::init`] wanted to write and `query_only` refused it.
+    /// [`Database::init`] wanted to write and `query_only` refused it, or
+    /// there is no database yet, which only a lease holder may create.
     Refusal,
     /// Anything else, worded as [`Database::open`] words it.
     Fail(anyhow::Error),
@@ -145,9 +150,9 @@ impl Drop for QueryOnlyRestore<'_> {
 impl Database {
     /// Open (or create) the database at the given path as a reader: the
     /// connection runs with `PRAGMA query_only` on. A schema upgrade
-    /// [`Self::init`] needs, or a missing file, is written once under a short
-    /// writer lease (2 s wait); if a writer holds it, the error's root is
-    /// [`OneTimeWriteBusy`].
+    /// [`Self::init`] needs, or a missing or empty file, is written once under
+    /// a short writer lease (2 s wait); if a writer holds it, the error's root
+    /// is [`OneTimeWriteBusy`] and the reader has created nothing.
     /// Why: ADR-0031.
     pub fn open_read_only(path: &str, kb_path: &Path) -> Result<Self> {
         Self::open_read_only_with(path, kb_path, &|| {})
@@ -156,9 +161,13 @@ impl Database {
     /// [`Database::open_read_only`] with a hook run after the refusal is read
     /// and before the lease is waited for, so a test can change the world there.
     fn open_read_only_with(path: &str, kb_path: &Path, before_lease: &dyn Fn()) -> Result<Self> {
+        // Every attempt opens without CREATE: the file is created only by
+        // `open_writer` below, under the lease, so whether it exists is
+        // decided again there and not on what an attempt saw.
         let attempt = || -> std::result::Result<Self, AttemptFailure> {
             let (db, e) = match Self::open_query_only(path) {
-                Ok(db) => return Ok(db),
+                Ok(Some(db)) => return Ok(db),
+                Ok(None) => return Err(AttemptFailure::Refusal),
                 Err(failed) => failed,
             };
             Err(classify_attempt_error(path, db, e))
@@ -200,16 +209,19 @@ impl Database {
         }
     }
 
-    /// One reader open attempt: connect, switch `query_only` on, then [`Self::init`].
-    /// On failure the connection is handed back (when there is one) so the
-    /// caller can tell a `query_only` refusal from anything else.
+    /// One reader open attempt: connect to an existing database
+    /// ([`open_existing`]), switch `query_only` on, then [`Self::init`].
+    /// `Ok(None)` when there is no database yet. On failure the connection is
+    /// handed back (when there is one) so the caller can tell a `query_only`
+    /// refusal from anything else.
     #[allow(clippy::result_large_err)]
-    fn open_query_only(path: &str) -> std::result::Result<Self, (Option<Self>, anyhow::Error)> {
+    fn open_query_only(
+        path: &str,
+    ) -> std::result::Result<Option<Self>, (Option<Self>, anyhow::Error)> {
         ensure_vec_extension();
-        let conn = match Connection::open(path)
-            .with_context(|| format!("failed to open database at {path}"))
-        {
-            Ok(conn) => conn,
+        let conn = match open_existing(path) {
+            Ok(Some(conn)) => conn,
+            Ok(None) => return Ok(None),
             Err(e) => return Err((None, e)),
         };
         let db = Self {
@@ -221,10 +233,15 @@ impl Database {
         if let Err(e) = db.set_query_only(true) {
             return Err((Some(db), e));
         }
+        // `init`'s first statement reads the header, which a writer that has
+        // just created the file may hold locked for a moment.
+        if let Err(e) = db.conn.busy_timeout(READER_BUSY_TIMEOUT) {
+            return Err((Some(db), e.into()));
+        }
         if let Err(e) = db.init() {
             return Err((Some(db), e));
         }
-        Ok(db)
+        Ok(Some(db))
     }
 
     /// Run `f` as this reader's one-time write: take the writer lease as
@@ -334,6 +351,62 @@ impl Database {
     pub(crate) fn set_query_only(&self, on: bool) -> Result<()> {
         self.conn.pragma_update(None, "query_only", on)?;
         Ok(())
+    }
+}
+
+/// Open the database at the given path for a reader without creating it: `None` when
+/// there is no database yet -- the file is missing, or empty because a writer
+/// has created it and not yet written the header. Only a lease holder creates
+/// one (ADR-0031): a reader that created the file, or read an empty one with
+/// `query_only` on (`PRAGMA journal_mode = WAL` still writes the header), would
+/// write it outside the lease while a writer may be initialising it.
+fn open_existing(path: &str) -> Result<Option<Connection>> {
+    use rusqlite::OpenFlags;
+    // READ_WRITE without CREATE, not READ_ONLY: a write refused on a READ_ONLY
+    // connection is not a `query_only` refusal, so a needed migration would go unseen.
+    let flags = OpenFlags::default() - OpenFlags::SQLITE_OPEN_CREATE;
+    let failed = || format!("failed to open database at {path}");
+    let mut reopened = false;
+    loop {
+        let e = match Connection::open_with_flags(path, flags) {
+            Ok(conn) => {
+                return match std::fs::metadata(path) {
+                    Ok(m) if m.len() > 0 => Ok(Some(conn)),
+                    Ok(_) => Ok(None),
+                    Err(m) if m.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(m) => Err(anyhow::Error::new(m).context(failed())),
+                };
+            }
+            Err(e) => e,
+        };
+        let cannot_open = matches!(
+            &e,
+            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen
+        );
+        if cannot_open {
+            match std::fs::metadata(path) {
+                // Missing, in a directory that is there (a missing directory
+                // keeps the error it always had).
+                Err(m) if m.kind() == std::io::ErrorKind::NotFound && parent_is_dir(path) => {
+                    return Ok(None);
+                }
+                // Created between the open and this look: open it once more.
+                Ok(m) if m.is_file() && !reopened => {
+                    reopened = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Err(anyhow::Error::new(e).context(failed()));
+    }
+}
+
+/// Whether the directory a database at the given path would be created in exists.
+fn parent_is_dir(path: &str) -> bool {
+    match Path::new(path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.is_dir(),
+        _ => true,
     }
 }
 
@@ -671,6 +744,111 @@ mod tests {
         assert_eq!(busy.purpose, OneTimeWrite::SchemaUpgrade);
         let size = std::fs::metadata(&path).map(|m| m.len());
         eprintln!("P2 header: size of the missing DB after a refused reader open = {size:?}");
+    }
+
+    /// Whether `<path>`, `<path>-wal` or `<path>-shm` exists.
+    fn any_db_file(path: &str) -> bool {
+        ["", "-wal", "-shm"]
+            .iter()
+            .any(|side| Path::new(&format!("{path}{side}")).exists())
+    }
+
+    #[test]
+    fn open_read_only_on_a_missing_db_while_a_writer_holds_the_lease_creates_nothing() {
+        // Local Codex review round 3: the reader must not create the file, or
+        // write its header, outside the lease.
+        let dir = TempDir::new("ro-missing-held-nothing");
+        let kb = kb_of(&dir);
+        let path = db_path_of(&dir);
+        let held = WriterLease::try_acquire(Path::new(&path), Role::Index, &kb).unwrap();
+        let err = open_read_only_err(&path, &kb);
+        let busy = err
+            .downcast_ref::<OneTimeWriteBusy>()
+            .unwrap_or_else(|| panic!("not OneTimeWriteBusy: {err:#}"));
+        assert_eq!(busy.purpose, OneTimeWrite::SchemaUpgrade);
+        assert!(!any_db_file(&path), "the reader created the DB file");
+        drop(held);
+
+        let r = Database::open_read_only(&path, &kb).unwrap();
+        assert!(Path::new(&path).is_file());
+        assert_eq!(query_only_flag(&r), 1);
+        drop(r);
+        assert!(lease_is_free(&path, &kb));
+    }
+
+    #[test]
+    fn open_read_only_leaves_an_empty_db_alone_while_its_writer_initialises_it() {
+        // Local Codex review round 3, the deterministic interleaving: the index
+        // holder has created the file (0 bytes, as `Connection::open` leaves
+        // it) and not yet run `init` when a reader opens it.
+        let dir = TempDir::new("ro-empty-held");
+        let kb = kb_of(&dir);
+        let path = db_path_of(&dir);
+        let held = WriterLease::try_acquire(Path::new(&path), Role::Index, &kb).unwrap();
+        let created = Connection::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let err = open_read_only_err(&path, &kb);
+        let busy = err
+            .downcast_ref::<OneTimeWriteBusy>()
+            .unwrap_or_else(|| panic!("not OneTimeWriteBusy: {err:#}"));
+        assert_eq!(busy.purpose, OneTimeWrite::SchemaUpgrade);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "the reader wrote the header"
+        );
+
+        // The writer's own init goes through, with no SQLite error left by the reader.
+        drop(created);
+        let w = Database::open_writer(&path, &held).unwrap();
+        w.verify_embedding_meta(MODEL, DIM).unwrap();
+        drop(w);
+        drop(held);
+
+        let r = Database::open_read_only(&path, &kb).unwrap();
+        assert_eq!(query_only_flag(&r), 1);
+        assert_eq!(
+            r.read_embedding_meta().unwrap(),
+            Some((MODEL.to_string(), DIM))
+        );
+    }
+
+    #[test]
+    fn open_read_only_rereads_once_when_the_holder_created_the_missing_db_meanwhile() {
+        // I42 for a missing DB.
+        let dir = TempDir::new("ro-missing-reread");
+        let kb = kb_of(&dir);
+        let path = db_path_of(&dir);
+        let held: Mutex<Option<WriterLease>> = Mutex::new(None);
+        let before_lease = || {
+            assert!(!any_db_file(&path), "the first attempt created the DB file");
+            let lease = WriterLease::try_acquire(Path::new(&path), Role::Index, &kb).unwrap();
+            drop(Database::open_writer(&path, &lease).unwrap());
+            *held.lock().unwrap() = Some(lease);
+        };
+        let r = Database::open_read_only_with(&path, &kb, &before_lease).unwrap();
+        assert!(
+            held.lock().unwrap().is_some(),
+            "before_lease was not called"
+        );
+        assert_eq!(query_only_flag(&r), 1);
+    }
+
+    #[test]
+    fn open_read_only_on_a_directory_fails_without_waiting_for_the_lease() {
+        let dir = TempDir::new("ro-dir");
+        let kb = kb_of(&dir);
+        let path = dir.path().join("a-directory");
+        std::fs::create_dir_all(&path).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        let err = open_read_only_err(&path, &kb);
+        assert!(err.downcast_ref::<OneTimeWriteBusy>().is_none(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("failed to open database"),
+            "{err:#}"
+        );
+        assert!(!WriterLease::lock_path_for(Path::new(&path)).exists());
     }
 
     #[test]
