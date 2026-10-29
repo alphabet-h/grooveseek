@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-use crate::db::{ChunkVector, Database, FrontmatterTopic};
+use crate::db::{CasDelete, ChunkVector, Database, FrontmatterTopic, PathIdHash};
 use crate::embedder::Embedder;
 use crate::parser::{ParserExt, Registry};
 use crate::quality;
@@ -1030,6 +1030,58 @@ fn documents_to_delete(
         .collect()
 }
 
+/// (ADR-0031) Candidates per immediate transaction of the prune. Wide enough that a large
+/// prune takes the write lock a few times rather than once per row, and narrow enough that
+/// one batch holds it only briefly against another writer waiting on its busy timeout.
+pub(crate) const PRUNE_BATCH: usize = 256;
+
+/// (ADR-0031) The prune of a completed run: `candidates` (sorted) in batches of `batch`,
+/// each through [`Database::delete_documents_if_unchanged`] against the `(id, content_hash)`
+/// the run read into `snapshot` before its walk. `on_deleted` is called for each deleted
+/// path after its batch commits. An `Err` from a batch is returned as is; that batch wrote
+/// nothing, and the batches before it stay committed.
+fn prune_candidates(
+    db: &Database,
+    snapshot: &PathIdHash,
+    candidates: &[String],
+    batch: usize,
+    on_deleted: &mut dyn FnMut(&str),
+) -> Result<CasDelete> {
+    let mut out = CasDelete::default();
+    for slice in candidates.chunks(batch.max(1)) {
+        // Every candidate comes from the snapshot's keys; one that does not is not deleted.
+        let expected: Vec<(&str, i64, &str)> = slice
+            .iter()
+            .filter_map(|p| {
+                snapshot
+                    .get(p)
+                    .map(|(id, hash)| (p.as_str(), *id, hash.as_str()))
+            })
+            .collect();
+        let done = db.delete_documents_if_unchanged(&expected)?;
+        for path in &done.deleted {
+            on_deleted(path);
+        }
+        out.kept_changed += done.kept_changed;
+        out.deleted.extend(done.deleted);
+    }
+    Ok(out)
+}
+
+/// (ADR-0031) The stderr line for the rows the prune kept because another writer changed
+/// them during the run; `None` for 0. ASCII.
+fn kept_changed_note(n: u32) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            concat!(
+                "note: kept {} row(s) another writer changed during this run; ",
+                "the next run checks them again."
+            ),
+            n
+        )
+    })
+}
+
 /// (feature-60) The order the per-document loop in [`rebuild_index`] visits `entries`: those
 /// whose `rel` is in `first` (the renames that force a re-parse), then the rest, each group in
 /// the order `entries` already has -- the walk's, which sorts `PathBuf`s component by
@@ -1104,6 +1156,10 @@ pub struct IndexResult {
     /// chunks all match. Always 0 under `force`, which embeds every chunk. For a
     /// [`Self::cancelled`] run, the count up to the stop.
     pub chunks_reused: u32,
+    /// (ADR-0031) Rows the prune kept because another writer changed them during this run
+    /// (their `(id, content_hash)` no longer matched what the run read before its walk). The
+    /// next run judges them again. Always 0 for a [`Self::cancelled`] run, which does not prune.
+    pub kept_changed: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
     /// (v1.14.0+) The run stopped at a check point because the
@@ -1483,6 +1539,12 @@ pub fn rebuild_index(
     };
     let refresh_any = refresh_frontmatter || refresh_fields;
 
+    // (ADR-0031) Every row's `(id, content_hash)`, read once before the walk, also under
+    // `force`. Under the writer lock no other writer runs; against a writer that does not take
+    // it, the prune below compares each candidate with this snapshot and keeps the rows that
+    // writer changed in the meantime. The rename detection's `(path, hash)` map is built from it.
+    let snapshot: PathIdHash = db.all_path_ids_hashes()?;
+
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
     // 起動時に 1 度解決して焼き込むと、daemon 側だけ古い規則で走り続ける。
@@ -1541,10 +1603,13 @@ pub fn rebuild_index(
     // so the scan can tell which files rename detection may pair -- a path the index does not
     // hold whose hash a row does -- and read their frontmatter topic from the bytes it hashes.
     // Nothing writes between here and the renames below. `force` detects no renames.
-    let db_path_hashes = if force {
+    let db_path_hashes: std::collections::HashMap<String, String> = if force {
         std::collections::HashMap::new()
     } else {
-        db.all_path_hashes()?
+        snapshot
+            .iter()
+            .map(|(path, (_, hash))| (path.clone(), hash.clone()))
+            .collect()
     };
     let db_hashes: HashSet<&str> = db_path_hashes.values().map(String::as_str).collect();
     let rename_candidate =
@@ -2058,11 +2123,21 @@ pub fn rebuild_index(
 
     // 3. Delete documents in DB that no longer exist on disk.
     //    §4.2 統一原則: visited ∪ skipped は保持、それ以外 (= disk から消えた) のみ削除。
-    let all_db_paths = db.all_document_paths()?;
-    for db_path in documents_to_delete(&all_db_paths, &visited_paths, &skipped_paths) {
-        db.delete_document(&db_path)?;
+    //    (ADR-0031) The candidates are the snapshot's paths, sorted as `ORDER BY path` sorts
+    //    them, so the batch boundaries are the same from run to run. A row written after the
+    //    snapshot is not a candidate, and each batch deletes only the rows whose `(id, hash)`
+    //    still match it; a deleted row is counted after its batch commits.
+    let mut snapshot_paths: Vec<String> = snapshot.keys().cloned().collect();
+    snapshot_paths.sort_unstable();
+    let candidates = documents_to_delete(&snapshot_paths, &visited_paths, &skipped_paths);
+    let pruned = prune_candidates(db, &snapshot, &candidates, PRUNE_BATCH, &mut |path| {
         tally.deleted += 1;
-        progress.report_deleted(&db_path);
+        progress.report_deleted(path);
+    })?;
+    tally.kept_changed = pruned.kept_changed;
+    // Not through `progress`: a quiet or callback reporter would drop the count.
+    if let Some(note) = kept_changed_note(tally.kept_changed) {
+        eprintln!("{note}");
     }
 
     // (#251, codex P2 round 6 on PR #291) Every unchanged Markdown document has now been
@@ -10712,5 +10787,261 @@ mod tests {
             parsed_bodies(&registry, "note.md", I552_BYTES),
             "the row's chunks are not the Markdown parser's"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The prune against a writer that does not take the writer lock (ADR-0031)
+    // -----------------------------------------------------------------------
+
+    /// A file database under `dir` opened twice: the run's connection and a second one that
+    /// stands for another writer. Both carry the stub embedder's meta.
+    fn two_connections(dir: &TmpDir) -> (Database, Database) {
+        let db_file = dir.0.join("index.db");
+        let open = || {
+            let db = Database::open(db_file.to_str().unwrap()).unwrap();
+            db.verify_embedding_meta("test-model", 2).unwrap();
+            db
+        };
+        let run = open();
+        let other = open();
+        (run, other)
+    }
+
+    /// `rebuild_index` over `kb` with the stub embedder, no schema, and `registry`.
+    fn prune_run(
+        db: &Database,
+        kb: &std::path::Path,
+        registry: &Registry,
+        force: bool,
+        progress: progress::ProgressReporter,
+    ) -> IndexResult {
+        rebuild_index(
+            db,
+            &mut Embedder::stub_for_tests(2),
+            kb,
+            None,
+            force,
+            None,
+            &[],
+            registry,
+            progress,
+            ContextMode::Off,
+        )
+        .unwrap()
+    }
+
+    /// The `(id, content_hash)` of `rel`'s row, read on `db`.
+    fn id_hash(db: &Database, rel: &str) -> Option<(i64, String)> {
+        db.all_path_ids_hashes().unwrap().remove(rel)
+    }
+
+    /// The last event of the per-document loop: an `Indexed` or `Unchanged` with `done == total`.
+    fn is_last_loop_event(event: &progress::ProgressEvent<'_>) -> bool {
+        matches!(
+            event,
+            progress::ProgressEvent::Indexed { done, total, .. }
+                | progress::ProgressEvent::Unchanged { done, total, .. }
+                if done == total
+        )
+    }
+
+    /// Rows another writer changed after the run read its snapshot are kept, each counted in
+    /// `kept_changed`; the untouched one is pruned; a row written after the snapshot is not a
+    /// candidate at all.
+    #[test]
+    fn t_a1_the_prune_keeps_rows_another_writer_changed_during_the_run() {
+        let tmp = mk_tmp("pr3-ta1");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        for rel in ["g1.md", "g2.md", "g3.md"] {
+            // Not a sha256, so no file on disk pairs with it as a rename.
+            write_row(&db, rel, &format!("h-{}", &rel[..2]), &[]);
+        }
+        let g2_before = id_hash(&db, "g2.md").unwrap();
+        let kb_cb = kb.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !is_last_loop_event(&event) || done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // (a) a new document, on disk and in the index
+            write_file(&kb_cb, "new.md", "# new\n");
+            other
+                .upsert_document("new.md", None, None, None, None, &[], None, "h-new", 1)
+                .unwrap();
+            // (b) a candidate's hash changed
+            other.overwrite_content_hash(&["g1.md"], "changed").unwrap();
+            // (c) a candidate deleted and written again under the same hash: a new id
+            other.delete_document("g2.md").unwrap();
+            other
+                .upsert_document("g2.md", None, None, None, None, &[], None, "h-g2", 1)
+                .unwrap();
+            // (d) g3.md is left alone
+        }));
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        let g2_after = id_hash(&db, "g2.md").expect("g2.md was pruned");
+        assert_ne!(g2_after.0, g2_before.0, "the re-created g2.md kept its id");
+        assert!(id_hash(&db, "new.md").is_some(), "new.md was pruned");
+        assert_eq!(
+            id_hash(&db, "g1.md").map(|(_, h)| h).as_deref(),
+            Some("changed"),
+            "g1.md was pruned or rewritten"
+        );
+        assert!(id_hash(&db, "g3.md").is_none(), "g3.md was kept");
+        assert_eq!(result.kept_changed, 2, "{result:?}");
+        assert_eq!(result.deleted, 1, "{result:?}");
+    }
+
+    /// The batches are separate transactions: a change made after the first batch committed is
+    /// seen by the batch that holds the changed row.
+    #[test]
+    fn t_a2_a_later_batch_sees_a_change_made_after_the_first_batch_committed() {
+        let tmp = mk_tmp("pr3-ta2");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        let rels: Vec<String> = (0..=PRUNE_BATCH)
+            .map(|i| format!("gone-{i:04}.md"))
+            .collect();
+        {
+            let tx = db.begin_transaction().unwrap();
+            for rel in &rels {
+                write_row(&db, rel, &format!("h-{rel}"), &[]);
+            }
+            tx.commit().unwrap();
+        }
+        let last = rels.last().unwrap().clone();
+        let last_cb = last.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            let progress::ProgressEvent::Deleted { rel } = event else {
+                return;
+            };
+            if done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // (i) the first batch has committed before its deletes are reported
+            assert!(
+                other.get_document_hash(rel).unwrap().is_none(),
+                "{rel} was reported before its batch committed"
+            );
+            // (ii) the row the second batch holds changes
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&[last_cb.as_str()], "changed")
+                    .unwrap(),
+                1
+            );
+        }));
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        for rel in &rels[..PRUNE_BATCH] {
+            assert!(id_hash(&db, rel).is_none(), "{rel} was kept");
+        }
+        assert_eq!(
+            id_hash(&db, &last).map(|(_, h)| h).as_deref(),
+            Some("changed"),
+            "the changed row of the second batch was pruned"
+        );
+        assert_eq!(result.deleted as usize, PRUNE_BATCH, "{result:?}");
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+    }
+
+    /// A forced run reads its snapshot too: a row written after it is not a candidate.
+    #[test]
+    fn a_forced_run_does_not_prune_rows_written_after_its_snapshot() {
+        let tmp = mk_tmp("pr3-force-late");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !is_last_loop_event(&event) || done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            other
+                .upsert_document("late.md", None, None, None, None, &[], None, "h-late", 1)
+                .unwrap();
+        }));
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, true, progress);
+
+        assert!(id_hash(&db, "late.md").is_some(), "late.md was pruned");
+        assert_eq!(result.deleted, 0, "{result:?}");
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+    }
+
+    /// A run with no other writer keeps nothing it should prune and prunes only what is gone:
+    /// the renames (one within a parser, one across parsers) and an oversized file's row are
+    /// not counted as kept, and the row of a file removed from disk goes.
+    #[test]
+    fn a_run_alone_keeps_nothing_and_prunes_what_is_gone() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let tmp = mk_tmp("pr3-alone");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let (db, _other) = two_connections(&tmp);
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(32),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string()];
+        let registry =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+                .expect("md + txt");
+
+        // a.md -> b.md, the same bytes and the same parser
+        let ab: &[u8] = b"# ab\n\nsame body\n";
+        std::fs::write(kb.join("b.md"), ab).unwrap();
+        let ab_chunks = parse_doc(&registry, "md", "a.md", ab).chunks;
+        write_row(&db, "a.md", &sha256_hex_bytes(ab), &ab_chunks);
+        // c.txt -> c.md, the same bytes across parsers
+        let c: &[u8] = b"# c\n\nmoved body\n";
+        std::fs::write(kb.join("c.md"), c).unwrap();
+        let c_chunks = parse_doc(&registry, "txt", "c.txt", c).chunks;
+        write_row(&db, "c.txt", &sha256_hex_bytes(c), &c_chunks);
+        // gone.md: a row whose file is not on disk
+        write_row(&db, "gone.md", "h-gone", &[]);
+        // big.md: on disk past the text cap, with a row
+        std::fs::write(kb.join("big.md"), [b'x'; 64]).unwrap();
+        write_row(&db, "big.md", "h-big", &[]);
+
+        let result = prune_run(
+            &db,
+            &kb,
+            &registry,
+            false,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+        assert_eq!(result.deleted, 1, "{result:?}");
+        assert!(id_hash(&db, "gone.md").is_none(), "gone.md was kept");
+        assert!(id_hash(&db, "a.md").is_none(), "a.md is still there");
+        assert!(id_hash(&db, "c.txt").is_none(), "c.txt is still there");
+        assert!(id_hash(&db, "b.md").is_some(), "b.md is missing");
+        assert!(id_hash(&db, "c.md").is_some(), "c.md is missing");
+        assert!(id_hash(&db, "big.md").is_some(), "big.md was pruned");
+    }
+
+    #[test]
+    fn kept_changed_note_is_ascii_and_absent_for_zero() {
+        assert_eq!(kept_changed_note(0), None);
+        let note = kept_changed_note(3).unwrap();
+        assert_eq!(
+            note,
+            concat!(
+                "note: kept 3 row(s) another writer changed during this run; ",
+                "the next run checks them again."
+            )
+        );
+        assert!(note.is_ascii());
     }
 }
