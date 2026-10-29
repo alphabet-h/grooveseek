@@ -161,15 +161,17 @@ impl Database {
     /// [`Database::open_read_only`] with a hook run after the refusal is read
     /// and before the lease is waited for, so a test can change the world there.
     fn open_read_only_with(path: &str, kb_path: &Path, before_lease: &dyn Fn()) -> Result<Self> {
-        // Resolved once, before the first attempt: the reader then holds the
-        // file a lease on this same path locks, so a later one-time write
-        // under that lease ([`Self::write_once_under_lease`]) writes the file
-        // it locked, even if a symlink at `path` is repointed meanwhile.
+        // Resolved once, whole, before the first attempt: the reader then
+        // holds the file a lease on this same path locks, so a later one-time
+        // write under that lease ([`Self::write_once_under_lease`]) writes the
+        // file it locked, even if a symlink at `path` or a directory link
+        // above it is repointed meanwhile. Messages keep the caller's spelling.
+        let shown = path;
         let resolved = WriterLease::resolved_db_path(Path::new(path));
         let resolved = match resolved.to_str() {
             Some(p) => p.to_string(),
             None => anyhow::bail!(
-                "the database at {path} is a symlink to a path that is not valid UTF-8, which groove cannot open"
+                "the database at {path} resolves to a path that is not valid UTF-8, which groove cannot open"
             ),
         };
         let path = resolved.as_str();
@@ -182,7 +184,7 @@ impl Database {
                 Ok(None) => return Err(AttemptFailure::Refusal),
                 Err(failed) => failed,
             };
-            Err(classify_attempt_error(path, db, e))
+            Err(classify_attempt_error(shown, db, e))
         };
         match attempt() {
             Ok(db) => return Ok(db),
@@ -203,7 +205,7 @@ impl Database {
                     Ok(db) => Ok(db),
                     Err(AttemptFailure::Fail(e)) => Err(e),
                     Err(AttemptFailure::Refusal) => anyhow::bail!(
-                        "the index at {path} still needs a schema upgrade after one was run"
+                        "the index at {shown} still needs a schema upgrade after one was run"
                     ),
                 }
             }
@@ -213,7 +215,7 @@ impl Database {
                 Err(AttemptFailure::Fail(e)) => Err(e),
                 Err(AttemptFailure::Refusal) => Err(anyhow::Error::new(OneTimeWriteBusy {
                     purpose: OneTimeWrite::SchemaUpgrade,
-                    db_path: db_path.to_path_buf(),
+                    db_path: PathBuf::from(shown),
                     holder,
                 })),
             },
@@ -284,15 +286,16 @@ impl Database {
             Err(e @ LeaseError::Io { .. }) => return Err(anyhow::Error::new(e)),
         };
         // The lease covers the file `db_path` resolved to just now; this
-        // connection was opened earlier. If a symlink at `db_path` was
-        // repointed in between, they are different files, and writing here
-        // would write a file another process's lease may cover (ADR-0031).
-        if !connection_is_on(&self.conn, lease.db_path()) {
+        // connection was opened earlier. If a symlink in `db_path` (at the
+        // file or a directory above it) was repointed in between, they are
+        // different files, and writing here would write a file another
+        // process's lease may cover (ADR-0031).
+        if !connection_is_on(&self.conn, lease.resolved_path()) {
             anyhow::bail!(
                 "the index at {} now resolves to {}, not the file this connection opened; \
                  nothing was written, run the command again",
                 db_path.display(),
-                lease.db_path().display()
+                lease.resolved_path().display()
             );
         }
         // From here on the guard puts query_only back on before the lease
@@ -359,17 +362,19 @@ impl Database {
     /// [`Database::open`] for a process that holds the writer lease; asking
     /// for the lease is how the caller shows it holds one. When the given path
     /// is the one the lease was asked for, the file opened is the one the lease
-    /// locks ([`WriterLease::db_path`], resolved when it was taken), not what
-    /// that path names now: a symlink repointed in between would otherwise put
-    /// this writer on a file another process's lease covers (ADR-0031).
+    /// locks ([`WriterLease::resolved_path`], resolved when it was taken), not
+    /// what that path names now: a symlink repointed in between, at the file or
+    /// at a directory above it, would otherwise put this writer on a file
+    /// another process's lease covers (ADR-0031). A corrupt file is named as
+    /// the caller spelled it.
     pub fn open_writer(path: &str, lease: &WriterLease) -> Result<Self> {
-        Self::open(&leased_path(path, lease)?)
+        Self::open(&leased_path(path, lease)?).map_err(|e| shown_as(e, path))
     }
 
     /// [`Database::open_or_replace_corrupt`] for a process that holds the
     /// writer lease, on the same file as [`Database::open_writer`] picks.
     pub fn open_or_replace_corrupt_with(path: &str, lease: &WriterLease) -> Result<(Self, bool)> {
-        Self::open_or_replace_corrupt(&leased_path(path, lease)?)
+        Self::open_or_replace_corrupt(&leased_path(path, lease)?).map_err(|e| shown_as(e, path))
     }
 
     /// Set `PRAGMA query_only` on this connection: while it is on, every
@@ -381,7 +386,7 @@ impl Database {
 }
 
 /// The file a writer under the given lease opens for the given path: the
-/// lease's resolved database ([`WriterLease::db_path`]) when the path is
+/// lease's resolved database ([`WriterLease::resolved_path`]) when the path is
 /// spelled as the lease was asked for, else the path as given. No production
 /// caller passes another path: the binary opens its writer only in its
 /// index command, under the lease it took on that same path.
@@ -389,11 +394,24 @@ fn leased_path(path: &str, lease: &WriterLease) -> Result<String> {
     if Path::new(path) != lease.requested_path() {
         return Ok(path.to_string());
     }
-    match lease.db_path().to_str() {
+    match lease.resolved_path().to_str() {
         Some(p) => Ok(p.to_string()),
         None => anyhow::bail!(
-            "the database at {path} is a symlink to a path that is not valid UTF-8, which groove cannot open"
+            "the database at {path} resolves to a path that is not valid UTF-8, which groove cannot open"
         ),
+    }
+}
+
+/// A [`CorruptDatabase`] from opening the resolved path, renamed to the path
+/// the caller spelled (the same file when the lease was taken): messages show
+/// the operator's spelling, not a canonical one. Any other error is kept.
+fn shown_as(e: anyhow::Error, shown: &str) -> anyhow::Error {
+    match e.downcast::<CorruptDatabase>() {
+        Ok(mut corrupt) => {
+            corrupt.path = shown.to_string();
+            anyhow::Error::new(corrupt)
+        }
+        Err(e) => e,
     }
 }
 
@@ -1346,6 +1364,111 @@ mod tests {
             let db = Database::open(db.to_str().unwrap()).unwrap();
             assert!(db.read_embedding_meta().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn the_writer_stays_in_its_directory_after_a_directory_link_above_the_db_is_repointed() {
+        // Local Codex pre-push, second round of this push [high]: the
+        // deterministic interleaving is acquire -> repoint the directory -> open.
+        // `a` has no database yet (a first index); `b` has one.
+        use crate::writer_lease::DirLink;
+        for kind in DirLink::all() {
+            let dir = TempDir::new("dirrepointed-writer");
+            let kb = kb_of(&dir);
+            let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            let (a_db, b_db) = (a.join(".groove.db"), b.join(".groove.db"));
+            drop(Database::open(b_db.to_str().unwrap()).unwrap());
+            let alias = dir.path().join("alias");
+            if !kind.point(&alias, &a) {
+                continue;
+            }
+            let alias_db = alias.join(".groove.db");
+            let alias_str = alias_db.to_str().unwrap();
+            let lease = WriterLease::try_acquire(&alias_db, Role::Index, &kb).unwrap();
+            assert!(kind.point(&alias, &b));
+
+            let w = Database::open_writer(alias_str, &lease).unwrap();
+            upsert(&w, "a.md").unwrap();
+            drop(w);
+            let (w, replaced) = Database::open_or_replace_corrupt_with(alias_str, &lease).unwrap();
+            assert!(!replaced);
+            upsert(&w, "b.md").unwrap();
+            drop(w);
+
+            assert_eq!(
+                document_count(&a_db),
+                2,
+                "{kind:?}: the writer did not write a"
+            );
+            assert_eq!(
+                document_count(&b_db),
+                0,
+                "{kind:?}: the writer wrote b, outside its lease"
+            );
+            // b's lock is free: another process could take it and write b.
+            assert!(lease_is_free(b_db.to_str().unwrap(), &kb), "{kind:?}");
+            drop(lease);
+        }
+    }
+
+    #[test]
+    fn a_one_time_write_refuses_when_a_directory_link_was_repointed_after_the_reader_opened() {
+        use crate::writer_lease::DirLink;
+        for kind in DirLink::all() {
+            let dir = TempDir::new("dirrepointed-reader");
+            let kb = kb_of(&dir);
+            let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+            for d in [&a, &b] {
+                std::fs::create_dir_all(d).unwrap();
+                make_metaless_db(d.join(".groove.db").to_str().unwrap());
+            }
+            let alias = dir.path().join("alias");
+            if !kind.point(&alias, &a) {
+                continue;
+            }
+            let alias_db = alias.join(".groove.db");
+            let r = Database::open_read_only(alias_db.to_str().unwrap(), &kb).unwrap();
+            let before_lease = || assert!(kind.point(&alias, &b));
+            let err = r
+                .verify_embedding_meta_or_record_with(&alias_db, &kb, MODEL, DIM, &before_lease)
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("now resolves to"),
+                "{kind:?}: {err:#}"
+            );
+            drop(r);
+            for d in [&a, &b] {
+                let db = Database::open(d.join(".groove.db").to_str().unwrap()).unwrap();
+                assert!(db.read_embedding_meta().unwrap().is_none(), "{kind:?}");
+            }
+        }
+    }
+
+    /// Whether SQLite opens a database through a verbatim `\\?\C:\...` path, the
+    /// form `std::fs::canonicalize` returns on Windows, and keeps its `-wal` and
+    /// `-shm` beside it: the writer lease keeps that form when it cannot drop the
+    /// prefix (see [`crate::writer_lease`]).
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_drive_path_opens_with_its_wal_and_shm_beside_it() {
+        let dir = TempDir::new("verbatim");
+        let db_path = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join(".groove.db");
+        let path = db_path.to_str().unwrap();
+        assert!(path.starts_with(r"\\?\"), "{path}");
+        let db = Database::open(path).unwrap();
+        upsert(&db, "a.md").unwrap();
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                dir.path().join(format!(".groove.db{suffix}")).exists(),
+                "no {suffix} beside {path}"
+            );
+        }
+        drop(db);
+        assert_eq!(document_count(&dir.path().join(".groove.db")), 1);
     }
 
     #[test]

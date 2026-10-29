@@ -96,9 +96,13 @@ pub struct WriterLease {
     file: File,
     /// The path the lease was asked for, spelled as the caller gave it.
     requested_path: PathBuf,
-    /// The database file this lease locks: the requested path after
-    /// [`sidecar_base`] followed it once, when the lease was taken.
+    /// The database as it is shown: the requested path after [`sidecar_base`]
+    /// followed a symlink at its last component. Display only.
     db_path: PathBuf,
+    /// The database file this lease locks, resolved whole ([`resolve_whole`])
+    /// once, when the lease was taken. The lock, the holder json and the
+    /// writer's open are all made from it, never from a spelling resolved again.
+    resolved_path: PathBuf,
     lock_path: PathBuf,
     info_path: PathBuf,
     acquired_at: SystemTime,
@@ -112,22 +116,25 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 // directly; the error path runs once per command, so its size costs nothing.
 #[allow(clippy::result_large_err)]
 impl WriterLease {
-    /// `<db>.writer-lock`: the file the OS lock is taken on. `<db>` is the
-    /// database file after [`sidecar_base`] follows it if it is a symlink.
+    /// `<db>.writer-lock` as messages show it: `<db>` is the database file
+    /// after [`sidecar_base`] follows it if it is a symlink. It names the file
+    /// the OS lock is taken on, which the lease itself opens through the
+    /// whole-path resolution ([`WriterLease::resolved_db_path`]).
     pub fn lock_path_for(db_path: &Path) -> PathBuf {
         suffixed(&sidecar_base(db_path), ".writer-lock")
     }
 
-    /// The database file a lease taken now on the given path would lock: that
-    /// path, or the target it names while it is a symlink (see [`sidecar_base`]).
-    /// A reader that may later write under the lease opens this path, so the
-    /// file it holds is the file the lease is named after.
+    /// The database file a lease taken now on the given path would lock: the
+    /// path with every symlink in it resolved, the directories above the file
+    /// included (see [`resolve_whole`]). A reader that may later write under
+    /// the lease opens this path, so the file it holds is the file the lease
+    /// is named after.
     pub fn resolved_db_path(db_path: &Path) -> PathBuf {
-        sidecar_base(db_path)
+        resolve_whole(db_path)
     }
 
-    /// `<db>.writer.json`: the display-only description of the holder, beside
-    /// the same resolved `<db>` as [`WriterLease::lock_path_for`].
+    /// `<db>.writer.json` as messages show it, beside the same `<db>` as
+    /// [`WriterLease::lock_path_for`].
     pub fn info_path_for(db_path: &Path) -> PathBuf {
         suffixed(&sidecar_base(db_path), ".writer.json")
     }
@@ -145,12 +152,15 @@ impl WriterLease {
         kb_path: &Path,
         write_info: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
     ) -> Result<Self, LeaseError> {
-        // Resolved once: the lock, the holder json and the database the
-        // holder opens ([`WriterLease::db_path`]) all name this one file, even
-        // if a symlink at `db_path` is repointed while the lease is held.
-        let resolved = sidecar_base(db_path);
+        // Resolved once, whole: the lock, the holder json and the database
+        // the holder opens ([`WriterLease::resolved_path`]) all name this one
+        // file, even if a symlink at `db_path` -- or a directory link above
+        // it -- is repointed while the lease is held. `shown` is for messages.
+        let resolved = resolve_whole(db_path);
+        let shown = sidecar_base(db_path);
         let lock_path = suffixed(&resolved, ".writer-lock");
         let info_path = suffixed(&resolved, ".writer.json");
+        let shown_lock_path = suffixed(&shown, ".writer-lock");
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -159,17 +169,27 @@ impl WriterLease {
             .open(&lock_path)
         {
             Ok(file) => file,
-            Err(source) => return Err(LeaseError::Io { lock_path, source }),
+            Err(source) => {
+                return Err(LeaseError::Io {
+                    lock_path: shown_lock_path,
+                    source,
+                });
+            }
         };
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(LeaseError::Busy {
-                    lock_path,
+                    lock_path: shown_lock_path,
                     holder: read_holder_at(&info_path),
                 });
             }
-            Err(TryLockError::Error(source)) => return Err(LeaseError::Io { lock_path, source }),
+            Err(TryLockError::Error(source)) => {
+                return Err(LeaseError::Io {
+                    lock_path: shown_lock_path,
+                    source,
+                });
+            }
         }
 
         let acquired_at = SystemTime::now();
@@ -188,7 +208,8 @@ impl WriterLease {
         Ok(WriterLease {
             file,
             requested_path: db_path.to_path_buf(),
-            db_path: resolved,
+            db_path: shown,
+            resolved_path: resolved,
             lock_path,
             info_path,
             acquired_at,
@@ -230,16 +251,26 @@ impl WriterLease {
         }
     }
 
-    /// What `<db>.writer.json` says, or `None` when it is missing, unreadable or broken.
+    /// What `<db>.writer.json` says, or `None` when it is missing, unreadable or
+    /// broken. Read beside the database resolved now ([`resolve_whole`]); display only.
     pub fn read_holder(db_path: &Path) -> Option<HolderInfo> {
-        read_holder_at(&Self::info_path_for(db_path))
+        read_holder_at(&suffixed(&resolve_whole(db_path), ".writer.json"))
     }
 
-    /// The database file this lease locks, resolved once when it was taken.
-    /// A writer under this lease opens this path, not the spelling it was
-    /// asked for: a symlink repointed since then names another file.
+    /// The database as messages show it: the path the lease was asked for,
+    /// or the target of a symlink at its last component (see [`sidecar_base`]).
+    /// Display only: a writer opens [`WriterLease::resolved_path`].
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// The database file this lease locks, every symlink in its path resolved
+    /// once when the lease was taken ([`resolve_whole`]). A writer under this
+    /// lease opens this path, not the spelling it was asked for: a symlink
+    /// repointed since then, at the file or at a directory above it, names
+    /// another file.
+    pub fn resolved_path(&self) -> &Path {
+        &self.resolved_path
     }
 
     /// The path the lease was asked for, as the caller spelled it.
@@ -386,23 +417,17 @@ pub fn index_waiting_line(db_path: &Path, holder: Option<&HolderInfo>, wait_secs
 /// How many symlinks [`sidecar_base`] follows before it gives up (Linux's `MAXSYMLINKS`).
 const MAX_SYMLINK_HOPS: usize = 40;
 
-/// The path the writer-lease sidecars are named after: the database path, or,
-/// while that path itself is a symlink, its target (a relative target is taken from
-/// the link's directory), so two aliases of one database share one lock.
+/// The database path as messages show the writer-lease sidecars: the database
+/// path, or, while that path itself is a symlink, its target (a relative target
+/// is taken from the link's directory). Display only -- the lease locks and
+/// opens [`resolve_whole`]'s path.
 ///
-/// SQLite opens the target in both cases: the unix VFS (`unixFullPathname` in
-/// the bundled `sqlite3.c`) resolves every symlink in the path, since groove
-/// never passes `SQLITE_OPEN_NOFOLLOW`; the Windows VFS only makes the path
-/// absolute (`GetFullPathNameW`), and `CreateFileW` then follows the link.
-///
-/// Only the last component is followed: a symlinked directory higher up is
-/// followed by the OS when the sidecar is opened, so it already leads to one
-/// file. The path is not canonicalized either, so a path without a symlink
-/// keeps the spelling it was given (no `\\?\`, 8.3 names or `/private/var`).
-/// A database that does not exist yet is not a symlink, and keeps its path; a
-/// dangling symlink is followed to where SQLite would create the file. A
-/// link that cannot be read, or a chain longer than [`MAX_SYMLINK_HOPS`],
-/// leaves the last path reached; SQLite cannot open such a path either.
+/// Only the last component is followed, and nothing is canonicalized, so a
+/// path without a symlink keeps the spelling it was given (no `\\?\`, 8.3
+/// names or `/private/var`). A database that does not exist yet is not a
+/// symlink, and keeps its path; a dangling symlink is followed to where
+/// SQLite would create the file. A link that cannot be read, or a chain
+/// longer than [`MAX_SYMLINK_HOPS`], leaves the last path reached.
 fn sidecar_base(db_path: &Path) -> PathBuf {
     let mut path = db_path.to_path_buf();
     for _ in 0..MAX_SYMLINK_HOPS {
@@ -419,6 +444,60 @@ fn sidecar_base(db_path: &Path) -> PathBuf {
         };
     }
     path
+}
+
+/// The database file a lease on the given path locks and its writer opens:
+/// [`sidecar_base`]'s path with every symlink (and Windows junction) in it
+/// resolved, the directories above the file included, so two aliases of one
+/// database share one lock, and a directory link repointed after the lease is
+/// taken does not move the holder to another file. SQLite would open the same
+/// file through the alias at that moment: the unix VFS (`unixFullPathname` in
+/// the bundled `sqlite3.c`) resolves every symlink in the path, since groove
+/// never passes `SQLITE_OPEN_NOFOLLOW`; on Windows `CreateFileW` follows them.
+///
+/// A path that exists is `std::fs::canonicalize`d. One that does not (a
+/// database not created yet, or a dangling symlink's target) has its nearest
+/// existing ancestor canonicalized and the rest appended as spelled; with no
+/// such ancestor the absolute path is kept. On Windows the verbatim prefix
+/// `canonicalize` adds is dropped where the plain spelling names the same path
+/// (the Windows-only helper in [`crate::config`] that a found config's
+/// relative base also uses); where it cannot be, the `\\?\C:\...` form is
+/// kept, which SQLite opens with its `-wal` and `-shm` beside it (Windows 11,
+/// the test `a_verbatim_drive_path_opens_with_its_wal_and_shm_beside_it` in
+/// the lease tests of [`crate::db`]).
+fn resolve_whole(db_path: &Path) -> PathBuf {
+    let base = sidecar_base(db_path);
+    let resolved = std::fs::canonicalize(&base).unwrap_or_else(|_| resolve_by_ancestor(&base));
+    #[cfg(windows)]
+    {
+        if let Some(plain) = crate::config::without_verbatim_prefix(&resolved) {
+            return plain;
+        }
+    }
+    resolved
+}
+
+/// [`resolve_whole`] for a path that does not exist: canonicalize the nearest
+/// ancestor that does and append the remaining names as given.
+fn resolve_by_ancestor(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut tail = Vec::new();
+    let mut cur = absolute.as_path();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(cur) {
+            for name in tail.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return absolute,
+        }
+    }
 }
 
 /// What the holder json at `info_path` says, or `None` when it is missing,
@@ -485,6 +564,78 @@ pub(crate) fn file_symlink_or_skip(target: &Path, link: &Path) -> bool {
     let made = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
     let made = std::os::windows::fs::symlink_file(target, link);
+    symlink_made_or_skip(made, "file", target, link)
+}
+
+/// Test helper: [`file_symlink_or_skip`] for a directory symlink, under the same rule.
+#[cfg(test)]
+pub(crate) fn dir_symlink_or_skip(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(target, link);
+    symlink_made_or_skip(made, "directory", target, link)
+}
+
+/// A directory link a test points the way a person might alias a knowledge base.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DirLink {
+    /// A directory symlink ([`dir_symlink_or_skip`]: skipped where it cannot be made).
+    Symlink,
+    /// A Windows junction (`mklink /J`), which needs no privilege, so the test
+    /// also runs on a Windows machine without Developer Mode.
+    #[cfg(windows)]
+    Junction,
+}
+
+#[cfg(test)]
+impl DirLink {
+    /// Every kind a test runs through on this platform.
+    pub(crate) fn all() -> Vec<DirLink> {
+        #[allow(unused_mut)]
+        let mut kinds = vec![DirLink::Symlink];
+        #[cfg(windows)]
+        kinds.push(DirLink::Junction);
+        kinds
+    }
+
+    /// Make `link` point at the directory `target`, replacing a link already
+    /// there. False when the kind cannot be made here and the test skips it.
+    pub(crate) fn point(self, link: &Path, target: &Path) -> bool {
+        if std::fs::symlink_metadata(link).is_ok() {
+            // A directory symlink is removed as a file on unix and as a
+            // directory on Windows, as is a junction.
+            #[cfg(unix)]
+            std::fs::remove_file(link).unwrap();
+            #[cfg(windows)]
+            std::fs::remove_dir(link).unwrap();
+        }
+        match self {
+            DirLink::Symlink => dir_symlink_or_skip(target, link),
+            #[cfg(windows)]
+            DirLink::Junction => {
+                let made = std::process::Command::new("cmd")
+                    .args([
+                        "/c",
+                        "mklink",
+                        "/J",
+                        &link.display().to_string(),
+                        &target.display().to_string(),
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .expect("mklink must be runnable");
+                assert!(made.success(), "mklink /J needs no elevation");
+                true
+            }
+        }
+    }
+}
+
+/// The rule [`file_symlink_or_skip`] states, for the result of making a file or directory symlink.
+#[cfg(test)]
+fn symlink_made_or_skip(made: std::io::Result<()>, kind: &str, target: &Path, link: &Path) -> bool {
     let err = match made {
         Ok(()) => return true,
         Err(e) => e,
@@ -493,12 +644,12 @@ pub(crate) fn file_symlink_or_skip(target: &Path, link: &Path) -> bool {
     const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
     if cfg!(windows) && err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) && !on_ci {
         eprintln!(
-            "SKIPPED: could not create a file symlink here (os error 1314: Windows needs Developer Mode or admin); CI runs this test"
+            "SKIPPED: could not create a {kind} symlink here (os error 1314: Windows needs Developer Mode or admin); CI runs this test"
         );
         return false;
     }
     panic!(
-        "could not create the file symlink {} -> {}: {}{}",
+        "could not create the {kind} symlink {} -> {}: {}{}",
         link.display(),
         target.display(),
         crate::embedder::ascii_io_error(&err),
@@ -797,6 +948,85 @@ mod tests {
         drop(WriterLease::try_acquire(&other_db, Role::Index, &kb).expect("other.db is free"));
         drop(lease);
         assert!(!WriterLease::info_path_for(&real_db).exists());
+    }
+
+    /// Whether two paths name one file, compared by canonical path.
+    fn same_file(a: &Path, b: &Path) -> bool {
+        std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
+    }
+
+    /// (Local Codex pre-push, second round of this push, [high]) The lease
+    /// resolves a directory link above the database too: after the link is
+    /// repointed, the lock, the holder json and [`WriterLease::resolved_path`]
+    /// stay on the first directory's database, and the second's stays free.
+    #[test]
+    fn a_held_lease_keeps_its_database_when_a_directory_link_above_it_is_repointed() {
+        for kind in DirLink::all() {
+            let (dir, _db, kb) = layout("dirrepoint");
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            for d in [&a, &b] {
+                std::fs::create_dir_all(d).unwrap();
+                std::fs::write(d.join(".groove.db"), b"").unwrap();
+            }
+            let alias = dir.path().join("alias");
+            if !kind.point(&alias, &a) {
+                continue;
+            }
+            let alias_db = alias.join(".groove.db");
+            let (a_db, b_db) = (a.join(".groove.db"), b.join(".groove.db"));
+            let lease = WriterLease::try_acquire(&alias_db, Role::Index, &kb).unwrap();
+            assert!(kind.point(&alias, &b));
+
+            assert!(same_file(lease.resolved_path(), &a_db), "{kind:?}");
+            assert!(suffixed(&a_db, ".writer.json").exists(), "{kind:?}");
+            assert!(!suffixed(&b_db, ".writer.json").exists(), "{kind:?}");
+            assert!(
+                matches!(
+                    WriterLease::try_acquire(&a_db, Role::Index, &kb),
+                    Err(LeaseError::Busy { .. })
+                ),
+                "{kind:?}: a's lease must stay held"
+            );
+            drop(WriterLease::try_acquire(&alias_db, Role::Index, &kb).expect("b is free"));
+            drop(lease);
+            assert!(!suffixed(&a_db, ".writer.json").exists(), "{kind:?}");
+            drop(WriterLease::try_acquire(&a_db, Role::Index, &kb).expect("a is free again"));
+        }
+    }
+
+    /// A database that does not exist yet under a directory link resolves
+    /// through its nearest existing ancestor, so it too stays put.
+    #[test]
+    fn a_missing_database_under_a_directory_link_resolves_through_its_parent() {
+        for kind in DirLink::all() {
+            let (dir, _db, kb) = layout("dirmissing");
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            let alias = dir.path().join("alias");
+            if !kind.point(&alias, &a) {
+                continue;
+            }
+            let alias_db = alias.join(".groove.db");
+            let lease = WriterLease::try_acquire(&alias_db, Role::Index, &kb).unwrap();
+            assert!(kind.point(&alias, &b));
+            let resolved = lease.resolved_path();
+            assert_eq!(
+                resolved.file_name(),
+                Some(std::ffi::OsStr::new(".groove.db"))
+            );
+            assert!(same_file(resolved.parent().unwrap(), &a), "{kind:?}");
+            assert!(
+                !resolved.to_string_lossy().starts_with(r"\\?\"),
+                "{kind:?}: {}",
+                resolved.display()
+            );
+            assert!(suffixed(&a.join(".groove.db"), ".writer-lock").exists());
+            assert!(!suffixed(&b.join(".groove.db"), ".writer-lock").exists());
+            drop(lease);
+        }
     }
 
     #[test]

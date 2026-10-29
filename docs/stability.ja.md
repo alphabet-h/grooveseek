@@ -355,7 +355,7 @@ snake_case で、配列は複数形。よって `--path-glob` と `path_globs` �
 | | |
 |---|---|
 | 索引 DB | `.groove.db`（`kb_path` の**親ディレクトリ内**） |
-| writer lock (v1.22.0+) | DB の隣の `.groove.db.writer-lock` (消さない。`groove service uninstall --purge` も消すのは `.groove.db` だけで、これは残る)、process が索引に書いている間の `.groove.db.writer.json`、およびそれを置き換える一時ファイル `.groove.db.writer.json.tmp-<pid>` (置き換えに失敗すると残ることがある)。`.groove.db` が symlink なら、3 つともその先の file の名前で、その隣に置く |
+| writer lock (v1.22.0+) | DB の隣の `.groove.db.writer-lock` (消さない。`groove service uninstall --purge` も消すのは `.groove.db` だけで、これは残る)、process が索引に書いている間の `.groove.db.writer.json`、およびそれを置き換える一時ファイル `.groove.db.writer.json.tmp-<pid>` (置き換えに失敗すると残ることがある)。`.groove.db` が symlink なら、3 つともその先の file の名前で、その隣に置く。その上の directory の symlink / junction も解決するので、DB の path が解決した先の file の隣に置く |
 | 設定 | `groove.toml` |
 | 除外ファイル | `.grooveignore` |
 | 評価セット / 履歴 | `.groove-eval.yml` / `.groove-eval-history.json` |

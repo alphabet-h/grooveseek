@@ -114,8 +114,10 @@ in which `groove serve` takes the lock, not the behaviour of v1.22.0.
   path plus `.writer-lock`; when `.groove.db` is a symlink, this file and the
   two below are named after its target and sit beside it, because SQLite opens
   the target and a lock per alias would put two writers on one database; the
-  link is read once, when the lease is taken, and the holder opens that file,
-  so repointing the link later cannot move a writer off its lock. A hard link
+  whole path is resolved once, when the lease is taken -- a symlink at the file
+  and any directory symlink or junction above it -- and the lock, the holder
+  json and the holder's open all use that resolved path, so repointing a link
+  later cannot move a writer off its lock. A hard link
   that gives one database two names is not handled: SQLite itself calls opening
   a database under two names undefined behaviour, since each name gets its own
   journal and WAL ([How To Corrupt An SQLite Database File, section

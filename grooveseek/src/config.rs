@@ -2395,7 +2395,7 @@ fn relative_base(canonical_dir: &Path) -> PathBuf {
 /// spelling names the same path ([`relative_base`]). `None` when it might not, or when the
 /// path has no verbatim prefix to drop.
 #[cfg(windows)]
-fn without_verbatim_prefix(p: &Path) -> Option<PathBuf> {
+pub(crate) fn without_verbatim_prefix(p: &Path) -> Option<PathBuf> {
     use std::path::{Component, Prefix};
     let mut components = p.components();
     let plain_prefix = match components.next()? {
