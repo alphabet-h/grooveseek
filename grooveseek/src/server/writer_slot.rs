@@ -83,7 +83,7 @@ impl SlotInner {
         }
     }
 
-    /// The role the marks call for: the watcher's makes it a server (I24).
+    /// The role the marks call for: the watcher's makes it a server. ADR-0031.
     fn role(&self) -> Option<Role> {
         if self.watcher.is_some() {
             Some(Role::Serve)
@@ -108,8 +108,8 @@ impl SlotInner {
         }
     }
 
-    /// Lower `who`'s mark if it is still `generation` (I21); a lowered
-    /// watcher's mark outside shutdown records the stop (I43).
+    /// Lower `who`'s mark if it is still `generation`; a lowered
+    /// watcher's mark outside shutdown records the stop. ADR-0031.
     fn lower(&mut self, who: Claimant, generation: u64) -> bool {
         if self.mark(who) != Some(generation) {
             return false;
@@ -125,7 +125,7 @@ impl SlotInner {
         true
     }
 
-    /// What writer.json's `watching` says now (I41).
+    /// What writer.json's `watching` says now. ADR-0031.
     fn watching(&self) -> Option<bool> {
         let Some(generation) = self.watcher else {
             return Some(false);
@@ -184,7 +184,7 @@ impl Claimant {
     }
 }
 
-/// Why the server's first claim did not take the lease (I39).
+/// Why the server's first claim did not take the lease. ADR-0031.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum ReaderReason {
@@ -197,7 +197,7 @@ pub enum ReaderReason {
     Io { lock_path: PathBuf, error: String },
 }
 
-/// Why the watcher is not watching (I36): the cause only, worded by the reader of it.
+/// Why the watcher is not watching: the cause only, worded by the reader of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WatchErrorCause {
@@ -206,7 +206,7 @@ pub struct WatchErrorCause {
     pub retry_secs: u64,
 }
 
-/// The watcher's claim went down outside shutdown (I43); `error` is its
+/// The watcher's claim went down outside shutdown; `error` is its
 /// task's error, `None` after a panic.
 pub struct WatcherStopped {
     // Read by the status of a later task of #259 PR2, and by the tests.
@@ -215,7 +215,7 @@ pub struct WatcherStopped {
 }
 
 /// A live claim. `release` it with the database guard held; dropped without
-/// that (a panic), it is queued for `settle_pending` (I18).
+/// that (a panic), it is queued for `settle_pending`.
 pub struct ClaimGuard {
     slot: Arc<WriterSlot>,
     who: Claimant,
@@ -317,7 +317,7 @@ impl WriterSlot {
     pub fn claim(self: &Arc<Self>, who: Claimant) -> Result<ClaimGuard, LeaseError> {
         // Declared before the inner guard so that it drops after it: if a
         // later step panics, its Drop queues the claim without deadlocking
-        // on the inner mutex this function still holds (controller decision 13).
+        // on the inner mutex this function still holds.
         let made: ClaimGuard;
         let mut inner = self.lock();
         if inner.closed {
@@ -370,7 +370,7 @@ impl WriterSlot {
         }
     }
 
-    // Same reason as on `claim`.
+    // The same `LeaseError` as the lease's, for the reason given on `claim`.
     #[allow(clippy::result_large_err)]
     fn acquire(&self, role: Role) -> Result<WriterLease, LeaseError> {
         match &self.mode {
@@ -385,14 +385,14 @@ impl WriterSlot {
     }
 
     /// The first claim found the lease held or failing: from now on every
-    /// claim is [`LeaseError::Reader`] (I39).
+    /// claim is [`LeaseError::Reader`].
     pub fn become_reader(&self, reason: ReaderReason) {
         self.lock().reader = Some(reason);
     }
 
-    /// The watcher's bridge reports a watch error, or `None` once registered
-    /// (I36). Only the live watcher's generation is taken; a change of
-    /// `watching` rewrites writer.json at once (I41).
+    /// The watcher's bridge reports a watch error, or `None` once registered.
+    /// Only the live watcher's generation is taken; a change of
+    /// `watching` rewrites writer.json at once.
     pub fn set_watch_error(&self, watcher_gen: u64, cause: Option<WatchErrorCause>) {
         let mut inner = self.lock();
         if inner.watcher != Some(watcher_gen)
@@ -430,7 +430,7 @@ impl WriterSlot {
         }
     }
 
-    /// The watcher's task ended with `error`; called before its `release` (I43).
+    /// The watcher's task ended with `error`; called before its `release`.
     pub fn set_watcher_exit(&self, watcher_gen: u64, error: String) {
         let mut inner = self.lock();
         if inner.watcher == Some(watcher_gen) {
@@ -439,7 +439,7 @@ impl WriterSlot {
     }
 
     /// Turn `query_only` off for `guard`'s claim, with the db guard held;
-    /// a lease taken anew has its embedding meta checked first (I20). Any
+    /// a lease taken anew has its embedding meta checked first. Any
     /// `Err` has already released the claim: the caller does not `release` it.
     pub fn make_writable(&self, guard: &mut ClaimGuard, db: &Database) -> anyhow::Result<()> {
         let SlotMode::Managed {
@@ -455,6 +455,20 @@ impl WriterSlot {
         // guard keeps the lease from going meanwhile.
         let (resolved, meta_unchecked) = {
             let inner = self.lock();
+            // A guard that outlived shutdown, or whose mark is gone, must not
+            // turn the connection writable again. Its mark is not there to
+            // lower, and `query_only` is left as it is for any live claim.
+            if inner.closed {
+                guard.released = true;
+                return Err(LeaseError::Closed.into());
+            }
+            if inner.mark(guard.who) != Some(guard.generation()) {
+                guard.released = true;
+                return Err(anyhow::anyhow!(
+                    "this {} claim on the writer lease is no longer live",
+                    guard.who.as_str()
+                ));
+            }
             match inner.lease.as_ref() {
                 Some(lease) => (lease.resolved_path().to_path_buf(), inner.meta_unchecked),
                 None => {
@@ -511,8 +525,8 @@ impl WriterSlot {
     }
 
     /// Release `guard`'s claim, with the db guard held: lower its mark if it
-    /// is still this claim's (I21); with no claim left, `query_only` on, then
-    /// the lease dropped (I5).
+    /// is still this claim's; with no claim left, `query_only` on, then
+    /// the lease dropped (ADR-0031).
     pub fn release(&self, mut guard: ClaimGuard, db: &Database) {
         guard.released = true;
         if matches!(self.mode, SlotMode::Unmanaged) {
@@ -527,7 +541,7 @@ impl WriterSlot {
 
     /// Settle the claims a panic left queued, as `release` would, with the
     /// db guard held. Returns who was released; a queued claim whose mark has
-    /// a newer generation is only discarded (I21).
+    /// a newer generation is only discarded.
     pub fn settle_pending(&self, db: &Database) -> Vec<Claimant> {
         let mut inner = self.lock();
         let pending = std::mem::take(&mut inner.pending_release);
@@ -550,12 +564,12 @@ impl WriterSlot {
     }
 
     /// The first step of shutdown: later claims are `Closed`, and the
-    /// watcher's release no longer records a stop (I43).
+    /// watcher's release no longer records a stop.
     pub fn begin_shutdown(&self) {
         self.lock().closed = true;
     }
 
-    /// Shut down with the db guard held (I23): `query_only` on, every mark
+    /// Shut down with the db guard held: `query_only` on, every mark
     /// and queued claim discarded, the lease dropped. If `query_only` cannot
     /// be turned on, the lease is kept until the process exits.
     pub fn shutdown(&self, db: &Database) {
@@ -852,6 +866,35 @@ mod tests {
         assert!(f.lease_is_free());
         drop((w, r));
         assert!(f.lease_is_free());
+        assert!(!slot.has_pending());
+    }
+
+    #[test]
+    fn a_guard_that_outlived_shutdown_cannot_make_the_connection_writable() {
+        let f = fixture("after-shutdown");
+        let slot = f.slot();
+        let mut w = slot.claim(Claimant::Watcher).unwrap();
+        slot.shutdown(&f.db);
+        let err = slot.make_writable(&mut w, &f.db).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<LeaseError>(), Some(LeaseError::Closed)),
+            "{err:#}"
+        );
+        assert_eq!(f.query_only(), 1);
+        assert!(f.lease_is_free());
+        drop(w);
+        assert!(!slot.has_pending());
+    }
+
+    #[test]
+    fn a_failed_make_writable_of_the_watcher_records_a_stopped_watcher() {
+        let f = fixture_with_model("watcher-meta", "other-model");
+        let slot = f.slot();
+        let mut w = slot.claim(Claimant::Watcher).unwrap();
+        slot.make_writable(&mut w, &f.db).unwrap_err();
+        assert_eq!(slot.watcher_stopped_error(), Some(None));
+        assert_eq!(f.query_only(), 1);
+        assert!(f.lease_is_free());
     }
 
     #[test]
@@ -928,7 +971,7 @@ mod tests {
         slot.shutdown(&f.db);
         assert!(f.lease_is_free());
 
-        // An exit of an older generation leaves nothing.
+        // An exit of another generation leaves nothing.
         let slot = f.slot();
         let w = slot.claim(Claimant::Watcher).unwrap();
         slot.set_watcher_exit(w.generation() + 1, "stale".to_string());
@@ -997,7 +1040,7 @@ mod tests {
         slot.set_watch_error(w.generation(), None);
         assert_eq!(f.holder().unwrap().watching, Some(true));
 
-        // An older generation's report changes nothing.
+        // Another generation's report changes nothing.
         let before = f.info_bytes();
         slot.set_watch_error(w.generation() + 1, Some(cause));
         assert_eq!(f.info_bytes(), before);
