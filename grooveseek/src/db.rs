@@ -533,7 +533,7 @@ pub struct CasDelete {
 /// order of `pairs`.
 #[derive(Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct RenameOutcome {
+pub struct CheckedRenames {
     /// Renamed: the old row still had the snapshot's `(id, content_hash)` and the new
     /// path was free.
     pub applied: Vec<(String, String)>,
@@ -9716,6 +9716,28 @@ mod tests {
     }
 
     #[test]
+    fn checked_renames_skip_a_pair_whose_old_row_was_recreated() {
+        let (_dir, db, other) = two_connections("checked-renames-recreated");
+        upsert_with_hash(&db, "a.md", "ha");
+        // A later row, so the re-created a.md cannot reuse a's id.
+        upsert_with_hash(&db, "z.md", "hz");
+        let snap = db.all_path_ids_hashes().unwrap();
+
+        other.delete_document("a.md").unwrap();
+        let new_a = upsert_with_hash(&other, "a.md", "ha");
+        assert_ne!(new_a, snap["a.md"].0);
+
+        let out = db
+            .rename_documents_checked(&[pair("a.md", "a2.md")], &snap, &[], &HashMap::new())
+            .unwrap();
+        assert!(out.applied.is_empty());
+        assert_eq!(out.skipped, vec![pair("a.md", "a2.md")]);
+        let after = db.all_path_ids_hashes().unwrap();
+        assert_eq!(after["a.md"], (new_a, "ha".to_string()));
+        assert!(!after.contains_key("a2.md"));
+    }
+
+    #[test]
     fn checked_renames_with_no_pairs_open_no_transaction() {
         let (_dir, db, other) = two_connections("checked-renames-empty");
         let snap = db.all_path_ids_hashes().unwrap();
@@ -9724,7 +9746,7 @@ mod tests {
         let out = db
             .rename_documents_checked(&[], &snap, &[], &HashMap::new())
             .unwrap();
-        assert_eq!(out, RenameOutcome::default());
+        assert_eq!(out, CheckedRenames::default());
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(1000),
             "no pairs waited {:?} for the other writer's lock",

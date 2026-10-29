@@ -1504,6 +1504,7 @@ impl Database {
     ///
     /// The checks and the renames share the immediate transaction, so a row another writer
     /// changed, moved or created after `snapshot` was read is left as that writer left it.
+    /// Pairs are checked and applied in order; a later pair sees the rows the earlier ones moved.
     /// A pair whose old path is not in `snapshot` is skipped. `frontmatter_topics` is keyed
     /// by the new path, as for [`Self::rename_documents_atomic`]. Empty `pairs` return at once
     /// without opening a transaction. Reads no file. On `Err` (a failed statement) nothing
@@ -1514,15 +1515,15 @@ impl Database {
         snapshot: &PathIdHash,
         crossed_old_paths: &[&str],
         frontmatter_topics: &std::collections::HashMap<String, Option<String>>,
-    ) -> Result<RenameOutcome> {
+    ) -> Result<CheckedRenames> {
         if pairs.is_empty() {
-            return Ok(RenameOutcome::default());
+            return Ok(CheckedRenames::default());
         }
         if !self.conn.is_autocommit() {
             anyhow::bail!("rename_documents_checked must not run inside a caller's transaction");
         }
         let tx = self.begin_immediate_transaction()?;
-        let mut out = RenameOutcome::default();
+        let mut out = CheckedRenames::default();
         {
             let mut read_old = self
                 .conn
