@@ -734,10 +734,7 @@ mod tests {
                 acquire: Some(Box::new(|db: &Path, _role: Role, _kb: &Path| {
                     Err(LeaseError::Io {
                         lock_path: WriterLease::lock_path_for(db),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "refused for a test",
-                        ),
+                        source: std::io::Error::from_raw_os_error(IO_TEST_OS_ERROR),
                     })
                 })),
                 ..Default::default()
@@ -748,9 +745,63 @@ mod tests {
         assert!(!status.held, "{status:?}");
         let notice = status.reader_notice.expect("a reader notice");
         let lock = WriterLease::lock_path_for(&ts.kb.db_path);
-        assert!(notice.contains(&lock.display().to_string()), "{notice}");
+        let lock = lock.display().to_string();
+        assert!(notice.contains(&lock), "{notice}");
+        // The error is the OS error alone, not the lease's sentence that
+        // names the lock path again.
+        let os_error =
+            crate::embedder::ascii_io_error(&std::io::Error::from_raw_os_error(IO_TEST_OS_ERROR));
+        assert!(notice.contains(&format!("{lock} ({os_error})")), "{notice}");
+        assert_eq!(notice.matches(&lock).count(), 1, "{notice}");
         assert!(handles.watcher.is_none());
         finish(&ts, handles).await;
+    }
+
+    /// The OS error code the injected lock failure carries.
+    const IO_TEST_OS_ERROR: i32 = 5;
+
+    /// A claim that can only be `Reader` or `Closed` stops the start with
+    /// an error rather than a role.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_refused_as_reader_or_closed_is_an_error() {
+        let (ts, handles) = start_writer_for_test(
+            TestKb::new("refused"),
+            StartOpts {
+                holder: Some(Holder::Serve),
+                ..Default::default()
+            },
+        );
+        assert!(ts.writer.status().reader);
+        let again = claim_writer_role(
+            &ts.writer,
+            &ts.shared.db,
+            &ts.kb.db_path,
+            &ts.kb.kb,
+            true,
+            ContextMode::Off,
+        );
+        assert!(again.is_err(), "a reader's second claim must be an error");
+        finish(&ts, handles).await;
+        drop(ts);
+
+        let mut opts = StartOpts::default();
+        let ts = serve_for_test(TestKb::new("closed"), &mut opts);
+        ts.writer.begin_shutdown();
+        let role = claim_writer_role(
+            &ts.writer,
+            &ts.shared.db,
+            &ts.kb.db_path,
+            &ts.kb.kb,
+            true,
+            ContextMode::Off,
+        );
+        assert!(
+            role.is_err(),
+            "a claim after shutdown began must be an error"
+        );
+        assert!(ts.kb.lease_is_free());
+        assert_eq!(ts.query_only(), 1);
+        finish(&ts, WriterRoleHandles::default()).await;
     }
 
     /// T-L9 7: the janitor settles a rebuild that panicked, and the
@@ -758,9 +809,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_janitor_settles_a_panicked_rebuild_claim_and_keeps_the_watchers_lease() {
         let (ts, handles) = start_writer_for_test(TestKb::new("settle"), StartOpts::default());
+        // Hold the db so no settle can finish before the pending check.
+        let db = Arc::clone(&ts.shared.db);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let db_holder = std::thread::spawn(move || {
+            let _g = recover_db(db.lock());
+            held_tx.send(()).unwrap();
+            let _ = go_rx.recv();
+        });
+        held_rx.recv().unwrap();
         let guard = ts.writer.claim(Claimant::Rebuild).unwrap();
         panic_with(guard);
         assert!(ts.writer.has_pending());
+        go_tx.send(()).unwrap();
+        db_holder.join().unwrap();
         let settled = eventually(Duration::from_secs(10), || !ts.writer.has_pending()).await;
         assert!(settled, "the janitor must settle within 10 s");
         assert!(
