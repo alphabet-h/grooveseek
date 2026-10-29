@@ -41,6 +41,13 @@ use kb_uri::{HitWithUri, LoadFailure, resource_error};
 #[cfg(test)]
 use kb_uri::resource_text;
 mod search;
+mod writer_slot;
+
+// The writer lease inside one server (ADR-0031): `run_server` and the handlers
+// reach these by `crate::server::X`.
+pub use writer_slot::{
+    ClaimGuard, Claimant, ReaderReason, WatchErrorCause, WatchStatusFn, WriterSlot,
+};
 
 // (audit L-1 PR-2) `GET_DOCUMENT_MAX_BYTES` is the one name here that
 // production code outside this module reaches by path -- `doctor.rs` reports
