@@ -43,6 +43,10 @@ use kb_uri::resource_text;
 mod search;
 mod writer_role;
 mod writer_slot;
+use writer_role::{
+    StartRole, WriterRoleHandles, claim_writer_role, shutdown_writer_role, spawn_janitor,
+    start_writer_role,
+};
 
 // The writer lease inside one server (ADR-0031): `run_server` and the handlers
 // reach these by `crate::server::X`.
@@ -1632,24 +1636,70 @@ pub async fn run_server(
     context_mode_desired: crate::db::ContextMode,
     fail_on_frontmatter_error: bool,
 ) -> Result<()> {
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Instant, SystemTime};
+    let models = embedding.clone();
+    run_server_with(
+        kb_path,
+        embedding,
+        rerank_by_default,
+        exclude_headings,
+        exclude_dirs,
+        quality_threshold,
+        best_practice_templates,
+        parser_registry,
+        watch_config,
+        transport,
+        min_confidence_ratio,
+        search_config,
+        config_source,
+        context_mode_desired,
+        fail_on_frontmatter_error,
+        move |_db| {
+            Ok((
+                Embedder::with_settings(models)?,
+                Reranker::try_new(reranker_choice)?,
+            ))
+        },
+    )
+    .await
+}
 
+/// The body of [`run_server`], with the loading of the models (their
+/// download included) handed in as `load_models`. The index is opened as a
+/// reader, the writer role is claimed and the janitor started before
+/// `load_models` runs, so a long download keeps the heartbeat fresh
+/// (ADR-0031). `load_models` runs once, on a blocking thread, and gets a
+/// clone of the database the start opened. Every exit after the claim goes
+/// through the writer role's shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn run_server_with(
+    kb_path: &std::path::Path,
+    embedding: EmbeddingSettings,
+    rerank_by_default: bool,
+    exclude_headings: Option<Vec<String>>,
+    exclude_dirs: Vec<String>,
+    quality_threshold: f32,
+    best_practice_templates: Vec<String>,
+    parser_registry: Registry,
+    watch_config: crate::watcher::WatchConfig,
+    transport: crate::transport::Transport,
+    min_confidence_ratio: f32,
+    search_config: crate::config::SearchConfig,
+    config_source: crate::config::ConfigSource,
+    context_mode_desired: crate::db::ContextMode,
+    fail_on_frontmatter_error: bool,
+    load_models: impl FnOnce(Arc<Mutex<Database>>) -> anyhow::Result<(Embedder, Option<Reranker>)>
+    + Send
+    + 'static,
+) -> Result<()> {
+    let model_id = embedding.model_id().to_string();
+    let dim = embedding.dimension() as u32;
     let db_path = crate::resolve_db_path(kb_path);
-    let db = Database::open(&db_path.to_string_lossy())?;
+    let db_str = crate::writer_lease::db_path_utf8(&db_path)?;
+    let db = Database::open_read_only(db_str, kb_path)?;
 
     // モデル DL の前に meta 整合性を確認。不整合ならここで止めて DL を回避。
-    db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
-
-    // codex P2 (PR #73 F2): fresh DB (chunk 0 件、`index` 未実行のまま `serve`
-    // 起動) かつ `[contextual] enabled = true` の場合、watcher 経由の
-    // `reindex_single_file` は `read_context_mode()` が `None` を返すたびに
-    // `Off` へ fallback していた (= grandfather 判定は「レコードが無い」を
-    // legacy DB とみなす設計だが、fresh DB では正しくない)。watcher が動く前に
-    // ここで一度 resolve しておけば、fresh DB では desired mode が記録され、
-    // 既存 DB では従来通り grandfather / warning 挙動のままになる。watcher 自体は
-    // 「DB に記録された mode に追従する」設計を変えない (呼ぶのはここ 1 回だけ)。
-    indexer::resolve_context_mode(&db, context_mode_desired, false)?;
+    // meta が無ければ短い writer lease の下で記録する。
+    db.verify_embedding_meta_or_record(&db_path, kb_path, &model_id, dim)?;
 
     // AU-06 (codex P2): `[parsers].enabled` を狭めた後、その拡張子の行は DB に
     // 残る。`groove index` なら prune されるが `serve` は index しないので、
@@ -1665,15 +1715,128 @@ pub async fn run_server(
             tracing::warn!(
                 "{} indexed document(s) have an extension that [parsers].enabled no longer \
                  covers (e.g. {}). They still appear in search results but get_document \
-                 rejects them. Run `groove index` to remove them from the index.",
+                 rejects them. Run `groove index` (or, while a server is writing this \
+                 index, its MCP `rebuild_index`) to remove them from the index.",
                 stale.len(),
                 sample.join(", ")
             );
         }
     }
 
-    let embedder = Embedder::with_settings(embedding)?;
-    let reranker = Reranker::try_new(reranker_choice)?;
+    // Before the model download (ADR-0031): with the watch on, the watcher's
+    // claim takes the lease, makes the connection writable and resolves the
+    // context mode, so a fresh index records the desired mode before the
+    // watcher reindexes anything (codex P2, PR #73 F2). The janitor starts
+    // right after, for every role.
+    let db = Arc::new(Mutex::new(db));
+    let writer = WriterSlot::managed(db_path.clone(), kb_path.to_path_buf(), model_id, dim);
+    let role = claim_writer_role(
+        &writer,
+        &db,
+        &db_path,
+        kb_path,
+        watch_config.enabled,
+        context_mode_desired,
+    )?;
+    let mut handles = WriterRoleHandles {
+        janitor: Some(spawn_janitor(Arc::clone(&writer), Arc::clone(&db))),
+        watcher: None,
+        watcher_stop: None,
+    };
+    // Kept here, not in `serve_claimed`, so a start that fails before the
+    // watcher takes the claim still holds it when the shutdown begins; let
+    // go only after, it queues nothing as panicked.
+    let mut role = Some(role);
+    let result = serve_claimed(
+        kb_path,
+        &db,
+        &writer,
+        &mut role,
+        &mut handles,
+        load_models,
+        ServeSettings {
+            rerank_by_default,
+            exclude_headings,
+            exclude_dirs,
+            quality_threshold,
+            best_practice_templates,
+            parser_registry,
+            watch_config,
+            transport,
+            min_confidence_ratio,
+            search_config,
+            config_source,
+            context_mode_desired,
+            fail_on_frontmatter_error,
+        },
+    )
+    .await;
+    #[cfg(test)]
+    record_pending_before_shutdown(&db_path, writer.has_pending());
+    shutdown_writer_role(&writer, &db, handles).await;
+    drop(role);
+    result
+}
+
+/// What [`serve_claimed`] passes on to the server's shared state, the
+/// watcher and the transport.
+struct ServeSettings {
+    rerank_by_default: bool,
+    exclude_headings: Option<Vec<String>>,
+    exclude_dirs: Vec<String>,
+    quality_threshold: f32,
+    best_practice_templates: Vec<String>,
+    parser_registry: Registry,
+    watch_config: crate::watcher::WatchConfig,
+    transport: crate::transport::Transport,
+    min_confidence_ratio: f32,
+    search_config: crate::config::SearchConfig,
+    config_source: crate::config::ConfigSource,
+    context_mode_desired: crate::db::ContextMode,
+    fail_on_frontmatter_error: bool,
+}
+
+/// The start after the claim: load the models on a blocking thread, build
+/// the shared state, hand the role to [`start_writer_role`] (a writer's
+/// watcher starts here) and serve the transport until it ends. `role` is
+/// taken only when the watcher starts; an error before that leaves it with
+/// the caller.
+async fn serve_claimed(
+    kb_path: &std::path::Path,
+    db: &Arc<Mutex<Database>>,
+    writer: &Arc<WriterSlot>,
+    role: &mut Option<StartRole>,
+    handles: &mut WriterRoleHandles,
+    load_models: impl FnOnce(Arc<Mutex<Database>>) -> anyhow::Result<(Embedder, Option<Reranker>)>
+    + Send
+    + 'static,
+    settings: ServeSettings,
+) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Instant, SystemTime};
+
+    let ServeSettings {
+        rerank_by_default,
+        exclude_headings,
+        exclude_dirs,
+        quality_threshold,
+        best_practice_templates,
+        parser_registry,
+        watch_config,
+        transport,
+        min_confidence_ratio,
+        search_config,
+        config_source,
+        context_mode_desired,
+        fail_on_frontmatter_error,
+    } = settings;
+
+    // On a blocking thread, so the janitor keeps ticking through a download
+    // even on a runtime with a single worker.
+    let models_db = Arc::clone(db);
+    let (embedder, reranker) = tokio::task::spawn_blocking(move || load_models(models_db))
+        .await
+        .map_err(|e| anyhow::anyhow!("loading the models did not finish: {e}"))??;
 
     let kb_path = kb_path
         .canonicalize()
@@ -1739,7 +1902,7 @@ pub async fn run_server(
     // watcher と共有するため Arc 化。
     // HTTP service factory でも共有するため KbServerShared にまとめる。
     let shared = KbServerShared {
-        db: Arc::new(Mutex::new(db)),
+        db: Arc::clone(db),
         embedder: Arc::new(Mutex::new(embedder)),
         reranker: Arc::new(Mutex::new(reranker)),
         rerank_by_default,
@@ -1760,34 +1923,40 @@ pub async fn run_server(
         watcher_debounce_ms,
         config_source_label: format!("{:?}", config_source),
         allowed_admin_hosts,
-        // Unmanaged until serve takes the lease here.
-        writer: WriterSlot::unmanaged(),
+        writer: Arc::clone(writer),
     };
 
-    // watcher をバックグラウンドで並走。
-    let watcher_state = crate::watcher::WatcherState {
-        kb_path: kb_path.clone(),
-        db: Arc::clone(&shared.db),
-        embedder: Arc::clone(&shared.embedder),
-        registry: Arc::clone(&shared.parser_registry),
-        exclude_headings: shared.exclude_headings.clone(),
-        // (feature-49) `.grooveignore` を起動時に 1 度読む。以後、ファイル自体が
-        // 書き換わったら watcher が組み直す。`rebuild_index` 側は毎回読み直すので
-        // ここの値は共有しない。
-        rules: crate::exclusion::ExclusionRules::load(&kb_path, shared.exclude_dirs.clone()),
-        config: watch_config,
-        watcher_active: Arc::clone(&watcher_active),
-        watch_status: None,
-        watch_backoff: crate::watcher::WatcherState::DEFAULT_WATCH_BACKOFF,
-        batch_probe: None,
-    };
-    let watcher_handle = tokio::spawn(async move {
-        if let Err(e) = crate::watcher::run_watch_loop(watcher_state).await {
-            eprintln!("watcher exited with error: {e}");
+    // A writer's watcher runs in the background beside the transport.
+    let watcher_state = {
+        let kb_path = kb_path.clone();
+        let db = Arc::clone(&shared.db);
+        let embedder = Arc::clone(&shared.embedder);
+        let registry = Arc::clone(&shared.parser_registry);
+        let exclude_headings = shared.exclude_headings.clone();
+        let exclude_dirs = shared.exclude_dirs.clone();
+        let watcher_active = Arc::clone(&watcher_active);
+        move || crate::watcher::WatcherState {
+            // (feature-49) `.grooveignore` を起動時に 1 度読む。以後、ファイル自体が
+            // 書き換わったら watcher が組み直す。`rebuild_index` 側は毎回読み直すので
+            // ここの値は共有しない。
+            rules: crate::exclusion::ExclusionRules::load(&kb_path, exclude_dirs),
+            kb_path,
+            db,
+            embedder,
+            registry,
+            exclude_headings,
+            config: watch_config,
+            watcher_active,
+            watch_status: None,
+            watch_backoff: crate::watcher::WatcherState::DEFAULT_WATCH_BACKOFF,
+            batch_probe: None,
         }
-    });
+    };
+    if let Some(role) = role.take() {
+        start_writer_role(&shared, role, watcher_state, handles);
+    }
 
-    let result = match transport {
+    match transport {
         crate::transport::Transport::Stdio => crate::transport::stdio::run_stdio(&shared).await,
         crate::transport::Transport::Http {
             listen,
@@ -1808,9 +1977,29 @@ pub async fn run_server(
             )
             .await
         }
-    };
-    watcher_handle.abort();
-    result
+    }
+}
+
+/// What `has_pending` said between the end of [`serve_claimed`] and the
+/// writer role's shutdown, per database path, read by the tests of a
+/// failed start.
+#[cfg(test)]
+static PENDING_BEFORE_SHUTDOWN: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_pending_before_shutdown(db_path: &std::path::Path, pending: bool) {
+    recover(PENDING_BEFORE_SHUTDOWN.lock(), "pending_before_shutdown")
+        .push((db_path.to_path_buf(), pending));
+}
+
+/// The last `has_pending` recorded for `db_path` before its shutdown.
+#[cfg(test)]
+fn pending_before_shutdown_for_test(db_path: &std::path::Path) -> Option<bool> {
+    recover(PENDING_BEFORE_SHUTDOWN.lock(), "pending_before_shutdown")
+        .iter()
+        .rev()
+        .find(|(p, _)| p == db_path)
+        .map(|(_, pending)| *pending)
 }
 
 // ===========================================================================
@@ -6871,5 +7060,129 @@ mod tests {
             "the panicked rebuild's claim must wait for the janitor"
         );
         drop(watcher);
+    }
+
+    // ---- run_server_with: the start of a writer around the model loading ----
+
+    /// What the `load_models` closure saw after waiting two janitor ticks.
+    struct SeenWhileLoading {
+        heartbeat_fresh: bool,
+        watching: Option<bool>,
+    }
+
+    /// Start a server through `run_server_with` on a fresh knowledge base
+    /// whose `load_models` ages writer.json's heartbeat, waits two janitor
+    /// ticks, records what writer.json says, and fails. Then check that the
+    /// heartbeat was kept fresh during the load, that the failed start left
+    /// the index read-only and unleased, and that the start's claim was
+    /// still alive when the shutdown began (nothing was queued as panicked).
+    async fn assert_heartbeat_while_models_load(prefix: &str) {
+        use crate::writer_lease::{LeaseError, Role, WriterLease};
+        use std::time::SystemTime;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(crate::test_support::unique_temp_path(prefix));
+        let kb = scratch.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("note.md"), "# Note\n\nSome text to index.\n").unwrap();
+        let db_path = crate::resolve_db_path(&kb);
+
+        let kept: Arc<Mutex<Option<Arc<Mutex<Database>>>>> = Arc::default();
+        let seen: Arc<Mutex<Option<SeenWhileLoading>>> = Arc::default();
+        let load = {
+            let kept = Arc::clone(&kept);
+            let seen = Arc::clone(&seen);
+            let db_path = db_path.clone();
+            move |db: Arc<Mutex<Database>>| -> anyhow::Result<(Embedder, Option<Reranker>)> {
+                *kept.lock().unwrap() = Some(db);
+                let info = WriterLease::info_path_for(&db_path);
+                let mut h = WriterLease::read_holder(&db_path).expect("writer.json at load");
+                let old = chrono::Utc::now() - chrono::Duration::seconds(60);
+                h.heartbeat_at = Some(old.to_rfc3339());
+                std::fs::write(&info, serde_json::to_vec_pretty(&h).unwrap()).unwrap();
+                std::thread::sleep(writer_role::JANITOR_TICK * 2);
+                let h = WriterLease::read_holder(&db_path);
+                *seen.lock().unwrap() = Some(SeenWhileLoading {
+                    heartbeat_fresh: h
+                        .as_ref()
+                        .is_some_and(|h| h.heartbeat_fresh(SystemTime::now())),
+                    watching: h.and_then(|h| h.watching),
+                });
+                anyhow::bail!("injected model load failure")
+            }
+        };
+        let result = run_server_with(
+            &kb,
+            crate::embedder::EmbeddingSettings::fastembed(crate::embedder::ModelChoice::default()),
+            false,
+            None,
+            vec![],
+            0.0,
+            vec![],
+            Registry::defaults(),
+            crate::watcher::WatchConfig::default(),
+            crate::transport::Transport::Stdio,
+            1.5,
+            crate::config::SearchConfig::default(),
+            crate::config::ConfigSource::NotFound,
+            crate::db::ContextMode::Off,
+            false,
+            load,
+        )
+        .await;
+
+        let err = result.expect_err("the injected load failure must stop the start");
+        assert!(
+            format!("{err:#}").contains("injected model load failure"),
+            "{err:#}"
+        );
+        let seen = seen.lock().unwrap().take().expect("load_models ran");
+        assert!(
+            seen.heartbeat_fresh,
+            "the janitor must keep the heartbeat fresh while the models load"
+        );
+        assert_eq!(seen.watching, None, "no watcher has reported yet");
+
+        assert_eq!(
+            pending_before_shutdown_for_test(&db_path),
+            Some(false),
+            "the start's claim must still be held when the shutdown begins"
+        );
+        match WriterLease::try_acquire(&db_path, Role::Index, &kb) {
+            Ok(_) => {}
+            Err(LeaseError::Busy { .. }) => panic!("the failed start must release the lease"),
+            Err(e) => panic!("unexpected lease error: {e}"),
+        }
+        let db = kept
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the db the start opened");
+        assert_eq!(recover_db(db.lock()).query_only_for_test(), 1);
+        assert!(
+            WriterLease::read_holder(&db_path).is_none(),
+            "writer.json is removed with the lease"
+        );
+    }
+
+    /// The models load on a blocking thread, so the janitor ticks whatever
+    /// the number of workers; this is the runtime `groove serve` runs on
+    /// (`main.rs` builds a multi-thread runtime).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_heartbeat_stays_fresh_and_unreported_while_the_models_load() {
+        assert_heartbeat_while_models_load("groove-serve-load-mt").await;
+    }
+
+    /// The same on a single-thread runtime. Red if `load_models` is called on
+    /// the runtime's own thread: it blocks the only worker, the janitor
+    /// cannot tick, and the aged heartbeat stays stale.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_heartbeat_stays_fresh_while_the_models_load_on_a_single_thread_runtime() {
+        assert_heartbeat_while_models_load("groove-serve-load-ct").await;
     }
 }

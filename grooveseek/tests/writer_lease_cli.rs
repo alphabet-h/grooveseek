@@ -691,3 +691,77 @@ fn search_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothi
         "no lossy spelling of the knowledge base is created beside it: {stderr}"
     );
 }
+
+/// `groove serve` on a knowledge base whose database path is not UTF-8
+/// stops at start, as `groove index` and the reading commands do: exit 1
+/// within 30 s, the lease's reason in ASCII, and neither the database nor
+/// its lock file created (nor a lossy spelling of the knowledge base).
+#[test]
+fn serve_on_a_non_utf8_kb_path_stops_before_opening_the_index() {
+    let root = TempRoot::new("groove-serve-not-utf8");
+    let cache = TempRoot::new("groove-serve-not-utf8-cache");
+    let bad = root.path().join(non_utf8_name());
+    let kb = bad.join("kb");
+    if !create_non_utf8_dir_or_skip(
+        &kb,
+        "serve_on_a_non_utf8_kb_path_stops_before_opening_the_index",
+    ) {
+        return;
+    }
+    std::fs::write(
+        kb.join("note.md"),
+        "---\ntitle: Note\n---\n\n# Note\n\nEnough content here to stand as a chunk.\n",
+    )
+    .expect("write a note");
+
+    let mut cmd = Command::new(grooveseek_bin());
+    cmd.arg("serve").arg("--kb-path").arg(&kb);
+    hermetic(&mut cmd, cache.path());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn groove serve");
+    let mut pipe = child.stderr.take().expect("stderr is piped");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll groove serve") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("groove serve did not stop within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let stderr = strip_ansi(&String::from_utf8_lossy(
+        &reader.join().expect("the stderr reader"),
+    ));
+    assert_dir_empty(cache.path());
+
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.is_ascii(), "stderr stays ASCII: {stderr:?}");
+    assert!(stderr.contains("not valid UTF-8"), "{stderr}");
+    let names = |dir: &Path| -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .expect("read a directory of the test")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect()
+    };
+    assert_eq!(
+        names(&bad),
+        vec![std::ffi::OsString::from("kb")],
+        "neither .groove.db nor .groove.db.writer-lock is created: {stderr}"
+    );
+    assert_eq!(
+        names(root.path()),
+        vec![non_utf8_name()],
+        "no lossy spelling of the knowledge base is created beside it: {stderr}"
+    );
+}

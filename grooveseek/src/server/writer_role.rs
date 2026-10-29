@@ -2,10 +2,6 @@
 //! or no watch, the janitor that keeps the holder's heartbeat and settles
 //! panicked claims, and the watcher a writer runs.
 
-// `run_server` calls these once the start is wired to them; until then only
-// the tests below do.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

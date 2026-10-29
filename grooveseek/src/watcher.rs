@@ -2079,7 +2079,7 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
             // truth is that a full index fixes it, so the message says so.
             wdiag!(
                 "watcher: could not scan the new directory {rel}: {e}. \
-                 Its files stay unindexed until the next full `groove index`."
+                 Its files stay unindexed until the next full `groove index` (or this server's MCP `rebuild_index`)."
             );
             return;
         }
@@ -4404,7 +4404,7 @@ fn dispatch_directory_rename(
     let (to_kind, stat_err) = to_state(to);
     if let Some(e) = &stat_err {
         wdiag!(
-            "watcher: could not stat a rename destination: {e}. Handled as a file rename; if it was a directory, the rows under its old path stay until the next full `groove index`."
+            "watcher: could not stat a rename destination: {e}. Handled as a file rename; if it was a directory, the rows under its old path stay until the next full `groove index` (or this server's MCP `rebuild_index`)."
         );
     }
     let entry = match to_kind {
@@ -4422,7 +4422,7 @@ fn dispatch_directory_rename(
         Ok(None) => return false,
         Err(e) => {
             wdiag!(
-                "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index`."
+                "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index` (or this server's MCP `rebuild_index`)."
             );
             return false;
         }
@@ -4524,7 +4524,7 @@ fn dispatch_directory_rename(
         SourceSweep::Present => false,
         SourceSweep::Unknown(e) => {
             wdiag!(
-                "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
+                "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index` (or this server's MCP `rebuild_index`)."
             );
             false
         }
