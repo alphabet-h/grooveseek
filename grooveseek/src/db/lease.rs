@@ -93,6 +93,55 @@ fn classify_attempt_error(path: &str, db: Option<Database>, e: anyhow::Error) ->
     AttemptFailure::Fail(e.context(format!("failed to initialise database at {path}")))
 }
 
+/// Holds the lease of a [`Database::write_once_under_lease`] and, when it goes
+/// (also while a panic in the write unwinds), turns `query_only` back on
+/// before it releases the lease. If `query_only` cannot be turned back on, the
+/// lease is kept until the process ends, when the OS releases it: a writable
+/// connection must not outlive the lease (ADR-0031).
+struct QueryOnlyRestore<'a> {
+    db: &'a Database,
+    /// `None` once [`Self::finish`] or [`Drop`] has dealt with it.
+    lease: Option<WriterLease>,
+}
+
+impl QueryOnlyRestore<'_> {
+    /// Turn `query_only` back on, then release the lease; on failure keep
+    /// the lease (see the type) and return the error.
+    fn finish(mut self) -> Result<()> {
+        self.restore()
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let Some(lease) = self.lease.take() else {
+            return Ok(());
+        };
+        match self.db.set_query_only(true) {
+            Ok(()) => {
+                drop(lease);
+                Ok(())
+            }
+            Err(e) => {
+                std::mem::forget(lease);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for QueryOnlyRestore<'_> {
+    fn drop(&mut self) {
+        // Only reached with the lease still here when `finish` was not
+        // called: a `?` before it, or a panic. No panic here (abort risk).
+        if let Err(e) = self.restore() {
+            tracing::warn!(
+                error = %e,
+                "failed to turn query_only back on after a one-time write; \
+                 keeping the writer lease until this process exits"
+            );
+        }
+    }
+}
+
 impl Database {
     /// Open (or create) the database at the given path as a reader: the
     /// connection runs with `PRAGMA query_only` on. A schema upgrade
@@ -181,7 +230,7 @@ impl Database {
     /// Run `f` as this reader's one-time write: take the writer lease as
     /// [`Role::Migration`] (2 s wait; a busy lease is [`OneTimeWriteBusy`]),
     /// lift `query_only` for `f`, and put it back on before the lease goes,
-    /// whether `f` failed or not.
+    /// whether `f` failed, succeeded or panicked (see [`QueryOnlyRestore`]).
     pub fn write_once_under_lease<T>(
         &self,
         db_path: &Path,
@@ -205,16 +254,17 @@ impl Database {
             }
             Err(e @ LeaseError::Io { .. }) => return Err(anyhow::Error::new(e)),
         };
-        // On failure the connection is still query_only; the lease drops here.
+        // From here on the guard puts query_only back on before the lease
+        // goes, on every exit: `?`, `f`'s Err, and a panic in `f` unwinding.
+        let guard = QueryOnlyRestore {
+            db: self,
+            lease: Some(lease),
+        };
         self.set_query_only(false)?;
         let r = f(self);
-        if let Err(e) = self.set_query_only(true) {
-            // A writable connection must not outlive the lease: keep the lock
-            // until the process ends, when the OS releases it (spec §5.1.3).
-            std::mem::forget(lease);
-            return Err(e.context("failed to turn query_only back on after a one-time write"));
-        }
-        drop(lease);
+        guard
+            .finish()
+            .context("failed to turn query_only back on after a one-time write")?;
         r
     }
 
@@ -884,6 +934,35 @@ mod tests {
         );
         assert_eq!(query_only_flag(&r), 1);
         assert!(lease_is_free(&path, &kb));
+    }
+
+    #[test]
+    fn write_once_under_lease_turns_query_only_back_on_before_the_lease_goes_when_f_panics() {
+        // Local Codex review: a panic in `f` that the caller catches must not
+        // leave a writable connection behind a released lease.
+        let dir = TempDir::new("write-once-panic");
+        let kb = kb_of(&dir);
+        let (path, _) = fixture(&dir);
+        let before = snapshot(&path);
+        let r = Database::open_read_only(&path, &kb).unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.write_once_under_lease(
+                Path::new(&path),
+                &kb,
+                OneTimeWrite::EmbeddingMeta,
+                |db| -> Result<()> {
+                    assert_eq!(query_only_flag(db), 0);
+                    panic!("f panicked on purpose")
+                },
+            )
+        }));
+        assert!(caught.is_err(), "f's panic did not reach catch_unwind");
+        assert_eq!(query_only_flag(&r), 1);
+        let e = upsert(&r, "after-panic.md").unwrap_err();
+        assert!(is_query_only_refusal(&r.conn, &e), "{e:#}");
+        assert!(lease_is_free(&path, &kb));
+        drop(r);
+        assert_eq!(snapshot(&path), before);
     }
 
     #[test]
