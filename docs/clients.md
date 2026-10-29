@@ -83,8 +83,18 @@ Or, if you placed a `groove.toml` somewhere on the [discovery path](configuratio
 
 The server will be started automatically when the client connects.
 
+## Several sessions on one knowledge base
+
+(v1.22.0+) Each Claude Code session starts its own stdio `groove serve`. When several sessions point at the same knowledge base, only the server that started first writes the index and runs the file watcher; the others are readers that answer searches only ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). Closing the first session does not hand the index over: a reader keeps not updating it until it is restarted, so files added, edited or deleted meanwhile are not reflected, and a deleted file keeps showing up in search. A reader also refuses `rebuild_index`. To restart a reader's server in Claude Code, run `/mcp` in that session, select the server and choose Reconnect (or close the session and open it again); the new server writes the index if no other server holds it by then. Changes made before the restart still stay out of the index, so once it writes the index, run `rebuild_index` once.
+
+A reader says so in the `writer_notice` field of its `search` and `rebuild_index` replies ([MCP tools](mcp-tools.md)), where the agent reads it. It also warns on stderr once at start, but Claude Code does not usually show a server's stderr (estimate). If the first session's server was killed rather than closed, its `.groove.db.writer.json` stays behind: the readers' notice goes on saying that server keeps the index current until its heartbeat in that file is more than 15 seconds old, then says it has probably exited and changes are not reflected until restart.
+
+To use one knowledge base from several sessions and keep it current, let one server write it: run a resident daemon over HTTP (`groove service install`, or [HTTP transport for multiple simultaneous clients](#http-transport-for-multiple-simultaneous-clients)) and point every session at its `/mcp`.
+
 ## Keeping the index fresh via PostToolUse hook
-If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write. Minimal form:
+If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write.
+
+**Use the hook only when the server runs without its file watcher** (`groove serve --no-watch`, or `[watch].enabled = false`). A server whose watcher is on — the default — already picks up every edit (see [Live-sync via file watcher](#live-sync-via-file-watcher)), and the writing server holds the index's writer lease while its watcher runs: only one groove process writes an index at a time (a server that started as a reader holds none and refuses `rebuild_index`; see [behavior.md](behavior.md)). Paired with that server, the hook's `groove index` exits 3 on every edit. Drop the hook in that setup. Minimal form:
 
 <!-- groove-pin: posttooluse-hook-snippet -->
 ```json
@@ -104,7 +114,9 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 
 > **If your `groove.toml` sits beside the project rather than beside the binary, name it here too**: `groove --config /abs/path/groove.toml index`. A discovered config has `[parsers]` reset to Markdown alone ([Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations)), and `groove index` deletes the documents it did not visit — so a hook that rebuilds with the default parser set removes every `.txt`, PDF, Office document and source file already in the index, on the first edit after you upgrade. A config next to the binary, or one `groove service install` placed, is trusted and needs nothing added.
 
-SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md) — it takes `GROOVE_CONFIG` for exactly this. SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md) — it takes `GROOVE_CONFIG` for exactly this.
+
+Exit code 3 from the hook is not noise to ignore. It means another writer — the server's MCP `rebuild_index`, or an overlapping run of the hook — had the index, and **this edit may not be indexed yet**; run `groove index` again or call `rebuild_index`. To have the hook wait for that writer instead, write the command as `groove index --wait 30`. The bundled script does this through `GROOVE_INDEX_WAIT` (default 30 seconds) and still returns 3 when the wait runs out.
 
 ## Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:
@@ -245,9 +257,12 @@ curl http://127.0.0.1:3100/api/admin/status
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
   "kb":       { "documents": 596, "chunks": 8878, "model": "bge-m3" },
-  "config_source": "Cwd"
+  "config_source": "Cwd",
+  "writer":   { "held": true, "role": "serve", "held_since": "2026-07-26T09:12:04+00:00", "reader": false, "reader_notice": null, "watch_error": null, "watcher_stopped": null }
 }
 ```
+
+`writer` (v1.22.0+) is the index's writer lock as this server sees it ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). A server that writes the index holds it (`held: true`). A server that started while another process held it, or while the lock could not be taken (an I/O error on the lock file), is a reader until it is restarted: `held: false`, `reader: true`, and `reader_notice` carries the same text as the `writer_notice` of its MCP replies. `watch_error` is set while the watcher cannot register a watch, and is kept as it was if the watcher then stops; `watcher_stopped` is set once the watcher has stopped outside shutdown, and that server releases the lock.
 
 > **`kb.path` was removed.** It carried the knowledge base's absolute path, so
 > on Windows the payload — and the status band that printed it — read
@@ -271,7 +286,7 @@ whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
 
 - **Default on**. `[watch].enabled = false` in `groove.toml` or `--no-watch` on the command line disables it.
 - **Debounce** is 500 ms by default. Tune with `[watch].debounce_ms` or `--debounce-ms`.
-- **Coexists with the PostToolUse hook**. Both paths lock the same `Mutex<Database>` / `Mutex<Embedder>`, so concurrent triggers are serialized at the Rust layer and are idempotent.
+- **Not paired with the PostToolUse hook**. The hook's `groove index` is another process, and while this server watches it holds the index's writer lease, so the hook exits 3 on every edit. The watcher already covers those edits; drop the hook (see [Keeping the index fresh via PostToolUse hook](#keeping-the-index-fresh-via-posttooluse-hook)). Inside this server, the watcher and MCP `rebuild_index` lock the same `Mutex<Database>` / `Mutex<Embedder>`, so they are serialized at the Rust layer.
 - **Extension-aware**. The watcher shares the Parser registry with `rebuild_index`, so only files whose extension is enabled in `[parsers].enabled` are re-indexed; other events are dropped.
 - **Resilience**. Errors inside the watcher task are logged to stderr (not silently dropped) and the MCP server keeps running. Local disk is assumed — inotify on WSL / SMB / network shares is not guaranteed.
 - **Backpressure (v0.6.0+)**. The bridge from the debouncer to the indexer task uses a bounded 64-batch channel; if the consumer cannot keep up (e.g. embedder is paused), excess batches are dropped with a warn log instead of growing the queue indefinitely. Run `rebuild_index` manually after the burst to recover any missed events.

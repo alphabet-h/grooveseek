@@ -130,8 +130,21 @@ hook on every edit.
 
 ## Notes
 
-- **Concurrency**: SQLite is configured in WAL mode, so a running MCP server
-  and a hook-triggered `groove index` can coexist. The hook blocks the tool
+- **Concurrency**: only one groove process writes an index at a time. A
+  `groove serve` whose watcher is on (the default) holds that writer lease
+  while its watcher runs, and it already picks up every edit, so **do not pair
+  this hook with it**: each `groove index` the hook starts would wait out
+  `GROOVE_INDEX_WAIT` seconds on every edit and then exit 3. Drop the hook in
+  that setup. Use it beside a server started with `--no-watch`, or with no
+  server at all. There, the hook's `groove index` waits up to
+  `GROOVE_INDEX_WAIT` seconds (default 30) for another writer -- the server's
+  MCP `rebuild_index`, or an overlapping run of this hook. If that writer
+  still has the index when the wait runs out, the script exits 3, not 0: the
+  edit may not be indexed yet. Its first stderr line says so (Claude Code's
+  hook notice shows that line), and groove's own output follows. Run
+  `groove index` again or call `rebuild_index` to pick the edit up. If you set
+  a `timeout` on the hook, keep `GROOVE_INDEX_WAIT` at half of it or less
+  (Claude Code's default for command hooks is 600 s). The hook blocks the tool
   use until the rebuild finishes; for small KBs this is imperceptible.
 - **Quality filter**: rebuild respects `[quality_filter]` in
   `groove.toml`. Backfill runs at the start of every `groove index` but is

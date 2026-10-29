@@ -383,6 +383,20 @@ impl Database {
         self.conn.pragma_update(None, "query_only", on)?;
         Ok(())
     }
+
+    /// Whether this connection has the given file open, compared by
+    /// canonical path (see [`connection_is_on`]).
+    pub(crate) fn is_on(&self, path: &Path) -> bool {
+        connection_is_on(&self.conn, path)
+    }
+
+    /// `PRAGMA query_only` on this connection (1 = on), for tests outside [`crate::db`].
+    #[cfg(test)]
+    pub(crate) fn query_only_for_test(&self) -> i64 {
+        self.conn
+            .query_row("PRAGMA query_only", [], |r| r.get(0))
+            .unwrap()
+    }
 }
 
 /// The file a writer under the given lease opens for the given path: the

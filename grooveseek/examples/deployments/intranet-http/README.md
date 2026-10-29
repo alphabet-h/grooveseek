@@ -128,9 +128,15 @@ machines on the same intranet over Streamable HTTP.
 
 ## Operational notes
 
-- **Single writer**. `serve` holds the only `Mutex<Database>` for the
-  index. The watcher on the server picks up edits to files under
-  `kb_path` and re-indexes incrementally; clients never write.
+- **Single writer**. Inside the process, `serve` holds the only
+  `Mutex<Database>` for the index; between processes, it holds the
+  operating-system lock on `.groove.db.writer-lock` beside the database
+  while its watcher runs (v1.22.0+, see
+  [ADR-0031](../../../../docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)).
+  A second server started while it runs is a reader and refuses
+  `rebuild_index`; see [behavior.md](../../../../docs/behavior.md).
+  The watcher on the server picks up edits to files under `kb_path` and
+  re-indexes incrementally; clients never write.
 - **Concurrency**. rmcp's Streamable HTTP layer accepts many connections
   in parallel, but `search` calls serialize on the embedder + DB
   mutexes. Throughput is roughly 5-15 qps per groove instance with
@@ -145,8 +151,11 @@ machines on the same intranet over Streamable HTTP.
     The watcher catches the resulting file changes.
 - **Restart safety**. The DB is written with WAL + `synchronous = NORMAL`
   by SQLite defaults. Killing the process mid-index loses at most the
-  current chunk's commit — the next `groove index` rebuilds from
-  authoritative source files.
+  current chunk's commit, and the operating system drops the writer lock
+  with the process. To rebuild from the authoritative source files,
+  call the running server's MCP `rebuild_index`, or stop the service
+  and run `groove index` (while the service runs, a `groove index` on
+  the same index exits with code 3).
 
 ## Security model
 

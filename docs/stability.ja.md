@@ -172,6 +172,10 @@ loopback origin** である。
 両方について書き下す (wrapper は同一、1 フィールドだけ違う。後述)。
 **この表に無いフィールドは約束の対象ではない。**
 
+`search` MCP tool は、server が索引を最新に保っていないとき、これらのフィールドの横に
+`writer_notice` (文字列) を足すことがある (v1.22.0+。[mcp-tools.ja.md](mcp-tools.ja.md) を参照)。
+advisory であって、この凍結の外にある。
+
 `topic` が 2 箇所に出て意味が違うので、名前はパスで書く。
 
 | フィールド | 型 | 存在 |

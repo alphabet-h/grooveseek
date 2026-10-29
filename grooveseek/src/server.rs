@@ -41,6 +41,18 @@ use kb_uri::{HitWithUri, LoadFailure, resource_error};
 #[cfg(test)]
 use kb_uri::resource_text;
 mod search;
+mod writer_role;
+mod writer_slot;
+use writer_role::{
+    StartRole, WriterRoleHandles, claim_writer_role, shutdown_writer_role, spawn_janitor,
+    start_writer_role,
+};
+
+// The writer lease inside one server (ADR-0031): `run_server` and the handlers
+// reach these by `crate::server::X`.
+pub use writer_slot::{
+    ClaimGuard, Claimant, ReaderReason, WatchErrorCause, WatchStatusFn, WriterSlot, WriterStatus,
+};
 
 // (audit L-1 PR-2) `GET_DOCUMENT_MAX_BYTES` is the one name here that
 // production code outside this module reaches by path -- `doctor.rs` reports
@@ -152,6 +164,14 @@ pub(crate) struct KbCore {
     /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
     /// in-process index operation (codex P2 round 1 on PR #57).
     indexing_state: Arc<Mutex<Option<IndexingState>>>,
+    /// The writer lease inside this server (ADR-0031), shared by every
+    /// session; its notice rides on the replies that carry one.
+    pub(crate) writer: Arc<WriterSlot>,
+    /// Test seam: [`KbCore::rebuild_index_blocking`] panics after
+    /// [`WriterSlot::make_writable`]
+    /// while this is set, so a test can drive a panic through the handler.
+    #[cfg(test)]
+    panic_in_rebuild_for_test: std::sync::atomic::AtomicBool,
 }
 
 /// The rmcp tool surface. Holds nothing but an `Arc` to the state, so the
@@ -524,9 +544,32 @@ fn with_chunk_counts<T: Serialize>(body: T, result: &indexer::IndexResult) -> Wi
     }
 }
 
-#[derive(Serialize, Debug)]
+/// Deserialize too: a panicked rebuild's reply is read back to put the
+/// writer notice beside it.
+#[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct ErrorResponse {
     error: String,
+}
+
+/// Every way the body of [`KbServer::rebuild_index`] under the lease returns. Untagged,
+/// so each serializes as the type it holds and the reply is unchanged.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RebuildReply {
+    Error(ErrorResponse),
+    Strict(WithChunkCounts<StrictIndexFailure>),
+    Stats(WithChunkCounts<IndexStats>),
+}
+
+/// A reply with the writer notice beside it (ADR-0031): flattened, so the
+/// reply gains one top-level key, and that key is absent while there is no
+/// notice — the bytes are then exactly the body's.
+#[derive(Serialize)]
+struct WithWriterNotice<T: Serialize> {
+    #[serde(flatten)]
+    body: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writer_notice: Option<String>,
 }
 
 /// The wrapper both search surfaces answer with (feature-26).
@@ -651,6 +694,32 @@ impl SearchFilterEcho {
 /// only ever reached through the `spawn_blocking` wrappers in
 /// `impl KbServer` below, which is what keeps the tokio workers free.
 impl KbCore {
+    /// `body` as pretty JSON, with the writer notice when this server has
+    /// one. The notice reads writer.json, so call it with no db, embedder or
+    /// reranker guard held. `body` must serialize as a map or a struct: it is
+    /// flattened, and anything else fails to serialize.
+    fn with_writer_notice<T: Serialize>(&self, body: T) -> String {
+        let out = serde_json::to_string_pretty(&WithWriterNotice {
+            body,
+            writer_notice: self.writer.notice(),
+        });
+        debug_assert!(
+            out.is_ok(),
+            "with_writer_notice: the body must serialize as a map: {out:?}"
+        );
+        out.unwrap_or_default()
+    }
+
+    /// A panicked rebuild's reply (the `error` envelope [`run_blocking`]
+    /// makes) with the writer notice beside it; a body that does not read
+    /// back as that envelope is returned as it is.
+    fn after_panicked_rebuild(&self, body: String) -> String {
+        match serde_json::from_str::<ErrorResponse>(&body) {
+            Ok(error) => self.with_writer_notice(error),
+            Err(_) => body,
+        }
+    }
+
     fn list_topics_blocking(&self) -> String {
         let db = recover_db(self.db.lock());
         match db.list_topics() {
@@ -678,12 +747,53 @@ impl KbCore {
     /// Holding the slot for the length of this call is also what
     /// `/api/admin/status` reads to report indexing.active=true (codex P2 rounds
     /// 1 and 4 on PR #57).
-    fn rebuild_index_blocking(&self, params: RebuildIndexParams, _slot: RebuildSlot) -> String {
-        let force = params.force.unwrap_or(false);
+    ///
+    /// `guard` is the writer lease's claim, also taken by the caller. The
+    /// connection is made writable under the db guard, the body runs, and
+    /// the claim is released before the reply is put together, whichever
+    /// way the body returned (ADR-0031). The notice is worded after the
+    /// release, with no guard held.
+    fn rebuild_index_blocking(
+        &self,
+        params: RebuildIndexParams,
+        _slot: RebuildSlot,
+        mut guard: ClaimGuard,
+    ) -> String {
+        let reply = {
+            // Lock order: embedder first, then db (consistent with search)
+            let mut embedder = recover(self.embedder.lock(), "embedder");
+            let db = recover_db(self.db.lock());
+            if let Err(e) = self.writer.make_writable(&mut guard, &db) {
+                // `make_writable` has already released the claim.
+                drop(db);
+                drop(embedder);
+                return self.with_writer_notice(ErrorResponse {
+                    error: format!("Rebuild failed: {e:#}"),
+                });
+            }
+            #[cfg(test)]
+            if self
+                .panic_in_rebuild_for_test
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("rebuild_index panicked for a test");
+            }
+            let reply = self.rebuild_with_lease(&db, &mut embedder, params);
+            self.writer.release(guard, &db);
+            reply
+        };
+        self.with_writer_notice(reply)
+    }
 
-        // Lock order: embedder first, then db (consistent with search)
-        let mut embedder = recover(self.embedder.lock(), "embedder");
-        let db = recover_db(self.db.lock());
+    /// The rebuild itself, with the claim held and the connection writable.
+    /// Every early return leaves through the caller, which releases the claim.
+    fn rebuild_with_lease(
+        &self,
+        db: &Database,
+        embedder: &mut Embedder,
+        params: RebuildIndexParams,
+    ) -> RebuildReply {
+        let force = params.force.unwrap_or(false);
 
         // (feature-58, codex P2 round 3 on PR #291) Read the schema once, here, before
         // `rebuild_index` -- it no longer reads the file itself and takes this snapshot
@@ -693,16 +803,15 @@ impl KbCore {
         let schema = match indexer::load_declared_schema(&self.kb_path) {
             Ok(schema) => schema,
             Err(e) => {
-                return serde_json::to_string_pretty(&ErrorResponse {
+                return RebuildReply::Error(ErrorResponse {
                     error: format!("Rebuild failed: {e}"),
-                })
-                .unwrap_or_default();
+                });
             }
         };
 
         match indexer::rebuild_index(
-            &db,
-            &mut embedder,
+            db,
+            embedder,
             &self.kb_path,
             schema,
             force,
@@ -730,8 +839,7 @@ impl KbCore {
                         ),
                         stats,
                     };
-                    return serde_json::to_string_pretty(&with_chunk_counts(reply, &result))
-                        .unwrap_or_default();
+                    return RebuildReply::Strict(with_chunk_counts(reply, &result));
                 }
                 if result.fails_forced_rebuild_rejections() {
                     let reply = StrictIndexFailure {
@@ -740,8 +848,7 @@ impl KbCore {
                         ),
                         stats,
                     };
-                    return serde_json::to_string_pretty(&with_chunk_counts(reply, &result))
-                        .unwrap_or_default();
+                    return RebuildReply::Strict(with_chunk_counts(reply, &result));
                 }
                 if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
                     let reply = StrictIndexFailure {
@@ -753,10 +860,9 @@ impl KbCore {
                         ),
                         stats,
                     };
-                    return serde_json::to_string_pretty(&with_chunk_counts(reply, &result))
-                        .unwrap_or_default();
+                    return RebuildReply::Strict(with_chunk_counts(reply, &result));
                 }
-                serde_json::to_string_pretty(&with_chunk_counts(stats, &result)).unwrap_or_default()
+                RebuildReply::Stats(with_chunk_counts(stats, &result))
             }
             // (AW-04, AW-16) Through `body_free_message`, like the search tool's embed error:
             // the indexer wraps every embed failure in its own context, and the reply names
@@ -764,10 +870,9 @@ impl KbCore {
             // response body. Only the status and `serde_json` layers are cut; any other
             // error, embedding or not, arrives with its whole chain (OS / SQLite text, the
             // absolute paths a directory walk names).
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
+            Err(e) => RebuildReply::Error(ErrorResponse {
                 error: format!("Rebuild failed: {}", crate::embedder::body_free_message(&e)),
-            })
-            .unwrap_or_default(),
+            }),
         }
     }
 
@@ -863,7 +968,7 @@ where
 impl KbServer {
     #[tool(
         name = "search",
-        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them). Prefix a whitespace-delimited group with a hyphen to exclude it from both halves of the search, e.g. `rust -async` or `-\"exact phrase\"`; the excluded phrases are echoed in filter_applied.excluded_terms. A query made only of exclusions is refused, and a hyphen inside quotes (`\"-foo\"`) is searched for literally."
+        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them). Prefix a whitespace-delimited group with a hyphen to exclude it from both halves of the search, e.g. `rust -async` or `-\"exact phrase\"`; the excluded phrases are echoed in filter_applied.excluded_terms. A query made only of exclusions is refused, and a hyphen inside quotes (`\"-foo\"`) is searched for literally. When a reply carries writer_notice, this server is not keeping the index current and the text says why; pass it on to the user."
     )]
     pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         let core = Arc::clone(&self.core);
@@ -912,7 +1017,14 @@ impl KbServer {
                        running is refused with an error naming how long the \
                        running one has been going. Search is unavailable until \
                        a rebuild finishes, because it holds the embedder and \
-                       the database."
+                       the database. The call is refused, without waiting for \
+                       the embedder, the database or a running rebuild, when \
+                       another groove process (a groove index run, or another \
+                       server's watcher) is writing the same index, or when \
+                       this server started while one was and is reading only. \
+                       When a reply carries writer_notice, this server is \
+                       not keeping the index current and the text says why; \
+                       pass it on to the user."
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
         // Claimed here, in the handler, rather than inside the closure below —
@@ -924,13 +1036,42 @@ impl KbServer {
         // two-field struct, held for the length of one comparison.
         let slot = match claim_rebuild_slot(&self.core.indexing_state) {
             Ok(slot) => slot,
-            Err(started_at) => return rebuild_already_running(started_at),
+            Err(started_at) => {
+                // The notice reads writer.json, so it is worded on the pool.
+                let core = Arc::clone(&self.core);
+                return run_blocking("rebuild_index", move || {
+                    core.with_writer_notice(rebuild_already_running_error(started_at))
+                })
+                .await;
+            }
         };
+        // One hop onto the pool: the writer lease is claimed there (its file
+        // I/O stays off the async workers), and a refused claim answers at
+        // once, before the embedder or the database is touched (ADR-0031).
+        // `finished` tells a panicked body's reply from one the body made.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::clone(&finished);
         let core = Arc::clone(&self.core);
-        run_blocking("rebuild_index", move || {
-            core.rebuild_index_blocking(params, slot)
+        let body = run_blocking("rebuild_index", move || {
+            let guard = match core.writer.claim(Claimant::Rebuild) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    drop(slot);
+                    let reply = core.with_writer_notice(core.writer.rebuild_refusal(&e));
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return reply;
+                }
+            };
+            let reply = core.rebuild_index_blocking(params, slot, guard);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            reply
         })
-        .await
+        .await;
+        if finished.load(std::sync::atomic::Ordering::SeqCst) {
+            body
+        } else {
+            self.core.after_panicked_rebuild(body)
+        }
     }
 
     #[tool(
@@ -1158,7 +1299,7 @@ fn internal_error(e: String) -> rmcp::ErrorData {
 ///
 /// Same obligation as every tool handler (BU-06): the body does its work on the
 /// blocking pool, never on an async worker.
-async fn run_blocking_typed<T, F>(what: &'static str, f: F) -> Result<T, String>
+pub(crate) async fn run_blocking_typed<T, F>(what: &'static str, f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -1216,6 +1357,10 @@ pub struct KbServerShared {
     /// Hosts allowed by the admin sub-router Host header check.
     /// Always includes the loopback aliases; HTTP transport also adds its bind addr.
     pub allowed_admin_hosts: Vec<String>,
+    /// The writer lease inside this server (ADR-0031). Every session built
+    /// by [`KbServer::from_shared`] shares this one slot, and
+    /// `/api/admin/status` reports it.
+    pub writer: Arc<WriterSlot>,
 }
 
 /// The one rebuild in progress, or `None`.
@@ -1251,16 +1396,22 @@ impl Drop for RebuildSlot {
 ///
 /// The elapsed time is the useful part: "wait" without a number gives no way to
 /// tell a rebuild that is nearly done from one that just started.
+#[cfg(test)]
 fn rebuild_already_running(started_at: std::time::SystemTime) -> String {
+    serde_json::to_string_pretty(&rebuild_already_running_error(started_at)).unwrap_or_default()
+}
+
+/// The refusal above as the envelope, so the handler can put the writer
+/// notice beside it.
+fn rebuild_already_running_error(started_at: std::time::SystemTime) -> ErrorResponse {
     let secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-    serde_json::to_string_pretty(&ErrorResponse {
+    ErrorResponse {
         error: format!(
             "A rebuild is already running (started {secs}s ago). Wait for it to \
              finish and call again: each rebuild re-embeds the whole corpus, and \
              search is unavailable while one runs."
         ),
-    })
-    .unwrap_or_default()
+    }
 }
 
 /// Take the rebuild slot, or report when the rebuild already holding it began.
@@ -1322,6 +1473,9 @@ impl KbServer {
                 context_mode_desired: shared.context_mode_desired,
                 fail_on_frontmatter_error: shared.fail_on_frontmatter_error,
                 indexing_state: Arc::clone(&shared.indexing_state),
+                writer: Arc::clone(&shared.writer),
+                #[cfg(test)]
+                panic_in_rebuild_for_test: std::sync::atomic::AtomicBool::new(false),
             }),
             tool_router: KbServer::tool_router(),
         }
@@ -1416,8 +1570,19 @@ impl KbServerShared {
     /// go through `run_server`; this helper exists so integration tests can
     /// build a `KbServerShared` without booting the full transport stack.
     /// All non-essential fields are filled with defaults (loopback-only admin
-    /// allow-list, no reranker, no watcher).
+    /// allow-list, no reranker, no watcher, an unmanaged writer slot).
     pub fn for_test(db: Database, embedder: Embedder, kb_path: PathBuf) -> Self {
+        Self::for_test_with_writer(db, embedder, kb_path, WriterSlot::unmanaged())
+    }
+
+    /// [`KbServerShared::for_test`] with the writer slot given, so a test can
+    /// serve as a reader or under a managed lease.
+    pub fn for_test_with_writer(
+        db: Database,
+        embedder: Embedder,
+        kb_path: PathBuf,
+        writer: Arc<WriterSlot>,
+    ) -> Self {
         use std::sync::atomic::AtomicBool;
         use std::time::{Instant, SystemTime};
         Self {
@@ -1448,6 +1613,7 @@ impl KbServerShared {
                 .iter()
                 .map(|h| (*h).to_string())
                 .collect(),
+            writer,
         }
     }
 }
@@ -1472,24 +1638,74 @@ pub async fn run_server(
     context_mode_desired: crate::db::ContextMode,
     fail_on_frontmatter_error: bool,
 ) -> Result<()> {
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Instant, SystemTime};
+    let models = embedding.clone();
+    run_server_with(
+        kb_path,
+        embedding,
+        rerank_by_default,
+        exclude_headings,
+        exclude_dirs,
+        quality_threshold,
+        best_practice_templates,
+        parser_registry,
+        watch_config,
+        transport,
+        min_confidence_ratio,
+        search_config,
+        config_source,
+        context_mode_desired,
+        fail_on_frontmatter_error,
+        move |_db, _writer| {
+            Ok((
+                Embedder::with_settings(models)?,
+                Reranker::try_new(reranker_choice)?,
+            ))
+        },
+    )
+    .await
+}
 
+/// The body of [`run_server`], with the loading of the models (their
+/// download included) handed in as `load_models`. The index is opened as a
+/// reader, the writer role is claimed and the janitor started before
+/// `load_models` runs, so a long download keeps the heartbeat fresh
+/// (ADR-0031). `load_models` runs once, on a blocking thread, and gets
+/// clones of the database the start opened and of its writer slot (the
+/// production closure uses neither; a test reads them after the start).
+/// Every exit after the claim goes through the writer role's shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn run_server_with(
+    kb_path: &std::path::Path,
+    embedding: EmbeddingSettings,
+    rerank_by_default: bool,
+    exclude_headings: Option<Vec<String>>,
+    exclude_dirs: Vec<String>,
+    quality_threshold: f32,
+    best_practice_templates: Vec<String>,
+    parser_registry: Registry,
+    watch_config: crate::watcher::WatchConfig,
+    transport: crate::transport::Transport,
+    min_confidence_ratio: f32,
+    search_config: crate::config::SearchConfig,
+    config_source: crate::config::ConfigSource,
+    context_mode_desired: crate::db::ContextMode,
+    fail_on_frontmatter_error: bool,
+    load_models: impl FnOnce(
+        Arc<Mutex<Database>>,
+        Arc<WriterSlot>,
+    ) -> anyhow::Result<(Embedder, Option<Reranker>)>
+    + Send
+    + 'static,
+) -> Result<()> {
+    let model_id = embedding.model_id().to_string();
+    let dim = embedding.dimension() as u32;
     let db_path = crate::resolve_db_path(kb_path);
-    let db = Database::open(&db_path.to_string_lossy())?;
+    let db_str = crate::writer_lease::db_path_utf8(&db_path)?;
+    let db = Database::open_read_only(db_str, kb_path)?;
 
     // モデル DL の前に meta 整合性を確認。不整合ならここで止めて DL を回避。
-    db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
-
-    // codex P2 (PR #73 F2): fresh DB (chunk 0 件、`index` 未実行のまま `serve`
-    // 起動) かつ `[contextual] enabled = true` の場合、watcher 経由の
-    // `reindex_single_file` は `read_context_mode()` が `None` を返すたびに
-    // `Off` へ fallback していた (= grandfather 判定は「レコードが無い」を
-    // legacy DB とみなす設計だが、fresh DB では正しくない)。watcher が動く前に
-    // ここで一度 resolve しておけば、fresh DB では desired mode が記録され、
-    // 既存 DB では従来通り grandfather / warning 挙動のままになる。watcher 自体は
-    // 「DB に記録された mode に追従する」設計を変えない (呼ぶのはここ 1 回だけ)。
-    indexer::resolve_context_mode(&db, context_mode_desired, false)?;
+    // meta が無ければ短い writer lease の下で記録する。
+    db.verify_embedding_meta_or_record(&db_path, kb_path, &model_id, dim)?;
 
     // AU-06 (codex P2): `[parsers].enabled` を狭めた後、その拡張子の行は DB に
     // 残る。`groove index` なら prune されるが `serve` は index しないので、
@@ -1505,15 +1721,131 @@ pub async fn run_server(
             tracing::warn!(
                 "{} indexed document(s) have an extension that [parsers].enabled no longer \
                  covers (e.g. {}). They still appear in search results but get_document \
-                 rejects them. Run `groove index` to remove them from the index.",
+                 rejects them. Run `groove index` (or, while a server is writing this \
+                 index, its MCP `rebuild_index`) to remove them from the index.",
                 stale.len(),
                 sample.join(", ")
             );
         }
     }
 
-    let embedder = Embedder::with_settings(embedding)?;
-    let reranker = Reranker::try_new(reranker_choice)?;
+    // Before the model download (ADR-0031): with the watch on, the watcher's
+    // claim takes the lease, makes the connection writable and resolves the
+    // context mode, so a fresh index records the desired mode before the
+    // watcher reindexes anything (codex P2, PR #73 F2). The janitor starts
+    // right after, for every role.
+    let db = Arc::new(Mutex::new(db));
+    let writer = WriterSlot::managed(db_path.clone(), kb_path.to_path_buf(), model_id, dim);
+    let role = claim_writer_role(
+        &writer,
+        &db,
+        &db_path,
+        kb_path,
+        watch_config.enabled,
+        context_mode_desired,
+    )?;
+    let mut handles = WriterRoleHandles {
+        janitor: Some(spawn_janitor(Arc::clone(&writer), Arc::clone(&db))),
+        watcher: None,
+        watcher_stop: None,
+    };
+    // Kept here, not in `serve_claimed`, so a start that fails before the
+    // watcher takes the claim still holds it when the shutdown begins; let
+    // go only after, it queues nothing as panicked.
+    let mut role = Some(role);
+    let result = serve_claimed(
+        kb_path,
+        &db,
+        &writer,
+        &mut role,
+        &mut handles,
+        load_models,
+        ServeSettings {
+            rerank_by_default,
+            exclude_headings,
+            exclude_dirs,
+            quality_threshold,
+            best_practice_templates,
+            parser_registry,
+            watch_config,
+            transport,
+            min_confidence_ratio,
+            search_config,
+            config_source,
+            context_mode_desired,
+            fail_on_frontmatter_error,
+        },
+    )
+    .await;
+    shutdown_writer_role(&writer, &db, handles).await;
+    drop(role);
+    result
+}
+
+/// What [`serve_claimed`] passes on to the server's shared state, the
+/// watcher and the transport.
+struct ServeSettings {
+    rerank_by_default: bool,
+    exclude_headings: Option<Vec<String>>,
+    exclude_dirs: Vec<String>,
+    quality_threshold: f32,
+    best_practice_templates: Vec<String>,
+    parser_registry: Registry,
+    watch_config: crate::watcher::WatchConfig,
+    transport: crate::transport::Transport,
+    min_confidence_ratio: f32,
+    search_config: crate::config::SearchConfig,
+    config_source: crate::config::ConfigSource,
+    context_mode_desired: crate::db::ContextMode,
+    fail_on_frontmatter_error: bool,
+}
+
+/// The start after the claim: load the models on a blocking thread, build
+/// the shared state, hand the role to [`start_writer_role`] (a writer's
+/// watcher starts here) and serve the transport until it ends. The role is
+/// taken only when the watcher starts; an error before that leaves it with
+/// the caller.
+async fn serve_claimed(
+    kb_path: &std::path::Path,
+    db: &Arc<Mutex<Database>>,
+    writer: &Arc<WriterSlot>,
+    role: &mut Option<StartRole>,
+    handles: &mut WriterRoleHandles,
+    load_models: impl FnOnce(
+        Arc<Mutex<Database>>,
+        Arc<WriterSlot>,
+    ) -> anyhow::Result<(Embedder, Option<Reranker>)>
+    + Send
+    + 'static,
+    settings: ServeSettings,
+) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Instant, SystemTime};
+
+    let ServeSettings {
+        rerank_by_default,
+        exclude_headings,
+        exclude_dirs,
+        quality_threshold,
+        best_practice_templates,
+        parser_registry,
+        watch_config,
+        transport,
+        min_confidence_ratio,
+        search_config,
+        config_source,
+        context_mode_desired,
+        fail_on_frontmatter_error,
+    } = settings;
+
+    // On a blocking thread, so the janitor keeps ticking through a download
+    // even on a runtime with a single worker.
+    let models_db = Arc::clone(db);
+    let models_writer = Arc::clone(writer);
+    let (embedder, reranker) =
+        tokio::task::spawn_blocking(move || load_models(models_db, models_writer))
+            .await
+            .map_err(|e| anyhow::anyhow!("loading the models did not finish: {e}"))??;
 
     let kb_path = kb_path
         .canonicalize()
@@ -1579,7 +1911,7 @@ pub async fn run_server(
     // watcher と共有するため Arc 化。
     // HTTP service factory でも共有するため KbServerShared にまとめる。
     let shared = KbServerShared {
-        db: Arc::new(Mutex::new(db)),
+        db: Arc::clone(db),
         embedder: Arc::new(Mutex::new(embedder)),
         reranker: Arc::new(Mutex::new(reranker)),
         rerank_by_default,
@@ -1600,29 +1932,40 @@ pub async fn run_server(
         watcher_debounce_ms,
         config_source_label: format!("{:?}", config_source),
         allowed_admin_hosts,
+        writer: Arc::clone(writer),
     };
 
-    // watcher をバックグラウンドで並走。
-    let watcher_state = crate::watcher::WatcherState {
-        kb_path: kb_path.clone(),
-        db: Arc::clone(&shared.db),
-        embedder: Arc::clone(&shared.embedder),
-        registry: Arc::clone(&shared.parser_registry),
-        exclude_headings: shared.exclude_headings.clone(),
-        // (feature-49) `.grooveignore` を起動時に 1 度読む。以後、ファイル自体が
-        // 書き換わったら watcher が組み直す。`rebuild_index` 側は毎回読み直すので
-        // ここの値は共有しない。
-        rules: crate::exclusion::ExclusionRules::load(&kb_path, shared.exclude_dirs.clone()),
-        config: watch_config,
-        watcher_active: Arc::clone(&watcher_active),
-    };
-    let watcher_handle = tokio::spawn(async move {
-        if let Err(e) = crate::watcher::run_watch_loop(watcher_state).await {
-            eprintln!("watcher exited with error: {e}");
+    // A writer's watcher runs in the background beside the transport.
+    let watcher_state = {
+        let kb_path = kb_path.clone();
+        let db = Arc::clone(&shared.db);
+        let embedder = Arc::clone(&shared.embedder);
+        let registry = Arc::clone(&shared.parser_registry);
+        let exclude_headings = shared.exclude_headings.clone();
+        let exclude_dirs = shared.exclude_dirs.clone();
+        let watcher_active = Arc::clone(&watcher_active);
+        move || crate::watcher::WatcherState {
+            // (feature-49) `.grooveignore` を起動時に 1 度読む。以後、ファイル自体が
+            // 書き換わったら watcher が組み直す。`rebuild_index` 側は毎回読み直すので
+            // ここの値は共有しない。
+            rules: crate::exclusion::ExclusionRules::load(&kb_path, exclude_dirs),
+            kb_path,
+            db,
+            embedder,
+            registry,
+            exclude_headings,
+            config: watch_config,
+            watcher_active,
+            watch_status: None,
+            watch_backoff: crate::watcher::WatcherState::DEFAULT_WATCH_BACKOFF,
+            batch_probe: None,
         }
-    });
+    };
+    if let Some(role) = role.take() {
+        start_writer_role(&shared, role, watcher_state, handles);
+    }
 
-    let result = match transport {
+    match transport {
         crate::transport::Transport::Stdio => crate::transport::stdio::run_stdio(&shared).await,
         crate::transport::Transport::Http {
             listen,
@@ -1643,9 +1986,7 @@ pub async fn run_server(
             )
             .await
         }
-    };
-    watcher_handle.abort();
-    result
+    }
 }
 
 // ===========================================================================
@@ -4319,9 +4660,11 @@ mod tests {
     /// を引いて silent に `Off` へ fallback していた (grandfather 判定は
     /// 「レコード不在 = legacy DB」前提だが、fresh DB では誤り)。
     ///
-    /// `run_server` は DB open 直後・watcher 起動前に
+    /// watch ありの `serve` では、書き手の claim ([`crate::server::writer_role::claim_writer_role`]) が
+    /// lease を取って接続を書けるようにした直後、model の DL と watcher 起動の前に
     /// `indexer::resolve_context_mode(&db, context_mode_desired, false)` を
-    /// 一度呼ぶよう修正済み (このテストが検証する呼び出しパターンそのもの)。
+    /// 一度呼ぶ (このテストが検証する呼び出しパターンそのもの)。reader と
+    /// `--no-watch` の serve は接続が読み取り専用なので呼ばない。
     /// ここでは `run_server` を丸ごと起動せず (Embedder / listener 不要)、
     /// その呼び出しパターンを直接再現して DB に記録される値と、
     /// `reindex_single_file` が使うのと同じ fallback 式の結果を検証する。
@@ -4336,7 +4679,7 @@ mod tests {
             "precondition: no context_mode recorded yet"
         );
 
-        // run_server が watcher 起動前に行うのと同じ呼び出し。
+        // watch ありの書き手の claim (claim_writer_role) が watcher 起動前に行うのと同じ呼び出し。
         crate::indexer::resolve_context_mode(&db, crate::db::ContextMode::Static, false)
             .expect("resolve_context_mode");
 
@@ -6161,5 +6504,747 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A managed slot that started as a reader, the way a second serve is
+    /// left when another process holds the lease. Nothing is written to disk:
+    /// the notice reads writer.json and finds none.
+    fn reader_slot() -> Arc<WriterSlot> {
+        let dir = crate::test_support::unique_temp_path("writer-notice");
+        let slot = WriterSlot::managed(
+            dir.join("kb.db"),
+            dir.join("kb"),
+            "test-model".to_string(),
+            4,
+        );
+        slot.become_reader(ReaderReason::Busy {
+            holder_at_start: None,
+            relation: crate::writer_lease::HolderRelation::Unknown,
+        });
+        slot
+    }
+
+    /// An empty index the 4-dimensional stub embedder can search.
+    fn stub_db() -> Database {
+        let db = Database::open_in_memory().expect("in-memory db");
+        db.verify_embedding_meta("test-model", 4)
+            .expect("declare the stub's identity");
+        db
+    }
+
+    fn shared_with(writer: Arc<WriterSlot>) -> KbServerShared {
+        KbServerShared::for_test_with_writer(
+            stub_db(),
+            Embedder::stub_for_tests(4),
+            PathBuf::from("."),
+            writer,
+        )
+    }
+
+    async fn search_json(shared: &KbServerShared, params: SearchParams) -> serde_json::Value {
+        let out = KbServer::from_shared(shared)
+            .search(Parameters(params))
+            .await;
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("not JSON ({e}): {out}"))
+    }
+
+    /// A reader's successful search says why the index may be behind; a
+    /// search through [`KbServerShared::for_test`] (an unmanaged slot)
+    /// answers exactly as before.
+    #[tokio::test]
+    async fn mcp_search_success_carries_writer_notice_and_the_for_test_search_does_not() {
+        let slot = reader_slot();
+        let expected = slot.notice().expect("a reader slot has a notice");
+        let reader = shared_with(slot);
+        let json = search_json(
+            &reader,
+            SearchParams {
+                query: "x".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        for key in ["results", "low_confidence", "filter_applied"] {
+            assert!(json.get(key).is_some(), "`{key}` missing: {json}");
+        }
+        assert_eq!(json["writer_notice"], expected, "{json}");
+
+        let plain = KbServerShared::for_test(stub_db(), Embedder::stub_for_tests(4), ".".into());
+        let json = search_json(
+            &plain,
+            SearchParams {
+                query: "x".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(json.get("results").is_some(), "{json}");
+        assert!(json.get("writer_notice").is_none(), "{json}");
+    }
+
+    /// An error reply is the `error` envelope alone, even on a reader.
+    #[tokio::test]
+    async fn a_search_error_reply_carries_no_writer_notice() {
+        let reader = shared_with(reader_slot());
+        let json = search_json(
+            &reader,
+            SearchParams {
+                query: "x".into(),
+                mmr_lambda: Some(2.0),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(json.get("error").is_some(), "{json}");
+        assert!(json.get("writer_notice").is_none(), "{json}");
+    }
+
+    /// Without a notice the wrapper adds nothing: the same bytes, keys in the
+    /// same order, for every reply type it can wrap.
+    #[test]
+    fn with_writer_notice_without_a_notice_is_byte_identical_to_the_body() {
+        let shared = KbServerShared::for_test(stub_db(), Embedder::stub_for_tests(4), ".".into());
+        let server = KbServer::from_shared(&shared);
+        let core = &server.core;
+
+        let error = || ErrorResponse {
+            error: "boom".to_string(),
+        };
+        assert_eq!(
+            core.with_writer_notice(error()),
+            serde_json::to_string_pretty(&error()).unwrap()
+        );
+
+        let stats = || IndexStats {
+            total_documents: 3,
+            updated: 1,
+            renamed: 2,
+            deleted: 0,
+            skipped: 4,
+            frontmatter_unparsed: 1,
+            total_chunks: 140,
+            duration_ms: 7,
+        };
+        let plain = || WithChunkCounts {
+            body: stats(),
+            chunks_embedded: 5,
+            chunks_reused: 135,
+        };
+        assert_eq!(
+            core.with_writer_notice(plain()),
+            serde_json::to_string_pretty(&plain()).unwrap()
+        );
+        let failure = || WithChunkCounts {
+            body: StrictIndexFailure {
+                error: "boom".to_string(),
+                stats: stats(),
+            },
+            chunks_embedded: 5,
+            chunks_reused: 135,
+        };
+        assert_eq!(
+            core.with_writer_notice(failure()),
+            serde_json::to_string_pretty(&failure()).unwrap()
+        );
+
+        // The success reply of `search_blocking`: one hit, one non-default echo.
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        let response = || SearchResponse {
+            results: maximal_hits()
+                .into_iter()
+                .take(1)
+                .map(|h| HitWithUri::new(h, &rules))
+                .collect(),
+            low_confidence: true,
+            filter_applied: SearchFilterEcho::new(
+                Some("c".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                crate::db::FieldFilters::new(),
+                crate::db::FieldFilters::new(),
+            ),
+        };
+        let expected = serde_json::to_string_pretty(&response()).unwrap();
+        assert!(expected.contains("\"category\": \"c\""), "{expected}");
+        assert!(expected.contains("\"uri\""), "{expected}");
+        assert_eq!(core.with_writer_notice(response()), expected);
+    }
+
+    /// Every session the HTTP transport builds from one shared state reads
+    /// the same slot.
+    #[tokio::test]
+    async fn every_session_built_from_one_shared_sees_the_same_writer_notice() {
+        let slot = reader_slot();
+        let expected = slot.notice().expect("a reader slot has a notice");
+        let shared = shared_with(slot);
+        for _ in 0..2 {
+            let json = search_json(
+                &shared,
+                SearchParams {
+                    query: "x".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(json["writer_notice"], expected, "{json}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // rebuild_index under the writer lease (ADR-0031)
+    // -----------------------------------------------------------------------
+
+    /// A knowledge base (`note.md`) and its index (meta `test-model`, 4) in a
+    /// temp dir, served through a managed slot the way `groove serve` builds it.
+    struct LeaseKb {
+        dir: TempKb,
+        kb: PathBuf,
+        db_path: PathBuf,
+    }
+
+    impl LeaseKb {
+        fn new(prefix: &str) -> Self {
+            let dir = TempKb::new(prefix);
+            let kb = dir.path.join("kb");
+            fs::create_dir_all(&kb).unwrap();
+            fs::write(kb.join("note.md"), "# Note\n\nSome text to index.\n").unwrap();
+            let db_path = dir.path.join(".groove.db");
+            {
+                let w = Database::open(db_path.to_str().unwrap()).unwrap();
+                w.verify_embedding_meta("test-model", 4).unwrap();
+            }
+            Self { dir, kb, db_path }
+        }
+
+        fn slot(&self) -> Arc<WriterSlot> {
+            WriterSlot::managed(
+                self.db_path.clone(),
+                self.kb.clone(),
+                "test-model".to_string(),
+                4,
+            )
+        }
+
+        /// A sibling of `kb/` that exists.
+        fn other_kb(&self) -> PathBuf {
+            let other = self.dir.path.join("other");
+            fs::create_dir_all(&other).unwrap();
+            other
+        }
+
+        /// The shared state of a server on this index: a reader connection
+        /// (`query_only` on) and the 4-dimensional stub embedder.
+        fn shared(&self, writer: Arc<WriterSlot>) -> KbServerShared {
+            let db = Database::open_read_only(self.db_path.to_str().unwrap(), &self.kb).unwrap();
+            KbServerShared::for_test_with_writer(
+                db,
+                Embedder::stub_for_tests(4),
+                self.kb.clone(),
+                writer,
+            )
+        }
+
+        /// Another process's lease on this index, held until dropped.
+        fn hold_lease(
+            &self,
+            role: crate::writer_lease::Role,
+            kb: &std::path::Path,
+        ) -> crate::writer_lease::WriterLease {
+            crate::writer_lease::WriterLease::try_acquire(&self.db_path, role, kb)
+                .unwrap_or_else(|e| panic!("another handle must take the lease: {e}"))
+        }
+
+        /// Whether another handle can take the lease now (dropped at once).
+        fn lease_is_free(&self) -> bool {
+            match crate::writer_lease::WriterLease::try_acquire(
+                &self.db_path,
+                crate::writer_lease::Role::Index,
+                &self.kb,
+            ) {
+                Ok(_) => true,
+                Err(crate::writer_lease::LeaseError::Busy { .. }) => false,
+                Err(e) => panic!("unexpected lease error: {e}"),
+            }
+        }
+    }
+
+    fn query_only_of(shared: &KbServerShared) -> i64 {
+        recover_db(shared.db.lock()).query_only_for_test()
+    }
+
+    async fn rebuild_json(shared: &KbServerShared) -> serde_json::Value {
+        let out = KbServer::from_shared(shared)
+            .rebuild_index(Parameters(RebuildIndexParams::default()))
+            .await;
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("not JSON ({e}): {out}"))
+    }
+
+    /// The handler's reply while another thread holds the embedder: it must
+    /// come within 2 s, so it did not wait for the embedder.
+    async fn rebuild_json_with_the_embedder_held(shared: &KbServerShared) -> serde_json::Value {
+        let embedder = Arc::clone(&shared.embedder);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _g = recover(embedder.lock(), "embedder");
+            held_tx.send(()).unwrap();
+            let _ = go_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        // The bound is 2 s rather than 300 ms: the claim runs on the blocking
+        // pool, and a slow CI runner can take longer than 300 ms to start one.
+        // Answering at all while the embedder is held is what shows the
+        // refusal does not wait for it. The handler runs in a task of its own
+        // on a worker, so one that blocked its thread on the embedder cannot
+        // stop the timeout here from firing.
+        let shared = shared.clone();
+        let call = tokio::spawn(async move { rebuild_json(&shared).await });
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
+        drop(go_tx);
+        holder.join().unwrap();
+        answered
+            .expect("the refusal waited for the embedder")
+            .expect("the handler task panicked")
+    }
+
+    fn watch_cause(kb: &std::path::Path) -> WatchErrorCause {
+        WatchErrorCause {
+            kb: kb.to_path_buf(),
+            error: "injected watch failure".to_string(),
+            retry_secs: 3,
+        }
+    }
+
+    /// Another process holds the lease, so the claim is refused before
+    /// the embedder is touched.
+    // The handler is spawned as its own task on a worker, so a wrong handler
+    // that took the embedder on the async worker fails the 2 s bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebuild_refuses_at_once_while_another_process_holds_the_lease() {
+        let l = LeaseKb::new("rebuild-busy");
+        let _other = l.hold_lease(crate::writer_lease::Role::Index, &l.kb);
+        let shared = l.shared(l.slot());
+        let json = rebuild_json_with_the_embedder_held(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.contains("Another groove process"), "{json}");
+    }
+
+    /// A lock that cannot be taken is reported by its path, not
+    /// blamed on another process.
+    #[tokio::test]
+    // `LeaseError::Busy` carries the holder inline so callers can match on it
+    // directly; the error path runs once per command, so its size costs nothing.
+    #[allow(clippy::result_large_err)]
+    async fn rebuild_on_a_no_watch_server_with_a_broken_lock_reports_the_lock_path() {
+        let l = LeaseKb::new("rebuild-io");
+        let lock_path = crate::writer_lease::WriterLease::lock_path_for(&l.db_path);
+        let injected = lock_path.clone();
+        let slot = WriterSlot::managed_with_acquire(
+            l.db_path.clone(),
+            l.kb.clone(),
+            "test-model".to_string(),
+            4,
+            Box::new(move |_, _, _| {
+                Err(crate::writer_lease::LeaseError::Io {
+                    lock_path: injected.clone(),
+                    source: std::io::Error::other("injected"),
+                })
+            }),
+        );
+        let shared = l.shared(slot);
+        let json = rebuild_json(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.contains(&lock_path.display().to_string()), "{json}");
+        assert!(!error.contains("Another groove process"), "{json}");
+    }
+
+    /// A reader refuses without waiting for the embedder and without
+    /// ever taking the lease, and says why in `writer_notice`.
+    // Multi-thread for the same reason as the test above: the handler runs
+    // as its own task on a worker, so a blocked worker fails the 2 s bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_refuses_rebuild_at_once_and_never_takes_the_lease() {
+        let l = LeaseKb::new("rebuild-reader");
+        let slot = l.slot();
+        slot.become_reader(ReaderReason::Busy {
+            holder_at_start: None,
+            relation: crate::writer_lease::HolderRelation::Unknown,
+        });
+        let shared = l.shared(Arc::clone(&slot));
+        let json = rebuild_json_with_the_embedder_held(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.contains("cannot rebuild the index"), "{json}");
+        assert!(!error.contains("Another groove process"), "{json}");
+        let notice = json["writer_notice"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{json}"));
+        assert!(notice.contains("not updating the index"), "{json}");
+        assert!(!slot.is_held());
+        assert!(l.lease_is_free(), "a reader must not take the lease");
+    }
+
+    /// The rebuild-slot refusal carries the watch error too.
+    #[tokio::test]
+    async fn an_overlapping_rebuild_refusal_still_carries_the_watch_error() {
+        let l = LeaseKb::new("rebuild-overlap");
+        let slot = l.slot();
+        let watcher = slot.claim(Claimant::Watcher).unwrap();
+        slot.set_watch_error(watcher.generation(), Some(watch_cause(&l.kb)));
+        let shared = l.shared(Arc::clone(&slot));
+        let _running = claim_rebuild_slot(&shared.indexing_state).unwrap();
+        let json = rebuild_json(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.contains("A rebuild is already running"), "{json}");
+        let notice = json["writer_notice"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{json}"));
+        assert!(notice.contains("could not watch"), "{json}");
+        drop(watcher);
+    }
+
+    /// A holder on another knowledge base sharing the index must not
+    /// be pointed to for a rebuild of this one.
+    #[tokio::test]
+    async fn a_busy_refusal_for_another_kb_warns_against_its_rebuild_index() {
+        let l = LeaseKb::new("rebuild-otherkb");
+        let other = l.other_kb();
+        let _other = l.hold_lease(crate::writer_lease::Role::Serve, &other);
+        let shared = l.shared(l.slot());
+        let json = rebuild_json(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.contains("different knowledge base"), "{json}");
+        assert!(
+            !error.contains("that process's own rebuild_index"),
+            "{json}"
+        );
+    }
+
+    /// A CLI index has no rebuild_index to point to.
+    #[tokio::test]
+    async fn no_watch_rebuild_refused_by_a_cli_index_does_not_point_to_its_rebuild_index() {
+        let l = LeaseKb::new("rebuild-cli");
+        let _other = l.hold_lease(crate::writer_lease::Role::Index, &l.kb);
+        let shared = l.shared(l.slot());
+        let json = rebuild_json(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.ends_with("groove index with --wait can."), "{json}");
+        assert!(!error.contains("own rebuild_index"), "{json}");
+    }
+
+    /// An early return of the body (the schema read) still releases
+    /// the lease before the reply, without waiting for the janitor.
+    #[tokio::test]
+    async fn a_schema_failure_releases_the_lease_before_the_reply() {
+        let l = LeaseKb::new("rebuild-schema");
+        fs::write(l.kb.join("groove-schema.toml"), b"\xff\xfe").unwrap();
+        let slot = l.slot();
+        let shared = l.shared(Arc::clone(&slot));
+        let json = rebuild_json(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.starts_with("Rebuild failed"), "{json}");
+        assert!(l.lease_is_free(), "the lease outlived the reply");
+        assert_eq!(query_only_of(&shared), 1);
+        assert!(!slot.has_pending());
+    }
+
+    /// A lease taken anew over an index whose meta changed is refused before
+    /// anything runs, and left released.
+    #[tokio::test]
+    async fn a_no_watch_rebuild_with_a_changed_meta_refuses_and_releases() {
+        let l = LeaseKb::new("rebuild-meta");
+        let slot = l.slot();
+        let shared = l.shared(Arc::clone(&slot));
+        let before = recover_db(shared.db.lock()).document_count().unwrap();
+        {
+            let w = Database::open(l.db_path.to_str().unwrap()).unwrap();
+            w.write_embedding_meta("other-model", 4).unwrap();
+        }
+        let json = rebuild_json(&shared).await;
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(error.contains("embedding model mismatch"), "{json}");
+        assert_eq!(
+            recover_db(shared.db.lock()).document_count().unwrap(),
+            before,
+            "the rebuild ran: {json}"
+        );
+        assert!(l.lease_is_free(), "the lease outlived the reply");
+        assert_eq!(query_only_of(&shared), 1);
+        assert!(!slot.has_pending());
+    }
+
+    #[tokio::test]
+    async fn a_successful_no_watch_rebuild_releases_and_has_no_notice() {
+        let l = LeaseKb::new("rebuild-ok");
+        let slot = l.slot();
+        let shared = l.shared(Arc::clone(&slot));
+        let json = rebuild_json(&shared).await;
+        assert!(json.get("total_documents").is_some(), "{json}");
+        assert!(json.get("writer_notice").is_none(), "{json}");
+        assert!(l.lease_is_free(), "the lease outlived the reply");
+        assert_eq!(query_only_of(&shared), 1);
+        assert!(!slot.has_pending());
+    }
+
+    /// A panicked rebuild's reply, read back through the seam the handler
+    /// uses, still carries the notice.
+    #[tokio::test]
+    async fn a_panicked_rebuild_reply_still_carries_writer_notice() {
+        let l = LeaseKb::new("rebuild-panic-seam");
+        let slot = l.slot();
+        let watcher = slot.claim(Claimant::Watcher).unwrap();
+        slot.set_watch_error(watcher.generation(), Some(watch_cause(&l.kb)));
+        let shared = l.shared(Arc::clone(&slot));
+        let server = KbServer::from_shared(&shared);
+        let body = run_blocking("rebuild_index", || -> String { panic!("boom") }).await;
+        let json: serde_json::Value =
+            serde_json::from_str(&server.core.after_panicked_rebuild(body)).unwrap();
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(
+            error.starts_with("rebuild_index failed: the request panicked"),
+            "{json}"
+        );
+        let notice = json["writer_notice"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{json}"));
+        assert!(notice.contains("could not watch"), "{json}");
+        drop(watcher);
+    }
+
+    /// The same, through the handler: the `finished` mark routes a panicked
+    /// body through [`KbCore::after_panicked_rebuild`].
+    #[tokio::test]
+    async fn a_rebuild_that_panics_through_the_handler_still_carries_writer_notice() {
+        let l = LeaseKb::new("rebuild-panic-handler");
+        let slot = l.slot();
+        let watcher = slot.claim(Claimant::Watcher).unwrap();
+        slot.set_watch_error(watcher.generation(), Some(watch_cause(&l.kb)));
+        let shared = l.shared(Arc::clone(&slot));
+        let server = KbServer::from_shared(&shared);
+        server
+            .core
+            .panic_in_rebuild_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let out = server
+            .rebuild_index(Parameters(RebuildIndexParams::default()))
+            .await;
+        let json: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("not JSON ({e}): {out}"));
+        let error = json["error"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert!(
+            error.starts_with("rebuild_index failed: the request panicked"),
+            "{json}"
+        );
+        let notice = json["writer_notice"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{json}"));
+        assert!(notice.contains("could not watch"), "{json}");
+        assert!(
+            slot.has_pending(),
+            "the panicked rebuild's claim must wait for the janitor"
+        );
+        drop(watcher);
+    }
+
+    // ---- run_server_with: the start of a writer around the model loading ----
+
+    /// What the `load_models` closure saw after waiting two janitor ticks.
+    struct SeenWhileLoading {
+        heartbeat_fresh: bool,
+        watching: Option<bool>,
+    }
+
+    /// The handles a `load_models` closure leaves for the test: the start's
+    /// database and writer slot, and the sender that lets go of the db
+    /// guard a thread of the closure holds.
+    #[derive(Default)]
+    struct LeftByLoad {
+        db: Option<Arc<Mutex<Database>>>,
+        writer: Option<Arc<WriterSlot>>,
+        release_db: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    /// Wait until the closure has left its handles, then watch [`WriterSlot::has_pending`]
+    /// for 2 s while the db guard is still held, and let go of the guard.
+    /// Returns whether a queued claim was seen.
+    ///
+    /// The shutdown's last step waits for that guard, so the 2 s fall
+    /// between the end of [`serve_claimed`] and the shutdown's end. A start
+    /// that let go of its claim before the shutdown began queues it as
+    /// panicked there, and the queue shows; one that lets go only after the
+    /// shutdown queues nothing. Read after the start returns,
+    /// [`WriterSlot::has_pending`]
+    /// cannot tell the two apart: the shutdown clears the queue.
+    async fn pending_while_the_shutdown_waits(left: Arc<Mutex<LeftByLoad>>) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (writer, release) = loop {
+            {
+                let mut l = left.lock().unwrap();
+                if l.release_db.is_some() {
+                    break (
+                        l.writer.clone().expect("the writer slot"),
+                        l.release_db.take(),
+                    );
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "load_models must hold the db within 60 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut pending = false;
+        while std::time::Instant::now() < watch_until {
+            pending |= writer.has_pending();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = release.expect("the release sender").send(());
+        pending
+    }
+
+    /// Start a server through [`run_server_with`] on a fresh knowledge base
+    /// whose `load_models` ages writer.json's heartbeat, waits two janitor
+    /// ticks, records what writer.json says, has a thread take the db guard,
+    /// and fails. Then check that the heartbeat was kept fresh during the
+    /// load, that the start's claim was still alive when the shutdown began
+    /// (nothing was queued as panicked, see
+    /// [`pending_while_the_shutdown_waits`]), and that the failed start left
+    /// the index read-only and unleased.
+    async fn assert_heartbeat_while_models_load(prefix: &str) {
+        use crate::writer_lease::{LeaseError, Role, WriterLease};
+        use std::time::SystemTime;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(crate::test_support::unique_temp_path(prefix));
+        let kb = scratch.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("note.md"), "# Note\n\nSome text to index.\n").unwrap();
+        let db_path = crate::resolve_db_path(&kb);
+
+        let left: Arc<Mutex<LeftByLoad>> = Arc::default();
+        let seen: Arc<Mutex<Option<SeenWhileLoading>>> = Arc::default();
+        let load = {
+            let left = Arc::clone(&left);
+            let seen = Arc::clone(&seen);
+            let db_path = db_path.clone();
+            move |db: Arc<Mutex<Database>>,
+                  writer: Arc<WriterSlot>|
+                  -> anyhow::Result<(Embedder, Option<Reranker>)> {
+                let info = WriterLease::info_path_for(&db_path);
+                let mut h = WriterLease::read_holder(&db_path).expect("writer.json at load");
+                let old = chrono::Utc::now() - chrono::Duration::seconds(60);
+                h.heartbeat_at = Some(old.to_rfc3339());
+                std::fs::write(&info, serde_json::to_vec_pretty(&h).unwrap()).unwrap();
+                std::thread::sleep(writer_role::JANITOR_TICK * 2);
+                let h = WriterLease::read_holder(&db_path);
+                *seen.lock().unwrap() = Some(SeenWhileLoading {
+                    heartbeat_fresh: h
+                        .as_ref()
+                        .is_some_and(|h| h.heartbeat_fresh(SystemTime::now())),
+                    watching: h.and_then(|h| h.watching),
+                });
+                // A thread holds the db guard until the test lets go, so the
+                // shutdown's last step waits for it.
+                let (held_tx, held_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let holder_db = Arc::clone(&db);
+                std::thread::spawn(move || {
+                    let _guard = recover_db(holder_db.lock());
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                });
+                held_rx.recv().unwrap();
+                *left.lock().unwrap() = LeftByLoad {
+                    db: Some(db),
+                    writer: Some(writer),
+                    release_db: Some(release_tx),
+                };
+                anyhow::bail!("injected model load failure")
+            }
+        };
+        let start = run_server_with(
+            &kb,
+            crate::embedder::EmbeddingSettings::fastembed(crate::embedder::ModelChoice::default()),
+            false,
+            None,
+            vec![],
+            0.0,
+            vec![],
+            Registry::defaults(),
+            crate::watcher::WatchConfig::default(),
+            crate::transport::Transport::Stdio,
+            1.5,
+            crate::config::SearchConfig::default(),
+            crate::config::ConfigSource::NotFound,
+            crate::db::ContextMode::Off,
+            false,
+            load,
+        );
+        let (result, pending) =
+            tokio::join!(start, pending_while_the_shutdown_waits(Arc::clone(&left)));
+
+        let err = result.expect_err("the injected load failure must stop the start");
+        assert!(
+            format!("{err:#}").contains("injected model load failure"),
+            "{err:#}"
+        );
+        let seen = seen.lock().unwrap().take().expect("load_models ran");
+        assert!(
+            seen.heartbeat_fresh,
+            "the janitor must keep the heartbeat fresh while the models load"
+        );
+        assert_eq!(seen.watching, None, "no watcher has reported yet");
+
+        assert!(
+            !pending,
+            "the start's claim must still be held when the shutdown begins"
+        );
+        let writer = left.lock().unwrap().writer.take().expect("the writer slot");
+        assert!(!writer.has_pending());
+        assert!(!writer.status().held);
+        match WriterLease::try_acquire(&db_path, Role::Index, &kb) {
+            Ok(_) => {}
+            Err(LeaseError::Busy { .. }) => panic!("the failed start must release the lease"),
+            Err(e) => panic!("unexpected lease error: {e}"),
+        }
+        let db = left
+            .lock()
+            .unwrap()
+            .db
+            .take()
+            .expect("the db the start opened");
+        assert_eq!(recover_db(db.lock()).query_only_for_test(), 1);
+        assert!(
+            WriterLease::read_holder(&db_path).is_none(),
+            "writer.json is removed with the lease"
+        );
+    }
+
+    /// The models load on a blocking thread, so the janitor ticks whatever
+    /// the number of workers; this is the runtime `groove serve` runs on
+    /// (the `groove` binary builds a multi-thread runtime).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_heartbeat_stays_fresh_and_unreported_while_the_models_load() {
+        assert_heartbeat_while_models_load("groove-serve-load-mt").await;
+    }
+
+    /// The same on a single-thread runtime. Red if `load_models` is called on
+    /// the runtime's own thread: it blocks the only worker, the janitor
+    /// cannot tick, and the aged heartbeat stays stale.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_heartbeat_stays_fresh_while_the_models_load_on_a_single_thread_runtime() {
+        assert_heartbeat_while_models_load("groove-serve-load-ct").await;
     }
 }

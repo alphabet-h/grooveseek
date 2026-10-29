@@ -3,8 +3,8 @@
 - Status: accepted
 - Date: 2026-10-29
 - Deciders: プロジェクトオーナー
-- Applies to: v1.22.0 では `groove index` と読む command (PR #408)。
-  `groove serve` が加わるのは後の版
+- Applies to: v1.22.0。`groove index` と読む command (PR #408)、
+  および `groove serve` と MCP の tool `rebuild_index`
 
 ## 背景と課題
 
@@ -85,12 +85,6 @@ run の間にもう一方の process が書いた、実在する file の row �
 
 ## 決定
 
-**v1.22.0 で入るもの。** lock を取るのは `groove index` だけで、DB を `query_only` で開くのは
-読む command (`status`・`search`・`graph`・`doctor`・`eval`・`tune`) だけである。`groove serve`
-はまだ加わらない: これまでどおり lock を取らずに DB を書ける形で開くので、同じ索引に対して
-`groove index` が並んで走れ、両方が書ける。下の箇条と結果のうち server について書いた所は、
-`groove serve` が lock を取る版の設計であって、v1.22.0 の挙動ではない。
-
 - **lock。** DB の隣の `.groove.db.writer-lock` (DB の path に `.writer-lock` を足したもの。
   `.groove.db` が symlink なら、この file と下の 2 つはその先の file の名前で、その隣に置く。
   SQLite は symlink の先を開くので、別名ごとに lock が分かれると 2 つの書き手が同じ DB に並ぶため。
@@ -120,8 +114,8 @@ run の間にもう一方の process が書いた、実在する file の row �
   不明。run の本体は lock を受け取る 1 つの関数に置き、書ける接続 (counter の書き出しと checkpoint
   を含む) が lock より先に drop されるようにする: 順序を関数の境界で固定する。呼び出し側に後から
   `drop(lease)` を足すと黙って崩れる形にはしない。
-- **読む側。** `status`・`search`・`graph`・`doctor`・`eval`・`tune` (と、`groove serve` が
-  加わった後は書き手でない server) は、DB を `PRAGMA query_only` で開き、意図しない書き込みを、書かれる代わりに Err にする。読む側に
+- **読む側。** `status`・`search`・`graph`・`doctor`・`eval`・`tune` (と、claim のどれかが lock を
+  取るまでの `groove serve`) は、DB を `PRAGMA query_only` で開き、意図しない書き込みを、書かれる代わりに Err にする。読む側に
   要る 1 回きりの書き込み (schema の upgrade、embedding model の記録、context mode) は role
   `migration` の短い lock の下で行い、最大 2 s 待つ。lock が取られていれば、諦める前に 1 回だけ
   読み直す (その間に holder が同じ書き込みを済ませ得る)。`query_only` に断られた書き込みを他の
@@ -131,21 +125,19 @@ run の間にもう一方の process が書いた、実在する file の row �
   `open_or_replace_corrupt_with`)。source の走査で、binary がそれ以外の場所で書き手を開かない
   ことを確かめられる。library の `Database::open` は意味を変えない: 書けて、lock を取らず、
   書き手を 1 つにするのは呼び出し側の責務。
-- **watcher つきの `groove serve`** (後の版から。この節の冒頭を参照) は起動時に、model の DL の前に lock を取り、終了まで持つ。
+- **watcher つきの `groove serve`** は起動時に、model の DL の前に lock を取り、終了まで持つ。
   取れなかった server は restart まで reader のまま: watcher を持たず、MCP の tool
   `rebuild_index` を断り、そのことを `search` と `rebuild_index` の応答ごと (`writer_notice`) と
-  `/api/admin/status` で知らせる。`--no-watch` の server は `rebuild_index` の呼び出しごとにだけ
-  lock を取る。終了時に watcher は abort しない: batch の境界で止めて await し、接続を
+  `/api/admin/status` で知らせる。書いている側の server も、watcher が watch を登録できない間と、
+  watcher が止まった後は同じ所で知らせる。`--no-watch` の server は `rebuild_index` の呼び出しごとにだけ
+  lock を取り、取れない呼び出しは embedder・DB・実行中の再構築を待たずに断る。終了時に watcher は abort しない: batch の境界で止めて await し、接続を
   `query_only` に戻してから lock を放す。
 
 ## 結果と代償
 
-server が lock を持つ・待つことに関わる結果は、`groove serve` が加わる版から始まる。v1.22.0 の
-server はどちらもしない。
-
 - **`groove index` に exit code `3` ができた**: 他の groove process が索引に書いている、または
-  `--wait` の期限が切れた。`groove serve` が lock を取るようになると、watch する server と並んで
-  走っていた hook や timer の `groove index` は `3` で止まる。v1.22.0 ではまだ server と並んで走る。
+  `--wait` の期限が切れた。watch する server と並んで走っていた hook や timer の `groove index` は
+  `3` で止まる。
 - **他の process が lock を持っている間に起動した server は、restart まで書かない。** その間に
   削除した file の row は、restart とその後の rebuild まで残る。
 - **watch する server の初回の model の DL の間** (BGE-M3 は約 2.3 GB)、同じ索引への
@@ -157,6 +149,9 @@ server はどちらもしない。
 - **助言は持ち主で変わる**: 持ち主が同じナレッジベースを watch する server のときだけ、索引を
   最新に保つと書き、その `rebuild_index` を勧める。1 回きりの run、別のナレッジベース、不明の
   ときは勧めない。今の持ち主は知らせのたびに json から読み直す。
+- **watcher が終了処理の外で止まった server は、その時点で lock を手放す**。終了を待たず、
+  restart まで `writer_notice` と `/api/admin/status` でそのことを知らせる。決定の「終了まで持つ」は、
+  watcher が動いている間に絞られる。
 - **watcher が止まった書き手の server も、自分の `rebuild_index` は断らない**: その設定は watcher
   が止まる前に索引を書いていたものと同じで、断ると restart の他の唯一の手を奪う。断るかは、
   引き継ぎと同じ後の判断に回した。
@@ -177,7 +172,12 @@ server はどちらもしない。
 - **test が守る場所**: `grooveseek/src/writer_lease.rs` (lock、json、助言)、
   `grooveseek/src/db/lease.rs` (書き手の open、`query_only` とその拒否、1 回きりの書き込み)、
   `grooveseek/tests/writer_lease_cli.rs` (`groove index`、`--wait`、exit 3、kill された holder)、
-  `grooveseek/tests/writer_lease_sources.rs` (書き手は lock の下でだけ開く)。
+  `grooveseek/tests/writer_lease_sources.rs` (書き手は lock の下でだけ開く)、
+  `grooveseek/src/server/writer_slot.rs` (server の中の lock: claim、release、heartbeat、知らせの文)、
+  `grooveseek/src/server/writer_role.rs` (起動時の server の役割、janitor、終了処理)、
+  `grooveseek/tests/mcp_protocol_surface.rs` の
+  `the_search_and_rebuild_descriptions_name_writer_notice` (`search` と `rebuild_index` の
+  description が `writer_notice` を名指す)。
 
 ## 参考
 

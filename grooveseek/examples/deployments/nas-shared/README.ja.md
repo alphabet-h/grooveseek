@@ -149,6 +149,16 @@
   [`intranet-http/`](../intranet-http/) にして 1 回だけ払う
 - **インデックスは最大でタイマー間隔分だけ古い**。マシンごとにその窓の
   どこにいるかも違う。壊れはせず、検索結果が少し古くなるだけ
+- **1 つの index の書き手は 1 つ** (v1.22.0+、
+  [ADR-0031](../../../../docs/decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。
+  `groove index` の run は `/var/lib/groove/.groove.db.writer-lock` に OS の
+  ロックを取る。この file は DB の隣のローカルディスクに置かれ、NAS には
+  置かれない。このレシピの MCP サーバは watcher を切って動くので、ロックを
+  取るのは MCP `rebuild_index` の実行中だけで、タイマーはその横で動き続ける。
+  タイマーの run が他の書き手 (手で打った `groove index`、または
+  `rebuild_index`) と重なると、DB に触れずに exit code 3 で止まり、systemd は
+  その run を失敗と記録し、次の tick が追いつく。lock file は毎回残るが、
+  そのままにしておく
 - **モデルキャッシュもマシンごと**。`fastembed_cache_dir` は **ローカル**
   パスにする。NAS を指すとモデルロードが遅くなり、ホスト間で直列化する
 - **設定の食い違いは黙って許されない**。あるマシンが

@@ -27,6 +27,15 @@
 # file types count as knowledge-base content — set it to match
 # `[parsers].enabled` in your groove.toml.
 #
+# **Do not pair this hook with a `groove serve` whose watcher is on.** That
+# server holds the index's writer lease while its watcher runs and already
+# picks up every edit, so each `groove index` here would spend the whole
+# GROOVE_INDEX_WAIT and then exit 3. Use the hook only beside a server started
+# with `--no-watch` (or with no server at all). There, exit 3 means another
+# writer -- MCP `rebuild_index`, or an overlapping run of this hook -- kept the
+# index for longer than GROOVE_INDEX_WAIT, and this edit may not be indexed
+# yet. The script returns 3 as it is, after one line saying so.
+#
 # **Set GROOVE_CONFIG if your groove.toml lives beside the project rather than
 # beside the binary.** groove honours a config it merely discovered only in
 # part, and `[parsers]` is one of the keys it resets to the default — Markdown
@@ -56,6 +65,13 @@ GROOVE_CONFIG="${GROOVE_CONFIG:-}"
 # default build can parse. "py" is not among them because it needs a grammar
 # plugin placed first; add it yourself once you have.
 KB_EXTENSIONS="${KB_EXTENSIONS:-md txt pdf docx xlsx pptx rs}"
+
+# Seconds `groove index` waits for another writer (MCP `rebuild_index`, or an
+# overlapping run of this hook) before it gives up with exit 3. Claude Code's
+# command hooks time out after 600 s by default; if you set `timeout` on this
+# hook, keep this at half of it or less, so the index run after the wait and
+# the guidance line both fit inside it.
+GROOVE_INDEX_WAIT="${GROOVE_INDEX_WAIT:-30}"
 # -----------------------------------------------------------------------------
 
 if [[ -z "$KB_PATH" ]]; then
@@ -108,15 +124,44 @@ if [[ "$should_rebuild" != "true" ]]; then
   exit 0
 fi
 
-# `--config` goes before the subcommand: it is a global flag.
-if [[ -n "$GROOVE_CONFIG" ]]; then
-  if [[ ! -f "$GROOVE_CONFIG" ]]; then
-    # groove would stop with "--config path not found", and a hook that fails
-    # is noise on every edit. Say what is wrong once and leave the index alone.
-    echo "rebuild-on-edit.sh: GROOVE_CONFIG=$GROOVE_CONFIG does not exist; skipping" >&2
-    exit 0
-  fi
-  "$GROOVE_BIN" --config "$GROOVE_CONFIG" index --kb-path "$KB_PATH" >&2
-else
-  "$GROOVE_BIN" index --kb-path "$KB_PATH" >&2
+if [[ -n "$GROOVE_CONFIG" && ! -f "$GROOVE_CONFIG" ]]; then
+  # groove would stop with "--config path not found", and a hook that fails
+  # is noise on every edit. Say what is wrong once and leave the index alone.
+  echo "rebuild-on-edit.sh: GROOVE_CONFIG=$GROOVE_CONFIG does not exist; skipping" >&2
+  exit 0
 fi
+
+# `--config` goes before the subcommand: it is a global flag. Two spelled-out
+# calls rather than an argument array: an empty "${arr[@]}" is an unbound
+# variable under `set -u` in the bash 3.2 that macOS ships.
+run_index() {
+  if [[ -n "$GROOVE_CONFIG" ]]; then
+    "$GROOVE_BIN" --config "$GROOVE_CONFIG" index --wait "$GROOVE_INDEX_WAIT" --kb-path "$KB_PATH"
+  else
+    "$GROOVE_BIN" index --wait "$GROOVE_INDEX_WAIT" --kb-path "$KB_PATH"
+  fi
+}
+
+guidance="rebuild-on-edit.sh: another groove process kept the index for ${GROOVE_INDEX_WAIT}s; this edit may not be indexed yet. Run groove index again, or call rebuild_index."
+
+# groove's stderr goes to a file first, so that on exit 3 the guidance is the
+# first stderr line (Claude Code's hook notice shows only that one) and
+# groove's own lines follow it. groove's stdout goes to stderr as before.
+# `|| rc=$?` keeps `set -e` from ending the script before the guidance.
+err="$(mktemp)" || err=""
+rc=0
+if [[ -z "$err" ]]; then
+  # No temp file: the old order, with the guidance after groove's stderr.
+  run_index >&2 || rc=$?
+  if [[ "$rc" -eq 3 ]]; then
+    echo "$guidance" >&2
+  fi
+  exit "$rc"
+fi
+trap 'rm -f "$err"' EXIT
+run_index >&2 2>"$err" || rc=$?
+if [[ "$rc" -eq 3 ]]; then
+  echo "$guidance" >&2
+fi
+cat "$err" >&2 || true
+exit "$rc"

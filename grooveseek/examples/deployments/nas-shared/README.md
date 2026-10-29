@@ -159,6 +159,17 @@ edits the same files. **The index does not.** Each machine keeps its own
 - **The index can lag behind the files** by up to one timer interval,
   and different machines can be at different points in that window.
   Nothing breaks — search just returns slightly older content.
+- **One writer per index** (v1.22.0+, see
+  [ADR-0031](../../../../docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)).
+  A `groove index` run takes an operating-system lock on
+  `/var/lib/groove/.groove.db.writer-lock`, beside the database on the
+  local disk, never on the NAS. The MCP server in this recipe runs with
+  its watcher off, so it takes that lock only while an MCP `rebuild_index`
+  runs, and the timer keeps working beside it. When a timer run overlaps
+  another writer (a `groove index` you started by hand, or a
+  `rebuild_index`), it exits with code 3 without touching the database,
+  systemd marks that run failed, and the next tick catches up. The lock
+  file stays after every run; leave it there.
 - **Model caches are per machine too.** Point `fastembed_cache_dir` only
   at a *local* path; aiming it at the NAS makes model loading slow and
   serializes it across hosts.

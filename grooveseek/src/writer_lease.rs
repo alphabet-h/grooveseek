@@ -4,6 +4,7 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -50,8 +51,39 @@ pub struct HolderInfo {
     pub watching: Option<bool>,
 }
 
+/// How far `heartbeat_at` may be from now, either way, for the holder to
+/// count as alive and reporting.
+pub const HEARTBEAT_FRESH: Duration = Duration::from_secs(15);
+
+impl HolderInfo {
+    /// Whether `heartbeat_at` parses as RFC3339 and lies within
+    /// [`HEARTBEAT_FRESH`] of `now`, before or after it. A missing or
+    /// unparsable heartbeat, or one further off (the clock jumped), is not fresh.
+    pub fn heartbeat_fresh(&self, now: SystemTime) -> bool {
+        let Some(at) = self.heartbeat_at.as_deref() else {
+            return false;
+        };
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(at) else {
+            return false;
+        };
+        let at = SystemTime::from(at.with_timezone(&chrono::Utc));
+        let gap = match now.duration_since(at) {
+            Ok(past) => past,
+            Err(e) => e.duration(),
+        };
+        gap <= HEARTBEAT_FRESH
+    }
+
+    /// Whether the holder keeps the index current: a fresh heartbeat
+    /// ([`HolderInfo::heartbeat_fresh`]) and a watcher it reported running.
+    pub fn keeps_current(&self, now: SystemTime) -> bool {
+        self.heartbeat_fresh(now) && self.watching == Some(true)
+    }
+}
+
 /// Why the lease was not taken.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LeaseError {
     /// Another handle holds the lock. `holder` is what `<db>.writer.json` says, if readable.
     Busy {
@@ -72,6 +104,10 @@ pub enum LeaseError {
         db_path: PathBuf,
         resolved_path: Option<PathBuf>,
     },
+    /// The server is shutting down and takes the lease no more.
+    Closed,
+    /// The server started as a reader: it never takes the writer lock.
+    Reader,
 }
 
 impl std::fmt::Display for LeaseError {
@@ -111,6 +147,11 @@ impl std::fmt::Display for LeaseError {
                      put the knowledge base under a directory whose path is valid UTF-8."
                 )
             }
+            LeaseError::Closed => write!(f, "this server is shutting down"),
+            LeaseError::Reader => write!(
+                f,
+                "this server started as a reader and does not take the writer lock"
+            ),
         }
     }
 }
@@ -151,7 +192,14 @@ pub struct WriterLease {
     info_path: PathBuf,
     acquired_at: SystemTime,
     role: Role,
+    /// What `<db>.writer.json` was last asked to say; [`WriterLease::set_role`]
+    /// and [`WriterLease::touch_heartbeat`] rewrite it and publish it again.
+    info: HolderInfo,
 }
+
+/// Whether a failed heartbeat write has been warned about: the heartbeat is
+/// rewritten every few seconds, so its failure is logged once per process.
+static HEARTBEAT_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// How often [`WriterLease::acquire_with_wait`] retries while the lock is busy.
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -264,7 +312,7 @@ impl WriterLease {
             heartbeat_at: Some(now),
             watching: None,
         };
-        publish_info(&info_path, &info, write_info);
+        publish_info(&info_path, &info, write_info, true);
 
         Ok(WriterLease {
             file,
@@ -275,7 +323,46 @@ impl WriterLease {
             info_path,
             acquired_at,
             role,
+            info,
         })
+    }
+
+    /// Change the role this lease is held for, and rewrite `<db>.writer.json`
+    /// to say so; `started_at` stays. A failed rewrite is handled as on
+    /// acquire: the previous json is removed, so no stale role is shown.
+    pub fn set_role(&mut self, role: Role) {
+        self.set_role_with(role, &write_info_file);
+    }
+
+    /// [`WriterLease::set_role`] with the `<db>.writer.json` write injected.
+    fn set_role_with(
+        &mut self,
+        role: Role,
+        write_info: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+    ) {
+        self.role = role;
+        self.info.role = role;
+        publish_info(&self.info_path, &self.info, write_info, true);
+    }
+
+    /// Rewrite `<db>.writer.json` with `heartbeat_at` set to now and
+    /// `watching` as given; `None` leaves the field out (the holder has not
+    /// reported a watcher yet). A failed write is warned about once per
+    /// process and keeps the previous json: its older heartbeat then goes
+    /// stale by itself.
+    pub fn touch_heartbeat(&mut self, watching: Option<bool>) {
+        self.touch_heartbeat_with(watching, &write_info_file);
+    }
+
+    /// [`WriterLease::touch_heartbeat`] with the `<db>.writer.json` write injected.
+    fn touch_heartbeat_with(
+        &mut self,
+        watching: Option<bool>,
+        write_info: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+    ) {
+        self.info.heartbeat_at = Some(chrono::Utc::now().to_rfc3339());
+        self.info.watching = watching;
+        publish_info(&self.info_path, &self.info, write_info, false);
     }
 
     /// Retry [`WriterLease::try_acquire`] every 250 ms until it succeeds or
@@ -575,6 +662,21 @@ fn suffixed(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A kb path recorded in writer.json, as a server's notice or refusal shows it.
+/// writer.json keeps the canonical form; on Windows that carries the verbatim
+/// prefix `canonicalize` adds, which is dropped here where the plain spelling
+/// names the same path (`\\?\C:\a` -> `C:\a`, `\\?\UNC\srv\share` ->
+/// `\\srv\share`). Anything else is shown as recorded.
+pub(crate) fn kb_shown(kb: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(plain) = crate::config::without_verbatim_prefix(Path::new(kb)) {
+            return plain.display().to_string();
+        }
+    }
+    kb.to_string()
+}
+
 /// The kb path as the holder records it: canonical, else absolute, else as given.
 fn normalized_kb_path(kb_path: &Path) -> String {
     std::fs::canonicalize(kb_path)
@@ -588,13 +690,19 @@ fn write_info_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// Replace `<db>.writer.json` through `<db>.writer.json.tmp-<pid>`. On failure,
-/// remove the temp file and the previous holder's json, so no stale holder is
-/// shown; the lease itself is unaffected.
+/// Replace `<db>.writer.json` through `<db>.writer.json.tmp-<pid>`. On failure
+/// the temp file is removed; the lease itself is unaffected.
+///
+/// With `remove_on_failure`, a failure also removes the previous json and is
+/// warned about every time: the json would name another holder or role, so
+/// none is shown instead. Without it (a heartbeat), the previous json stays,
+/// since its heartbeat goes stale by itself, and the failure is warned about
+/// once per process ([`HEARTBEAT_WARNED`]).
 fn publish_info(
     info_path: &Path,
     info: &HolderInfo,
     write_info: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+    remove_on_failure: bool,
 ) {
     let tmp = suffixed(info_path, &format!(".tmp-{}", std::process::id()));
     let result = serde_json::to_vec_pretty(info)
@@ -602,13 +710,22 @@ fn publish_info(
         .and_then(|bytes| write_info(&tmp, &bytes))
         .and_then(|()| std::fs::rename(&tmp, info_path));
     if let Err(e) = result {
-        tracing::warn!(
-            "could not write {} (display only, the lease is held): {}",
-            info_path.display(),
-            crate::embedder::ascii_io_error(&e)
-        );
         let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(info_path);
+        if remove_on_failure {
+            tracing::warn!(
+                "could not write {} (display only, the lease is held): {}",
+                info_path.display(),
+                crate::embedder::ascii_io_error(&e)
+            );
+            let _ = std::fs::remove_file(info_path);
+        } else if !HEARTBEAT_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "could not refresh the heartbeat in {} (display only, the lease is held; \
+                 warned once): {}",
+                info_path.display(),
+                crate::embedder::ascii_io_error(&e)
+            );
+        }
     }
 }
 
@@ -1274,6 +1391,50 @@ mod tests {
         assert!(Path::new(&h.kb_path).is_absolute());
     }
 
+    /// writer.json keeps the canonical kb, which [`holder_relation`] still matches
+    /// through either spelling; only the shown form drops the verbatim prefix.
+    #[test]
+    fn the_shown_kb_drops_the_verbatim_prefix_while_writer_json_keeps_the_canonical_form() {
+        let (_dir, kb, spelled) = non_canonical_layout("shown");
+        let db = crate::resolve_db_path(&kb);
+        let _lease = WriterLease::try_acquire(&db, Role::Serve, &spelled).unwrap();
+        let h = WriterLease::read_holder(&db).expect("writer.json is readable");
+        let canonical = std::fs::canonicalize(&kb).unwrap().display().to_string();
+        assert_eq!(h.kb_path, canonical);
+        assert_eq!(
+            holder_relation(Some(&h), &kb),
+            HolderRelation::WatchingSameKb
+        );
+        assert_eq!(
+            holder_relation(Some(&h), &spelled),
+            HolderRelation::WatchingSameKb
+        );
+        let shown = kb_shown(&h.kb_path);
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+        assert!(Path::new(&shown).is_absolute(), "{shown}");
+        assert_eq!(
+            std::fs::canonicalize(&shown).unwrap().display().to_string(),
+            canonical
+        );
+    }
+
+    /// The shown form of drive, UNC and unstrippable verbatim paths.
+    #[cfg(windows)]
+    #[test]
+    fn kb_shown_maps_drive_and_unc_verbatim_paths_and_keeps_the_rest() {
+        assert_eq!(kb_shown(r"\\?\C:\Users\me\kb"), r"C:\Users\me\kb");
+        assert_eq!(kb_shown(r"\\?\UNC\server\share\kb"), r"\\server\share\kb");
+        assert_eq!(kb_shown(r"C:\Users\me\kb"), r"C:\Users\me\kb");
+        // A trailing dot names another path without the prefix, so it is kept.
+        assert_eq!(kb_shown(r"\\?\C:\kb."), r"\\?\C:\kb.");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn kb_shown_keeps_a_unix_path_as_recorded() {
+        assert_eq!(kb_shown("/srv/kb"), "/srv/kb");
+    }
+
     #[test]
     fn holder_relation_is_watching_same_kb_for_a_serve_on_this_kb() {
         let (_dir, kb, _spelled) = non_canonical_layout("same");
@@ -1588,5 +1749,125 @@ mod tests {
         };
         assert_eq!(db_path, &bad);
         assert_not_utf8_display(&e);
+    }
+
+    /// `now` shifted by `secs` (negative is the past), as the RFC3339 the holder json carries.
+    fn rfc3339_at(now: SystemTime, secs: i64) -> String {
+        let shifted = if secs >= 0 {
+            now + Duration::from_secs(secs as u64)
+        } else {
+            now - Duration::from_secs(secs.unsigned_abs())
+        };
+        chrono::DateTime::<chrono::Utc>::from(shifted).to_rfc3339()
+    }
+
+    fn with_heartbeat(heartbeat_at: Option<String>, watching: Option<bool>) -> HolderInfo {
+        HolderInfo {
+            heartbeat_at,
+            watching,
+            ..holder(Role::Serve, "/kb")
+        }
+    }
+
+    #[test]
+    fn heartbeat_fresh_within_15s_and_stale_after() {
+        let now = SystemTime::now();
+        for (secs, fresh) in [(-14, true), (-16, false), (14, true), (60, false)] {
+            let h = with_heartbeat(Some(rfc3339_at(now, secs)), None);
+            assert_eq!(h.heartbeat_fresh(now), fresh, "heartbeat {secs}s from now");
+        }
+        assert!(!with_heartbeat(None, None).heartbeat_fresh(now));
+        assert!(!with_heartbeat(Some("garbage".to_string()), None).heartbeat_fresh(now));
+    }
+
+    #[test]
+    fn keeps_current_needs_a_fresh_heartbeat_and_watching_true() {
+        let now = SystemTime::now();
+        let fresh = || Some(rfc3339_at(now, -1));
+        assert!(with_heartbeat(fresh(), Some(true)).keeps_current(now));
+        assert!(!with_heartbeat(fresh(), Some(false)).keeps_current(now));
+        assert!(!with_heartbeat(fresh(), None).keeps_current(now));
+        assert!(!with_heartbeat(Some(rfc3339_at(now, -60)), Some(true)).keeps_current(now));
+    }
+
+    #[test]
+    fn set_role_rewrites_writer_json_and_keeps_started_at() {
+        let (_dir, db, kb) = layout("setrole");
+        let mut lease = WriterLease::try_acquire(&db, Role::Serve, &kb).unwrap();
+        let before = WriterLease::read_holder(&db).expect("writer.json after acquire");
+        lease.set_role(Role::Rebuild);
+        let after = WriterLease::read_holder(&db).expect("writer.json after set_role");
+        assert_eq!(after.role, Role::Rebuild);
+        assert_eq!(after.started_at, before.started_at);
+        assert_eq!(lease.role(), Role::Rebuild);
+    }
+
+    #[test]
+    fn touch_heartbeat_writes_heartbeat_and_watching() {
+        let (_dir, db, kb) = layout("touch");
+        let mut lease = WriterLease::try_acquire(&db, Role::Serve, &kb).unwrap();
+        let mut old = WriterLease::read_holder(&db).unwrap();
+        old.heartbeat_at = Some(rfc3339_at(SystemTime::now(), -60));
+        std::fs::write(
+            WriterLease::info_path_for(&db),
+            serde_json::to_vec_pretty(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !WriterLease::read_holder(&db)
+                .unwrap()
+                .heartbeat_fresh(SystemTime::now())
+        );
+
+        lease.touch_heartbeat(Some(true));
+        let h = WriterLease::read_holder(&db).unwrap();
+        assert!(h.heartbeat_fresh(SystemTime::now()) && h.watching == Some(true));
+
+        lease.touch_heartbeat(Some(false));
+        assert_eq!(WriterLease::read_holder(&db).unwrap().watching, Some(false));
+
+        lease.touch_heartbeat(None);
+        let h = WriterLease::read_holder(&db).unwrap();
+        assert_eq!(h.watching, None);
+        assert!(h.heartbeat_fresh(SystemTime::now()));
+        assert!(no_tmp_files_left(&db));
+    }
+
+    #[test]
+    fn touch_heartbeat_failure_keeps_the_previous_json() {
+        let (_dir, db, kb) = layout("touchfail");
+        let mut lease = WriterLease::try_acquire(&db, Role::Serve, &kb).unwrap();
+        let fail =
+            |_: &Path, _: &[u8]| -> std::io::Result<()> { Err(std::io::Error::other("injected")) };
+        lease.touch_heartbeat_with(Some(true), &fail);
+        assert_eq!(
+            WriterLease::read_holder(&db).map(|h| h.pid),
+            Some(std::process::id()),
+            "a failed heartbeat leaves the previous json in place"
+        );
+        assert!(no_tmp_files_left(&db));
+
+        lease.set_role_with(Role::Rebuild, &fail);
+        assert_eq!(
+            WriterLease::read_holder(&db),
+            None,
+            "a failed role rewrite removes the previous json"
+        );
+        assert!(no_tmp_files_left(&db));
+    }
+
+    #[test]
+    fn closed_and_reader_display_is_ascii() {
+        for (e, expected) in [
+            (LeaseError::Closed, "this server is shutting down"),
+            (
+                LeaseError::Reader,
+                "this server started as a reader and does not take the writer lock",
+            ),
+        ] {
+            let s = e.to_string();
+            assert!(s.is_ascii(), "non-ASCII display: {s}");
+            assert_eq!(s, expected);
+        }
     }
 }

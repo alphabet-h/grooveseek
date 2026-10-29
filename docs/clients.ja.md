@@ -83,8 +83,18 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 
 クライアント接続時にサーバが自動起動する。
 
+## 1 つのナレッジベースを複数の session で使う
+
+(v1.22.0+) Claude Code の session はそれぞれ自分の stdio の `groove serve` を起動する。複数の session が同じナレッジベースを指すと、索引を書いてファイルウォッチャを動かすのは最初に起動した server だけで、残りは検索にだけ答える reader になる ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。最初の session を閉じても索引は引き継がれない: reader は restart されるまで索引を更新しないので、その間に足した・編集した・消した file は反映されず、消した file は search に出続ける。reader は `rebuild_index` も断る。Claude Code で reader の server を restart するには、その session で `/mcp` を開き、server を選んで Reconnect を押す (session を閉じて開き直してもよい)。その時点で他の server が索引を持っていなければ、新しい server が索引を書く。それでも restart の前の変更は索引に入らないので、書き手になったら `rebuild_index` を 1 回走らせる。
+
+reader であることは、その server の `search` と `rebuild_index` の応答の `writer_notice` field に載り ([MCP ツール](mcp-tools.ja.md))、agent はそこで読む。起動時に stderr にも 1 回 warning を出すが、Claude Code は通常 server の stderr を見せない (推定)。最初の session の server が閉じられたのではなく kill された場合は、その `.groove.db.writer.json` が残る: reader の注記は、その file の heartbeat が 15 秒より古くなるまで「その server が索引を最新に保つ」と言い続け、その後は「終了した見込みで、restart まで反映されない」に替わる。
+
+1 つのナレッジベースを複数の session で使い、最新に保つなら、書く server を 1 つにする: HTTP で常駐する daemon (`groove service install`、または [HTTP トランスポート (複数クライアント同時接続)](#http-トランスポート-複数クライアント同時接続)) を動かし、各 session をその `/mcp` に向ける。
+
 ## PostToolUse hook による index 鮮度保守
-Claude Code セッション内部からナレッジベースを編集する (または Markdown を書く skill を実行する) 場合、MCP サーバは再構築されるまで古い結果を返し続ける。`.claude/settings.json` の `PostToolUse` hook で書込み後に自動再 index できる。最小形:
+Claude Code セッション内部からナレッジベースを編集する (または Markdown を書く skill を実行する) 場合、MCP サーバは再構築されるまで古い結果を返し続ける。`.claude/settings.json` の `PostToolUse` hook で書込み後に自動再 index できる。
+
+**hook を使うのは、server をファイルウォッチャなしで動かすときだけ** (`groove serve --no-watch`、または `[watch].enabled = false`)。watcher が有効な (既定の) server は編集をすべて自分で拾い ([ライブ同期 (file watcher)](#ライブ同期-file-watcher) 参照)、書き手の server は watcher が動いている間、索引の書き手の lease を持つ: 1 つの索引を書く groove の process は同時に 1 つだけ (reader として起動した server は lease を持たず `rebuild_index` を断る。[behavior.ja.md](behavior.ja.md) を参照)。その server と組むと、hook の `groove index` は編集のたびに exit 3 になる。その構成では hook を外す。最小形:
 
 <!-- groove-pin: posttooluse-hook-snippet -->
 ```json
@@ -104,7 +114,9 @@ Claude Code セッション内部からナレッジベースを編集する (ま
 
 > **`groove.toml` がバイナリの隣ではなくプロジェクトの隣にあるなら、ここでも名指しすること**: `groove --config /abs/path/groove.toml index`。見つけただけの config は `[parsers]` が Markdown のみへ戻され ([信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所))、`groove index` は**訪れなかった document を削除する** — つまり既定の parser 集合で再構築する hook は、アップグレード後の最初の編集で、索引済みの `.txt` / PDF / Office 文書 / ソースコードをすべて索引から消す。バイナリの隣にある config や `groove service install` が置いた config は信頼されるので何も足さなくてよい。
 
-`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照 (まさにこのために `GROOVE_CONFIG` を受け取る)。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
+`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照 (まさにこのために `GROOVE_CONFIG` を受け取る)。
+
+hook の exit code 3 は無視してよい雑音ではない。他の書き手 (server の MCP `rebuild_index`、または重なったもう 1 本の hook) が索引を持っていて、**この編集はまだ索引に入っていないかもしれない**という意味で、`groove index` を打ち直すか `rebuild_index` を呼ぶ。代わりにその書き手を待たせたいなら、command を `groove index --wait 30` と書く。同梱のスクリプトは `GROOVE_INDEX_WAIT` (既定 30 秒) でこれを行い、待ちを過ぎたときは 3 のまま返す。
 
 ## Frontmatter スキーマ検証
 ナレッジベースで frontmatter 規約を運用しているなら (例: `title` 必須、`date` は YYYY-MM-DD、`topic` は enum)、以下でファイル毎の違反をチェックできる:
@@ -239,9 +251,12 @@ curl http://127.0.0.1:3100/api/admin/status
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
   "kb":       { "documents": 596, "chunks": 8878, "model": "bge-m3" },
-  "config_source": "Cwd"
+  "config_source": "Cwd",
+  "writer":   { "held": true, "role": "serve", "held_since": "2026-07-26T09:12:04+00:00", "reader": false, "reader_notice": null, "watch_error": null, "watcher_stopped": null }
 }
 ```
+
+`writer` (v1.22.0+) は、この server から見た索引の書き手のロック ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。索引を書く server はそれを持つ (`held: true`)。他の process が持っている間、またはロックが取れない状態 (lock file の I/O エラー) で起動した server は restart まで reader で、`held: false`、`reader: true` になり、`reader_notice` に MCP の応答の `writer_notice` と同じ文が入る。`watch_error` は watcher が watch を登録できない間に入り、その後 watcher が止まってもその時の値のまま残る。`watcher_stopped` は watcher が終了処理の外で止まった後に入り、その server はロックを手放す。
 
 > **`kb.path` は削除した。** ナレッジベースの絶対パスを持っていたので、Windows では
 > payload も、それを表示していた状態帯も `C:\Users\<名前>\...` と読めていた。
@@ -265,7 +280,7 @@ peer で、既定の `Host` も allow-list に載るため、`/ui` を proxy す
 
 - **既定 on**。`groove.toml` の `[watch].enabled = false` または CLI `--no-watch` で無効化
 - **Debounce** は既定 500 ms。`[watch].debounce_ms` または `--debounce-ms` で調整
-- **PostToolUse hook と共存**。両経路は同じ `Mutex<Database>` / `Mutex<Embedder>` をロックするため、同時トリガは Rust 層で直列化され冪等
+- **PostToolUse hook とは組まない**。hook の `groove index` は別 process で、この server は watch している間、索引の書き手の lease を持つので、hook は編集のたびに exit 3 になる。その編集は watcher が拾うので hook を外す ([PostToolUse hook による index 鮮度保守](#posttooluse-hook-による-index-鮮度保守) 参照)。この server の中では、watcher と MCP `rebuild_index` が同じ `Mutex<Database>` / `Mutex<Embedder>` をロックするので Rust 層で直列化される
 - **拡張子対応**。watcher は `rebuild_index` と同じ Parser registry を共有し、`[parsers].enabled` で有効化された拡張子のファイルのみを再インデックスする。他イベントは破棄
 - **耐障害性**。watcher タスク内部のエラーは stderr にログされ (黙殺しない)、MCP サーバは動作し続ける。ローカルディスクを想定 — WSL / SMB / ネットワーク共有上の inotify は保証外
 - **バックプレッシャ (v0.6.0+)**。debouncer から indexer task へのブリッジは bounded な 64 batch channel。consumer が追い付けない場合 (embedder が一時停止中など) は無限に queue が伸びることはなく、超過 batch を warn ログ付きで drop する。バースト後に `rebuild_index` を手動実行で取り漏らしを補える

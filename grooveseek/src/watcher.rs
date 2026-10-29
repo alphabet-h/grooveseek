@@ -32,7 +32,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{LockResult, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
 use crate::poison::{recover, recover_db};
@@ -48,6 +49,7 @@ use crate::db::Database;
 use crate::embedder::Embedder;
 use crate::indexer;
 use crate::parser::Registry;
+use crate::server::{WatchErrorCause, WatchStatusFn};
 
 /// Print a watcher diagnostic, ASCII-escaped.
 ///
@@ -128,6 +130,59 @@ pub struct WatcherState {
     /// Set to `true` for the duration of the watch loop (feature-43 PR-2).
     /// Shared with `KbServerShared` so `/api/admin/status` can report it.
     pub watcher_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Told why the watch failed, from the bridge thread, before each retry
+    /// sleep; told `None` once the watch is registered. `None` reports nothing.
+    pub watch_status: Option<WatchStatusFn>,
+    /// The first and the longest retry wait of the bridge thread after a
+    /// failed watch. [`WatcherState::DEFAULT_WATCH_BACKOFF`] in production.
+    pub watch_backoff: (Duration, Duration),
+    /// Counts batches as they pass the channel and the event loop; `None`
+    /// counts nothing.
+    pub batch_probe: Option<Arc<WatchBatchProbe>>,
+}
+
+impl WatcherState {
+    /// One second first, doubling up to thirty.
+    pub const DEFAULT_WATCH_BACKOFF: (Duration, Duration) =
+        (Duration::from_secs(1), Duration::from_secs(30));
+
+    /// Lock `m` (the embedder or the database) for batch handling. With a
+    /// [`WatcherState::batch_probe`] set, a lock held elsewhere is counted in
+    /// [`WatchBatchProbe::lock_waits`] before the wait; without one this is
+    /// `m.lock()`.
+    fn lock_for_batch<'a, T>(&self, m: &'a Mutex<T>) -> LockResult<MutexGuard<'a, T>> {
+        if let Some(p) = &self.batch_probe {
+            match m.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(poisoned)) => return Err(poisoned),
+                Err(TryLockError::WouldBlock) => {
+                    p.lock_waits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        m.lock()
+    }
+}
+
+/// Batch counters of one watch loop, for a caller that has to know whether a
+/// batch was cut short by the stop signal.
+#[derive(Debug, Default)]
+pub struct WatchBatchProbe {
+    /// Batches the debouncer handed over, counted before the channel send
+    /// whatever it returned (a batch sent after the loop stopped finds the
+    /// channel closed and is still counted).
+    pub emitted: AtomicU64,
+    /// Batches the event loop took off the channel.
+    pub started: AtomicU64,
+    /// Batches whose handling returned.
+    pub finished: AtomicU64,
+    /// The stop signal found a batch still waiting in the channel.
+    pub stopped_with_queued: AtomicBool,
+    /// Times batch handling found the embedder or database lock held
+    /// elsewhere, counted before it waits for that lock. A batch blocked on a
+    /// lock its caller holds has counted here once.
+    pub lock_waits: AtomicU64,
 }
 
 /// Watcher タスク本体。notify の裏スレッドから tokio channel 越しにイベントを
@@ -137,7 +192,24 @@ pub struct WatcherState {
 /// タスク内部での処理エラーはログに流して次のイベントへ進む (silent drop 禁止)。
 /// tokio task が panic しないよう各イベント処理は `catch_unwind` 相当の防衛線を
 /// 張らない代わりに、error 経路は `eprintln!` で可視化する。
-pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
+///
+/// Runs until the channel closes; it has no stop signal. A caller that has to
+/// stop it uses [`run_watch_loop_until`].
+pub async fn run_watch_loop(state: WatcherState) -> Result<()> {
+    // The sender is held for the whole loop, so the signal never fires.
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    run_watch_loop_until(state, rx).await
+}
+
+/// [`run_watch_loop`] with a stop signal: once the stop receiver turns `true` the
+/// loop
+/// returns `Ok(())` at the next batch boundary. A batch already being handled
+/// is finished first; one still waiting in the channel is not handled.
+/// Dropping the stop signal's sender is not a stop.
+pub async fn run_watch_loop_until(
+    mut state: WatcherState,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     if !state.config.enabled {
         return Ok(());
     }
@@ -166,6 +238,9 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
     let (tx_async, mut rx_async) = mpsc::channel::<Vec<DebouncedEvent>>(WATCHER_CHANNEL_CAPACITY);
     let debounce = Duration::from_millis(state.config.debounce_ms);
     let kb_watch_path = state.kb_path.clone();
+    let watch_status = state.watch_status.clone();
+    let (backoff0, max_backoff) = state.watch_backoff;
+    let probe_tx = state.batch_probe.clone();
 
     // bridge thread: std::sync::mpsc → tokio::sync::mpsc
     // watch 初期化や watch() が失敗 (ディレクトリ削除等) した
@@ -175,10 +250,22 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
         .spawn(move || {
             // 外側ループ = self-heal。debouncer ハンドルが生きている間は
             // inner parking で停止、壊れたら backoff して再構築。
-            let mut backoff = Duration::from_secs(1);
-            let max_backoff = Duration::from_secs(30);
+            let mut backoff = backoff0;
+            let report = |cause: Option<WatchErrorCause>| {
+                if let Some(f) = &watch_status {
+                    f(cause);
+                }
+            };
+            let failed = |error: String, backoff: Duration| {
+                report(Some(WatchErrorCause {
+                    kb: kb_watch_path.clone(),
+                    error,
+                    retry_secs: backoff.as_secs(),
+                }))
+            };
             loop {
                 let tx_clone = tx_async.clone();
+                let probe_cb = probe_tx.clone();
                 let debouncer_result = new_debouncer_opt::<_, Backend, RecommendedCache>(
                     debounce,
                     None,
@@ -192,6 +279,9 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                             // ない (debouncer の固定 windowing) ので、ここで
                             // drop した変更は観測できないが、tail-drop は
                             // memory の観点で確定の上限が出る。
+                            if let Some(p) = &probe_cb {
+                                p.emitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
                             match tx_clone.try_send(events) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -222,6 +312,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                             "watcher: failed to create debouncer: {e} (retry in {}s)",
                             backoff.as_secs()
                         );
+                        failed(e.to_string(), backoff);
                         std::thread::sleep(backoff);
                         backoff = (backoff * 2).min(max_backoff);
                         continue;
@@ -234,12 +325,13 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                         backoff.as_secs()
                     );
                     drop(debouncer);
+                    failed(e.to_string(), backoff);
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(max_backoff);
                     continue;
                 }
                 // 成功: backoff をリセット
-                backoff = Duration::from_secs(1);
+                backoff = backoff0;
                 // (AU-55) The only point at which the watcher is actually
                 // armed. `wait_http_200` returning says the *server* is up,
                 // which happens before this thread finishes building the
@@ -256,6 +348,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                     kb_watch_path.display(),
                     debounce.as_millis()
                 );
+                report(None);
                 // periodic liveness probe: 30 秒ごとに kb_path の
                 // 存在確認をして、ディレクトリが消えていたら debouncer を
                 // drop して再構築する。inotify は親ディレクトリ削除時に
@@ -282,19 +375,51 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
         state.registry.extensions()
     );
 
-    while let Some(events) = rx_async.recv().await {
-        // `handle_events` locks `embedder` and, on the first embed call, builds
-        // the blocking reqwest client — both happen synchronously here, so
-        // running it inline on this tokio worker panics exactly like the
-        // pre-fix search path did (`Cannot drop a runtime in a context where
-        // blocking is not allowed`). Move to the blocking pool per batch
-        // (not around the whole receive loop) so shutdown still responds.
-        state = tokio::task::spawn_blocking(move || {
-            handle_events(&mut state, &events);
-            state
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("watcher: handle_events task panicked: {e}"))?;
+    use std::sync::atomic::Ordering::SeqCst;
+    let probe = state.batch_probe.clone();
+    // Cleared when the stop sender is dropped: that is not a stop, and a
+    // closed `wait_for` would otherwise return at once on every turn.
+    let mut stop_open = true;
+    loop {
+        tokio::select! {
+            // The stop is looked at first, so a batch waiting in the channel
+            // is not started once the signal is up.
+            biased;
+            // The `Ref` that `wait_for` returns is not `Send`; it is read and
+            // let go inside this future so it never lives across an await.
+            stopped = async { stop.wait_for(|v| *v).await.is_ok() }, if stop_open => {
+                if stopped {
+                    if let Some(p) = &probe
+                        && rx_async.try_recv().is_ok()
+                    {
+                        p.stopped_with_queued.store(true, SeqCst);
+                    }
+                    break;
+                }
+                stop_open = false;
+            }
+            ev = rx_async.recv() => {
+                let Some(events) = ev else { break };
+                if let Some(p) = &probe {
+                    p.started.fetch_add(1, SeqCst);
+                }
+                // `handle_events` locks `embedder` and, on the first embed call, builds
+                // the blocking reqwest client — both happen synchronously here, so
+                // running it inline on this tokio worker panics exactly like the
+                // pre-fix search path did (`Cannot drop a runtime in a context where
+                // blocking is not allowed`). Move to the blocking pool per batch
+                // (not around the whole receive loop) so shutdown still responds.
+                state = tokio::task::spawn_blocking(move || {
+                    handle_events(&mut state, &events);
+                    state
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("watcher: handle_events task panicked: {e}"))?;
+                if let Some(p) = &probe {
+                    p.finished.fetch_add(1, SeqCst);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -623,7 +748,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // a link, so an ordinary event costs one `symlink_metadata` and no lock.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
                         let handled = {
-                            let db = recover_db(state.db.lock());
+                            let db = recover_db(state.lock_for_batch(&state.db));
                             match deindex_under_a_link_parts(&db, &state.kb_path, p) {
                                 Some((under, outcome)) => {
                                     match outcome {
@@ -658,7 +783,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                         // ordinary directory Modify still costs no lock.
                         if arrived {
                             let arrival = {
-                                let db = recover_db(state.db.lock());
+                                let db = recover_db(state.lock_for_batch(&state.db));
                                 act_on_arrived_directory(&db, &state.kb_path, &rel, p)
                                 // `db` is dropped here, before the scan locks it again.
                             };
@@ -1105,7 +1230,7 @@ fn remove_if_still_gone(
 /// would deadlock against every other reindex.
 fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path) {
     let under_db = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         remove_if_still_gone(
             &db,
             &state.kb_path,
@@ -1977,7 +2102,7 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
             // truth is that a full index fixes it, so the message says so.
             wdiag!(
                 "watcher: could not scan the new directory {rel}: {e}. \
-                 Its files stay unindexed until the next full `groove index`."
+                 Its files stay unindexed until the next full `groove index` (or this server's MCP `rebuild_index`)."
             );
             return;
         }
@@ -2079,7 +2204,7 @@ fn hand_on_rows_the_walk_left_behind(state: &WatcherState, rel: &str, found: &[(
         return;
     }
     let held = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         db.document_paths_under(rel)
         // `db` is dropped here, before any row is handed on.
     };
@@ -2198,8 +2323,8 @@ enum ReindexOrigin<'a> {
 /// the time the locks are held, is a directory, or is there only under another case of its
 /// name keeps no row under that spelling.
 fn dispatch_reindex_from(state: &WatcherState, rel: &str, origin: ReindexOrigin<'_>) {
-    let mut embedder = recover(state.embedder.lock(), "embedder");
-    let db = recover_db(state.db.lock());
+    let mut embedder = recover(state.lock_for_batch(&state.embedder), "embedder");
+    let db = recover_db(state.lock_for_batch(&state.db));
     match origin {
         ReindexOrigin::Removal { full } => {
             reindex_after_removal_locked(state, &db, &mut embedder, rel, full)
@@ -2800,7 +2925,7 @@ fn log_reindex_result(
 }
 
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
-    let db = recover_db(state.db.lock());
+    let db = recover_db(state.lock_for_batch(&state.db));
     match indexer::deindex_single_file(&db, rel) {
         Ok(true) => wdiag!("watcher: deindexed {rel}"),
         Ok(false) => { /* no-op: not in DB */ }
@@ -2968,7 +3093,7 @@ fn subtree_removal_under_lock(
 /// why.
 fn dispatch_subtree_removal(state: &WatcherState, p: &Path) {
     let decided = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         subtree_removal_under_lock(&db, &state.kb_path, p)
         // `db` is dropped here, before any row under the directory is handled.
     };
@@ -3292,8 +3417,8 @@ fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
 /// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
 /// is gone by then ([`finish_rename_locked`]).
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) {
-    let mut embedder = recover(state.embedder.lock(), "embedder");
-    let db = recover_db(state.db.lock());
+    let mut embedder = recover(state.lock_for_batch(&state.embedder), "embedder");
+    let db = recover_db(state.lock_for_batch(&state.db));
     let kb_path = &state.kb_path;
     let dest = written_path_on_disk(kb_path, new_rel, look);
     let plan = match rename_plan(&db, old_rel, new_rel, dest) {
@@ -4302,12 +4427,12 @@ fn dispatch_directory_rename(
     let (to_kind, stat_err) = to_state(to);
     if let Some(e) = &stat_err {
         wdiag!(
-            "watcher: could not stat a rename destination: {e}. Handled as a file rename; if it was a directory, the rows under its old path stay until the next full `groove index`."
+            "watcher: could not stat a rename destination: {e}. Handled as a file rename; if it was a directory, the rows under its old path stay until the next full `groove index` (or this server's MCP `rebuild_index`)."
         );
     }
     let entry = match to_kind {
         ToState::Missing => {
-            let db = recover_db(state.db.lock());
+            let db = recover_db(state.lock_for_batch(&state.db));
             dir_rename_entry(to_kind, Some(&db), old_rel)
             // `db` is dropped here, before the outcome is acted on.
         }
@@ -4320,7 +4445,7 @@ fn dispatch_directory_rename(
         Ok(None) => return false,
         Err(e) => {
             wdiag!(
-                "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index`."
+                "watcher: listing the documents of a renamed directory failed: {e}. They stay under the old path until the next full `groove index` (or this server's MCP `rebuild_index`)."
             );
             return false;
         }
@@ -4330,7 +4455,7 @@ fn dispatch_directory_rename(
     let mut moves = true;
     if entry == DirRenameEntry::ScanDestination {
         let (listed, to_spelled) = {
-            let db = recover_db(state.db.lock());
+            let db = recover_db(state.lock_for_batch(&state.db));
             (
                 db.document_paths_under(old_rel),
                 arrived_directory_on_disk(&state.kb_path, new_rel, to),
@@ -4409,7 +4534,7 @@ fn dispatch_directory_rename(
     // range delete share one db lock region; on the sweep-only path the delete
     // takes the listed rows too.
     let swept = {
-        let db = recover_db(state.db.lock());
+        let db = recover_db(state.lock_for_batch(&state.db));
         sweep_source_if_gone(&db, &state.kb_path, from)
         // `db` is dropped here, before any `dispatch_*` locks it again.
     };
@@ -4422,7 +4547,7 @@ fn dispatch_directory_rename(
         SourceSweep::Present => false,
         SourceSweep::Unknown(e) => {
             wdiag!(
-                "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index`."
+                "watcher: could not stat the source of a renamed directory: {e}. Rows added under its old path after the listing stay until the next full `groove index` (or this server's MCP `rebuild_index`)."
             );
             false
         }
@@ -6693,6 +6818,9 @@ mod tests {
             rules: crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs()),
             config: WatchConfig::default(),
             watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watch_status: None,
+            watch_backoff: WatcherState::DEFAULT_WATCH_BACKOFF,
+            batch_probe: None,
         };
         let events = [mk_evt(
             EventKind::Remove(notify_debouncer_full::notify::event::RemoveKind::File),
@@ -10410,5 +10538,297 @@ mod tests {
             ),
             RenameAction::Rename
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // (#259 PR2) run_watch_loop_until, watch_status, watch_backoff, batch_probe
+    // -----------------------------------------------------------------------
+
+    /// A watcher state over `kb` with a stub embedder and an in-memory store
+    /// holding `doc.md`, debouncing for 100 ms.
+    fn until_state(kb: &Path) -> WatcherState {
+        WatcherState {
+            kb_path: kb.to_path_buf(),
+            db: Arc::new(Mutex::new(dir_rename_db(&["doc.md"]))),
+            embedder: Arc::new(Mutex::new(Embedder::stub_for_tests(384))),
+            registry: Arc::new(Registry::defaults()),
+            exclude_headings: None,
+            rules: crate::exclusion::ExclusionRules::load(kb, default_exclude_dirs()),
+            config: WatchConfig {
+                enabled: true,
+                debounce_ms: 100,
+            },
+            watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watch_status: None,
+            watch_backoff: WatcherState::DEFAULT_WATCH_BACKOFF,
+            batch_probe: None,
+        }
+    }
+
+    /// Poll `cond` every 20 ms until it holds or `limit` runs out.
+    async fn poll_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if cond() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A `true` on the stop signal ends the loop with `Ok(())`.
+    #[tokio::test]
+    async fn the_stop_signal_ends_the_loop_with_ok() {
+        let kb = i549_kb("groove-watcher-until-stop");
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(until_state(&kb.0), stop_rx));
+        stop_tx.send(true).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let joined = ended.expect("the loop did not end within 5 s of the stop signal");
+        joined
+            .expect("the loop task panicked")
+            .expect("the loop ended with an error");
+    }
+
+    /// Dropping the stop sender is not a stop: the loop keeps running.
+    #[tokio::test]
+    async fn dropping_the_stop_sender_does_not_end_the_loop() {
+        let kb = i549_kb("groove-watcher-until-drop");
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(until_state(&kb.0), stop_rx));
+        drop(stop_tx);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let finished = task.is_finished();
+        task.abort();
+        assert!(!finished, "dropping the stop sender ended the loop");
+    }
+
+    /// A kb directory that is not there is reported through `watch_status`
+    /// with the kb and the error; once it appears, `None` clears it.
+    #[tokio::test]
+    async fn watch_status_reports_a_missing_dir_then_clears() {
+        let kb_path = crate::test_support::unique_temp_path("groove-watcher-until-missing");
+        assert!(!kb_path.exists());
+        let _cleanup = I549Kb(kb_path.clone());
+        let seen: Arc<Mutex<Vec<Option<crate::server::WatchErrorCause>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let mut state = until_state(&kb_path);
+        // The bridge thread outlives the test and retries once the dir is gone;
+        // a 2 s cap keeps that slow while the first retries stay short.
+        state.watch_backoff = (Duration::from_millis(50), Duration::from_secs(2));
+        // Weak: the leaked bridge thread must not keep pushing into `seen`.
+        let sink = Arc::downgrade(&seen);
+        state.watch_status = Some(Arc::new(move |cause| {
+            if let Some(seen) = sink.upgrade() {
+                seen.lock().unwrap().push(cause);
+            }
+        }));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+
+        let reported = poll_until(Duration::from_secs(10), || {
+            seen.lock().unwrap().iter().any(|c| c.is_some())
+        })
+        .await;
+        assert!(
+            reported,
+            "no watch error within 10 s: {:?}",
+            seen.lock().unwrap()
+        );
+        let cause = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .next()
+            .cloned()
+            .unwrap();
+        assert!(!cause.error.is_empty(), "{cause:?}");
+        assert_eq!(cause.kb, kb_path);
+
+        std::fs::create_dir_all(&kb_path).unwrap();
+        let cleared = poll_until(Duration::from_secs(10), || {
+            let seen = seen.lock().unwrap();
+            let first_error = seen.iter().position(|c| c.is_some()).unwrap();
+            seen[first_error..].iter().any(|c| c.is_none())
+        })
+        .await;
+        assert!(
+            cleared,
+            "no clear within 10 s of the dir appearing: {:?}",
+            seen.lock().unwrap()
+        );
+
+        stop_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// Rewriting an indexed file is one batch the probe sees emitted, started
+    /// and finished.
+    #[tokio::test]
+    async fn the_batch_probe_counts_started_and_finished_batches() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let kb = i549_kb("groove-watcher-until-probe");
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(WatchBatchProbe::default());
+        let mut state = until_state(&kb.0);
+        let flag = Arc::clone(&armed);
+        state.watch_status = Some(Arc::new(move |cause| {
+            if cause.is_none() {
+                flag.store(true, SeqCst);
+            }
+        }));
+        state.batch_probe = Some(Arc::clone(&probe));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+
+        assert!(
+            poll_until(Duration::from_secs(10), || armed.load(SeqCst)).await,
+            "the watch was not registered within 10 s"
+        );
+        std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten body\n").unwrap();
+        let counted = poll_until(Duration::from_secs(10), || {
+            let started = probe.started.load(SeqCst);
+            started >= 1 && probe.finished.load(SeqCst) == started
+        })
+        .await;
+        let (emitted, started, finished) = (
+            probe.emitted.load(SeqCst),
+            probe.started.load(SeqCst),
+            probe.finished.load(SeqCst),
+        );
+        assert!(
+            counted,
+            "emitted {emitted}, started {started}, finished {finished}"
+        );
+        assert!(
+            emitted >= started,
+            "emitted {emitted}, started {started}, finished {finished}"
+        );
+
+        stop_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A watch state over `kb` with a fresh probe and a flag raised when the
+    /// watch is registered.
+    fn probed_state(
+        kb: &Path,
+    ) -> (
+        WatcherState,
+        Arc<WatchBatchProbe>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(WatchBatchProbe::default());
+        let mut state = until_state(kb);
+        let flag = Arc::clone(&armed);
+        state.watch_status = Some(Arc::new(move |cause| {
+            if cause.is_none() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        state.batch_probe = Some(Arc::clone(&probe));
+        (state, probe, armed)
+    }
+
+    /// A stop that arrives while a batch is being handled lets that batch
+    /// finish, then the loop returns `Ok(())`.
+    /// A loop that dropped the in-flight handling on the stop would return
+    /// with [`WatchBatchProbe::finished`] still 0.
+    #[tokio::test]
+    async fn a_stop_during_a_batch_waits_for_that_batch_to_finish() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let kb = i549_kb("groove-watcher-until-mid-batch");
+        // The canonical kb, as `groove serve` hands the watcher one. On macOS
+        // the temp dir is under `/var`, a link to `/private/var`, and FSEvents
+        // names every path under the latter: against the spelling as written
+        // the write is not under the kb, and its batch finishes without
+        // taking the embedder.
+        let (state, probe, armed) = probed_state(&kb.0.canonicalize().unwrap());
+        let embedder = Arc::clone(&state.embedder);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+        assert!(
+            poll_until(Duration::from_secs(10), || armed.load(SeqCst)).await,
+            "the watch was not registered within 10 s"
+        );
+
+        // Hold the embedder lock on a plain thread (as the i548 test holds it)
+        // so the reindex of the batch blocks until it is let go.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = embedder.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let waits_before = probe.lock_waits.load(SeqCst);
+
+        std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten mid batch\n").unwrap();
+        // Not "a batch is in flight": on Linux the write's `Access(Open)` can
+        // come as a batch of its own that takes no lock and finishes first.
+        // A rise in `lock_waits` says a batch has reached the held lock.
+        let reached = poll_until(Duration::from_secs(10), || {
+            probe.lock_waits.load(SeqCst) > waits_before
+        })
+        .await;
+        assert!(
+            reached,
+            "no batch reached the held lock within 10 s: {probe:?}"
+        );
+        // The loop handles one batch at a time, and this one is blocked.
+        let (started, finished) = (probe.started.load(SeqCst), probe.finished.load(SeqCst));
+        stop_tx.send(true).unwrap();
+        // The batch is blocked on the lock, so the loop must still be running.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(probe.finished.load(SeqCst), finished, "{probe:?}");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), task).await;
+        ended
+            .expect("the loop did not end within 10 s of the lock being let go")
+            .expect("the loop task panicked")
+            .expect("the loop ended with an error");
+        // The stop let the blocked batch finish and started no other.
+        assert_eq!(probe.started.load(SeqCst), started, "{probe:?}");
+        assert_eq!(probe.finished.load(SeqCst), started, "{probe:?}");
+    }
+
+    /// After the stop, a batch the debouncer hands over finds the channel
+    /// closed and is still counted in `emitted`.
+    /// Counting only a successful send would leave `emitted` where it was.
+    #[tokio::test]
+    async fn a_batch_after_the_stop_is_still_counted_as_emitted() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let kb = i549_kb("groove-watcher-until-after-stop");
+        let (state, probe, armed) = probed_state(&kb.0);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+        assert!(
+            poll_until(Duration::from_secs(10), || armed.load(SeqCst)).await,
+            "the watch was not registered within 10 s"
+        );
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop did not end within 5 s of the stop signal")
+            .expect("the loop task panicked")
+            .expect("the loop ended with an error");
+
+        let before = probe.emitted.load(SeqCst);
+        std::fs::write(kb.0.join("doc.md"), "# doc\n\nwritten after the stop\n").unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || probe.emitted.load(SeqCst)
+                > before)
+            .await,
+            "no batch counted within 10 s of a write after the stop (emitted {before})"
+        );
+        assert_eq!(probe.started.load(SeqCst), 0);
     }
 }

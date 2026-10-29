@@ -691,3 +691,305 @@ fn search_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothi
         "no lossy spelling of the knowledge base is created beside it: {stderr}"
     );
 }
+
+/// `groove serve` on a knowledge base whose database path is not UTF-8
+/// stops at start, as `groove index` and the reading commands do: exit 1
+/// within 30 s, the lease's reason in ASCII, and neither the database nor
+/// its lock file created (nor a lossy spelling of the knowledge base).
+#[test]
+fn serve_on_a_non_utf8_kb_path_stops_before_opening_the_index() {
+    let root = TempRoot::new("groove-serve-not-utf8");
+    let cache = TempRoot::new("groove-serve-not-utf8-cache");
+    let bad = root.path().join(non_utf8_name());
+    let kb = bad.join("kb");
+    if !create_non_utf8_dir_or_skip(
+        &kb,
+        "serve_on_a_non_utf8_kb_path_stops_before_opening_the_index",
+    ) {
+        return;
+    }
+    std::fs::write(
+        kb.join("note.md"),
+        "---\ntitle: Note\n---\n\n# Note\n\nEnough content here to stand as a chunk.\n",
+    )
+    .expect("write a note");
+
+    let mut cmd = Command::new(grooveseek_bin());
+    cmd.arg("serve").arg("--kb-path").arg(&kb);
+    hermetic(&mut cmd, cache.path());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn groove serve");
+    let mut pipe = child.stderr.take().expect("stderr is piped");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll groove serve") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("groove serve did not stop within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let stderr = strip_ansi(&String::from_utf8_lossy(
+        &reader.join().expect("the stderr reader"),
+    ));
+    assert_dir_empty(cache.path());
+
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.is_ascii(), "stderr stays ASCII: {stderr:?}");
+    assert!(stderr.contains("not valid UTF-8"), "{stderr}");
+    let names = |dir: &Path| -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .expect("read a directory of the test")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect()
+    };
+    assert_eq!(
+        names(&bad),
+        vec![std::ffi::OsString::from("kb")],
+        "neither .groove.db nor .groove.db.writer-lock is created: {stderr}"
+    );
+    assert_eq!(
+        names(root.path()),
+        vec![non_utf8_name()],
+        "no lossy spelling of the knowledge base is created beside it: {stderr}"
+    );
+}
+
+/// The `rebuild-on-edit.sh` hook sample shipped beside the crate.
+fn hook_script() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("hooks")
+        .join("rebuild-on-edit.sh")
+}
+
+/// A path in the form Git's bash takes as an argument or an env value on
+/// Windows (`C:/...`); unchanged elsewhere.
+fn bash_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// Git's bash. Never looked up on PATH on Windows: there `System32\bash.exe`
+/// comes first, and it is the WSL launcher, which runs the script on the Linux
+/// side (it cannot run the Windows `groove.exe`, and without a distro it does
+/// not start at all). Panics when no bash is found: this test does not skip.
+fn git_bash() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let mut tried = Vec::new();
+        if let Ok(out) = Command::new("git").arg("--exec-path").output()
+            && out.status.success()
+        {
+            // e.g. `C:/Program Files/Git/mingw64/libexec/git-core`: three up is the Git root.
+            let exec = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            if let Some(root) = exec.ancestors().nth(3) {
+                let bash = root.join("bin").join("bash.exe");
+                if bash.is_file() {
+                    return bash;
+                }
+                tried.push(bash);
+            }
+        }
+        let known = std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
+        if known.is_file() {
+            return known;
+        }
+        tried.push(known);
+        panic!("Git's bash was not found (tried {tried:?}); this test needs Git for Windows");
+    }
+    let bash = std::path::PathBuf::from("/bin/bash");
+    assert!(bash.is_file(), "/bin/bash was not found");
+    bash
+}
+
+#[test]
+fn the_hook_script_puts_its_guidance_on_the_first_stderr_line_when_the_wait_runs_out() {
+    // T-L13, the script's case without GROOVE_CONFIG: groove discovers the
+    // config from its working directory, which is the temp root holding only
+    // the test's groove.toml (never the repository's own).
+    hook_script_exits_3_with_the_guidance_first("groove-hook-guidance", false);
+}
+
+#[test]
+fn the_hook_script_with_groove_config_puts_its_guidance_first_when_the_wait_runs_out() {
+    // T-L13, the script's `--config "$GROOVE_CONFIG"` branch.
+    hook_script_exits_3_with_the_guidance_first("groove-hook-guidance-config", true);
+}
+
+/// Run `rebuild-on-edit.sh` under Git's bash while the test holds a rebuild's
+/// lease, and check that it exits 3 with the guidance on the first stderr line
+/// and groove's own wait and refusal after it. No model is involved: groove
+/// stops at the lease. `named_config` passes the temp root's `groove.toml` as
+/// `GROOVE_CONFIG`; otherwise the script runs with that root as its working
+/// directory, so the same file is the one groove discovers.
+fn hook_script_exits_3_with_the_guidance_first(prefix: &str, named_config: bool) {
+    let kb = layout(prefix);
+    let cache = TempRoot::new(&format!("{prefix}-cache"));
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, "model = \"bge-small-en-v1.5\"\n").expect("write groove.toml");
+    let _lease = hold(&kb, Role::Rebuild, kb.kb());
+    let mut cmd = Command::new(git_bash());
+    cmd.arg(bash_path(&hook_script()))
+        .current_dir(kb.root())
+        .env("KB_PATH", bash_path(kb.kb()))
+        .env("GROOVE_BIN", bash_path(&grooveseek_bin()))
+        .env("GROOVE_INDEX_WAIT", "2")
+        .env_remove("KB_EXTENSIONS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if named_config {
+        cmd.env("GROOVE_CONFIG", bash_path(&cfg));
+    } else {
+        cmd.env_remove("GROOVE_CONFIG");
+    }
+    hermetic(&mut cmd, cache.path());
+    let mut child = cmd.spawn().expect("spawn bash");
+    // A payload without a file path takes the unconditional rebuild path.
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"{}")
+        .expect("write the payload");
+    let out = child.wait_with_output().expect("wait for bash");
+    assert_dir_empty(cache.path());
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(3), "exit 3 stays 3: {stderr}");
+    let mut lines = stderr.lines();
+    let first = lines.next().unwrap_or_default();
+    assert!(
+        first.starts_with("rebuild-on-edit.sh: another groove process kept the index for"),
+        "the guidance is the first stderr line (Claude Code shows only that one): {stderr}"
+    );
+    let rest: Vec<&str> = lines.collect();
+    assert!(
+        rest.iter()
+            .any(|l| l.starts_with("waiting for the writer of"))
+            && rest.iter().any(|l| l.starts_with("error: waited 2s;")),
+        "groove's own stderr follows the guidance: {stderr}"
+    );
+}
+
+/// Spawn `cmd` with stderr piped and return once a stderr line starts with
+/// `prefix`, with a thread that collects the whole stderr (ANSI stripped).
+fn spawn_until_line(
+    mut cmd: Command,
+    prefix: &str,
+    limit: Duration,
+) -> (Child, std::thread::JoinHandle<String>) {
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn groove");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            let line = strip_ansi(&line);
+            let _ = tx.send(line.clone());
+            all.push(line);
+        }
+        all.join("\n")
+    });
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) if line.starts_with(prefix) => return (child, reader),
+            Ok(_) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("no `{prefix}` line from groove: {e}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "downloads the embedding model"]
+fn a_hook_index_waits_for_a_rebuild_and_picks_up_the_edit() {
+    // T-L13: the hook's `groove index --wait` behind a rebuild picks up the edit
+    // once the rebuild lets go, and gives up with exit 3 when it does not.
+    let kb = layout("groove-hook-index-wait");
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, "model = \"bge-small-en-v1.5\"\n").expect("write groove.toml");
+    let groove = |args: &[&str]| -> Command {
+        let mut cmd = Command::new(grooveseek_bin());
+        cmd.arg("--config")
+            .arg(&cfg)
+            .args(args)
+            .arg("--kb-path")
+            .arg(kb.kb());
+        cmd
+    };
+    let first = groove(&["index"]).output().expect("spawn groove index");
+    assert!(
+        first.status.success(),
+        "the first index: {}",
+        strip_ansi(&String::from_utf8_lossy(&first.stderr))
+    );
+
+    let lease = hold(&kb, Role::Rebuild, kb.kb());
+    kb.write(
+        "fresh.md",
+        "---\ntitle: Fresh\n---\n\n# Fresh\n\nThe zephyrquokka arrived after the first index.\n",
+    );
+    kb.write(
+        "note.md",
+        "---\ntitle: Note\n---\n\n# Note\n\nThe marmaladeplatypus replaced what this note said.\n",
+    );
+    let (mut child, reader) = spawn_until_line(
+        groove(&["index", "--wait", "30"]),
+        "waiting for the writer of",
+        Duration::from_secs(30),
+    );
+    drop(lease);
+    let status = child.wait().expect("wait for groove index");
+    let stderr = reader.join().expect("join the stderr reader");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the wait ended with the lease: {stderr}"
+    );
+
+    for (query, expected) in [
+        ("zephyrquokka", "fresh.md"),
+        ("marmaladeplatypus", "marmaladeplatypus"),
+    ] {
+        let out = groove(&["search", query, "--format", "json"])
+            .output()
+            .expect("spawn groove search");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(expected),
+            "search {query} finds {expected}: stdout={stdout} stderr={}",
+            strip_ansi(&String::from_utf8_lossy(&out.stderr))
+        );
+    }
+
+    let _held = hold(&kb, Role::Rebuild, kb.kb());
+    let out = groove(&["index", "--wait", "2"])
+        .output()
+        .expect("spawn groove index");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a rebuild that does not let go: {stderr}"
+    );
+}

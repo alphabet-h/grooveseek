@@ -531,6 +531,8 @@ pub struct AdminStatus {
     pub watcher: WatcherInfo,
     pub kb: crate::server::KbInfo,
     pub config_source: String,
+    /// The writer lease and its notices (ADR-0031).
+    pub writer: crate::server::WriterStatus,
 }
 
 #[derive(serde::Serialize)]
@@ -2004,6 +2006,19 @@ async fn api_admin_status(
             "kb info unavailable".to_string(),
         )
     })?;
+    // `status()` reads writer.json, so it runs on the blocking pool (BU-06).
+    let writer = {
+        let slot = Arc::clone(&shared.writer);
+        crate::server::run_blocking_typed("admin_status", move || slot.status())
+            .await
+            .map_err(|e| {
+                tracing::warn!("admin_status writer status failure: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "writer status unavailable".to_string(),
+                )
+            })?
+    };
     Ok(axum::Json(AdminStatus {
         daemon: DaemonInfo {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -2020,6 +2035,7 @@ async fn api_admin_status(
         },
         kb,
         config_source: shared.config_source_label.clone(),
+        writer,
     }))
 }
 
@@ -4581,5 +4597,58 @@ mod tests {
             "the 5th session with a cap of 4 is refused"
         );
         assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    /// Admin status reports the writer lease after every key it already had.
+    #[tokio::test]
+    async fn admin_status_carries_the_writer_object() {
+        use crate::server::{ReaderReason, WriterSlot};
+        let dir = crate::test_support::unique_temp_path("admin-writer");
+        let slot = WriterSlot::managed(
+            dir.join("kb.db"),
+            dir.join("kb"),
+            "test-model".to_string(),
+            4,
+        );
+        slot.become_reader(ReaderReason::Busy {
+            holder_at_start: None,
+            relation: crate::writer_lease::HolderRelation::Unknown,
+        });
+        let db = crate::db::Database::open_in_memory().expect("in-memory db");
+        let shared = Arc::new(KbServerShared::for_test_with_writer(
+            db,
+            crate::embedder::Embedder::stub_for_tests(4),
+            std::path::PathBuf::from("."),
+            slot,
+        ));
+
+        let axum::Json(status) = api_admin_status(State(shared))
+            .await
+            .unwrap_or_else(|(code, body)| panic!("{code}: {body}"));
+        let text = serde_json::to_string(&status).expect("admin status serializes");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["writer"]["reader"], true, "{json}");
+        assert!(json["writer"]["reader_notice"].is_string(), "{json}");
+        assert_eq!(json["writer"]["held"], false, "{json}");
+
+        let at = |key: &str| {
+            text.find(&format!("\"{key}\":"))
+                .unwrap_or_else(|| panic!("`{key}` missing: {text}"))
+        };
+        let order: Vec<usize> = [
+            "daemon",
+            "indexing",
+            "watcher",
+            "kb",
+            "config_source",
+            "writer",
+        ]
+        .iter()
+        .map(|k| at(k))
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "the existing keys keep their order and `writer` comes last: {text}"
+        );
     }
 }

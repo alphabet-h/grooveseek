@@ -105,6 +105,6 @@ rebuild をスキップする。
 
 ## 補足
 
-- **並行実行**: SQLite は WAL モードで構成されているため、起動中の MCP サーバと hook トリガーの `groove index` が共存できる。hook は rebuild 完了までツール実行をブロックするが、小さな KB では気にならないほど速い
+- **並行実行**: 1 つの索引を書く groove の process は同時に 1 つだけ。watcher が有効な (既定の) `groove serve` は watcher が動いている間この書き手の lease を持ち、編集もすべて自分で拾うので、**この hook と組まない**: hook が起こす `groove index` は編集のたびに `GROOVE_INDEX_WAIT` 秒待ちきってから exit 3 になる。その構成では hook を外す。hook を使うのは `--no-watch` で起動した server と組むときか、server が無いときだけ。その構成では、hook の `groove index` は他の書き手 (server の MCP `rebuild_index`、または重なったもう 1 本のこの hook) を最大 `GROOVE_INDEX_WAIT` 秒 (既定 30) 待つ。待ちを過ぎてもその書き手が索引を持っていれば、スクリプトは 0 ではなく exit 3 を返す: その編集はまだ索引に入っていないかもしれない。stderr の 1 行目がそのことを告げ (Claude Code の hook の通知はこの行を出す)、groove 自身の出力がその後に続く。編集を拾わせるには `groove index` を打ち直すか `rebuild_index` を呼ぶ。hook に `timeout` を書くなら、`GROOVE_INDEX_WAIT` はその半分以下にする (Claude Code の command hook の既定は 600 s)。hook は rebuild 完了までツール実行をブロックするが、小さな KB では気にならないほど速い
 - **品質フィルタ**: rebuild は `groove.toml` の `[quality_filter]` を尊重する。backfill は `groove index` の冒頭で毎回走るが冪等
 - **一時的にスキップ**: hook を削除せず無効化したいときは、Tier B なら `KB_PATH=` (空) に、Tier A ならエントリをコメントアウトする

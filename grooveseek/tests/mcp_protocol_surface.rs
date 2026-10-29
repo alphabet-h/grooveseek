@@ -692,6 +692,50 @@ fn the_tool_descriptions_name_the_behaviour_the_server_has() {
     }
 }
 
+/// Both tools that can carry `writer_notice` tell the client what it
+/// means and to pass it on, and the rebuild tool says when it is refused at
+/// once. Each stays one paragraph (the `\` continuations are the risk).
+#[test]
+fn the_search_and_rebuild_descriptions_name_writer_notice() {
+    let (_kb, _guard, base) = start();
+
+    let listed = rpc(&base, "tools/list", serde_json::json!({"_meta": meta()}));
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list must return an array: {listed}"));
+    let describe = |name: &str| -> String {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be advertised: {listed}"))["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} must carry a description: {listed}"))
+            .to_string()
+    };
+
+    let search = describe("search");
+    let rebuild = describe("rebuild_index");
+    for (name, text) in [("search", &search), ("rebuild_index", &rebuild)] {
+        for wanted in ["writer_notice", "pass it on to the user"] {
+            assert!(
+                text.contains(wanted),
+                "{name}'s description must name {wanted:?}: {text:?}"
+            );
+        }
+        assert!(
+            !text.contains("  ") && !text.contains('\n'),
+            "{name}'s description must read as one paragraph: {text:?}"
+        );
+    }
+    assert!(
+        rebuild.contains(
+            "The call is refused, without waiting for the embedder, the database or a running \
+             rebuild, when another groove process"
+        ),
+        "rebuild_index must say its refusal does not wait while another process writes: {rebuild:?}"
+    );
+}
+
 /// A server over an index seeded through the library, the way
 /// `tests/doctor_cli.rs` seeds one: no model run is needed for rows to exist,
 /// and `groove serve` does not index on start, so what the tool reads back is exactly
