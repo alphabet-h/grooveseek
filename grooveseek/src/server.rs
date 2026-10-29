@@ -1622,6 +1622,9 @@ pub async fn run_server(
         rules: crate::exclusion::ExclusionRules::load(&kb_path, shared.exclude_dirs.clone()),
         config: watch_config,
         watcher_active: Arc::clone(&watcher_active),
+        watch_status: None,
+        watch_backoff: crate::watcher::WatcherState::DEFAULT_WATCH_BACKOFF,
+        batch_probe: None,
     };
     let watcher_handle = tokio::spawn(async move {
         if let Err(e) = crate::watcher::run_watch_loop(watcher_state).await {
