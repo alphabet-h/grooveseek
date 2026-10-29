@@ -10593,9 +10593,16 @@ mod tests {
         let seen: Arc<Mutex<Vec<Option<crate::server::WatchErrorCause>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let mut state = until_state(&kb_path);
-        state.watch_backoff = (Duration::from_millis(50), Duration::from_millis(200));
-        let sink = Arc::clone(&seen);
-        state.watch_status = Some(Arc::new(move |cause| sink.lock().unwrap().push(cause)));
+        // The bridge thread outlives the test and retries once the dir is gone;
+        // a 2 s cap keeps that slow while the first retries stay short.
+        state.watch_backoff = (Duration::from_millis(50), Duration::from_secs(2));
+        // Weak: the leaked bridge thread must not keep pushing into `seen`.
+        let sink = Arc::downgrade(&seen);
+        state.watch_status = Some(Arc::new(move |cause| {
+            if let Some(seen) = sink.upgrade() {
+                seen.lock().unwrap().push(cause);
+            }
+        }));
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
 
@@ -10681,5 +10688,108 @@ mod tests {
 
         stop_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A watch state over `kb` with a fresh probe and a flag raised when the
+    /// watch is registered.
+    fn probed_state(
+        kb: &Path,
+    ) -> (
+        WatcherState,
+        Arc<WatchBatchProbe>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(WatchBatchProbe::default());
+        let mut state = until_state(kb);
+        let flag = Arc::clone(&armed);
+        state.watch_status = Some(Arc::new(move |cause| {
+            if cause.is_none() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        state.batch_probe = Some(Arc::clone(&probe));
+        (state, probe, armed)
+    }
+
+    /// A stop that arrives while a batch is being handled lets that batch
+    /// finish, then the loop returns `Ok(())`.
+    /// A loop that dropped the in-flight handling on the stop would return
+    /// with `finished == 0`.
+    #[tokio::test]
+    async fn a_stop_during_a_batch_waits_for_that_batch_to_finish() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let kb = i549_kb("groove-watcher-until-mid-batch");
+        let (state, probe, armed) = probed_state(&kb.0);
+        let embedder = Arc::clone(&state.embedder);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+        assert!(
+            poll_until(Duration::from_secs(10), || armed.load(SeqCst)).await,
+            "the watch was not registered within 10 s"
+        );
+
+        // Hold the embedder lock on a plain thread (as the i548 test holds it)
+        // so the reindex of the batch blocks until it is let go.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = embedder.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten mid batch\n").unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || probe.started.load(SeqCst) == 1).await,
+            "no batch started within 10 s"
+        );
+        stop_tx.send(true).unwrap();
+        // The batch is blocked on the lock, so the loop must still be running.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(probe.finished.load(SeqCst), 0);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), task).await;
+        ended
+            .expect("the loop did not end within 10 s of the lock being let go")
+            .expect("the loop task panicked")
+            .expect("the loop ended with an error");
+        assert_eq!(probe.started.load(SeqCst), 1);
+        assert_eq!(probe.finished.load(SeqCst), 1);
+    }
+
+    /// After the stop, a batch the debouncer hands over finds the channel
+    /// closed and is still counted in `emitted`.
+    /// Counting only a successful send would leave `emitted` where it was.
+    #[tokio::test]
+    async fn a_batch_after_the_stop_is_still_counted_as_emitted() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let kb = i549_kb("groove-watcher-until-after-stop");
+        let (state, probe, armed) = probed_state(&kb.0);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+        assert!(
+            poll_until(Duration::from_secs(10), || armed.load(SeqCst)).await,
+            "the watch was not registered within 10 s"
+        );
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop did not end within 5 s of the stop signal")
+            .expect("the loop task panicked")
+            .expect("the loop ended with an error");
+
+        let before = probe.emitted.load(SeqCst);
+        std::fs::write(kb.0.join("doc.md"), "# doc\n\nwritten after the stop\n").unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || probe.emitted.load(SeqCst)
+                > before)
+            .await,
+            "no batch counted within 10 s of a write after the stop (emitted {before})"
+        );
+        assert_eq!(probe.started.load(SeqCst), 0);
     }
 }
