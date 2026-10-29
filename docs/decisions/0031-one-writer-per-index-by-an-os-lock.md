@@ -163,7 +163,8 @@ The three designs were scored by three reviewers on five axes, 10 points each
   (`writer_notice`) and in `/api/admin/status`. The writing server reports there
   too while its watcher cannot register a watch, and after its watcher stopped.
   A server with `--no-watch` takes the lock only for each `rebuild_index` call,
-  and a call that cannot take it is refused at once. At shutdown the watcher is
+  and a call that cannot take it is refused without waiting for the embedder,
+  the database or a running rebuild. At shutdown the watcher is
   not aborted: it stops at a batch boundary, is awaited, the connection goes
   back to `query_only`, and then the lock is released.
 

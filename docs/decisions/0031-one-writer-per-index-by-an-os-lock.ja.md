@@ -130,7 +130,7 @@ run の間にもう一方の process が書いた、実在する file の row �
   `rebuild_index` を断り、そのことを `search` と `rebuild_index` の応答ごと (`writer_notice`) と
   `/api/admin/status` で知らせる。書いている側の server も、watcher が watch を登録できない間と、
   watcher が止まった後は同じ所で知らせる。`--no-watch` の server は `rebuild_index` の呼び出しごとにだけ
-  lock を取り、取れない呼び出しは即座に断る。終了時に watcher は abort しない: batch の境界で止めて await し、接続を
+  lock を取り、取れない呼び出しは embedder・DB・実行中の再構築を待たずに断る。終了時に watcher は abort しない: batch の境界で止めて await し、接続を
   `query_only` に戻してから lock を放す。
 
 ## 結果と代償
