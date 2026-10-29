@@ -159,6 +159,9 @@ pub(crate) struct KbCore {
     /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
     /// in-process index operation (codex P2 round 1 on PR #57).
     indexing_state: Arc<Mutex<Option<IndexingState>>>,
+    /// The writer lease inside this server (ADR-0031), shared by every
+    /// session; its notice rides on the replies that carry one.
+    pub(crate) writer: Arc<WriterSlot>,
 }
 
 /// The rmcp tool surface. Holds nothing but an `Arc` to the state, so the
@@ -536,6 +539,17 @@ pub(crate) struct ErrorResponse {
     error: String,
 }
 
+/// A reply with the writer notice beside it (ADR-0031): flattened, so the
+/// reply gains one top-level key, and that key is absent while there is no
+/// notice — the bytes are then exactly the body's.
+#[derive(Serialize)]
+struct WithWriterNotice<T: Serialize> {
+    #[serde(flatten)]
+    body: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writer_notice: Option<String>,
+}
+
 /// The wrapper both search surfaces answer with (feature-26).
 ///
 /// Generic over the hit type because the two surfaces differ in exactly one
@@ -658,6 +672,17 @@ impl SearchFilterEcho {
 /// only ever reached through the `spawn_blocking` wrappers in
 /// `impl KbServer` below, which is what keeps the tokio workers free.
 impl KbCore {
+    /// `body` as pretty JSON, with the writer notice when this server has
+    /// one. The notice reads writer.json, so call it with no db, embedder or
+    /// reranker guard held.
+    fn with_writer_notice<T: Serialize>(&self, body: T) -> String {
+        serde_json::to_string_pretty(&WithWriterNotice {
+            body,
+            writer_notice: self.writer.notice(),
+        })
+        .unwrap_or_default()
+    }
+
     fn list_topics_blocking(&self) -> String {
         let db = recover_db(self.db.lock());
         match db.list_topics() {
@@ -1165,7 +1190,7 @@ fn internal_error(e: String) -> rmcp::ErrorData {
 ///
 /// Same obligation as every tool handler (BU-06): the body does its work on the
 /// blocking pool, never on an async worker.
-async fn run_blocking_typed<T, F>(what: &'static str, f: F) -> Result<T, String>
+pub(crate) async fn run_blocking_typed<T, F>(what: &'static str, f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -1223,6 +1248,10 @@ pub struct KbServerShared {
     /// Hosts allowed by the admin sub-router Host header check.
     /// Always includes the loopback aliases; HTTP transport also adds its bind addr.
     pub allowed_admin_hosts: Vec<String>,
+    /// The writer lease inside this server (ADR-0031). Every session built
+    /// by [`KbServer::from_shared`] shares this one slot, and
+    /// `/api/admin/status` reports it.
+    pub writer: Arc<WriterSlot>,
 }
 
 /// The one rebuild in progress, or `None`.
@@ -1329,6 +1358,7 @@ impl KbServer {
                 context_mode_desired: shared.context_mode_desired,
                 fail_on_frontmatter_error: shared.fail_on_frontmatter_error,
                 indexing_state: Arc::clone(&shared.indexing_state),
+                writer: Arc::clone(&shared.writer),
             }),
             tool_router: KbServer::tool_router(),
         }
@@ -1423,8 +1453,19 @@ impl KbServerShared {
     /// go through `run_server`; this helper exists so integration tests can
     /// build a `KbServerShared` without booting the full transport stack.
     /// All non-essential fields are filled with defaults (loopback-only admin
-    /// allow-list, no reranker, no watcher).
+    /// allow-list, no reranker, no watcher, an unmanaged writer slot).
     pub fn for_test(db: Database, embedder: Embedder, kb_path: PathBuf) -> Self {
+        Self::for_test_with_writer(db, embedder, kb_path, WriterSlot::unmanaged())
+    }
+
+    /// [`KbServerShared::for_test`] with the writer slot given, so a test can
+    /// serve as a reader or under a managed lease.
+    pub fn for_test_with_writer(
+        db: Database,
+        embedder: Embedder,
+        kb_path: PathBuf,
+        writer: Arc<WriterSlot>,
+    ) -> Self {
         use std::sync::atomic::AtomicBool;
         use std::time::{Instant, SystemTime};
         Self {
@@ -1455,6 +1496,7 @@ impl KbServerShared {
                 .iter()
                 .map(|h| (*h).to_string())
                 .collect(),
+            writer,
         }
     }
 }
@@ -1607,6 +1649,8 @@ pub async fn run_server(
         watcher_debounce_ms,
         config_source_label: format!("{:?}", config_source),
         allowed_admin_hosts,
+        // Unmanaged until serve takes the lease here.
+        writer: WriterSlot::unmanaged(),
     };
 
     // watcher をバックグラウンドで並走。
@@ -6170,6 +6214,196 @@ mod tests {
                     }
                 );
             }
+        }
+    }
+
+    /// A managed slot that started as a reader, the way a second serve is
+    /// left when another process holds the lease. Nothing is written to disk:
+    /// the notice reads writer.json and finds none.
+    fn reader_slot() -> Arc<WriterSlot> {
+        let dir = crate::test_support::unique_temp_path("writer-notice");
+        let slot = WriterSlot::managed(
+            dir.join("kb.db"),
+            dir.join("kb"),
+            "test-model".to_string(),
+            4,
+        );
+        slot.become_reader(ReaderReason::Busy {
+            holder_at_start: None,
+            relation: crate::writer_lease::HolderRelation::Unknown,
+        });
+        slot
+    }
+
+    /// An empty index the 4-dimensional stub embedder can search.
+    fn stub_db() -> Database {
+        let db = Database::open_in_memory().expect("in-memory db");
+        db.verify_embedding_meta("test-model", 4)
+            .expect("declare the stub's identity");
+        db
+    }
+
+    fn shared_with(writer: Arc<WriterSlot>) -> KbServerShared {
+        KbServerShared::for_test_with_writer(
+            stub_db(),
+            Embedder::stub_for_tests(4),
+            PathBuf::from("."),
+            writer,
+        )
+    }
+
+    async fn search_json(shared: &KbServerShared, params: SearchParams) -> serde_json::Value {
+        let out = KbServer::from_shared(shared)
+            .search(Parameters(params))
+            .await;
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("not JSON ({e}): {out}"))
+    }
+
+    /// A reader's successful search says why the index may be behind; a
+    /// search through `for_test` (an unmanaged slot) answers exactly as before.
+    #[tokio::test]
+    async fn mcp_search_success_carries_writer_notice_and_the_for_test_search_does_not() {
+        let slot = reader_slot();
+        let expected = slot.notice().expect("a reader slot has a notice");
+        let reader = shared_with(slot);
+        let json = search_json(
+            &reader,
+            SearchParams {
+                query: "x".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        for key in ["results", "low_confidence", "filter_applied"] {
+            assert!(json.get(key).is_some(), "`{key}` missing: {json}");
+        }
+        assert_eq!(json["writer_notice"], expected, "{json}");
+
+        let plain = KbServerShared::for_test(stub_db(), Embedder::stub_for_tests(4), ".".into());
+        let json = search_json(
+            &plain,
+            SearchParams {
+                query: "x".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(json.get("results").is_some(), "{json}");
+        assert!(json.get("writer_notice").is_none(), "{json}");
+    }
+
+    /// An error reply is the `error` envelope alone, even on a reader.
+    #[tokio::test]
+    async fn a_search_error_reply_carries_no_writer_notice() {
+        let reader = shared_with(reader_slot());
+        let json = search_json(
+            &reader,
+            SearchParams {
+                query: "x".into(),
+                mmr_lambda: Some(2.0),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(json.get("error").is_some(), "{json}");
+        assert!(json.get("writer_notice").is_none(), "{json}");
+    }
+
+    /// Without a notice the wrapper adds nothing: the same bytes, keys in the
+    /// same order, for every reply type it can wrap.
+    #[test]
+    fn with_writer_notice_without_a_notice_is_byte_identical_to_the_body() {
+        let shared = KbServerShared::for_test(stub_db(), Embedder::stub_for_tests(4), ".".into());
+        let server = KbServer::from_shared(&shared);
+        let core = &server.core;
+
+        let error = || ErrorResponse {
+            error: "boom".to_string(),
+        };
+        assert_eq!(
+            core.with_writer_notice(error()),
+            serde_json::to_string_pretty(&error()).unwrap()
+        );
+
+        let stats = || IndexStats {
+            total_documents: 3,
+            updated: 1,
+            renamed: 2,
+            deleted: 0,
+            skipped: 4,
+            frontmatter_unparsed: 1,
+            total_chunks: 140,
+            duration_ms: 7,
+        };
+        let plain = || WithChunkCounts {
+            body: stats(),
+            chunks_embedded: 5,
+            chunks_reused: 135,
+        };
+        assert_eq!(
+            core.with_writer_notice(plain()),
+            serde_json::to_string_pretty(&plain()).unwrap()
+        );
+        let failure = || WithChunkCounts {
+            body: StrictIndexFailure {
+                error: "boom".to_string(),
+                stats: stats(),
+            },
+            chunks_embedded: 5,
+            chunks_reused: 135,
+        };
+        assert_eq!(
+            core.with_writer_notice(failure()),
+            serde_json::to_string_pretty(&failure()).unwrap()
+        );
+
+        // The success reply of `search_blocking`: one hit, one non-default echo.
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        let response = || SearchResponse {
+            results: maximal_hits()
+                .into_iter()
+                .take(1)
+                .map(|h| HitWithUri::new(h, &rules))
+                .collect(),
+            low_confidence: true,
+            filter_applied: SearchFilterEcho::new(
+                Some("c".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                crate::db::FieldFilters::new(),
+                crate::db::FieldFilters::new(),
+            ),
+        };
+        let expected = serde_json::to_string_pretty(&response()).unwrap();
+        assert!(expected.contains("\"category\": \"c\""), "{expected}");
+        assert!(expected.contains("\"uri\""), "{expected}");
+        assert_eq!(core.with_writer_notice(response()), expected);
+    }
+
+    /// Every session the HTTP transport builds from one shared state reads
+    /// the same slot.
+    #[tokio::test]
+    async fn every_session_built_from_one_shared_sees_the_same_writer_notice() {
+        let slot = reader_slot();
+        let expected = slot.notice().expect("a reader slot has a notice");
+        let shared = shared_with(slot);
+        for _ in 0..2 {
+            let json = search_json(
+                &shared,
+                SearchParams {
+                    query: "x".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(json["writer_notice"], expected, "{json}");
         }
     }
 }

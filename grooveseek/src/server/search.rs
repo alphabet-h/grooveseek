@@ -293,9 +293,9 @@ impl KbCore {
             parent_params,
         );
         // The last DB read of this request is behind us; release the snapshot.
-        if let Some(tx) = snapshot
-            && let Err(e) = tx.commit()
-        {
+        // `map_or` consumes it whole, so it borrows `db` no longer and the
+        // guard can be dropped below.
+        if let Err(e) = snapshot.map_or(Ok(()), |tx| tx.commit()) {
             return serde_json::to_string_pretty(&ErrorResponse {
                 error: format!("Search failed: {e}. Try running rebuild_index first."),
             })
@@ -344,7 +344,11 @@ impl KbCore {
             low_confidence,
             filter_applied: echo,
         };
-        serde_json::to_string_pretty(&resp).unwrap_or_default()
+        // The notice reads writer.json: release the index and the reranker
+        // first, so that read does not hold up another request.
+        drop(db);
+        drop(reranker_guard);
+        self.with_writer_notice(resp)
     }
 }
 
