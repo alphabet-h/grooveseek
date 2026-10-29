@@ -218,6 +218,7 @@ pub struct WatcherStopped {
 /// What admin status reports about the writer lease (ADR-0031). An
 /// unmanaged slot reports `held: false` and nothing else.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct WriterStatus {
     pub held: bool,
     /// The role writer.json names, while the lease is held.
@@ -1785,5 +1786,175 @@ mod tests {
             }
             assert!(words.is_ascii(), "{t}");
         }
+    }
+
+    // --- Whole texts, pinned word for word (ADR-0031) ---
+
+    /// The Busy reader's body with its three placeholders filled in.
+    fn busy_body(db: &Path, at_start: &str, keeper: &str, now: &str) -> String {
+        format!(
+            "this server is not updating the index at {}: when it started, another groove process held the writer lock ({at_start}). Searches still work and return what has been indexed. {keeper} This server cannot rebuild the index itself. After a restart while no other process holds the lock, it writes the index and watches files, but changes made before the restart need one rebuild after the restart. {now}",
+            db.display()
+        )
+    }
+
+    #[test]
+    fn busy_reader_text_is_pinned_for_each_at_start_and_keeper() {
+        let l = TextLayout::new("full-keeper");
+        let kb = l.canonical_kb();
+        let other = l.other_kb();
+        let info = WriterLease::info_path_for(&l.db).display().to_string();
+        let now = SystemTime::now();
+        let gone = format!("Now there is no {info}, so that process has probably exited.");
+        let h = holder_info(Role::Serve, &kb, Some(0), Some(true));
+        let at_start_some = format!("pid 4242 per {info}, which can be stale; serve, kb {kb}");
+        let at_start_none = format!("no {info} was readable");
+        let cases = [
+            (
+                HolderRelation::WatchingSameKb,
+                "That process is a server for this same knowledge base: while it runs and its watcher is watching files, it keeps the index current; after it exits, new, edited and deleted files are not reflected until this server is restarted.".to_string(),
+            ),
+            (
+                HolderRelation::OneOffRun(Role::Index),
+                "That process was a one-off index run that does not watch files, so new, edited and deleted files are not reflected until this server is restarted, even while it runs.".to_string(),
+            ),
+            (
+                HolderRelation::OtherKb(other.clone()),
+                format!(
+                    "That process works on a different knowledge base (kb {other}) that shares this index file, so nothing keeps this server's knowledge base (kb {}) current: new, edited and deleted files in it are not reflected until that process exits and this server is restarted.",
+                    l.kb.display()
+                ),
+            ),
+            (
+                HolderRelation::Unknown,
+                "Whether that process keeps this knowledge base current cannot be told, so treat new, edited and deleted files as not reflected until this server is restarted.".to_string(),
+            ),
+        ];
+        for (relation, keeper) in cases {
+            for (at_start, expected_at_start) in
+                [(Some(&h), &at_start_some), (None, &at_start_none)]
+            {
+                let reason = busy(at_start, relation.clone());
+                assert_eq!(
+                    reader_notice_text(&l.db, &l.kb, &reason, None, now),
+                    busy_body(&l.db, expected_at_start, &keeper, &gone),
+                    "{relation:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn busy_reader_now_text_is_pinned_for_each_form() {
+        let l = TextLayout::new("full-now");
+        let kb = l.canonical_kb();
+        let other = l.other_kb();
+        let info = WriterLease::info_path_for(&l.db).display().to_string();
+        let now = SystemTime::now();
+        let since = "2026-01-01T00:00:00+00:00";
+        let reason = busy(None, HolderRelation::Unknown);
+        let at_start = format!("no {info} was readable");
+        let keeper = "Whether that process keeps this knowledge base current cannot be told, so treat new, edited and deleted files as not reflected until this server is restarted.";
+        let cases = [
+            (
+                None,
+                format!("Now there is no {info}, so that process has probably exited."),
+            ),
+            (
+                Some(holder_info(Role::Index, &kb, Some(0), Some(true))),
+                format!(
+                    "Now {info} names pid 4242 (index, since {since}), which can be stale: a process that was killed leaves the file behind."
+                ),
+            ),
+            (
+                Some(holder_info(Role::Serve, &other, Some(0), Some(true))),
+                format!(
+                    "Now {info} names pid 4242 (serve, since {since}), which can be stale: a process that was killed leaves the file behind."
+                ),
+            ),
+            (
+                Some(holder_info(Role::Serve, &kb, Some(0), Some(true))),
+                format!(
+                    "Now {info} names pid 4242, a server watching this same knowledge base (since {since}): while it runs, it keeps the index current, so searches here see its changes and this server does not need a restart for that. The file can be stale: a process that was killed leaves it behind."
+                ),
+            ),
+            (
+                Some(holder_info(Role::Serve, &kb, Some(60), Some(true))),
+                format!(
+                    "Now {info} names pid 4242, a server watching this same knowledge base (since {since}), but its heartbeat is older than 15s, so that process has probably exited without removing the file; treat new, edited and deleted files as not reflected until this server is restarted."
+                ),
+            ),
+            (
+                Some(holder_info(Role::Serve, &kb, Some(0), Some(false))),
+                format!(
+                    "Now {info} names pid 4242, a server for this same knowledge base (since {since}), but it does not report that its watcher is watching files right now (for example, it could not register a watch and is retrying), so new, edited and deleted files are not being indexed while that lasts. The file can be stale: a process that was killed leaves it behind."
+                ),
+            ),
+        ];
+        for (holder_now, now_text) in cases {
+            assert_eq!(
+                reader_notice_text(&l.db, &l.kb, &reason, holder_now.as_ref(), now),
+                busy_body(&l.db, &at_start, keeper, &now_text),
+                "{holder_now:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_reader_watcher_stopped_and_watch_error_texts_are_pinned() {
+        let l = TextLayout::new("full-other");
+        let kb = l.canonical_kb();
+        let info = WriterLease::info_path_for(&l.db).display().to_string();
+        let lock_path = WriterLease::lock_path_for(&l.db);
+        let now = SystemTime::now();
+
+        let io = ReaderReason::Io {
+            lock_path: lock_path.clone(),
+            error: "access denied".to_string(),
+        };
+        assert_eq!(
+            reader_notice_text(&l.db, &l.kb, &io, None, now),
+            format!(
+                "this server is not updating the index at {}: it could not take the writer lock at {} (access denied) when it started. Searches still work and return what has been indexed. New, edited and deleted files are not reflected until the lock works and this server is restarted. This server cannot rebuild the index itself.",
+                l.db.display(),
+                lock_path.display()
+            )
+        );
+
+        let stopped = |why: &str| {
+            format!(
+                "this server stopped watching files for {} ({why}); new, edited and deleted files are not reflected until this server is restarted.",
+                l.kb.display()
+            )
+        };
+        assert_eq!(
+            watcher_stopped_text(&l.db, &l.kb, Some("boom"), false, None, now),
+            stopped("boom")
+        );
+        assert_eq!(
+            watcher_stopped_text(&l.db, &l.kb, None, false, None, now),
+            stopped("the watcher task ended without finishing")
+        );
+        let keeper = holder_info(Role::Serve, &kb, Some(0), Some(true));
+        assert_eq!(
+            watcher_stopped_text(&l.db, &l.kb, None, false, Some(&keeper), now),
+            format!(
+                "{} Now {info} names pid 4242, another server watching this same knowledge base (since 2026-01-01T00:00:00+00:00): while it runs, it keeps the index current, so searches here see its changes. The file can be stale: a process that was killed leaves it behind.",
+                stopped("the watcher task ended without finishing")
+            )
+        );
+
+        let cause = WatchErrorCause {
+            kb: l.kb.clone(),
+            error: "no such directory".to_string(),
+            retry_secs: 3,
+        };
+        assert_eq!(
+            watch_error_text(&cause),
+            format!(
+                "the watcher could not watch {}: no such directory (next retry in 3s); new, edited and deleted files are not being indexed until it succeeds. Fix the cause (on Linux, for example, raise fs.inotify.max_user_watches), or call rebuild_index to index what changed meanwhile.",
+                l.kb.display()
+            )
+        );
     }
 }
