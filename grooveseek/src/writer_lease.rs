@@ -73,17 +73,20 @@ impl std::fmt::Display for LeaseError {
                 "another groove process holds the writer lock at {}",
                 lock_path.display()
             ),
+            // The OS words `source` in the local language, so only its kind
+            // and code are shown: stderr stays ASCII (AGENTS.md).
             LeaseError::Io { lock_path, source } => write!(
                 f,
-                "could not take the writer lock at {}: {source}",
-                lock_path.display()
+                "could not take the writer lock at {}: {}",
+                lock_path.display(),
+                crate::embedder::ascii_io_error(source)
             ),
         }
     }
 }
 
-/// `source()` is left as `None` on purpose: the OS error is already part of
-/// the `Display` text, and a chain would print it a second time.
+/// `source()` is left as `None` on purpose: a chain would print the OS's own,
+/// possibly non-ASCII, wording of the error that `Display` names by kind and code.
 impl std::error::Error for LeaseError {}
 
 /// The held writer lease. Dropping it removes `<db>.writer.json` and releases
@@ -228,8 +231,9 @@ impl Drop for WriterLease {
         let _ = std::fs::remove_file(&self.info_path);
         if let Err(e) = self.file.unlock() {
             tracing::warn!(
-                "could not release the writer lock at {}: {e}",
-                self.lock_path.display()
+                "could not release the writer lock at {}: {}",
+                self.lock_path.display(),
+                crate::embedder::ascii_io_error(&e)
             );
         }
     }
@@ -382,8 +386,9 @@ fn publish_info(
         .and_then(|()| std::fs::rename(&tmp, info_path));
     if let Err(e) = result {
         tracing::warn!(
-            "could not write {} (display only, the lease is held): {e}",
-            info_path.display()
+            "could not write {} (display only, the lease is held): {}",
+            info_path.display(),
+            crate::embedder::ascii_io_error(&e)
         );
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(info_path);
@@ -609,6 +614,41 @@ mod tests {
         for e in errors {
             let s = e.to_string();
             assert!(s.is_ascii(), "non-ASCII display: {s}");
+        }
+    }
+
+    /// (local Codex round 2) The OS words a lock-file error in the local
+    /// language; the `Display` names it by kind and code instead, and keeps the path.
+    #[test]
+    fn lease_error_io_display_is_ascii_for_a_non_ascii_os_message() {
+        let (_dir, db, _kb) = layout("ascii-io");
+        let lock_path = WriterLease::lock_path_for(&db);
+        let shown = lock_path.display().to_string();
+        assert!(
+            shown.is_ascii(),
+            "the temp path itself must be ASCII for this test to mean anything: {shown}"
+        );
+        let cases = [
+            (
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "アクセスが拒否されました。",
+                ),
+                "PermissionDenied",
+            ),
+            (std::io::Error::other("ファイルを開けません"), "Other"),
+            // A real OS error: its text is CP932 Japanese on a Japanese Windows.
+            (std::io::Error::from_raw_os_error(5), "(os error 5)"),
+        ];
+        for (source, expected) in cases {
+            let e = LeaseError::Io {
+                lock_path: lock_path.clone(),
+                source,
+            };
+            let s = e.to_string();
+            assert!(s.is_ascii(), "non-ASCII display: {s}");
+            assert!(s.contains(&shown), "path dropped: {s}");
+            assert!(s.contains(expected), "kind or code dropped: {s}");
         }
     }
 
