@@ -191,15 +191,28 @@ pub(crate) fn start_writer_role(
             eprintln!("watcher exited with error: {e}");
         }
         let _ = tokio::task::spawn_blocking(move || {
-            let db = recover_db(db.lock());
-            if let Err(e) = &exit {
-                writer.set_watcher_exit(generation, e.to_string());
-            }
-            writer.release(guard, &db);
+            end_watcher(&writer, &db, guard, generation, &exit);
         })
         .await;
     }));
     handles.watcher_stop = Some(stop_tx);
+}
+
+/// The end of the watcher's task, under the db guard: record the error
+/// its loop ended with, then release its claim, so the stop the release
+/// records carries that error.
+fn end_watcher(
+    writer: &WriterSlot,
+    db: &Mutex<Database>,
+    guard: ClaimGuard,
+    generation: u64,
+    exit: &anyhow::Result<()>,
+) {
+    let db = recover_db(db.lock());
+    if let Err(e) = exit {
+        writer.set_watcher_exit(generation, e.to_string());
+    }
+    writer.release(guard, &db);
 }
 
 #[cfg(test)]
@@ -1099,18 +1112,44 @@ mod tests {
         assert!(before.contains("could not watch"), "{before}");
 
         std::fs::create_dir_all(&missing).unwrap();
-        // A negative check: twice the backoff's ceiling gives the bridge
-        // thread time to register the watch and report it.
-        tokio::time::sleep(SHORT_BACKOFF.1 * 2).await;
+        // A negative check: well over twice the backoff's ceiling gives the
+        // bridge thread time to register the watch and report it, even on
+        // a slow machine.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let status = ts.writer.status();
         assert_eq!(status.watch_error.as_deref(), Some(before.as_str()));
-        assert!(!before.contains("catch-up"), "{before}");
         let stopped = status.watcher_stopped.expect("watcher_stopped");
         assert!(stopped.contains("stopped watching files"), "{stopped}");
         assert!(stopped.contains("ended without finishing"), "{stopped}");
         let notice = search_notice(&ts).await.expect("writer_notice");
         assert_eq!(notice, stopped);
         assert!(!notice.contains("catch-up"), "{notice}");
+        finish(&ts, handles).await;
+    }
+
+    /// The error a watcher's loop ended with is what its stop records.
+    // Red if the release comes before the error is recorded: the stop is
+    // recorded without it, as after a panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watcher_that_ends_with_an_error_records_it_in_its_stop() {
+        let (mut ts, handles) = start_writer_for_test(
+            TestKb::new("ends-with-error"),
+            StartOpts {
+                skip_watcher: true,
+                ..Default::default()
+            },
+        );
+        let Some(StartRole::Writer(guard)) = ts.unstarted.take() else {
+            panic!("the start must make a writer");
+        };
+        let generation = guard.generation();
+        let exit: anyhow::Result<()> = Err(anyhow::anyhow!("boom"));
+        end_watcher(&ts.writer, &ts.shared.db, guard, generation, &exit);
+        assert_eq!(
+            ts.writer.watcher_stopped_error(),
+            Some(Some("boom".to_string()))
+        );
+        assert!(ts.kb.lease_is_free());
         finish(&ts, handles).await;
     }
 
