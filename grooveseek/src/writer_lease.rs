@@ -107,14 +107,16 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 // directly; the error path runs once per command, so its size costs nothing.
 #[allow(clippy::result_large_err)]
 impl WriterLease {
-    /// `<db>.writer-lock`: the file the OS lock is taken on.
+    /// `<db>.writer-lock`: the file the OS lock is taken on. `<db>` is the
+    /// database file after [`sidecar_base`] follows it if it is a symlink.
     pub fn lock_path_for(db_path: &Path) -> PathBuf {
-        suffixed(db_path, ".writer-lock")
+        suffixed(&sidecar_base(db_path), ".writer-lock")
     }
 
-    /// `<db>.writer.json`: the display-only description of the holder.
+    /// `<db>.writer.json`: the display-only description of the holder, beside
+    /// the same resolved `<db>` as [`WriterLease::lock_path_for`].
     pub fn info_path_for(db_path: &Path) -> PathBuf {
-        suffixed(db_path, ".writer.json")
+        suffixed(&sidecar_base(db_path), ".writer.json")
     }
 
     /// Take the lease now, or report who holds it.
@@ -351,6 +353,44 @@ pub fn index_waiting_line(db_path: &Path, holder: Option<&HolderInfo>, wait_secs
     )
 }
 
+/// How many symlinks [`sidecar_base`] follows before it gives up (Linux's `MAXSYMLINKS`).
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// The path the writer-lease sidecars are named after: `db_path`, or, while
+/// `db_path` itself is a symlink, its target (a relative target is taken from
+/// the link's directory), so two aliases of one database share one lock.
+///
+/// SQLite opens the target in both cases: the unix VFS (`unixFullPathname` in
+/// the bundled `sqlite3.c`) resolves every symlink in the path, since groove
+/// never passes `SQLITE_OPEN_NOFOLLOW`; the Windows VFS only makes the path
+/// absolute (`GetFullPathNameW`), and `CreateFileW` then follows the link.
+///
+/// Only the last component is followed: a symlinked directory higher up is
+/// followed by the OS when the sidecar is opened, so it already leads to one
+/// file. The path is not canonicalized either, so a path without a symlink
+/// keeps the spelling it was given (no `\\?\`, 8.3 names or `/private/var`).
+/// A database that does not exist yet is not a symlink, and keeps its path; a
+/// dangling symlink is followed to where SQLite would create the file. A
+/// link that cannot be read, or a chain longer than [`MAX_SYMLINK_HOPS`],
+/// leaves the last path reached; SQLite cannot open such a path either.
+fn sidecar_base(db_path: &Path) -> PathBuf {
+    let mut path = db_path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if !is_link {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        path = match path.parent() {
+            Some(dir) if target.is_relative() => dir.join(target),
+            _ => target,
+        };
+    }
+    path
+}
+
 /// `db_path` with `suffix` appended to its file name.
 fn suffixed(db_path: &Path, suffix: &str) -> PathBuf {
     let mut s = db_path.as_os_str().to_os_string();
@@ -585,6 +625,97 @@ mod tests {
         };
         assert_eq!(*lock_path, WriterLease::lock_path_for(&db));
         assert!(err.to_string().contains(&lock_path.display().to_string()));
+    }
+
+    /// Make `link` a file symlink to `target`; false when the OS refuses
+    /// (Windows needs Developer Mode or admin rights, WinError 1314).
+    fn file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(target, link).is_ok();
+        if !made {
+            eprintln!(
+                "SKIPPED: could not create a file symlink here (Windows needs Developer Mode or admin); unix CI runs this test"
+            );
+        }
+        made
+    }
+
+    /// (GitHub Codex round 1, P2) A `.groove.db` that is a symlink to another
+    /// knowledge base's database is the same database to SQLite, so taking the
+    /// lease through the alias must be `Busy` while the real path holds it.
+    #[test]
+    fn a_symlinked_database_shares_the_lock_of_its_target() {
+        let (dir, real_db, kb) = layout("alias");
+        std::fs::write(&real_db, b"").unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let alias_db = other.join(".groove.db");
+        if !file_symlink(&real_db, &alias_db) {
+            return;
+        }
+        assert_eq!(
+            WriterLease::lock_path_for(&alias_db),
+            WriterLease::lock_path_for(&real_db)
+        );
+        assert_eq!(
+            WriterLease::info_path_for(&alias_db),
+            WriterLease::info_path_for(&real_db)
+        );
+        let held = WriterLease::try_acquire(&real_db, Role::Serve, &kb).unwrap();
+        let Err(LeaseError::Busy { lock_path, holder }) =
+            WriterLease::try_acquire(&alias_db, Role::Index, &other)
+        else {
+            panic!("taking the lease through the alias must be Busy")
+        };
+        assert_eq!(lock_path, WriterLease::lock_path_for(&real_db));
+        assert_eq!(holder.map(|h| h.role), Some(Role::Serve));
+        drop(held);
+        let through_alias = WriterLease::try_acquire(&alias_db, Role::Index, &other).unwrap();
+        assert!(matches!(
+            WriterLease::try_acquire(&real_db, Role::Index, &kb),
+            Err(LeaseError::Busy { .. })
+        ));
+        drop(through_alias);
+        assert!(!other.join(".groove.db.writer-lock").exists());
+    }
+
+    /// A relative symlink target is taken from the link's directory, not the
+    /// process's current directory.
+    #[test]
+    fn a_relative_database_symlink_resolves_from_the_links_directory() {
+        let (dir, real_db, kb) = layout("relalias");
+        std::fs::write(&real_db, b"").unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let alias_db = other.join(".groove.db");
+        if !file_symlink(&Path::new("..").join(".groove.db"), &alias_db) {
+            return;
+        }
+        assert_eq!(
+            WriterLease::lock_path_for(&alias_db),
+            other.join("..").join(".groove.db.writer-lock")
+        );
+        let _held = WriterLease::try_acquire(&real_db, Role::Index, &kb).unwrap();
+        assert!(matches!(
+            WriterLease::try_acquire(&alias_db, Role::Index, &other),
+            Err(LeaseError::Busy { .. })
+        ));
+    }
+
+    #[test]
+    fn a_database_that_does_not_exist_keeps_its_own_lock_path() {
+        let (_dir, db, _kb) = layout("missingdb");
+        assert!(!db.exists());
+        assert_eq!(
+            WriterLease::lock_path_for(&db),
+            suffixed(&db, ".writer-lock")
+        );
+        assert_eq!(
+            WriterLease::info_path_for(&db),
+            suffixed(&db, ".writer.json")
+        );
     }
 
     #[test]

@@ -384,7 +384,7 @@ These are the reason the project renamed itself before 1.0.0 rather than after:
 | | |
 |---|---|
 | index database | `.groove.db`, in the parent directory of `kb_path` |
-| writer lock (v1.22.0+) | `.groove.db.writer-lock` beside the database (never deleted; `groove service uninstall --purge` removes `.groove.db` only and leaves it), `.groove.db.writer.json` while a process writes the index, and `.groove.db.writer.json.tmp-<pid>`, the temporary file that replaces it, which a failed replacement can leave behind |
+| writer lock (v1.22.0+) | `.groove.db.writer-lock` beside the database (never deleted; `groove service uninstall --purge` removes `.groove.db` only and leaves it), `.groove.db.writer.json` while a process writes the index, and `.groove.db.writer.json.tmp-<pid>`, the temporary file that replaces it, which a failed replacement can leave behind. When `.groove.db` is a symlink, all three are named after its target and sit beside it |
 | configuration | `groove.toml` |
 | exclusion file | `.grooveignore` |
 | evaluation set / history | `.groove-eval.yml` / `.groove-eval-history.json` |
