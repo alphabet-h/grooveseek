@@ -1653,7 +1653,7 @@ pub async fn run_server(
         config_source,
         context_mode_desired,
         fail_on_frontmatter_error,
-        move |_db| {
+        move |_db, _writer| {
             Ok((
                 Embedder::with_settings(models)?,
                 Reranker::try_new(reranker_choice)?,
@@ -1667,9 +1667,10 @@ pub async fn run_server(
 /// download included) handed in as `load_models`. The index is opened as a
 /// reader, the writer role is claimed and the janitor started before
 /// `load_models` runs, so a long download keeps the heartbeat fresh
-/// (ADR-0031). `load_models` runs once, on a blocking thread, and gets a
-/// clone of the database the start opened. Every exit after the claim goes
-/// through the writer role's shutdown.
+/// (ADR-0031). `load_models` runs once, on a blocking thread, and gets
+/// clones of the database the start opened and of its writer slot (the
+/// production closure uses neither; a test reads them after the start).
+/// Every exit after the claim goes through the writer role's shutdown.
 #[allow(clippy::too_many_arguments)]
 async fn run_server_with(
     kb_path: &std::path::Path,
@@ -1687,7 +1688,10 @@ async fn run_server_with(
     config_source: crate::config::ConfigSource,
     context_mode_desired: crate::db::ContextMode,
     fail_on_frontmatter_error: bool,
-    load_models: impl FnOnce(Arc<Mutex<Database>>) -> anyhow::Result<(Embedder, Option<Reranker>)>
+    load_models: impl FnOnce(
+        Arc<Mutex<Database>>,
+        Arc<WriterSlot>,
+    ) -> anyhow::Result<(Embedder, Option<Reranker>)>
     + Send
     + 'static,
 ) -> Result<()> {
@@ -1771,8 +1775,6 @@ async fn run_server_with(
         },
     )
     .await;
-    #[cfg(test)]
-    record_pending_before_shutdown(&db_path, writer.has_pending());
     shutdown_writer_role(&writer, &db, handles).await;
     drop(role);
     result
@@ -1807,7 +1809,10 @@ async fn serve_claimed(
     writer: &Arc<WriterSlot>,
     role: &mut Option<StartRole>,
     handles: &mut WriterRoleHandles,
-    load_models: impl FnOnce(Arc<Mutex<Database>>) -> anyhow::Result<(Embedder, Option<Reranker>)>
+    load_models: impl FnOnce(
+        Arc<Mutex<Database>>,
+        Arc<WriterSlot>,
+    ) -> anyhow::Result<(Embedder, Option<Reranker>)>
     + Send
     + 'static,
     settings: ServeSettings,
@@ -1834,9 +1839,11 @@ async fn serve_claimed(
     // On a blocking thread, so the janitor keeps ticking through a download
     // even on a runtime with a single worker.
     let models_db = Arc::clone(db);
-    let (embedder, reranker) = tokio::task::spawn_blocking(move || load_models(models_db))
-        .await
-        .map_err(|e| anyhow::anyhow!("loading the models did not finish: {e}"))??;
+    let models_writer = Arc::clone(writer);
+    let (embedder, reranker) =
+        tokio::task::spawn_blocking(move || load_models(models_db, models_writer))
+            .await
+            .map_err(|e| anyhow::anyhow!("loading the models did not finish: {e}"))??;
 
     let kb_path = kb_path
         .canonicalize()
@@ -1978,28 +1985,6 @@ async fn serve_claimed(
             .await
         }
     }
-}
-
-/// What `has_pending` said between the end of [`serve_claimed`] and the
-/// writer role's shutdown, per database path, read by the tests of a
-/// failed start.
-#[cfg(test)]
-static PENDING_BEFORE_SHUTDOWN: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
-fn record_pending_before_shutdown(db_path: &std::path::Path, pending: bool) {
-    recover(PENDING_BEFORE_SHUTDOWN.lock(), "pending_before_shutdown")
-        .push((db_path.to_path_buf(), pending));
-}
-
-/// The last `has_pending` recorded for `db_path` before its shutdown.
-#[cfg(test)]
-fn pending_before_shutdown_for_test(db_path: &std::path::Path) -> Option<bool> {
-    recover(PENDING_BEFORE_SHUTDOWN.lock(), "pending_before_shutdown")
-        .iter()
-        .rev()
-        .find(|(p, _)| p == db_path)
-        .map(|(_, pending)| *pending)
 }
 
 // ===========================================================================
@@ -4673,9 +4658,11 @@ mod tests {
     /// を引いて silent に `Off` へ fallback していた (grandfather 判定は
     /// 「レコード不在 = legacy DB」前提だが、fresh DB では誤り)。
     ///
-    /// `run_server` は DB open 直後・watcher 起動前に
+    /// watch ありの `serve` では、書き手の claim (`claim_writer_role`) が
+    /// lease を取って接続を書けるようにした直後、model の DL と watcher 起動の前に
     /// `indexer::resolve_context_mode(&db, context_mode_desired, false)` を
-    /// 一度呼ぶよう修正済み (このテストが検証する呼び出しパターンそのもの)。
+    /// 一度呼ぶ (このテストが検証する呼び出しパターンそのもの)。reader と
+    /// `--no-watch` の serve は接続が読み取り専用なので呼ばない。
     /// ここでは `run_server` を丸ごと起動せず (Embedder / listener 不要)、
     /// その呼び出しパターンを直接再現して DB に記録される値と、
     /// `reindex_single_file` が使うのと同じ fallback 式の結果を検証する。
@@ -4690,7 +4677,7 @@ mod tests {
             "precondition: no context_mode recorded yet"
         );
 
-        // run_server が watcher 起動前に行うのと同じ呼び出し。
+        // watch ありの書き手の claim (claim_writer_role) が watcher 起動前に行うのと同じ呼び出し。
         crate::indexer::resolve_context_mode(&db, crate::db::ContextMode::Static, false)
             .expect("resolve_context_mode");
 
@@ -7070,12 +7057,62 @@ mod tests {
         watching: Option<bool>,
     }
 
+    /// The handles a `load_models` closure leaves for the test: the start's
+    /// database and writer slot, and the sender that lets go of the db
+    /// guard a thread of the closure holds.
+    #[derive(Default)]
+    struct LeftByLoad {
+        db: Option<Arc<Mutex<Database>>>,
+        writer: Option<Arc<WriterSlot>>,
+        release_db: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    /// Wait until the closure has left its handles, then watch `has_pending`
+    /// for 2 s while the db guard is still held, and let go of the guard.
+    /// Returns whether a queued claim was seen.
+    ///
+    /// The shutdown's last step waits for that guard, so the 2 s fall
+    /// between the end of `serve_claimed` and the shutdown's end. A start
+    /// that let go of its claim before the shutdown began queues it as
+    /// panicked there, and the queue shows; one that lets go only after the
+    /// shutdown queues nothing. Read after the start returns, `has_pending`
+    /// cannot tell the two apart: the shutdown clears the queue.
+    async fn pending_while_the_shutdown_waits(left: Arc<Mutex<LeftByLoad>>) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (writer, release) = loop {
+            {
+                let mut l = left.lock().unwrap();
+                if l.release_db.is_some() {
+                    break (
+                        l.writer.clone().expect("the writer slot"),
+                        l.release_db.take(),
+                    );
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "load_models must hold the db within 60 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut pending = false;
+        while std::time::Instant::now() < watch_until {
+            pending |= writer.has_pending();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = release.expect("the release sender").send(());
+        pending
+    }
+
     /// Start a server through `run_server_with` on a fresh knowledge base
     /// whose `load_models` ages writer.json's heartbeat, waits two janitor
-    /// ticks, records what writer.json says, and fails. Then check that the
-    /// heartbeat was kept fresh during the load, that the failed start left
-    /// the index read-only and unleased, and that the start's claim was
-    /// still alive when the shutdown began (nothing was queued as panicked).
+    /// ticks, records what writer.json says, has a thread take the db guard,
+    /// and fails. Then check that the heartbeat was kept fresh during the
+    /// load, that the start's claim was still alive when the shutdown began
+    /// (nothing was queued as panicked, see
+    /// [`pending_while_the_shutdown_waits`]), and that the failed start left
+    /// the index read-only and unleased.
     async fn assert_heartbeat_while_models_load(prefix: &str) {
         use crate::writer_lease::{LeaseError, Role, WriterLease};
         use std::time::SystemTime;
@@ -7092,14 +7129,15 @@ mod tests {
         std::fs::write(kb.join("note.md"), "# Note\n\nSome text to index.\n").unwrap();
         let db_path = crate::resolve_db_path(&kb);
 
-        let kept: Arc<Mutex<Option<Arc<Mutex<Database>>>>> = Arc::default();
+        let left: Arc<Mutex<LeftByLoad>> = Arc::default();
         let seen: Arc<Mutex<Option<SeenWhileLoading>>> = Arc::default();
         let load = {
-            let kept = Arc::clone(&kept);
+            let left = Arc::clone(&left);
             let seen = Arc::clone(&seen);
             let db_path = db_path.clone();
-            move |db: Arc<Mutex<Database>>| -> anyhow::Result<(Embedder, Option<Reranker>)> {
-                *kept.lock().unwrap() = Some(db);
+            move |db: Arc<Mutex<Database>>,
+                  writer: Arc<WriterSlot>|
+                  -> anyhow::Result<(Embedder, Option<Reranker>)> {
                 let info = WriterLease::info_path_for(&db_path);
                 let mut h = WriterLease::read_holder(&db_path).expect("writer.json at load");
                 let old = chrono::Utc::now() - chrono::Duration::seconds(60);
@@ -7113,10 +7151,26 @@ mod tests {
                         .is_some_and(|h| h.heartbeat_fresh(SystemTime::now())),
                     watching: h.and_then(|h| h.watching),
                 });
+                // A thread holds the db guard until the test lets go, so the
+                // shutdown's last step waits for it.
+                let (held_tx, held_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let holder_db = Arc::clone(&db);
+                std::thread::spawn(move || {
+                    let _guard = recover_db(holder_db.lock());
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                });
+                held_rx.recv().unwrap();
+                *left.lock().unwrap() = LeftByLoad {
+                    db: Some(db),
+                    writer: Some(writer),
+                    release_db: Some(release_tx),
+                };
                 anyhow::bail!("injected model load failure")
             }
         };
-        let result = run_server_with(
+        let start = run_server_with(
             &kb,
             crate::embedder::EmbeddingSettings::fastembed(crate::embedder::ModelChoice::default()),
             false,
@@ -7133,8 +7187,9 @@ mod tests {
             crate::db::ContextMode::Off,
             false,
             load,
-        )
-        .await;
+        );
+        let (result, pending) =
+            tokio::join!(start, pending_while_the_shutdown_waits(Arc::clone(&left)));
 
         let err = result.expect_err("the injected load failure must stop the start");
         assert!(
@@ -7148,19 +7203,22 @@ mod tests {
         );
         assert_eq!(seen.watching, None, "no watcher has reported yet");
 
-        assert_eq!(
-            pending_before_shutdown_for_test(&db_path),
-            Some(false),
+        assert!(
+            !pending,
             "the start's claim must still be held when the shutdown begins"
         );
+        let writer = left.lock().unwrap().writer.take().expect("the writer slot");
+        assert!(!writer.has_pending());
+        assert!(!writer.status().held);
         match WriterLease::try_acquire(&db_path, Role::Index, &kb) {
             Ok(_) => {}
             Err(LeaseError::Busy { .. }) => panic!("the failed start must release the lease"),
             Err(e) => panic!("unexpected lease error: {e}"),
         }
-        let db = kept
+        let db = left
             .lock()
             .unwrap()
+            .db
             .take()
             .expect("the db the start opened");
         assert_eq!(recover_db(db.lock()).query_only_for_test(), 1);
