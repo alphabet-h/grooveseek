@@ -515,6 +515,20 @@ pub struct TopicInfo {
     pub children: Vec<TopicNode>,
 }
 
+/// `documents.path` -> `(documents.id, documents.content_hash)`, read in one statement
+/// by [`Database::all_path_ids_hashes`].
+pub type PathIdHash = std::collections::HashMap<String, (i64, String)>;
+
+/// What one batch of [`Database::delete_documents_if_unchanged`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CasDelete {
+    /// Deleted, in the order of `expected`.
+    pub deleted: Vec<String>,
+    /// Present but with another `(id, content_hash)`: kept.
+    pub kept_changed: u32,
+}
+
 // feature-48: `sanitize_fts_query` はここにあったが、クエリ全体を単一 phrase 化する
 // その規則こそが「自然文クエリで FTS 候補が 0 件になる」原因だったので、
 // `db/fts_query.rs` の `parse_query` に置き換えた。旧規則自体は
@@ -9451,5 +9465,153 @@ mod tests {
             None,
         );
         assert!(r.is_err());
+    }
+
+    /// Open two connections on one file DB (`verify_embedding_meta` run on the first).
+    fn two_connections(prefix: &str) -> (TempDir, Database, Database) {
+        let dir = TempDir::new(prefix);
+        let db_path = dir.path().join(".groove.db");
+        let db_path = db_path.to_str().unwrap();
+        let a = Database::open(db_path).unwrap();
+        a.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let b = Database::open(db_path).unwrap();
+        (dir, a, b)
+    }
+
+    fn upsert_with_hash(db: &Database, path: &str, hash: &str) -> i64 {
+        db.upsert_document(path, None, None, None, None, &[], None, hash, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn all_path_ids_hashes_reads_id_and_hash_of_every_row() {
+        let dir = TempDir::new("path-ids-hashes");
+        let db_path = dir.path().join(".groove.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let a = upsert_with_hash(&db, "a.md", "ha");
+        let b = upsert_with_hash(&db, "b.md", "hb");
+        let map = db.all_path_ids_hashes().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["a.md"], (a, "ha".to_string()));
+        assert_eq!(map["b.md"], (b, "hb".to_string()));
+    }
+
+    #[test]
+    fn cas_delete_removes_only_rows_that_still_match() {
+        let (_dir, db, other) = two_connections("cas-delete-match");
+        for (p, h) in [
+            ("a.md", "ha"),
+            ("b.md", "hb"),
+            ("c.md", "hc"),
+            ("d.md", "hd"),
+        ] {
+            upsert_with_hash(&db, p, h);
+        }
+        let snap = db.all_path_ids_hashes().unwrap();
+        let old_c = snap["c.md"].0;
+
+        // Another connection changes b's hash, re-creates c (new id, same hash), deletes d.
+        assert_eq!(
+            other.overwrite_content_hash(&["b.md"], "changed").unwrap(),
+            1
+        );
+        other.delete_document("c.md").unwrap();
+        // d still holds a larger id here, so the re-created c cannot reuse c's old one.
+        let new_c = upsert_with_hash(&other, "c.md", "hc");
+        assert_ne!(new_c, old_c);
+        other.delete_document("d.md").unwrap();
+
+        let expected: Vec<(&str, i64, &str)> = ["a.md", "b.md", "c.md", "d.md"]
+            .iter()
+            .map(|p| (*p, snap[*p].0, snap[*p].1.as_str()))
+            .collect();
+        let out = db.delete_documents_if_unchanged(&expected).unwrap();
+        assert_eq!(out.deleted, vec!["a.md".to_string()]);
+        assert_eq!(out.kept_changed, 2);
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert!(!after.contains_key("a.md"));
+        assert!(!after.contains_key("d.md"));
+        assert_eq!(after["b.md"].1, "changed");
+        assert_eq!(after["c.md"].0, new_c);
+    }
+
+    #[test]
+    fn cas_delete_with_nothing_expected_opens_no_transaction() {
+        let (_dir, db, other) = two_connections("cas-delete-empty");
+        let tx = other.begin_immediate_transaction().unwrap();
+        let t0 = std::time::Instant::now();
+        let out = db.delete_documents_if_unchanged(&[]).unwrap();
+        assert_eq!(out, CasDelete::default());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1000),
+            "an empty batch waited {:?} for the other writer's lock",
+            t0.elapsed()
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn cas_delete_refuses_inside_a_callers_transaction() {
+        let db = db_with_384();
+        let a = upsert_with_hash(&db, "a.md", "ha");
+        {
+            let _tx = db.begin_transaction().unwrap();
+            assert!(
+                db.delete_documents_if_unchanged(&[("a.md", a, "ha")])
+                    .is_err()
+            );
+        }
+        assert!(db.all_path_ids_hashes().unwrap().contains_key("a.md"));
+    }
+
+    #[test]
+    fn cas_delete_waits_for_a_concurrent_writer_and_judges_what_it_committed() {
+        let (_dir, a, b) = two_connections("cas-delete-waits");
+        let id = upsert_with_hash(&a, "a.md", "ha");
+
+        let tx = a.begin_immediate_transaction().unwrap();
+        a.overwrite_content_hash(&["a.md"], "changed").unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            let out = b.delete_documents_if_unchanged(&[("a.md", id, "ha")]);
+            (b, out, t0.elapsed())
+        });
+        started_rx.recv().unwrap();
+        // Only makes the wait observable; correctness does not depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "the delete must wait for A's write lock, not return before A commits"
+        );
+        tx.commit().unwrap();
+
+        let (b, out, waited) = handle.join().unwrap();
+        let out = out.unwrap();
+        assert!(out.deleted.is_empty());
+        assert_eq!(out.kept_changed, 1);
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "the delete returned after {waited:?}, so it did not wait for A"
+        );
+        assert_eq!(a.all_path_ids_hashes().unwrap()["a.md"].1, "changed");
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn cas_delete_compares_the_stored_spelling_exactly() {
+        let db = db_with_384();
+        let id = upsert_with_hash(&db, "Note.md", "h");
+        let out = db
+            .delete_documents_if_unchanged(&[("note.md", id, "h")])
+            .unwrap();
+        assert!(out.deleted.is_empty());
+        assert_eq!(out.kept_changed, 0);
+        assert!(db.all_path_ids_hashes().unwrap().contains_key("Note.md"));
     }
 }

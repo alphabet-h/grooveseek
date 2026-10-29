@@ -947,6 +947,78 @@ impl Database {
         Ok(())
     }
 
+    /// One batch of the prune: under `BEGIN IMMEDIATE`, re-reads `path, id, content_hash`
+    /// of `expected`'s paths (`WHERE path IN (..)`) and deletes (via
+    /// [`Database::delete_document`], joining the transaction) only the rows whose
+    /// `(id, hash)` equal `expected`'s. A path with no row is neither deleted nor counted.
+    /// Paths compare as stored (BINARY): `note.md` does not match a `Note.md` row.
+    ///
+    /// The re-read and the deletes share the immediate transaction, so a row another
+    /// writer changes or re-creates after `expected` was read is kept, and one it is still
+    /// writing is waited for (busy timeout) and judged as committed.
+    ///
+    /// Refuses to run inside a caller's transaction (bail, nothing written): joining a
+    /// deferred one would re-read on its snapshot and lose the guarantee. An empty
+    /// `expected` returns at once without opening a transaction. Refuses more than
+    /// 32766 entries (the SQLite host-parameter limit); keeping batches small is the
+    /// caller's job. Reads no file and embeds nothing.
+    pub fn delete_documents_if_unchanged(
+        &self,
+        expected: &[(&str, i64, &str)],
+    ) -> Result<CasDelete> {
+        if expected.is_empty() {
+            return Ok(CasDelete::default());
+        }
+        if !self.conn.is_autocommit() {
+            anyhow::bail!(
+                "delete_documents_if_unchanged must not run inside a caller's transaction"
+            );
+        }
+        const SQLITE_MAX_VARIABLES: usize = 32766;
+        if expected.len() > SQLITE_MAX_VARIABLES {
+            anyhow::bail!(
+                "delete_documents_if_unchanged got {} paths, more than the {SQLITE_MAX_VARIABLES} one statement can bind",
+                expected.len()
+            );
+        }
+        let tx = self.begin_immediate_transaction()?;
+        let mut current: PathIdHash = {
+            let placeholders: String = (1..=expected.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path, id, content_hash FROM documents WHERE path IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params_iter: Vec<&dyn rusqlite::ToSql> = expected
+                .iter()
+                .map(|(p, _, _)| p as &dyn rusqlite::ToSql)
+                .collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut out = CasDelete::default();
+        // `remove`, so a path listed twice is judged once.
+        for (path, id, hash) in expected {
+            match current.remove(*path) {
+                None => {}
+                Some((cur_id, cur_hash)) if cur_id == *id && cur_hash == *hash => {
+                    self.delete_document(path)?;
+                    out.deleted.push((*path).to_string());
+                }
+                Some(_) => out.kept_changed += 1,
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// (feature-67) Delete every document strictly under `dir` (`dir/...`, any depth),
     /// with its chunks / vectors / FTS rows / fields. Returns the deleted paths, sorted.
     /// `dir` itself is not touched. Refuses an empty `dir` and one ending in `/`.

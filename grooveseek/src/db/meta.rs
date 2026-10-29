@@ -1204,6 +1204,28 @@ impl Database {
         Ok(out)
     }
 
+    /// Every `documents.path` with its `id` and `content_hash`, read in one statement,
+    /// so the three come from one snapshot. The `id` tells a row deleted and written
+    /// again under the same path and hash apart from the row that was read.
+    pub fn all_path_ids_hashes(&self) -> Result<PathIdHash> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, id, content_hash FROM documents")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = PathIdHash::new();
+        for row in rows {
+            let (p, id, h) = row?;
+            out.insert(p, (id, h));
+        }
+        Ok(out)
+    }
+
     /// index の状態を **1 回の読み取りとして** 取る (AU-71)。
     ///
     /// 返すのは `(documents, chunks, digest)`。
