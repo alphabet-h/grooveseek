@@ -97,12 +97,17 @@ fn test_only_module_paths(file: &Path, text: &str) -> Vec<PathBuf> {
     out
 }
 
-/// T-L11b: no production line of the crate opens the index for writing
+/// No production line of the crate opens the index for writing
 /// outside the lease. `Database::open(` and `Database::open_or_replace_corrupt(`
 /// appear only in tests; production opens a reader
 /// (`Database::open_read_only(`) or a writer under a held lease
 /// (`Database::open_writer(` / `Database::open_or_replace_corrupt_with(`,
-/// which these needles do not match).
+/// which these needles do not match). The needles are the calls to
+/// [`grooveseek::db::Database::open`],
+/// [`grooveseek::db::Database::open_or_replace_corrupt`],
+/// [`grooveseek::db::Database::open_read_only`],
+/// [`grooveseek::db::Database::open_writer`] and
+/// [`grooveseek::db::Database::open_or_replace_corrupt_with`].
 #[test]
 fn no_source_file_opens_the_index_for_writing_outside_the_lease() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -161,7 +166,8 @@ fn no_source_file_opens_the_index_for_writing_outside_the_lease() {
     );
 }
 
-/// The only line range in `server.rs` that starts with `needle`.
+/// The only line range in the source of [`grooveseek::server`] that starts
+/// with `needle`.
 fn the_one_range(text: &str, needle: &str) -> (usize, usize) {
     let ranges = fn_ranges(text, needle);
     assert_eq!(
@@ -182,7 +188,7 @@ fn lines_with(prod: &[(usize, &str)], range: (usize, usize), needle: &str) -> Ve
 
 /// `groove serve` claims the writer role and starts the janitor before it
 /// loads the models, so the heartbeat runs through the download; the model
-/// loading itself is the closure `run_server` passes in.
+/// loading itself is the closure [`grooveseek::server::run_server`] passes in.
 #[test]
 fn run_server_with_spawns_the_janitor_before_the_model_download() {
     let text = src("server.rs");

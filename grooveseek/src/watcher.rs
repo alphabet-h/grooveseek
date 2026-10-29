@@ -179,10 +179,11 @@ pub async fn run_watch_loop(state: WatcherState) -> Result<()> {
     run_watch_loop_until(state, rx).await
 }
 
-/// [`run_watch_loop`] with a stop signal: once `stop` turns `true` the loop
+/// [`run_watch_loop`] with a stop signal: once the stop receiver turns `true` the
+/// loop
 /// returns `Ok(())` at the next batch boundary. A batch already being handled
 /// is finished first; one still waiting in the channel is not handled.
-/// Dropping the sender of `stop` is not a stop.
+/// Dropping the stop signal's sender is not a stop.
 pub async fn run_watch_loop_until(
     mut state: WatcherState,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -10715,7 +10716,7 @@ mod tests {
     /// A stop that arrives while a batch is being handled lets that batch
     /// finish, then the loop returns `Ok(())`.
     /// A loop that dropped the in-flight handling on the stop would return
-    /// with `finished == 0`.
+    /// with [`WatchBatchProbe::finished`] still 0.
     #[tokio::test]
     async fn a_stop_during_a_batch_waits_for_that_batch_to_finish() {
         use std::sync::atomic::Ordering::SeqCst;

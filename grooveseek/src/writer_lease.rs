@@ -1391,7 +1391,7 @@ mod tests {
         assert!(Path::new(&h.kb_path).is_absolute());
     }
 
-    /// writer.json keeps the canonical kb, which `holder_relation` still matches
+    /// writer.json keeps the canonical kb, which [`holder_relation`] still matches
     /// through either spelling; only the shown form drops the verbatim prefix.
     #[test]
     fn the_shown_kb_drops_the_verbatim_prefix_while_writer_json_keeps_the_canonical_form() {

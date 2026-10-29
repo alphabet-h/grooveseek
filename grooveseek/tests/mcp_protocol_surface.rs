@@ -692,8 +692,8 @@ fn the_tool_descriptions_name_the_behaviour_the_server_has() {
     }
 }
 
-/// T-L18: both tools that can carry `writer_notice` tell the client what it
-/// means and to pass it on, and `rebuild_index` says when it is refused at
+/// Both tools that can carry `writer_notice` tell the client what it
+/// means and to pass it on, and the rebuild tool says when it is refused at
 /// once. Each stays one paragraph (the `\` continuations are the risk).
 #[test]
 fn the_search_and_rebuild_descriptions_name_writer_notice() {

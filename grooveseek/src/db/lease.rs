@@ -384,13 +384,13 @@ impl Database {
         Ok(())
     }
 
-    /// Whether this connection has the file at `path` open, compared by
+    /// Whether this connection has the given file open, compared by
     /// canonical path (see [`connection_is_on`]).
     pub(crate) fn is_on(&self, path: &Path) -> bool {
         connection_is_on(&self.conn, path)
     }
 
-    /// `PRAGMA query_only` on this connection (1 = on), for tests outside `db`.
+    /// `PRAGMA query_only` on this connection (1 = on), for tests outside [`crate::db`].
     #[cfg(test)]
     pub(crate) fn query_only_for_test(&self) -> i64 {
         self.conn

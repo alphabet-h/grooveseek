@@ -167,7 +167,8 @@ pub(crate) struct KbCore {
     /// The writer lease inside this server (ADR-0031), shared by every
     /// session; its notice rides on the replies that carry one.
     pub(crate) writer: Arc<WriterSlot>,
-    /// Test seam: `rebuild_index_blocking` panics after `make_writable`
+    /// Test seam: [`KbCore::rebuild_index_blocking`] panics after
+    /// [`WriterSlot::make_writable`]
     /// while this is set, so a test can drive a panic through the handler.
     #[cfg(test)]
     panic_in_rebuild_for_test: std::sync::atomic::AtomicBool,
@@ -550,7 +551,7 @@ pub(crate) struct ErrorResponse {
     error: String,
 }
 
-/// Every way the body of `rebuild_index` under the lease returns. Untagged,
+/// Every way the body of [`KbServer::rebuild_index`] under the lease returns. Untagged,
 /// so each serializes as the type it holds and the reply is unchanged.
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -709,7 +710,7 @@ impl KbCore {
         out.unwrap_or_default()
     }
 
-    /// A panicked rebuild's reply (the `error` envelope `run_blocking`
+    /// A panicked rebuild's reply (the `error` envelope [`run_blocking`]
     /// makes) with the writer notice beside it; a body that does not read
     /// back as that envelope is returned as it is.
     fn after_panicked_rebuild(&self, body: String) -> String {
@@ -1800,7 +1801,7 @@ struct ServeSettings {
 
 /// The start after the claim: load the models on a blocking thread, build
 /// the shared state, hand the role to [`start_writer_role`] (a writer's
-/// watcher starts here) and serve the transport until it ends. `role` is
+/// watcher starts here) and serve the transport until it ends. The role is
 /// taken only when the watcher starts; an error before that leaves it with
 /// the caller.
 async fn serve_claimed(
@@ -4658,7 +4659,7 @@ mod tests {
     /// を引いて silent に `Off` へ fallback していた (grandfather 判定は
     /// 「レコード不在 = legacy DB」前提だが、fresh DB では誤り)。
     ///
-    /// watch ありの `serve` では、書き手の claim (`claim_writer_role`) が
+    /// watch ありの `serve` では、書き手の claim ([`crate::server::writer_role::claim_writer_role`]) が
     /// lease を取って接続を書けるようにした直後、model の DL と watcher 起動の前に
     /// `indexer::resolve_context_mode(&db, context_mode_desired, false)` を
     /// 一度呼ぶ (このテストが検証する呼び出しパターンそのもの)。reader と
@@ -6547,7 +6548,8 @@ mod tests {
     }
 
     /// A reader's successful search says why the index may be behind; a
-    /// search through `for_test` (an unmanaged slot) answers exactly as before.
+    /// search through [`KbServerShared::for_test`] (an unmanaged slot)
+    /// answers exactly as before.
     #[tokio::test]
     async fn mcp_search_success_carries_writer_notice_and_the_for_test_search_does_not() {
         let slot = reader_slot();
@@ -6819,7 +6821,7 @@ mod tests {
         }
     }
 
-    /// T-L8: another process holds the lease, so the claim is refused before
+    /// Another process holds the lease, so the claim is refused before
     /// the embedder is touched.
     // The handler is spawned as its own task on a worker, so a wrong handler
     // that took the embedder on the async worker fails the 2 s bound.
@@ -6833,7 +6835,7 @@ mod tests {
         assert!(error.contains("Another groove process"), "{json}");
     }
 
-    /// T-L8: a lock that cannot be taken is reported by its path, not
+    /// A lock that cannot be taken is reported by its path, not
     /// blamed on another process.
     #[tokio::test]
     // `LeaseError::Busy` carries the holder inline so callers can match on it
@@ -6862,7 +6864,7 @@ mod tests {
         assert!(!error.contains("Another groove process"), "{json}");
     }
 
-    /// T-L8: a reader refuses without waiting for the embedder and without
+    /// A reader refuses without waiting for the embedder and without
     /// ever taking the lease, and says why in `writer_notice`.
     // Multi-thread for the same reason as the test above: the handler runs
     // as its own task on a worker, so a blocked worker fails the 2 s bound.
@@ -6887,7 +6889,7 @@ mod tests {
         assert!(l.lease_is_free(), "a reader must not take the lease");
     }
 
-    /// T-L8: the rebuild-slot refusal carries the watch error too.
+    /// The rebuild-slot refusal carries the watch error too.
     #[tokio::test]
     async fn an_overlapping_rebuild_refusal_still_carries_the_watch_error() {
         let l = LeaseKb::new("rebuild-overlap");
@@ -6906,7 +6908,7 @@ mod tests {
         drop(watcher);
     }
 
-    /// T-L8: a holder on another knowledge base sharing the index must not
+    /// A holder on another knowledge base sharing the index must not
     /// be pointed to for a rebuild of this one.
     #[tokio::test]
     async fn a_busy_refusal_for_another_kb_warns_against_its_rebuild_index() {
@@ -6935,7 +6937,7 @@ mod tests {
         assert!(!error.contains("own rebuild_index"), "{json}");
     }
 
-    /// T-L8: an early return of the body (the schema read) still releases
+    /// An early return of the body (the schema read) still releases
     /// the lease before the reply, without waiting for the janitor.
     #[tokio::test]
     async fn a_schema_failure_releases_the_lease_before_the_reply() {
@@ -7015,7 +7017,7 @@ mod tests {
     }
 
     /// The same, through the handler: the `finished` mark routes a panicked
-    /// body through `after_panicked_rebuild`.
+    /// body through [`KbCore::after_panicked_rebuild`].
     #[tokio::test]
     async fn a_rebuild_that_panics_through_the_handler_still_carries_writer_notice() {
         let l = LeaseKb::new("rebuild-panic-handler");
@@ -7067,15 +7069,16 @@ mod tests {
         release_db: Option<std::sync::mpsc::Sender<()>>,
     }
 
-    /// Wait until the closure has left its handles, then watch `has_pending`
+    /// Wait until the closure has left its handles, then watch [`WriterSlot::has_pending`]
     /// for 2 s while the db guard is still held, and let go of the guard.
     /// Returns whether a queued claim was seen.
     ///
     /// The shutdown's last step waits for that guard, so the 2 s fall
-    /// between the end of `serve_claimed` and the shutdown's end. A start
+    /// between the end of [`serve_claimed`] and the shutdown's end. A start
     /// that let go of its claim before the shutdown began queues it as
     /// panicked there, and the queue shows; one that lets go only after the
-    /// shutdown queues nothing. Read after the start returns, `has_pending`
+    /// shutdown queues nothing. Read after the start returns,
+    /// [`WriterSlot::has_pending`]
     /// cannot tell the two apart: the shutdown clears the queue.
     async fn pending_while_the_shutdown_waits(left: Arc<Mutex<LeftByLoad>>) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -7105,7 +7108,7 @@ mod tests {
         pending
     }
 
-    /// Start a server through `run_server_with` on a fresh knowledge base
+    /// Start a server through [`run_server_with`] on a fresh knowledge base
     /// whose `load_models` ages writer.json's heartbeat, waits two janitor
     /// ticks, records what writer.json says, has a thread take the db guard,
     /// and fails. Then check that the heartbeat was kept fresh during the
@@ -7230,7 +7233,7 @@ mod tests {
 
     /// The models load on a blocking thread, so the janitor ticks whatever
     /// the number of workers; this is the runtime `groove serve` runs on
-    /// (`main.rs` builds a multi-thread runtime).
+    /// (the `groove` binary builds a multi-thread runtime).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_heartbeat_stays_fresh_and_unreported_while_the_models_load() {
         assert_heartbeat_while_models_load("groove-serve-load-mt").await;

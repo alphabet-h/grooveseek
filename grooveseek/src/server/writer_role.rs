@@ -25,7 +25,7 @@ pub(crate) enum StartRole {
     Writer(ClaimGuard),
     /// Another process held the lease, or it could not be taken: searches only.
     Reader,
-    /// `--no-watch`: no lease at start; a `rebuild_index` takes it.
+    /// `--no-watch`: no lease at start; a [`crate::server::KbServer::rebuild_index`] takes it.
     NoWatch,
 }
 
@@ -362,7 +362,7 @@ mod tests {
                 .is_some_and(|h| h.heartbeat_fresh(SystemTime::now()))
         }
 
-        /// Every row of `documents`, `chunks` and `index_meta`, read through
+        /// Every row of the documents, chunks and index_meta tables, read through
         /// a connection of its own.
         fn rows(&self) -> Vec<(String, Vec<String>)> {
             let conn = rusqlite::Connection::open_with_flags(
@@ -596,7 +596,7 @@ mod tests {
         }
     }
 
-    /// Drop `guard` inside a caught panic, as a panicking handler would.
+    /// Drop the guard inside a caught panic, as a panicking handler would.
     fn panic_with(guard: ClaimGuard) {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _held = guard;
@@ -609,7 +609,7 @@ mod tests {
         format!("pid {} per", std::process::id())
     }
 
-    /// T-L9 1: the first server on an index writes it and watches files.
+    /// The first server on an index writes it and watches files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_server_that_takes_the_lease_writes_and_watches() {
         let (ts, handles) = start_writer_for_test(TestKb::new("writer"), StartOpts::default());
@@ -626,7 +626,7 @@ mod tests {
         assert!(ts.kb.lease_is_free());
     }
 
-    /// T-L9 2: a server started while another holds the lease reads only,
+    /// A server started while another holds the lease reads only,
     /// and says why on every reply.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_server_started_while_another_holds_the_lease_is_a_reader() {
@@ -669,7 +669,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 3: a reader does not take the lease when the holder leaves.
+    /// A reader does not take the lease when the holder leaves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_stays_a_reader_after_the_holder_leaves() {
         let (mut ts, handles) = start_writer_for_test(
@@ -694,7 +694,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 4: a reader writes nothing, whatever happens to the files.
+    /// A reader writes nothing, whatever happens to the files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_writes_nothing() {
         let kb = TestKb::new("nothing");
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(ts.kb.rows(), before);
     }
 
-    /// T-L9 5: the reader's notice names what kind of holder kept it out.
+    /// The reader's notice names what kind of holder kept it out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_started_under_a_one_off_or_another_kb_or_unknown_holder() {
         // A one-off index run on this knowledge base.
@@ -775,7 +775,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 6: a lock that cannot be taken at all leaves a reader too.
+    /// A lock that cannot be taken at all leaves a reader too.
     // The injected acquisition returns the lease's own `LeaseError`.
     #[allow(clippy::result_large_err)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -856,7 +856,7 @@ mod tests {
         finish(&ts, WriterRoleHandles::default()).await;
     }
 
-    /// T-L9 7: the janitor settles a rebuild that panicked, and the
+    /// The janitor settles a rebuild that panicked, and the
     /// watcher's claim keeps the lease.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_janitor_settles_a_panicked_rebuild_claim_and_keeps_the_watchers_lease() {
@@ -941,7 +941,8 @@ mod tests {
     }
 
     /// The janitor runs from the claim on, so the heartbeat stays fresh
-    /// while the models download, before any watcher starts. `watching` is
+    /// while the models download, before any watcher starts.
+    /// [`crate::writer_lease::HolderInfo::watching`] is
     /// left unsaid until the watcher reports.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_janitor_keeps_the_heartbeat_fresh_before_the_watcher_starts() {
@@ -1018,14 +1019,14 @@ mod tests {
         }
     }
 
-    /// `writer_notice` of `search`, or `None` when it carries none.
+    /// `writer_notice` of [`TestServer::search`], or `None` when it carries none.
     async fn search_notice(ts: &TestServer) -> Option<String> {
         ts.search().await["writer_notice"]
             .as_str()
             .map(str::to_string)
     }
 
-    /// Poll `search` every 250 ms until its `writer_notice` meets `cond` or
+    /// Poll [`TestServer::search`] every 250 ms until its `writer_notice` meets `cond` or
     /// `within` passes. Returns whether it did, and the last notice read.
     async fn notice_within(
         ts: &TestServer,
@@ -1086,7 +1087,7 @@ mod tests {
         (ts, handles)
     }
 
-    /// T-L9 8: a writer that cannot register its watch says so on every
+    /// A writer that cannot register its watch says so on every
     /// reply and in writer.json, until the watch succeeds.
     // Red if the watcher gets no status callback, or one for a generation
     // other than its claim's: no watch error shows and writer.json never
@@ -1119,7 +1120,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 9: once the watcher's task is gone, its bridge thread still
+    /// Once the watcher's task is gone, its bridge thread still
     /// retries the watch, but nothing it reports reaches the slot.
     // Red if a report from the aborted claim's generation is still taken
     // (the watch error clears once the dir exists), or if the stop is never
@@ -1182,7 +1183,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 10: a reader's notice says what writer.json names now, not
+    /// A reader's notice says what writer.json names now, not
     /// only who held the lease when it started.
     // Red if the notice words the holder at start (a one-off run) instead
     // of the server that took the lease after it.
@@ -1221,7 +1222,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 10: a writer whose watcher stopped names another server only
+    /// A writer whose watcher stopped names another server only
     /// while that server reports a running watcher on this knowledge base.
     // Red if the stop is not recorded once the aborted claim is settled, or
     // if another server is named without checking that it is watching.
@@ -1258,7 +1259,7 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// T-L9 heartbeat: a reader's notice does not promise that a holder
+    /// A reader's notice does not promise that a holder
     /// keeps the index current when its heartbeat is stale or missing, or
     /// when it does not report a running watcher.
     // Red if the notice trusts writer.json's `watching` without its
@@ -1312,7 +1313,8 @@ mod tests {
         finish(&ts, handles).await;
     }
 
-    /// `(path, content_hash)` of every row of `documents`, read through a
+    /// The path and content hash of every row of the documents table, read
+    /// through a
     /// connection of its own.
     fn documents(kb: &TestKb) -> Vec<(String, String)> {
         let conn = rusqlite::Connection::open_with_flags(
@@ -1334,7 +1336,8 @@ mod tests {
         format!("{:x}", sha2::Sha256::digest(bytes))
     }
 
-    /// Wait until `started == finished` has held for 2 s, longer than the
+    /// Wait until [`WatchBatchProbe::started`] and
+    /// [`WatchBatchProbe::finished`] have been equal for 2 s, longer than the
     /// 100 ms debounce window, so no batch is left to come. Up to 10 s.
     async fn wait_until_quiet(probe: &WatchBatchProbe) {
         use std::sync::atomic::Ordering::SeqCst;
@@ -1407,7 +1410,8 @@ mod tests {
         rows_after: fn(&[(String, String)]),
     }
 
-    /// Start a writer, let `case.trigger`'s batch start while the test holds
+    /// Start a writer, let the batch of `case` ([`BatchCase::trigger`]) start
+    /// while the test holds
     /// the db, and shut down: the shutdown waits for the batch, keeping the
     /// lease and the writable connection until it has finished. The rows the
     /// batch leaves are checked only when it was the one batch the change
@@ -1495,7 +1499,7 @@ mod tests {
         }
     }
 
-    /// T-L9 11: the shutdown waits for a running dir-rename batch.
+    /// The shutdown waits for a running dir-rename batch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_waits_for_a_running_dir_rename_batch() {
         const FILES: [&str; 3] = ["a.md", "b.md", "c.md"];
@@ -1531,7 +1535,7 @@ mod tests {
     const SINGLE_BEFORE: &str = "# Single\n\nThe first text.\n";
     const SINGLE_AFTER: &str = "# Single\n\nThe text after the rewrite.\n";
 
-    /// T-L9 11b: the shutdown waits for a running batch of one rewritten file.
+    /// The shutdown waits for a running batch of one rewritten file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_waits_for_a_running_single_file_batch() {
         run_batch_probe_shutdown(BatchCase {

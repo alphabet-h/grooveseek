@@ -60,7 +60,7 @@ struct SlotInner {
     next_gen: u64,
     /// The lease was taken anew and the embedding meta not yet checked.
     meta_unchecked: bool,
-    /// Claims whose guard was dropped without `release` (a panic).
+    /// Claims whose guard was dropped without [`WriterSlot::release`] (a panic).
     pending_release: Vec<(Claimant, u64)>,
     closed: bool,
     reader: Option<ReaderReason>,
@@ -112,7 +112,7 @@ impl SlotInner {
         }
     }
 
-    /// Lower `who`'s mark if it is still `generation`; a lowered
+    /// Lower the mark of `who` if it still holds the given generation; a lowered
     /// watcher's mark outside shutdown records the stop. ADR-0031.
     fn lower(&mut self, who: Claimant, generation: u64) -> bool {
         if self.mark(who) != Some(generation) {
@@ -129,7 +129,8 @@ impl SlotInner {
         true
     }
 
-    /// What writer.json's `watching` says now. ADR-0031.
+    /// What writer.json's [`crate::writer_lease::HolderInfo::watching`] says
+    /// now. ADR-0031.
     fn watching(&self) -> Option<bool> {
         let Some(generation) = self.watcher else {
             return Some(false);
@@ -179,7 +180,7 @@ pub enum Claimant {
 }
 
 impl Claimant {
-    /// The name warnings use: `watcher` or `rebuild`.
+    /// The name warnings use: "watcher" or "rebuild".
     pub fn as_str(self) -> &'static str {
         match self {
             Claimant::Watcher => "watcher",
@@ -257,7 +258,7 @@ fn info_display(db: &Path) -> String {
 
 /// The notice of a reader server: why it does not update the index, who
 /// kept it then, and what writer.json says now (ADR-0031). It never names
-/// `rebuild_index`: a reader refuses it.
+/// [`crate::server::KbServer::rebuild_index`]: a reader refuses it.
 fn reader_notice_text(
     db: &Path,
     own_kb: &Path,
@@ -374,8 +375,10 @@ fn watch_error_text(cause: &WatchErrorCause) -> String {
     )
 }
 
-/// A live claim. `release` it with the database guard held; dropped without
-/// that (a panic), it is queued for `settle_pending`.
+/// A live claim. [`WriterSlot::release`] it with the database guard held;
+/// dropped without
+/// that (a panic), it is queued for
+/// [`WriterSlot::settle_pending`].
 pub struct ClaimGuard {
     slot: Arc<WriterSlot>,
     who: Claimant,
@@ -415,7 +418,7 @@ impl Drop for ClaimGuard {
 }
 
 impl WriterSlot {
-    /// A slot that takes the lease on `db_path` for the knowledge base at `kb_path`.
+    /// A slot that takes the lease on the database file for its knowledge base.
     pub fn managed(db_path: PathBuf, kb_path: PathBuf, model_id: String, dim: u32) -> Arc<Self> {
         Self::with_mode(SlotMode::Managed {
             db_path,
@@ -552,7 +555,7 @@ impl WriterSlot {
 
     /// The watcher's bridge reports a watch error, or `None` once registered.
     /// Only the live watcher's generation is taken; a change of
-    /// `watching` rewrites writer.json at once.
+    /// [`crate::writer_lease::HolderInfo::watching`] rewrites writer.json at once.
     pub fn set_watch_error(&self, watcher_gen: u64, cause: Option<WatchErrorCause>) {
         let mut inner = self.lock();
         if inner.watcher != Some(watcher_gen)
@@ -590,7 +593,7 @@ impl WriterSlot {
         }
     }
 
-    /// The watcher's task ended with `error`; called before its `release`.
+    /// The watcher's task ended with `error`; called before its [`Self::release`].
     pub fn set_watcher_exit(&self, watcher_gen: u64, error: String) {
         let mut inner = self.lock();
         if inner.watcher == Some(watcher_gen) {
@@ -598,9 +601,9 @@ impl WriterSlot {
         }
     }
 
-    /// Turn `query_only` off for `guard`'s claim, with the db guard held;
+    /// Turn `query_only` off for the guard's claim, with the db guard held;
     /// a lease taken anew has its embedding meta checked first. Any
-    /// `Err` has already released the claim: the caller does not `release` it.
+    /// `Err` has already released the claim: the caller does not [`Self::release`] it.
     pub fn make_writable(&self, guard: &mut ClaimGuard, db: &Database) -> anyhow::Result<()> {
         let SlotMode::Managed {
             db_path,
@@ -684,7 +687,7 @@ impl WriterSlot {
         e
     }
 
-    /// Release `guard`'s claim, with the db guard held: lower its mark if it
+    /// Release the guard's claim, with the db guard held: lower its mark if it
     /// is still this claim's; with no claim left, `query_only` on, then
     /// the lease dropped (ADR-0031).
     pub fn release(&self, mut guard: ClaimGuard, db: &Database) {
@@ -699,7 +702,7 @@ impl WriterSlot {
         self.sync_held(&inner);
     }
 
-    /// Settle the claims a panic left queued, as `release` would, with the
+    /// Settle the claims a panic left queued, as [`Self::release`] would, with the
     /// db guard held. Returns who was released; a queued claim whose mark has
     /// a newer generation is only discarded.
     pub fn settle_pending(&self, db: &Database) -> Vec<Claimant> {
@@ -744,7 +747,8 @@ impl WriterSlot {
         self.sync_held(&inner);
     }
 
-    /// Rewrite writer.json's heartbeat and `watching`, only while the lease
+    /// Rewrite writer.json's heartbeat and
+    /// [`crate::writer_lease::HolderInfo::watching`], only while the lease
     /// is held and the slot is not shutting down. Takes the inner mutex only.
     pub fn heartbeat(&self) {
         let mut inner = self.lock();
@@ -767,7 +771,8 @@ impl WriterSlot {
         self.lock().reader.is_some()
     }
 
-    /// What `rebuild_index` answers when its claim fails with `e` (ADR-0031).
+    /// What [`crate::server::KbServer::rebuild_index`] answers when its claim
+    /// fails with `e` (ADR-0031).
     /// Reads no file: a busy holder is the one `e` read from writer.json.
     /// An I/O failure is warned about once per process; the reply is the
     /// same every time.
@@ -876,7 +881,8 @@ impl WriterSlot {
         }
     }
 
-    /// The one notice a `search` or `rebuild_index` response carries: the
+    /// The one notice a [`crate::server::KbServer::search`] or
+    /// [`crate::server::KbServer::rebuild_index`] response carries: the
     /// reader's, else the stopped watcher's, else the watch error's
     /// (ADR-0031). A stopped watcher comes before its last watch error,
     /// which admin status still keeps.
@@ -972,7 +978,7 @@ mod tests {
     }
 
     /// A temp dir with `kb/` and `.groove.db` (meta recorded as `model`), and a
-    /// reader connection on it (`open_read_only`).
+    /// reader connection on it ([`Database::open_read_only`]).
     struct Fixture {
         _dir: TempDir,
         db_path: PathBuf,
@@ -1022,7 +1028,7 @@ mod tests {
                 Err(e) => panic!("unexpected lease error: {e}"),
             }
         }
-        /// The invariant T-L7 checks after every step: a writable connection
+        /// The invariant checked after every step: a writable connection
         /// implies the lease is held.
         fn assert_off_implies_held(&self, step: &str) {
             if self.query_only() == 0 {
@@ -1051,7 +1057,7 @@ mod tests {
         }
     }
 
-    /// Drop `guard` inside a caught panic, as a panicking handler would.
+    /// Drop the guard inside a caught panic, as a panicking handler would.
     fn panic_with(guard: ClaimGuard) {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _held = guard;
