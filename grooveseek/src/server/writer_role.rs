@@ -165,7 +165,11 @@ pub(crate) fn spawn_janitor(writer: Arc<WriterSlot>, db: Arc<Mutex<Database>>) -
 
 /// Start what the role runs after the models are loaded: a writer's
 /// watcher, whose claim is released under the db guard when its loop ends.
-/// A reader and a `--no-watch` server start nothing here.
+/// The watcher reports its watch failures and successes to the slot under
+/// its claim's generation, so a report that outlives the claim is dropped;
+/// an error its loop ends with is recorded before the release, for the
+/// stopped watcher's notice. A reader and a `--no-watch` server start
+/// nothing here.
 pub(crate) fn start_writer_role(
     shared: &KbServerShared,
     role: StartRole,
@@ -175,16 +179,22 @@ pub(crate) fn start_writer_role(
     let StartRole::Writer(guard) = role else {
         return;
     };
+    let generation = guard.generation();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let state = watcher_state();
+    let mut state = watcher_state();
+    state.watch_status = shared.writer.watch_status_callback(generation);
     let writer = Arc::clone(&shared.writer);
     let db = Arc::clone(&shared.db);
     handles.watcher = Some(tokio::spawn(async move {
-        if let Err(e) = run_watch_loop_until(state, stop_rx).await {
+        let exit = run_watch_loop_until(state, stop_rx).await;
+        if let Err(e) = &exit {
             eprintln!("watcher exited with error: {e}");
         }
         let _ = tokio::task::spawn_blocking(move || {
             let db = recover_db(db.lock());
+            if let Err(e) = &exit {
+                writer.set_watcher_exit(generation, e.to_string());
+            }
             writer.release(guard, &db);
         })
         .await;
@@ -947,6 +957,290 @@ mod tests {
         db_holder.join().unwrap();
         let settled = eventually(Duration::from_secs(10), || !ts.writer.has_pending()).await;
         assert!(settled, "the settle must finish once the db is free");
+        finish(&ts, handles).await;
+    }
+
+    /// The deadline every poll below waits up to.
+    const WITHIN: Duration = Duration::from_secs(10);
+
+    /// The shortened backoff of a watcher that cannot register its watch.
+    const SHORT_BACKOFF: (Duration, Duration) =
+        (Duration::from_millis(50), Duration::from_millis(200));
+
+    /// A start whose watcher watches `missing`, a directory not there yet.
+    fn unwatchable(missing: &Path) -> StartOpts {
+        StartOpts {
+            kb_path: Some(missing.to_path_buf()),
+            watch_backoff: Some(SHORT_BACKOFF),
+            ..Default::default()
+        }
+    }
+
+    /// `writer_notice` of `search`, or `None` when it carries none.
+    async fn search_notice(ts: &TestServer) -> Option<String> {
+        ts.search().await["writer_notice"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Poll `search` every 250 ms until its `writer_notice` meets `cond` or
+    /// `within` passes. Returns whether it did, and the last notice read.
+    async fn notice_within(
+        ts: &TestServer,
+        within: Duration,
+        cond: impl Fn(Option<&str>) -> bool,
+    ) -> (bool, Option<String>) {
+        let deadline = Instant::now() + within;
+        loop {
+            let notice = search_notice(ts).await;
+            if cond(notice.as_deref()) {
+                return (true, notice);
+            }
+            if Instant::now() >= deadline {
+                return (false, notice);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Wait for admin status to carry the watch error, and return it.
+    async fn the_watch_error(ts: &TestServer) -> String {
+        let seen = eventually(WITHIN, || ts.writer.status().watch_error.is_some()).await;
+        assert!(seen, "the watch error must show within 10 s");
+        ts.writer.status().watch_error.expect("a watch error")
+    }
+
+    /// Abort the watcher's task as a crash would end it, await the same
+    /// handle, and settle the claim its dropped guard queued.
+    async fn abort_the_watcher(ts: &TestServer, handles: &mut WriterRoleHandles) {
+        let watcher = handles.watcher.take().expect("a writer runs a watcher");
+        watcher.abort();
+        match watcher.await {
+            Err(e) => assert!(e.is_cancelled(), "{e}"),
+            Ok(()) => panic!("the watcher task ended before the abort"),
+        }
+        let db = recover_db(ts.shared.db.lock());
+        ts.writer.settle_pending(&db);
+    }
+
+    /// A server on this same knowledge base reporting `watching`.
+    fn serve_holder(kb: &TestKb, watching: Option<bool>) -> WriterLease {
+        let mut lease = kb.hold_lease(Role::Serve, &kb.kb);
+        lease.touch_heartbeat(watching);
+        lease
+    }
+
+    /// A reader started under a one-off index run that has since exited.
+    fn reader_whose_holder_left(prefix: &str) -> (TestServer, WriterRoleHandles) {
+        let (mut ts, handles) = start_writer_for_test(
+            TestKb::new(prefix),
+            StartOpts {
+                holder: Some(Holder::Index),
+                ..Default::default()
+            },
+        );
+        assert!(ts.writer.status().reader);
+        drop(ts.holder.take());
+        (ts, handles)
+    }
+
+    /// T-L9 8: a writer that cannot register its watch says so on every
+    /// reply and in writer.json, until the watch succeeds.
+    // Red if the watcher gets no status callback, or one for a generation
+    // other than its claim's: no watch error shows and writer.json never
+    // turns `watching` to `false` or back to `true`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_that_cannot_watch_reports_it_until_the_watch_succeeds() {
+        let kb = TestKb::new("cannot-watch");
+        let missing = kb.dir.join("not-yet");
+        let (ts, handles) = start_writer_for_test(kb, unwatchable(&missing));
+        let error = the_watch_error(&ts).await;
+        assert!(error.contains("could not watch"), "{error}");
+        let (seen, notice) = notice_within(&ts, WITHIN, |n| {
+            n.is_some_and(|n| n.contains("could not watch"))
+        })
+        .await;
+        assert!(seen, "{notice:?}");
+        let holder = ts.kb.holder().expect("writer.json");
+        assert_eq!(holder.watching, Some(false), "{holder:?}");
+
+        std::fs::create_dir_all(&missing).unwrap();
+        let cleared = eventually(WITHIN, || ts.writer.status().watch_error.is_none()).await;
+        assert!(cleared, "{:?}", ts.writer.status());
+        let json = ts.search().await;
+        assert!(json.get("writer_notice").is_none(), "{json}");
+        let watching = eventually(WITHIN, || {
+            ts.kb.holder().is_some_and(|h| h.watching == Some(true))
+        })
+        .await;
+        assert!(watching, "{:?}", ts.kb.holder());
+        finish(&ts, handles).await;
+    }
+
+    /// T-L9 9: once the watcher's task is gone, its bridge thread still
+    /// retries the watch, but nothing it reports reaches the slot.
+    // Red if a report from the aborted claim's generation is still taken
+    // (the watch error clears once the dir exists), or if the stop is never
+    // recorded (no watcher_stopped, the notice stays the watch error).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_the_watcher_task_is_aborted_its_bridge_thread_writes_nothing() {
+        let kb = TestKb::new("aborted");
+        let missing = kb.dir.join("not-yet");
+        let (ts, mut handles) = start_writer_for_test(kb, unwatchable(&missing));
+        let _ = the_watch_error(&ts).await;
+        abort_the_watcher(&ts, &mut handles).await;
+        assert_eq!(ts.writer.watcher_stopped_error(), Some(None));
+        assert!(ts.kb.lease_is_free(), "no claim is left to hold the lease");
+        let before = ts
+            .writer
+            .status()
+            .watch_error
+            .expect("the watch error is kept");
+        assert!(before.contains("could not watch"), "{before}");
+
+        std::fs::create_dir_all(&missing).unwrap();
+        // A negative check: twice the backoff's ceiling gives the bridge
+        // thread time to register the watch and report it.
+        tokio::time::sleep(SHORT_BACKOFF.1 * 2).await;
+        let status = ts.writer.status();
+        assert_eq!(status.watch_error.as_deref(), Some(before.as_str()));
+        assert!(!before.contains("catch-up"), "{before}");
+        let stopped = status.watcher_stopped.expect("watcher_stopped");
+        assert!(stopped.contains("stopped watching files"), "{stopped}");
+        assert!(stopped.contains("ended without finishing"), "{stopped}");
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert_eq!(notice, stopped);
+        assert!(!notice.contains("catch-up"), "{notice}");
+        finish(&ts, handles).await;
+    }
+
+    /// T-L9 10: a reader's notice says what writer.json names now, not
+    /// only who held the lease when it started.
+    // Red if the notice words the holder at start (a one-off run) instead
+    // of the server that took the lease after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reader_notice_follows_the_current_holder() {
+        let (ts, handles) = reader_whose_holder_left("follows");
+        let info = WriterLease::info_path_for(&ts.kb.db_path);
+        let names = format!("Now {} names pid", info.display());
+
+        let same = serve_holder(&ts.kb, Some(true));
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(
+            notice.contains("a server watching this same knowledge base"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("does not need a restart for that"),
+            "{notice}"
+        );
+        drop(same);
+
+        let other = ts.kb.other_kb();
+        let mut sibling = ts.kb.hold_lease(Role::Serve, &other);
+        sibling.touch_heartbeat(Some(true));
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(
+            !notice.contains("a server watching this same knowledge base"),
+            "{notice}"
+        );
+        assert!(
+            !notice.contains("does not need a restart for that"),
+            "{notice}"
+        );
+        assert!(notice.contains(&names), "{notice}");
+        drop(sibling);
+        finish(&ts, handles).await;
+    }
+
+    /// T-L9 10: a writer whose watcher stopped names another server only
+    /// while that server reports a running watcher on this knowledge base.
+    // Red if the stop is not recorded once the aborted claim is settled, or
+    // if another server is named without checking that it is watching.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_writer_names_another_server_only_while_it_keeps_the_index_current() {
+        let (ts, mut handles) = start_writer_for_test(TestKb::new("stopped"), StartOpts::default());
+        let started = eventually(WITHIN, || ts.watcher_active()).await;
+        assert!(started, "the watcher must start within 10 s");
+        abort_the_watcher(&ts, &mut handles).await;
+        assert!(ts.kb.lease_is_free());
+
+        let mut other = serve_holder(&ts.kb, Some(true));
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(notice.contains("stopped watching files"), "{notice}");
+        assert!(
+            notice.contains("another server watching this same knowledge base"),
+            "{notice}"
+        );
+
+        other.touch_heartbeat(Some(false));
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(notice.contains("stopped watching files"), "{notice}");
+        assert!(!notice.contains("another server watching"), "{notice}");
+
+        other.touch_heartbeat(Some(true));
+        ts.kb.age_the_heartbeat();
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(!notice.contains("another server watching"), "{notice}");
+
+        drop(other);
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(notice.contains("stopped watching files"), "{notice}");
+        assert!(!notice.contains("another server watching"), "{notice}");
+        finish(&ts, handles).await;
+    }
+
+    /// T-L9 heartbeat: a reader's notice does not promise that a holder
+    /// keeps the index current when its heartbeat is stale or missing, or
+    /// when it does not report a running watcher.
+    // Red if the notice trusts writer.json's `watching` without its
+    // heartbeat, or a holder that does not say it is watching.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reader_notice_does_not_trust_a_stale_or_not_watching_holder() {
+        let (ts, handles) = reader_whose_holder_left("stale-holder");
+        let mut holder = serve_holder(&ts.kb, Some(true));
+
+        ts.kb.age_the_heartbeat();
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(
+            !notice.contains("does not need a restart for that"),
+            "{notice}"
+        );
+        assert!(notice.contains("heartbeat is older than"), "{notice}");
+        assert!(notice.contains("probably exited"), "{notice}");
+
+        let mut h = ts.kb.holder().expect("writer.json");
+        h.heartbeat_at = None;
+        std::fs::write(
+            WriterLease::info_path_for(&ts.kb.db_path),
+            serde_json::to_vec_pretty(&h).unwrap(),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(WriterLease::info_path_for(&ts.kb.db_path)).unwrap();
+        assert!(!raw.contains("heartbeat_at"), "{raw}");
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(
+            !notice.contains("does not need a restart for that"),
+            "{notice}"
+        );
+        assert!(notice.contains("heartbeat is older than"), "{notice}");
+        assert!(notice.contains("probably exited"), "{notice}");
+
+        holder.touch_heartbeat(Some(false));
+        let notice = search_notice(&ts).await.expect("writer_notice");
+        assert!(
+            notice.contains("does not report that its watcher is watching"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("not being indexed while that lasts"),
+            "{notice}"
+        );
+        assert!(
+            !notice.contains("does not need a restart for that"),
+            "{notice}"
+        );
+        drop(holder);
         finish(&ts, handles).await;
     }
 }
