@@ -161,6 +161,18 @@ impl Database {
     /// [`Database::open_read_only`] with a hook run after the refusal is read
     /// and before the lease is waited for, so a test can change the world there.
     fn open_read_only_with(path: &str, kb_path: &Path, before_lease: &dyn Fn()) -> Result<Self> {
+        // Resolved once, before the first attempt: the reader then holds the
+        // file a lease on this same path locks, so a later one-time write
+        // under that lease ([`Self::write_once_under_lease`]) writes the file
+        // it locked, even if a symlink at `path` is repointed meanwhile.
+        let resolved = WriterLease::resolved_db_path(Path::new(path));
+        let resolved = match resolved.to_str() {
+            Some(p) => p.to_string(),
+            None => anyhow::bail!(
+                "the database at {path} is a symlink to a path that is not valid UTF-8, which groove cannot open"
+            ),
+        };
+        let path = resolved.as_str();
         // Every attempt opens without CREATE: the file is created only by
         // `open_writer` below, under the lease, so whether it exists is
         // decided again there and not on what an attempt saw.
@@ -271,6 +283,18 @@ impl Database {
             }
             Err(e @ LeaseError::Io { .. }) => return Err(anyhow::Error::new(e)),
         };
+        // The lease covers the file `db_path` resolved to just now; this
+        // connection was opened earlier. If a symlink at `db_path` was
+        // repointed in between, they are different files, and writing here
+        // would write a file another process's lease may cover (ADR-0031).
+        if !connection_is_on(&self.conn, lease.db_path()) {
+            anyhow::bail!(
+                "the index at {} now resolves to {}, not the file this connection opened; \
+                 nothing was written, run the command again",
+                db_path.display(),
+                lease.db_path().display()
+            );
+        }
         // From here on the guard puts query_only back on before the lease
         // goes, on every exit: `?`, `f`'s Err, and a panic in `f` unwinding.
         let guard = QueryOnlyRestore {
@@ -332,18 +356,20 @@ impl Database {
             Err(e) => Err(e),
         }
     }
-    /// [`Database::open`] for a process that holds the writer lease. The
-    /// lease is not read; asking for it is how the caller shows it holds one.
+    /// [`Database::open`] for a process that holds the writer lease; asking
+    /// for the lease is how the caller shows it holds one. When the given path
+    /// is the one the lease was asked for, the file opened is the one the lease
+    /// locks ([`WriterLease::db_path`], resolved when it was taken), not what
+    /// that path names now: a symlink repointed in between would otherwise put
+    /// this writer on a file another process's lease covers (ADR-0031).
     pub fn open_writer(path: &str, lease: &WriterLease) -> Result<Self> {
-        let _ = lease;
-        Self::open(path)
+        Self::open(&leased_path(path, lease)?)
     }
 
     /// [`Database::open_or_replace_corrupt`] for a process that holds the
-    /// writer lease. The lease is not read, as in [`Database::open_writer`].
+    /// writer lease, on the same file as [`Database::open_writer`] picks.
     pub fn open_or_replace_corrupt_with(path: &str, lease: &WriterLease) -> Result<(Self, bool)> {
-        let _ = lease;
-        Self::open_or_replace_corrupt(path)
+        Self::open_or_replace_corrupt(&leased_path(path, lease)?)
     }
 
     /// Set `PRAGMA query_only` on this connection: while it is on, every
@@ -351,6 +377,36 @@ impl Database {
     pub(crate) fn set_query_only(&self, on: bool) -> Result<()> {
         self.conn.pragma_update(None, "query_only", on)?;
         Ok(())
+    }
+}
+
+/// The file a writer under the given lease opens for the given path: the
+/// lease's resolved database ([`WriterLease::db_path`]) when the path is
+/// spelled as the lease was asked for, else the path as given. No production
+/// caller passes another path: the binary opens its writer only in its
+/// index command, under the lease it took on that same path.
+fn leased_path(path: &str, lease: &WriterLease) -> Result<String> {
+    if Path::new(path) != lease.requested_path() {
+        return Ok(path.to_string());
+    }
+    match lease.db_path().to_str() {
+        Some(p) => Ok(p.to_string()),
+        None => anyhow::bail!(
+            "the database at {path} is a symlink to a path that is not valid UTF-8, which groove cannot open"
+        ),
+    }
+}
+
+/// Whether the connection has the file at the given path open. Compared by canonical
+/// path, so two spellings of one file match; `false` when either side cannot
+/// be resolved (an in-memory connection has no file).
+fn connection_is_on(conn: &Connection, db_path: &Path) -> bool {
+    let Some(open) = conn.path().filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    match (std::fs::canonicalize(open), std::fs::canonicalize(db_path)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1203,5 +1259,112 @@ mod tests {
         assert!(!r.conn.is_readonly(MAIN).unwrap());
         drop(r);
         assert_eq!(snapshot(&path), before);
+    }
+
+    // -- Local Codex pre-push round 4: a symlink repointed under the lease --
+
+    /// Point the file symlink `link` at `target`, replacing what it pointed at.
+    /// False when the test should skip (see
+    /// [`crate::writer_lease::file_symlink_or_skip`]).
+    fn point_link(link: &Path, target: &Path) -> bool {
+        if std::fs::symlink_metadata(link).is_ok() {
+            std::fs::remove_file(link).unwrap();
+        }
+        crate::writer_lease::file_symlink_or_skip(target, link)
+    }
+
+    fn document_count(path: &Path) -> i64 {
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.conn
+            .query_row("SELECT count(*) FROM documents", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `<dir>/a.db` and `<dir>/b.db`, both made by `make`, and the path of a
+    /// symlink `<dir>/alias.db` (not yet made).
+    fn two_dbs_and_an_alias(dir: &TempDir, make: fn(&str)) -> (PathBuf, PathBuf, PathBuf) {
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        make(a.to_str().unwrap());
+        make(b.to_str().unwrap());
+        (a, b, dir.path().join("alias.db"))
+    }
+
+    #[test]
+    fn the_writer_opens_the_file_its_lease_locked_after_the_symlink_is_repointed() {
+        // Local Codex pre-push round 4 [medium]: the deterministic interleaving
+        // is acquire -> repoint -> open.
+        let dir = TempDir::new("repointed-writer");
+        let kb = kb_of(&dir);
+        let (a, b, alias) = two_dbs_and_an_alias(&dir, |p| drop(Database::open(p).unwrap()));
+        if !point_link(&alias, &a) {
+            return;
+        }
+        let alias_str = alias.to_str().unwrap();
+        let lease = WriterLease::try_acquire(&alias, Role::Index, &kb).unwrap();
+        assert!(point_link(&alias, &b));
+
+        let w = Database::open_writer(alias_str, &lease).unwrap();
+        upsert(&w, "a.md").unwrap();
+        drop(w);
+        let (w, replaced) = Database::open_or_replace_corrupt_with(alias_str, &lease).unwrap();
+        assert!(!replaced);
+        upsert(&w, "b.md").unwrap();
+        drop(w);
+
+        assert_eq!(document_count(&a), 2, "the writer did not write a.db");
+        assert_eq!(
+            document_count(&b),
+            0,
+            "the writer wrote b.db, outside its lease"
+        );
+        // b.db's lock is free: another process could take it and write b.db.
+        assert!(lease_is_free(b.to_str().unwrap(), &kb));
+        drop(lease);
+    }
+
+    #[test]
+    fn a_one_time_write_refuses_when_the_symlink_was_repointed_after_the_reader_opened() {
+        // The reader's sibling of the round 4 finding: the reader opened the
+        // file before the lease was taken.
+        let dir = TempDir::new("repointed-reader");
+        let kb = kb_of(&dir);
+        let (a, b, alias) = two_dbs_and_an_alias(&dir, make_metaless_db);
+        if !point_link(&alias, &a) {
+            return;
+        }
+        let r = Database::open_read_only(alias.to_str().unwrap(), &kb).unwrap();
+        let before_lease = || assert!(point_link(&alias, &b));
+        let err = r
+            .verify_embedding_meta_or_record_with(&alias, &kb, MODEL, DIM, &before_lease)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("now resolves to"), "{err:#}");
+        assert!(err.downcast_ref::<OneTimeWriteBusy>().is_none(), "{err:#}");
+        assert_eq!(query_only_flag(&r), 1);
+        drop(r);
+        for db in [&a, &b] {
+            let db = Database::open(db.to_str().unwrap()).unwrap();
+            assert!(db.read_embedding_meta().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn a_reader_records_the_meta_in_the_symlinks_target() {
+        // The same path without the repoint still writes, and writes the target.
+        let dir = TempDir::new("symlinked-reader");
+        let kb = kb_of(&dir);
+        let (a, _b, alias) = two_dbs_and_an_alias(&dir, make_metaless_db);
+        if !point_link(&alias, &a) {
+            return;
+        }
+        let r = Database::open_read_only(alias.to_str().unwrap(), &kb).unwrap();
+        r.verify_embedding_meta_or_record(&alias, &kb, MODEL, DIM)
+            .unwrap();
+        drop(r);
+        let db = Database::open(a.to_str().unwrap()).unwrap();
+        assert_eq!(
+            db.read_embedding_meta().unwrap(),
+            Some((MODEL.to_string(), DIM))
+        );
     }
 }

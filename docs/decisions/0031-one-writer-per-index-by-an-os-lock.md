@@ -113,7 +113,13 @@ in which `groove serve` takes the lock, not the behaviour of v1.22.0.
 - **The lock.** `.groove.db.writer-lock` beside the database (the database's
   path plus `.writer-lock`; when `.groove.db` is a symlink, this file and the
   two below are named after its target and sit beside it, because SQLite opens
-  the target and a lock per alias would put two writers on one database), 0
+  the target and a lock per alias would put two writers on one database; the
+  link is read once, when the lease is taken, and the holder opens that file,
+  so repointing the link later cannot move a writer off its lock. A hard link
+  that gives one database two names is not handled: SQLite itself calls opening
+  a database under two names undefined behaviour, since each name gets its own
+  journal and WAL ([How To Corrupt An SQLite Database File, section
+  2.6](https://www.sqlite.org/howtocorrupt.html))), 0
   bytes, locked exclusively with std's `File::try_lock` (`flock` on Unix,
   `LockFileEx` on Windows). It is **never deleted**: if it were, a process waiting on the old file and a new process
   creating a new one would each hold a lock, and there would be two writers.

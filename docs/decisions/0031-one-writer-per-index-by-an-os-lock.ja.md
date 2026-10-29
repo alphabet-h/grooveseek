@@ -93,7 +93,11 @@ run の間にもう一方の process が書いた、実在する file の row �
 
 - **lock。** DB の隣の `.groove.db.writer-lock` (DB の path に `.writer-lock` を足したもの。
   `.groove.db` が symlink なら、この file と下の 2 つはその先の file の名前で、その隣に置く。
-  SQLite は symlink の先を開くので、別名ごとに lock が分かれると 2 つの書き手が同じ DB に並ぶため)。
+  SQLite は symlink の先を開くので、別名ごとに lock が分かれると 2 つの書き手が同じ DB に並ぶため。
+  link は lease を取るときに 1 度だけ読み、holder はその file を開くので、後で link を付け替えても
+  書き手は自分の lock から外れない。hard link で 1 つの DB に 2 つの名前を付ける構成は扱わない:
+  名前ごとに journal と WAL が別になるので、2 つの名前で開くこと自体を SQLite が未定義の動作としている
+  ([How To Corrupt An SQLite Database File の 2.6 節](https://www.sqlite.org/howtocorrupt.html)))。
   0 byte で、std の `File::try_lock` (Unix は `flock`、Windows は `LockFileEx`) で排他に lock する。
   **消さない**: 消すと、古い file を待っていた process と新しい file を作った process がそれぞれ
   lock を持ち、書き手が 2 つになる。

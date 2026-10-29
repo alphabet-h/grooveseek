@@ -94,6 +94,11 @@ impl std::error::Error for LeaseError {}
 #[derive(Debug)]
 pub struct WriterLease {
     file: File,
+    /// The path the lease was asked for, spelled as the caller gave it.
+    requested_path: PathBuf,
+    /// The database file this lease locks: the requested path after
+    /// [`sidecar_base`] followed it once, when the lease was taken.
+    db_path: PathBuf,
     lock_path: PathBuf,
     info_path: PathBuf,
     acquired_at: SystemTime,
@@ -111,6 +116,14 @@ impl WriterLease {
     /// database file after [`sidecar_base`] follows it if it is a symlink.
     pub fn lock_path_for(db_path: &Path) -> PathBuf {
         suffixed(&sidecar_base(db_path), ".writer-lock")
+    }
+
+    /// The database file a lease taken now on the given path would lock: that
+    /// path, or the target it names while it is a symlink (see [`sidecar_base`]).
+    /// A reader that may later write under the lease opens this path, so the
+    /// file it holds is the file the lease is named after.
+    pub fn resolved_db_path(db_path: &Path) -> PathBuf {
+        sidecar_base(db_path)
     }
 
     /// `<db>.writer.json`: the display-only description of the holder, beside
@@ -132,7 +145,12 @@ impl WriterLease {
         kb_path: &Path,
         write_info: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
     ) -> Result<Self, LeaseError> {
-        let lock_path = Self::lock_path_for(db_path);
+        // Resolved once: the lock, the holder json and the database the
+        // holder opens ([`WriterLease::db_path`]) all name this one file, even
+        // if a symlink at `db_path` is repointed while the lease is held.
+        let resolved = sidecar_base(db_path);
+        let lock_path = suffixed(&resolved, ".writer-lock");
+        let info_path = suffixed(&resolved, ".writer.json");
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -148,7 +166,7 @@ impl WriterLease {
             Err(TryLockError::WouldBlock) => {
                 return Err(LeaseError::Busy {
                     lock_path,
-                    holder: Self::read_holder(db_path),
+                    holder: read_holder_at(&info_path),
                 });
             }
             Err(TryLockError::Error(source)) => return Err(LeaseError::Io { lock_path, source }),
@@ -165,11 +183,12 @@ impl WriterLease {
             heartbeat_at: Some(now),
             watching: None,
         };
-        let info_path = Self::info_path_for(db_path);
         publish_info(&info_path, &info, write_info);
 
         Ok(WriterLease {
             file,
+            requested_path: db_path.to_path_buf(),
+            db_path: resolved,
             lock_path,
             info_path,
             acquired_at,
@@ -213,8 +232,19 @@ impl WriterLease {
 
     /// What `<db>.writer.json` says, or `None` when it is missing, unreadable or broken.
     pub fn read_holder(db_path: &Path) -> Option<HolderInfo> {
-        let bytes = std::fs::read(Self::info_path_for(db_path)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        read_holder_at(&Self::info_path_for(db_path))
+    }
+
+    /// The database file this lease locks, resolved once when it was taken.
+    /// A writer under this lease opens this path, not the spelling it was
+    /// asked for: a symlink repointed since then names another file.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// The path the lease was asked for, as the caller spelled it.
+    pub(crate) fn requested_path(&self) -> &Path {
+        &self.requested_path
     }
 
     /// The role this lease was taken for.
@@ -356,8 +386,8 @@ pub fn index_waiting_line(db_path: &Path, holder: Option<&HolderInfo>, wait_secs
 /// How many symlinks [`sidecar_base`] follows before it gives up (Linux's `MAXSYMLINKS`).
 const MAX_SYMLINK_HOPS: usize = 40;
 
-/// The path the writer-lease sidecars are named after: `db_path`, or, while
-/// `db_path` itself is a symlink, its target (a relative target is taken from
+/// The path the writer-lease sidecars are named after: the database path, or,
+/// while that path itself is a symlink, its target (a relative target is taken from
 /// the link's directory), so two aliases of one database share one lock.
 ///
 /// SQLite opens the target in both cases: the unix VFS (`unixFullPathname` in
@@ -391,7 +421,14 @@ fn sidecar_base(db_path: &Path) -> PathBuf {
     path
 }
 
-/// `db_path` with `suffix` appended to its file name.
+/// What the holder json at `info_path` says, or `None` when it is missing,
+/// unreadable or broken.
+fn read_holder_at(info_path: &Path) -> Option<HolderInfo> {
+    let bytes = std::fs::read(info_path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The database path with `suffix` appended to its file name.
 fn suffixed(db_path: &Path, suffix: &str) -> PathBuf {
     let mut s = db_path.as_os_str().to_os_string();
     s.push(suffix);
@@ -433,6 +470,44 @@ fn publish_info(
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(info_path);
     }
+}
+
+/// Test helper: make `link` a file symlink to `target`. Returns false, and the
+/// test skips, only for Windows' "a required privilege is not held" (os error
+/// 1314: no Developer Mode, not elevated) outside CI. On CI (`CI` set, as
+/// GitHub Actions sets it) every failure panics: its Windows runners run as
+/// administrators with UAC off, so a symlink there can always be made, and a
+/// skip would turn the test green without checking Windows. Any other error
+/// panics everywhere.
+#[cfg(test)]
+pub(crate) fn file_symlink_or_skip(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    let err = match made {
+        Ok(()) => return true,
+        Err(e) => e,
+    };
+    let on_ci = std::env::var_os("CI").is_some_and(|v| !v.is_empty());
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    if cfg!(windows) && err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) && !on_ci {
+        eprintln!(
+            "SKIPPED: could not create a file symlink here (os error 1314: Windows needs Developer Mode or admin); CI runs this test"
+        );
+        return false;
+    }
+    panic!(
+        "could not create the file symlink {} -> {}: {}{}",
+        link.display(),
+        target.display(),
+        crate::embedder::ascii_io_error(&err),
+        if on_ci {
+            " (CI is set, so this test may not skip)"
+        } else {
+            ""
+        }
+    );
 }
 
 #[cfg(test)]
@@ -627,19 +702,9 @@ mod tests {
         assert!(err.to_string().contains(&lock_path.display().to_string()));
     }
 
-    /// Make `link` a file symlink to `target`; false when the OS refuses
-    /// (Windows needs Developer Mode or admin rights, WinError 1314).
+    /// See [`file_symlink_or_skip`].
     fn file_symlink(target: &Path, link: &Path) -> bool {
-        #[cfg(unix)]
-        let made = std::os::unix::fs::symlink(target, link).is_ok();
-        #[cfg(windows)]
-        let made = std::os::windows::fs::symlink_file(target, link).is_ok();
-        if !made {
-            eprintln!(
-                "SKIPPED: could not create a file symlink here (Windows needs Developer Mode or admin); unix CI runs this test"
-            );
-        }
-        made
+        file_symlink_or_skip(target, link)
     }
 
     /// (GitHub Codex round 1, P2) A `.groove.db` that is a symlink to another
@@ -702,6 +767,36 @@ mod tests {
             WriterLease::try_acquire(&alias_db, Role::Index, &other),
             Err(LeaseError::Busy { .. })
         ));
+    }
+
+    /// (Local Codex pre-push round 4) The lease resolves the symlink once: the
+    /// lock, the holder json and [`WriterLease::db_path`] stay on the old
+    /// target after the link is repointed, and the new target stays free.
+    #[test]
+    fn a_held_lease_keeps_the_file_it_resolved_when_the_symlink_is_repointed() {
+        let (dir, real_db, kb) = layout("repoint");
+        std::fs::write(&real_db, b"").unwrap();
+        let other_db = dir.path().join("other.db");
+        std::fs::write(&other_db, b"").unwrap();
+        let alias_db = dir.path().join("alias.db");
+        if !file_symlink(&real_db, &alias_db) {
+            return;
+        }
+        let lease = WriterLease::try_acquire(&alias_db, Role::Index, &kb).unwrap();
+        assert_eq!(lease.db_path(), real_db.as_path());
+        assert_eq!(lease.requested_path(), alias_db.as_path());
+        std::fs::remove_file(&alias_db).unwrap();
+        assert!(file_symlink(&other_db, &alias_db));
+
+        assert_eq!(lease.db_path(), real_db.as_path());
+        assert!(WriterLease::info_path_for(&real_db).exists());
+        assert!(matches!(
+            WriterLease::try_acquire(&real_db, Role::Index, &kb),
+            Err(LeaseError::Busy { .. })
+        ));
+        drop(WriterLease::try_acquire(&other_db, Role::Index, &kb).expect("other.db is free"));
+        drop(lease);
+        assert!(!WriterLease::info_path_for(&real_db).exists());
     }
 
     #[test]
