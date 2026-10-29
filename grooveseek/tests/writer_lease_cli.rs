@@ -600,3 +600,54 @@ fn index_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothin
         "neither the lock file nor the database is created: {stderr}"
     );
 }
+
+/// (local Codex round 7) A command that only reads the index stops the same
+/// way on a knowledge base whose database path is not UTF-8: exit 1, the
+/// lease's reason in ASCII, and nothing opened -- not the database, not its
+/// lock file, and not a lossy spelling of either. `groove search` is the one
+/// that would otherwise create a missing database.
+#[test]
+fn search_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothing() {
+    let root = TempRoot::new("groove-read-not-utf8");
+    let cache = TempRoot::new("groove-read-not-utf8-cache");
+    let bad = root.path().join(non_utf8_name());
+    let kb = bad.join("kb");
+    std::fs::create_dir_all(&kb).expect("create the kb");
+    std::fs::write(
+        kb.join("note.md"),
+        "---\ntitle: Note\n---\n\n# Note\n\nEnough content here to stand as a chunk.\n",
+    )
+    .expect("write a note");
+
+    let mut cmd = Command::new(grooveseek_bin());
+    cmd.arg("search").arg("anything").arg("--kb-path").arg(&kb);
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("spawn groove");
+    assert_dir_empty(cache.path());
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.is_ascii(), "stderr stays ASCII: {stderr:?}");
+    assert!(
+        stderr.contains("not valid UTF-8") && stderr.contains("put the knowledge base under"),
+        "the reason and the way out are named: {stderr}"
+    );
+    let names = |dir: &Path| -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .expect("read a directory of the test")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect()
+    };
+    assert_eq!(
+        names(&bad),
+        vec![std::ffi::OsString::from("kb")],
+        "neither the lock file nor the database is created: {stderr}"
+    );
+    assert_eq!(
+        names(root.path()),
+        vec![non_utf8_name()],
+        "no lossy spelling of the knowledge base is created beside it: {stderr}"
+    );
+}

@@ -1061,8 +1061,8 @@ fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            let db =
-                grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), &kb_path)?;
+            let db_str = grooveseek::writer_lease::db_path_utf8(&db_path)?;
+            let db = grooveseek::db::Database::open_read_only(db_str, &kb_path)?;
             let total_docs = db.document_count()?;
             let total_chunks = db.chunk_count()?;
             let tags_failures = db.tags_parse_failure_count();
@@ -1181,8 +1181,8 @@ fn main() -> anyhow::Result<()> {
                 cli_should_rerank(reranker_explicit, reranker_choice, cfg.rerank_by_default);
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
-            let db =
-                grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), &kb_path)?;
+            let db_str = grooveseek::writer_lease::db_path_utf8(&db_path)?;
+            let db = grooveseek::db::Database::open_read_only(db_str, &kb_path)?;
             // (codex P2 round 11 on PR #291) A field filter the index cannot answer yet
             // (its declared set is pending) is refused here, on the opened database and
             // before `Embedder::with_settings` below -- the search legs refuse it too, but
@@ -1336,8 +1336,8 @@ fn main() -> anyhow::Result<()> {
                     kb_path.display()
                 );
             }
-            let db =
-                grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), &kb_path)?;
+            let db_str = grooveseek::writer_lease::db_path_utf8(&db_path)?;
+            let db = grooveseek::db::Database::open_read_only(db_str, &kb_path)?;
             db.verify_embedding_meta_or_record(
                 &db_path,
                 &kb_path,
@@ -1881,7 +1881,8 @@ fn run_doctor(
         // keeps a doomed run from applying migrations to the file (D-19; the same
         // "cheap checks first" order `Commands::Index` uses).
         let schema = grooveseek::indexer::load_declared_schema(kb_path)?;
-        let db = grooveseek::db::Database::open_read_only(&db_path.to_string_lossy(), kb_path)?;
+        let db_str = grooveseek::writer_lease::db_path_utf8(&db_path)?;
+        let db = grooveseek::db::Database::open_read_only(db_str, kb_path)?;
         let registry = cfg.build_parser_registry(kb_path)?;
         grooveseek::doctor::run(&db, &registry, schema.as_ref())
     })();

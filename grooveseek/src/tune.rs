@@ -835,7 +835,8 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
             opts.kb_path.display()
         );
     }
-    let db = Database::open_read_only(&db_path.to_string_lossy(), &opts.kb_path)?;
+    let db_str = crate::writer_lease::db_path_utf8(&db_path)?;
+    let db = Database::open_read_only(db_str, &opts.kb_path)?;
     let embedding_model_id = opts.embedding.model_id().to_string();
     db.verify_embedding_meta_or_record(
         &db_path,

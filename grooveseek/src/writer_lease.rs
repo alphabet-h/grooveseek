@@ -119,6 +119,20 @@ impl std::fmt::Display for LeaseError {
 /// possibly non-ASCII, wording of the error that `Display` names by kind and code.
 impl std::error::Error for LeaseError {}
 
+/// The database path as the `&str` [`crate::db::Database`] opens, or
+/// [`LeaseError::NotUtf8`] when it is not valid UTF-8. A command that only
+/// reads the index checks this before it opens anything: a lossy spelling
+/// would name another file, which a reader's one-time write could create or
+/// migrate. Same refusal, and same wording, as [`WriterLease::try_acquire`].
+// The same `LeaseError` as the lease's, for the reason given on `impl WriterLease`.
+#[allow(clippy::result_large_err)]
+pub fn db_path_utf8(db_path: &Path) -> Result<&str, LeaseError> {
+    db_path.to_str().ok_or_else(|| LeaseError::NotUtf8 {
+        db_path: db_path.to_path_buf(),
+        resolved_path: None,
+    })
+}
+
 /// The held writer lease. Dropping it removes `<db>.writer.json` and releases
 /// the lock; the lock file itself stays.
 #[derive(Debug)]
@@ -1511,5 +1525,26 @@ mod tests {
         assert!(resolved.to_str().is_none());
         assert_not_utf8_display(&e);
         assert_eq!(names_in(&bad), vec!["kb".to_string()]);
+    }
+
+    /// [`db_path_utf8`], the check the reading commands run before they open
+    /// the index, hands a UTF-8 path back as it is and refuses one that is
+    /// not with the lease's own `NotUtf8`.
+    #[test]
+    fn db_path_utf8_returns_a_utf8_path_and_refuses_one_that_is_not() {
+        let ok = Path::new("kb").join(".groove.db");
+        assert_eq!(db_path_utf8(&ok).unwrap(), ok.to_str().unwrap());
+
+        let bad = Path::new("parent").join(non_utf8_name()).join(".groove.db");
+        let e = db_path_utf8(&bad).expect_err("a path that is not UTF-8");
+        let LeaseError::NotUtf8 {
+            ref db_path,
+            resolved_path: None,
+        } = e
+        else {
+            panic!("expected NotUtf8 naming the path itself: {e}");
+        };
+        assert_eq!(db_path, &bad);
+        assert_not_utf8_display(&e);
     }
 }
