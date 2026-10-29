@@ -85,7 +85,7 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 
 ## 1 つのナレッジベースを複数の session で使う
 
-(v1.22.0+) Claude Code の session はそれぞれ自分の stdio の `groove serve` を起動する。複数の session が同じナレッジベースを指すと、索引を書いてファイルウォッチャを動かすのは最初に起動した server だけで、残りは検索にだけ答える reader になる ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。最初の session を閉じても索引は引き継がれない: reader は restart されるまで索引を更新しないので、その間に足した・編集した・消した file は反映されず、消した file は search に出続ける。reader は `rebuild_index` も断る。Claude Code で reader の server を restart するには、その session で `/mcp` を開き、server を選んで Reconnect を押す (session を閉じて開き直してもよい)。その時点で他の server が索引を持っていなければ、新しい server が索引を書く。それでも restart の前の変更は索引に入らないので、restart の後に `rebuild_index` を 1 回走らせる。
+(v1.22.0+) Claude Code の session はそれぞれ自分の stdio の `groove serve` を起動する。複数の session が同じナレッジベースを指すと、索引を書いてファイルウォッチャを動かすのは最初に起動した server だけで、残りは検索にだけ答える reader になる ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。最初の session を閉じても索引は引き継がれない: reader は restart されるまで索引を更新しないので、その間に足した・編集した・消した file は反映されず、消した file は search に出続ける。reader は `rebuild_index` も断る。Claude Code で reader の server を restart するには、その session で `/mcp` を開き、server を選んで Reconnect を押す (session を閉じて開き直してもよい)。その時点で他の server が索引を持っていなければ、新しい server が索引を書く。それでも restart の前の変更は索引に入らないので、書き手になったら `rebuild_index` を 1 回走らせる。
 
 reader であることは、その server の `search` と `rebuild_index` の応答の `writer_notice` field に載り ([MCP ツール](mcp-tools.ja.md))、agent はそこで読む。起動時に stderr にも 1 回 warning を出すが、Claude Code は通常 server の stderr を見せない (推定)。最初の session の server が閉じられたのではなく kill された場合は、その `.groove.db.writer.json` が残る: reader の注記は、その file の heartbeat が 15 秒より古くなるまで「その server が索引を最新に保つ」と言い続け、その後は「終了した見込みで、restart まで反映されない」に替わる。
 
