@@ -219,7 +219,7 @@ impl Database {
                     holder,
                 })),
             },
-            Err(e @ LeaseError::Io { .. }) => Err(anyhow::Error::new(e)),
+            Err(e) => Err(anyhow::Error::new(e)),
         }
     }
 
@@ -283,7 +283,7 @@ impl Database {
                     holder,
                 }));
             }
-            Err(e @ LeaseError::Io { .. }) => return Err(anyhow::Error::new(e)),
+            Err(e) => return Err(anyhow::Error::new(e)),
         };
         // The lease covers the file `db_path` resolved to just now; this
         // connection was opened earlier. If a symlink in `db_path` (at the
@@ -389,7 +389,10 @@ impl Database {
 /// lease's resolved database ([`WriterLease::resolved_path`]) when the path is
 /// spelled as the lease was asked for, else the path as given. No production
 /// caller passes another path: the binary opens its writer only in its
-/// index command, under the lease it took on that same path.
+/// index command, under the lease it took on that same path. A lease is only
+/// ever taken on a path that is UTF-8 and resolves to one
+/// ([`LeaseError::NotUtf8`]), so a caller's `to_string_lossy` of that path is
+/// the path itself and compares equal.
 fn leased_path(path: &str, lease: &WriterLease) -> Result<String> {
     if Path::new(path) != lease.requested_path() {
         return Ok(path.to_string());
@@ -995,6 +998,46 @@ mod tests {
             err.downcast_ref::<CorruptDatabase>().is_some(),
             "not CorruptDatabase: {err:#}"
         );
+    }
+
+    /// (local Codex round 3) A reader's one-time write on a database path
+    /// that is not UTF-8 stops before the lease, with `NotUtf8` as the root,
+    /// and creates nothing beside that path; the write itself never runs.
+    #[test]
+    fn a_one_time_write_on_a_path_that_is_not_utf8_stops_before_the_lease() {
+        let dir = TempDir::new("not-utf8");
+        let kb = kb_of(&dir);
+        let path = db_path_of(&dir);
+        make_metaless_db(&path);
+        let bad = dir.path().join(crate::writer_lease::non_utf8_name());
+        std::fs::create_dir_all(&bad).unwrap();
+        let bad_db = bad.join(".groove.db");
+        let r = Database::open_read_only(&path, &kb).unwrap();
+        let errors = [
+            r.write_once_under_lease(&bad_db, &kb, OneTimeWrite::SchemaUpgrade, |_| {
+                panic!("the one-time write ran without a lease")
+            }),
+            r.verify_embedding_meta_or_record(&bad_db, &kb, MODEL, DIM),
+        ];
+        for e in errors {
+            let e = e.expect_err("a one-time write on a path that is not UTF-8");
+            assert!(
+                matches!(
+                    e.downcast_ref::<LeaseError>(),
+                    Some(LeaseError::NotUtf8 { .. })
+                ),
+                "NotUtf8 is the root: {e:#}"
+            );
+            let shown = format!("{e:#}");
+            assert!(shown.is_ascii(), "non-ASCII error: {shown}");
+        }
+        assert_eq!(
+            std::fs::read_dir(&bad).unwrap().count(),
+            0,
+            "nothing is created beside the path that is not UTF-8"
+        );
+        assert!(r.read_embedding_meta().unwrap().is_none());
+        assert_eq!(query_only_flag(&r), 1);
     }
 
     #[test]

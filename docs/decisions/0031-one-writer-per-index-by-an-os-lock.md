@@ -117,7 +117,10 @@ in which `groove serve` takes the lock, not the behaviour of v1.22.0.
   whole path is resolved once, when the lease is taken -- a symlink at the file
   and any directory symlink or junction above it -- and the lock, the holder
   json and the holder's open all use that resolved path, so repointing a link
-  later cannot move a writer off its lock. A hard link
+  later cannot move a writer off its lock. A database path that is not valid
+  UTF-8, or that resolves to one, is refused before the lock is taken (exit
+  code 1, nothing created): groove opens the database by a UTF-8 string, whose
+  lossy spelling would name another file than the one locked. A hard link
   that gives one database two names is not handled: SQLite itself calls opening
   a database under two names undefined behaviour, since each name gets its own
   journal and WAL ([How To Corrupt An SQLite Database File, section

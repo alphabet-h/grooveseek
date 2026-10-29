@@ -63,6 +63,15 @@ pub enum LeaseError {
         lock_path: PathBuf,
         source: std::io::Error,
     },
+    /// The database path, or the file it resolves to, is not valid UTF-8.
+    /// The database is opened by a `&str` path, so its writer would open
+    /// another spelling than the one locked; refused before anything is
+    /// created. The resolved path is left out when the path asked for is
+    /// itself the one that is not UTF-8.
+    NotUtf8 {
+        db_path: PathBuf,
+        resolved_path: Option<PathBuf>,
+    },
 }
 
 impl std::fmt::Display for LeaseError {
@@ -81,6 +90,27 @@ impl std::fmt::Display for LeaseError {
                 lock_path.display(),
                 crate::embedder::ascii_io_error(source)
             ),
+            // Paths by `Debug`, escaped: the bytes that are not UTF-8 show as
+            // `\xFF` (unix) or `\u{d800}` (Windows), and stderr stays ASCII.
+            LeaseError::NotUtf8 {
+                db_path,
+                resolved_path,
+            } => {
+                let shown = crate::watcher::ascii_diag(&format!("{db_path:?}"));
+                match resolved_path {
+                    None => write!(f, "the database path {shown} is not valid UTF-8")?,
+                    Some(r) => write!(
+                        f,
+                        "the database path {shown} resolves to {}, which is not valid UTF-8",
+                        crate::watcher::ascii_diag(&format!("{r:?}"))
+                    )?,
+                }
+                write!(
+                    f,
+                    ", so groove cannot take its writer lock and wrote nothing; \
+                     put the knowledge base under a directory whose path is valid UTF-8."
+                )
+            }
         }
     }
 }
@@ -139,7 +169,9 @@ impl WriterLease {
         suffixed(&sidecar_base(db_path), ".writer.json")
     }
 
-    /// Take the lease now, or report who holds it.
+    /// Take the lease now, or report who holds it. A database path that is
+    /// not valid UTF-8, or that resolves to one, is [`LeaseError::NotUtf8`],
+    /// before any file is created.
     pub fn try_acquire(db_path: &Path, role: Role, kb_path: &Path) -> Result<Self, LeaseError> {
         Self::try_acquire_with(db_path, role, kb_path, &write_info_file)
     }
@@ -152,11 +184,26 @@ impl WriterLease {
         kb_path: &Path,
         write_info: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
     ) -> Result<Self, LeaseError> {
+        // The database is opened by a `&str` path: a path that is not UTF-8
+        // would be opened by a lossy spelling, another file than the one
+        // locked here. Refused before anything is created (ADR-0031).
+        if db_path.to_str().is_none() {
+            return Err(LeaseError::NotUtf8 {
+                db_path: db_path.to_path_buf(),
+                resolved_path: None,
+            });
+        }
         // Resolved once, whole: the lock, the holder json and the database
         // the holder opens ([`WriterLease::resolved_path`]) all name this one
         // file, even if a symlink at `db_path` -- or a directory link above
         // it -- is repointed while the lease is held. `shown` is for messages.
         let resolved = resolve_whole(db_path);
+        if resolved.to_str().is_none() {
+            return Err(LeaseError::NotUtf8 {
+                db_path: db_path.to_path_buf(),
+                resolved_path: Some(resolved),
+            });
+        }
         let shown = sidecar_base(db_path);
         let lock_path = suffixed(&resolved, ".writer-lock");
         let info_path = suffixed(&resolved, ".writer.json");
@@ -549,6 +596,27 @@ fn publish_info(
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(info_path);
     }
+}
+
+/// Test helper: a file name that is not valid UTF-8 but that the file system
+/// takes: `kb-` and a lone `0xFF` byte on unix, `kb-` and an unpaired
+/// surrogate on Windows.
+#[cfg(test)]
+pub(crate) fn non_utf8_name() -> std::ffi::OsString {
+    #[cfg(unix)]
+    let name = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"kb-\xff".to_vec())
+    };
+    #[cfg(windows)]
+    let name = {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = "kb-".encode_utf16().collect();
+        wide.push(0xD800);
+        std::ffi::OsString::from_wide(&wide)
+    };
+    assert!(name.to_str().is_none(), "the name must not be UTF-8");
+    name
 }
 
 /// Test helper: make `link` a file symlink to `target`. Returns false, and the
@@ -1364,5 +1432,84 @@ mod tests {
             assert_eq!(role.as_str(), name);
             assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{name}\""));
         }
+    }
+
+    /// The names in `dir`, as lossy strings, for an assert message.
+    fn names_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `NotUtf8`'s display: ASCII, says why, and says what to do.
+    fn assert_not_utf8_display(e: &LeaseError) {
+        let s = e.to_string();
+        assert!(s.is_ascii(), "non-ASCII display: {s}");
+        assert!(
+            s.contains("not valid UTF-8") && s.contains("put the knowledge base under"),
+            "the reason and the way out are named: {s}"
+        );
+    }
+
+    /// (local Codex round 3) A database path that is not UTF-8 is refused
+    /// before the lock file or anything else is created: the writer opens the
+    /// database by a `&str`, whose lossy spelling would be another file.
+    #[test]
+    fn a_database_path_that_is_not_utf8_is_refused_before_anything_is_created() {
+        let dir = TempDir::new("not-utf8");
+        let bad = dir.path().join(non_utf8_name());
+        let kb = bad.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let db = crate::resolve_db_path(&kb);
+        let tries = [
+            WriterLease::try_acquire(&db, Role::Index, &kb),
+            WriterLease::acquire_with_wait(&db, Role::Migration, &kb, Duration::from_secs(2)),
+        ];
+        for r in tries {
+            let e = r.expect_err("a lease on a path that is not UTF-8");
+            let LeaseError::NotUtf8 {
+                ref db_path,
+                resolved_path: None,
+            } = e
+            else {
+                panic!("expected NotUtf8 naming the path itself: {e}");
+            };
+            assert_eq!(db_path, &db);
+            assert_not_utf8_display(&e);
+        }
+        assert_eq!(
+            names_in(&bad),
+            vec!["kb".to_string()],
+            "neither the lock file, the holder json nor the database is created"
+        );
+    }
+
+    /// The same when the path is UTF-8 but resolves, through a directory
+    /// link, to one that is not.
+    #[test]
+    fn a_database_path_that_resolves_to_one_that_is_not_utf8_is_refused() {
+        let dir = TempDir::new("not-utf8-link");
+        let bad = dir.path().join(non_utf8_name());
+        std::fs::create_dir_all(bad.join("kb")).unwrap();
+        let alias = dir.path().join("alias");
+        if !dir_symlink_or_skip(&bad, &alias) {
+            return;
+        }
+        let kb = alias.join("kb");
+        let db = crate::resolve_db_path(&kb);
+        assert!(db.to_str().is_some());
+        let e = WriterLease::try_acquire(&db, Role::Index, &kb).expect_err("a lease");
+        let LeaseError::NotUtf8 {
+            resolved_path: Some(ref resolved),
+            ..
+        } = e
+        else {
+            panic!("expected NotUtf8 naming the resolved path: {e}");
+        };
+        assert!(resolved.to_str().is_none());
+        assert_not_utf8_display(&e);
+        assert_eq!(names_in(&bad), vec!["kb".to_string()]);
     }
 }

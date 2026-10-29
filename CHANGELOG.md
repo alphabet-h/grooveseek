@@ -24,7 +24,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   operating-system lock on `.groove.db.writer-lock` beside the database before it touches the
   database or the embedding model; a second run on the same index stops with exit code 3 and
   names the holder (from `.groove.db.writer.json`, which can be stale) instead of writing beside
-  it. `--wait <SECONDS>` waits for the holder first.
+  it. `--wait <SECONDS>` waits for the holder first. A database path that is not valid UTF-8
+  is refused with exit code 1 before the lock is taken, where earlier versions opened a
+  differently spelled file.
 - **Read-only commands open the index read-only.** `status`, `search`, `graph`, `doctor`, `eval`
   and `tune` open the database with `PRAGMA query_only`. When an index still needs a schema upgrade
   or its embedding model recorded, they take the lock for that one write; if another process holds

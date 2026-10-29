@@ -538,3 +538,65 @@ fn status_on_a_legacy_index_fails_naming_the_writer_that_holds_the_lease() {
         "the upgrade and the writer holding it are named: {stderr}"
     );
 }
+
+/// A directory name that is not valid UTF-8 but that the file system takes:
+/// `kb-` and a lone `0xFF` byte on unix, `kb-` and an unpaired surrogate on
+/// Windows.
+fn non_utf8_name() -> std::ffi::OsString {
+    #[cfg(unix)]
+    let name = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"kb-\xff".to_vec())
+    };
+    #[cfg(windows)]
+    let name = {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = "kb-".encode_utf16().collect();
+        wide.push(0xD800);
+        std::ffi::OsString::from_wide(&wide)
+    };
+    assert!(name.to_str().is_none(), "the name must not be UTF-8");
+    name
+}
+
+/// (local Codex round 3) `groove index` on a knowledge base whose database
+/// path is not UTF-8 stops before the lease with exit 1 (not the busy 3),
+/// says why in ASCII, and creates neither the lock file nor the database.
+#[test]
+fn index_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothing() {
+    let root = TempRoot::new("groove-lease-not-utf8");
+    let cache = TempRoot::new("groove-lease-not-utf8-cache");
+    let bad = root.path().join(non_utf8_name());
+    let kb = bad.join("kb");
+    std::fs::create_dir_all(&kb).expect("create the kb");
+    std::fs::write(
+        kb.join("note.md"),
+        "---\ntitle: Note\n---\n\n# Note\n\nEnough content here to stand as a chunk.\n",
+    )
+    .expect("write a note");
+
+    let mut cmd = Command::new(grooveseek_bin());
+    cmd.arg("index").arg("--kb-path").arg(&kb);
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("spawn groove");
+    assert_dir_empty(cache.path());
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.is_ascii(), "stderr stays ASCII: {stderr:?}");
+    assert!(
+        stderr.contains("not valid UTF-8") && stderr.contains("put the knowledge base under"),
+        "the reason and the way out are named: {stderr}"
+    );
+    let names: Vec<_> = std::fs::read_dir(&bad)
+        .expect("read the parent of the kb")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        names,
+        vec![std::ffi::OsString::from("kb")],
+        "neither the lock file nor the database is created: {stderr}"
+    );
+}

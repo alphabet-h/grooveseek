@@ -96,7 +96,9 @@ run の間にもう一方の process が書いた、実在する file の row �
   SQLite は symlink の先を開くので、別名ごとに lock が分かれると 2 つの書き手が同じ DB に並ぶため。
   path 全体 (file の symlink と、その上の directory の symlink / junction) を lease を取るときに
   1 度だけ解決し、lock・holder の json・holder の open はすべてその解決済みの path を使うので、後で link を付け替えても
-  書き手は自分の lock から外れない。hard link で 1 つの DB に 2 つの名前を付ける構成は扱わない:
+  書き手は自分の lock から外れない。UTF-8 として読めない DB の path (と、解決するとそうなる path) は
+  lock を取る前に断る (exit code 1、何も作らない): groove は DB を UTF-8 の文字列で開くので、
+  置換文字に崩れた綴りは lock した file と別の file を指す。hard link で 1 つの DB に 2 つの名前を付ける構成は扱わない:
   名前ごとに journal と WAL が別になるので、2 つの名前で開くこと自体を SQLite が未定義の動作としている
   ([How To Corrupt An SQLite Database File の 2.6 節](https://www.sqlite.org/howtocorrupt.html)))。
   0 byte で、std の `File::try_lock` (Unix は `flock`、Windows は `LockFileEx`) で排他に lock する。
