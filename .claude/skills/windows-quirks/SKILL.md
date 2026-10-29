@@ -427,6 +427,8 @@ subagent に cargo を打たせる指示に貼る:
 - `run_in_background` を使わず foreground + timeout
 - status file は手順ごとに追記させる (途中で落ちても、続きを file から拾える)
 
+全体 test (cold な target からの build を含む) を打たせる時は、これに 5 点目が付く (script で段に分けて 1 段ずつ打つ。skill `house-rules` の cargo の項)。
+
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
 
 ## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **どの設定でも出ない。残るかどうかが設定で変わる**
@@ -1055,6 +1057,20 @@ def remove_tree(path):
 
 出典: 2026-10-22、grooveseek の private tooling の test (doc link sweep の test) で踏んだ。
 関連: 罠 23 / 24 (dir を消せない・改名できない別の原因 — あちらは process が cwd で掴んでいる)
+
+## 28. PowerShell 5.1 から cargo を `Start-Process -Wait` で待つと戻らない — 子孫の vctip.exe (MSVC の telemetry) が cargo より長く生きる
+
+**症状**: `Start-Process cargo ... -Wait` が、cargo の build が終わっても戻らない。wrapper を外から止めるまで tool の呼び出しが続く。
+**原因**: `-Wait` は子孫の process まで待つ。MSVC の link.exe が起こす `vctip.exe` は cargo の終了後も残る。
+**正しいやり方**: `-PassThru` で受けて `$p.WaitForExit(<ms>)` で cargo 本体だけを待つ (`$null = $p.Handle` を先に読むと `ExitCode` が取れる)。
+env `VSCMD_SKIP_SENDTELEMETRY=1` で vctip.exe を起こさせない。上限で止める時は `taskkill /PID <id> /T /F` で木ごと止める。
+
+同族: `$ErrorActionPreference='Stop'` の下で native exe の stderr を `2>$null` に送ると、終了扱いの error になる
+(罠 20 の `2>&1` と同じ ErrorRecord の経路)。その呼び出しの前後だけ `Continue` に落とす。
+
+出典: 2026-10-29、grooveseek の全体 test を段に分ける script (private tooling) で踏んだ。実測と経緯は
+`.dev/knowledge/cargo-full-test-staged-line-tables.md` の「罠」1 と 6 (KB の記録。DT には無い)。
+関連: 罠 16 (全体 test の打ち方の 5 点目)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
