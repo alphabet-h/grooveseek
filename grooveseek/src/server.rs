@@ -41,6 +41,7 @@ use kb_uri::{HitWithUri, LoadFailure, resource_error};
 #[cfg(test)]
 use kb_uri::resource_text;
 mod search;
+mod writer_role;
 mod writer_slot;
 
 // The writer lease inside one server (ADR-0031): `run_server` and the handlers
