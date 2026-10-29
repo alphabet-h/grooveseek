@@ -1031,13 +1031,17 @@ fn documents_to_delete(
 }
 
 /// (ADR-0031) Candidates per immediate transaction of the prune. Wide enough that a large
-/// prune takes the write lock a few times rather than once per row, and narrow enough that
-/// one batch holds it only briefly against another writer waiting on its busy timeout.
+/// prune takes the write lock a few times rather than once per row; the aim for one batch's
+/// hold is about 100 ms, since another writer waits it out within the busy timeout.
 ///
-/// Measured over 10 000 candidates of 3 chunks each (debug build, Windows), the longest
-/// hold of one batch was 1015 ms at 64, 2084 ms at 128, 4738 ms at 256, 8584 ms at 512 and
-/// 18116 ms at 1024; the hold grows with the width, at about 8 ms a row. No width came
-/// under 100 ms, so this is the narrowest one measured.
+/// Measured over 10 000 candidates of 3 chunks each, with 2-dimensional vectors (debug
+/// build, Windows), the longest hold of one batch was 1015 ms at 64, 2084 ms at 128,
+/// 4738 ms at 256, 8584 ms at 512 and 18116 ms at 1024: 16 to 19 ms a row for the longest
+/// batch, and about 8 ms a row for the whole prune divided by its candidates. The aim was
+/// not met: even at 64 one batch held the lock for about 1 s. A waiting writer does not fail
+/// for it, as it keeps trying until the busy timeout runs out. 64 is the narrowest width
+/// measured, and narrowing did not make the whole prune longer: it took 81 to 91 s at
+/// every width.
 pub(crate) const PRUNE_BATCH: usize = 64;
 
 /// (ADR-0031) The prune of a completed run: `candidates` (sorted) in batches of `batch`,
@@ -11013,6 +11017,8 @@ mod tests {
             assert_eq!(done.deleted.len(), DOCS);
             assert_eq!(reports.len(), DOCS);
 
+            // Every candidate is deleted, so each batch reports exactly `width` paths (the
+            // last fewer): a batch starts at every `width`-th report.
             let mut holds: Vec<f64> = (0..DOCS)
                 .step_by(width)
                 .map(|first| {
