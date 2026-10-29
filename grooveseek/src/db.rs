@@ -529,6 +529,18 @@ pub struct CasDelete {
     pub kept_changed: u32,
 }
 
+/// What [`Database::rename_documents_checked`] did with each `(old, new)` pair, in the
+/// order of `pairs`.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenameOutcome {
+    /// Renamed: the old row still had the snapshot's `(id, content_hash)` and the new
+    /// path was free.
+    pub applied: Vec<(String, String)>,
+    /// Left as they were: the old row was gone or changed, or a row was at the new path.
+    pub skipped: Vec<(String, String)>,
+}
+
 // feature-48: `sanitize_fts_query` はここにあったが、クエリ全体を単一 phrase 化する
 // その規則こそが「自然文クエリで FTS 候補が 0 件になる」原因だったので、
 // `db/fts_query.rs` の `parse_query` に置き換えた。旧規則自体は
@@ -9613,5 +9625,180 @@ mod tests {
         assert!(out.deleted.is_empty());
         assert_eq!(out.kept_changed, 0);
         assert!(db.all_path_ids_hashes().unwrap().contains_key("Note.md"));
+    }
+
+    fn pair(old: &str, new: &str) -> (String, String) {
+        (old.to_string(), new.to_string())
+    }
+
+    #[test]
+    fn checked_renames_apply_matching_pairs_and_skip_the_rest() {
+        let (_dir, db, other) = two_connections("checked-renames-match");
+        for (p, h) in [
+            ("a.md", "ha"),
+            ("b.md", "hb"),
+            ("c.md", "hc"),
+            ("d.md", "hd"),
+        ] {
+            upsert_with_hash(&db, p, h);
+        }
+        let snap = db.all_path_ids_hashes().unwrap();
+
+        // Another connection changes b's hash, takes c's target path, and moves d first.
+        assert_eq!(
+            other.overwrite_content_hash(&["b.md"], "changed").unwrap(),
+            1
+        );
+        let other_c2 = upsert_with_hash(&other, "c2.md", "hc2");
+        other
+            .rename_document("d.md", "d-moved.md", FrontmatterTopic::Unread)
+            .unwrap();
+
+        let pairs = vec![
+            pair("a.md", "a2.md"),
+            pair("b.md", "b2.md"),
+            pair("c.md", "c2.md"),
+            pair("d.md", "d2.md"),
+        ];
+        let out = db
+            .rename_documents_checked(&pairs, &snap, &[], &HashMap::new())
+            .unwrap();
+        assert_eq!(out.applied, vec![pair("a.md", "a2.md")]);
+        assert_eq!(
+            out.skipped,
+            vec![
+                pair("b.md", "b2.md"),
+                pair("c.md", "c2.md"),
+                pair("d.md", "d2.md")
+            ]
+        );
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert_eq!(after["a2.md"], snap["a.md"]);
+        assert!(!after.contains_key("a.md"));
+        assert_eq!(after["b.md"], (snap["b.md"].0, "changed".to_string()));
+        assert!(!after.contains_key("b2.md"));
+        assert_eq!(after["c.md"], snap["c.md"]);
+        assert_eq!(after["c2.md"], (other_c2, "hc2".to_string()));
+        assert_eq!(after["d-moved.md"], snap["d.md"]);
+        assert!(!after.contains_key("d2.md"));
+    }
+
+    #[test]
+    fn checked_renames_mark_only_applied_crossed_pairs() {
+        let (_dir, db, other) = two_connections("checked-renames-crossed");
+        upsert_with_hash(&db, "x.txt", "hx");
+        upsert_with_hash(&db, "y.txt", "hy");
+        let snap = db.all_path_ids_hashes().unwrap();
+        upsert_with_hash(&other, "y.md", "hy-md");
+
+        let out = db
+            .rename_documents_checked(
+                &[pair("x.txt", "x.md"), pair("y.txt", "y.md")],
+                &snap,
+                &["x.txt", "y.txt"],
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(out.applied, vec![pair("x.txt", "x.md")]);
+        assert_eq!(out.skipped, vec![pair("y.txt", "y.md")]);
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert_eq!(
+            after["x.md"],
+            (
+                snap["x.txt"].0,
+                crate::indexer::HASH_AWAITING_REPARSE.to_string()
+            )
+        );
+        assert_eq!(after["y.txt"], snap["y.txt"]);
+        assert_eq!(after["y.md"].1, "hy-md");
+    }
+
+    #[test]
+    fn checked_renames_with_no_pairs_open_no_transaction() {
+        let (_dir, db, other) = two_connections("checked-renames-empty");
+        let snap = db.all_path_ids_hashes().unwrap();
+        let tx = other.begin_immediate_transaction().unwrap();
+        let t0 = std::time::Instant::now();
+        let out = db
+            .rename_documents_checked(&[], &snap, &[], &HashMap::new())
+            .unwrap();
+        assert_eq!(out, RenameOutcome::default());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1000),
+            "no pairs waited {:?} for the other writer's lock",
+            t0.elapsed()
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn checked_renames_refuse_inside_a_callers_transaction() {
+        let db = db_with_384();
+        upsert_with_hash(&db, "a.md", "ha");
+        let snap = db.all_path_ids_hashes().unwrap();
+        {
+            let _tx = db.begin_transaction().unwrap();
+            assert!(
+                db.rename_documents_checked(&[pair("a.md", "a2.md")], &snap, &[], &HashMap::new())
+                    .is_err()
+            );
+        }
+        let after = db.all_path_ids_hashes().unwrap();
+        assert!(after.contains_key("a.md"));
+        assert!(!after.contains_key("a2.md"));
+    }
+
+    #[test]
+    fn checked_renames_carry_the_scanned_topic_like_the_atomic_one() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.upsert_document(
+            "a/x/e.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h2",
+            0,
+        )
+        .unwrap();
+        let snap = db.all_path_ids_hashes().unwrap();
+        let topics: HashMap<String, Option<String>> =
+            [("b/y/d.md".to_string(), Some("t".to_string()))]
+                .into_iter()
+                .collect();
+        let out = db
+            .rename_documents_checked(
+                &[pair("a/x/d.md", "b/y/d.md"), pair("a/x/e.md", "b/y/e.md")],
+                &snap,
+                &[],
+                &topics,
+            )
+            .unwrap();
+        assert_eq!(out.applied.len(), 2);
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("t".to_string()))
+        );
+        // A pair with no scanned topic is unread: the stored topic stays.
+        assert_eq!(
+            category_topic_of(&db, "b/y/e.md"),
+            (Some("b".to_string()), Some("x".to_string()))
+        );
     }
 }

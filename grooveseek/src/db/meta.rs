@@ -1496,6 +1496,72 @@ impl Database {
             .context("rename_documents_atomic: COMMIT failed")?;
         Ok(())
     }
+
+    /// Under one `BEGIN IMMEDIATE`: for each pair, applies it only if the old row's
+    /// `(id, content_hash)` is `snapshot`'s and no row is at the new path; an applied pair
+    /// whose old path is in `crossed_old_paths` gets [`crate::indexer::HASH_AWAITING_REPARSE`]
+    /// first. Others are skipped, never an error. Refuses inside a caller's transaction.
+    ///
+    /// The checks and the renames share the immediate transaction, so a row another writer
+    /// changed, moved or created after `snapshot` was read is left as that writer left it.
+    /// A pair whose old path is not in `snapshot` is skipped. `frontmatter_topics` is keyed
+    /// by the new path, as for [`Self::rename_documents_atomic`]. Empty `pairs` return at once
+    /// without opening a transaction. Reads no file. On `Err` (a failed statement) nothing
+    /// is written.
+    pub fn rename_documents_checked(
+        &self,
+        pairs: &[(String, String)],
+        snapshot: &PathIdHash,
+        crossed_old_paths: &[&str],
+        frontmatter_topics: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<RenameOutcome> {
+        if pairs.is_empty() {
+            return Ok(RenameOutcome::default());
+        }
+        if !self.conn.is_autocommit() {
+            anyhow::bail!("rename_documents_checked must not run inside a caller's transaction");
+        }
+        let tx = self.begin_immediate_transaction()?;
+        let mut out = RenameOutcome::default();
+        {
+            let mut read_old = self
+                .conn
+                .prepare("SELECT id, content_hash FROM documents WHERE path = ?1")?;
+            let mut read_new = self
+                .conn
+                .prepare("SELECT 1 FROM documents WHERE path = ?1")?;
+            for (old, new) in pairs {
+                let current: Option<(i64, String)> = read_old
+                    .query_map(params![old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .next()
+                    .transpose()?;
+                let new_taken = read_new.exists(params![new])?;
+                let unchanged = match (snapshot.get(old), current) {
+                    (Some(expected), Some(current)) => *expected == current,
+                    _ => false,
+                };
+                if !unchanged || new_taken {
+                    out.skipped.push((old.clone(), new.clone()));
+                    continue;
+                }
+                if crossed_old_paths.contains(&old.as_str()) {
+                    self.overwrite_content_hash(
+                        &[old.as_str()],
+                        crate::indexer::HASH_AWAITING_REPARSE,
+                    )?;
+                }
+                let topic = match frontmatter_topics.get(new) {
+                    Some(fm) => FrontmatterTopic::Read(fm.as_deref()),
+                    None => FrontmatterTopic::Unread,
+                };
+                self.rename_document(old, new, topic)?;
+                out.applied.push((old.clone(), new.clone()));
+            }
+        }
+        tx.commit()
+            .context("rename_documents_checked: COMMIT failed")?;
+        Ok(out)
+    }
 }
 
 /// What the bytes behind a rename say about the document's topic, for
