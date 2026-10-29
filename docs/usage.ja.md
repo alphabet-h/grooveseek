@@ -11,6 +11,7 @@
 groove index --kb-path /path/to/knowledge-base
 groove index --kb-path /path/to/knowledge-base --force   # 完全再インデックス
 groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 (1024 dim、多言語) に切替
+groove index --kb-path /path/to/knowledge-base --wait 30   # 他の writer を最大 30 秒待つ
 ```
 
 指定ディレクトリ配下のソースファイルを走査し、既定の `exclude_dirs` セット (`.obsidian` / `.git` / `node_modules` / `target` / `.vscode` / `.idea` — [docs/behavior.ja.md](behavior.ja.md) の「ディレクトリ除外」参照) をスキップする。既定では `.md` のみ取り込み。`groove.toml` に `[parsers].enabled = ["md", "txt"]` を追加すると `.txt` もインデックス対象になる (タイトルはファイル名から派生: `deep-dive-2026.txt` → `"deep dive 2026"`、本文全体が 1 チャンク)。このキーは groove が**信頼する** `groove.toml` — `--config` で名指ししたもの、バイナリの隣にあるもの、`groove service install` が置いたもの — に書くこと。KB の隣で見つけただけの config は `[parsers]` が既定へ戻される ([信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所))。前回実行時と content hash が変わっていないファイルは `--force` を渡さない限りスキップされる。
@@ -22,6 +23,8 @@ groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 
 - `bge-m3` — 1024 次元、多言語 (100+ 言語、日本語含む)、初回 DL 約 2.3 GB。日本語主体の KB ではこちら推奨
 
 既存インデックスでのモデル切替には `--force` が必須 (DB の `index_meta` テーブルにモデル / 次元が記録されており、不一致時は起動が拒否される)。
+
+1 つの index に書く `groove index` は同時に 1 つだけで (v1.22.0+)、DB の隣の `.groove.db.writer-lock` に OS のロックを持つ。他の groove のプロセスが持っていれば、`groove index` は DB にも embedding モデルにも触れずに exit code 3 で止まり、stderr に持ち主 (pid は `.groove.db.writer.json` による値で、古いことがある) と次の手を出す。代わりに待つなら `--wait <SECONDS>`。`groove serve` はまだこのロックを取らないので、同じ index の `groove serve` の横で `groove index` が走れてしまう。exit code: `0` 成功、`1` 失敗、`2` 使い方の誤り (引数の parser による)、`3` 他の groove プロセスがロックを持っている、または `--wait` の期限が切れた。このロックが効くのはローカルディスク上の DB に限る: network file system 上では、OS のロックが効くかどうかがファイルシステム次第になる。[ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md) を参照。
 
 ### 外部の OpenAI 互換 embedding
 

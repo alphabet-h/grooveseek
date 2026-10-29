@@ -1063,8 +1063,9 @@ fn ascii_cause(cause: &(dyn std::error::Error + 'static)) -> String {
 
 /// An `io::Error` as `ConnectionRefused (os error 10061)`: its text comes
 /// from the OS, which words it in the local language on a non-English
-/// Windows, while the kind and code are the same everywhere.
-fn ascii_io_error(error: &std::io::Error) -> String {
+/// Windows, while the kind and code are the same everywhere. The writer
+/// lease words its lock-file errors with it too.
+pub(crate) fn ascii_io_error(error: &std::io::Error) -> String {
     match error.raw_os_error() {
         Some(code) => format!("{:?} (os error {code})", error.kind()),
         None => format!("{:?}", error.kind()),

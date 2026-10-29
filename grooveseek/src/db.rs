@@ -3,6 +3,7 @@
 // because they are the group that talks mostly to itself: every one of them is
 // reached through `init`, and only six are called from anywhere else.
 mod fts_query;
+mod lease;
 mod meta;
 mod schema;
 mod search;
@@ -21,6 +22,8 @@ mod storage;
 // outside this module as `grooveseek::db::parse_query`; `search.rs` reaches it
 // through `use super::*`.
 pub use fts_query::{ParsedQuery, parse_query};
+// (#259) A reader's one-time write that the writer lease stopped, and which one it was.
+pub use lease::{OneTimeWrite, OneTimeWriteBusy};
 pub use search::FIELD_FILTERS_PENDING;
 // (feature-56) The indexer names this when it hands a code chunk's line range and definition
 // kind to the storage layer; every other caller uses the constructor that defaults it away.
@@ -815,6 +818,9 @@ impl Database {
     /// [`CorruptDatabase`], which names the file and the remedy. Nothing is
     /// deleted here; [`Database::open_or_replace_corrupt`] is the call that
     /// replaces it, and only `index --force` makes that call.
+    ///
+    /// Keeping to one writer is the caller's job. The binary opens through
+    /// [`Database::open_writer`] or [`Database::open_read_only`] instead (ADR-0031).
     pub fn open(path: &str) -> Result<Self> {
         ensure_vec_extension();
         let conn =
@@ -974,6 +980,22 @@ impl Drop for Database {
         // multi-instance で同 SQLite file を開く運用 (= long-lived `serve` daemon +
         // 別 CLI 並行) でも、各 session の delta が漏れなく加算される。
         let delta_signed: i64 = delta.try_into().unwrap_or(i64::MAX);
+        // A reader's connection runs with `query_only` on (ADR-0031), which
+        // would refuse this write. The counter is the one write a reader
+        // makes, so lift it for the flush and put it back after.
+        let query_only = match self
+            .conn
+            .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+        {
+            Ok(v) => v == 1,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read PRAGMA query_only on drop");
+                false
+            }
+        };
+        if query_only && let Err(e) = self.set_query_only(false) {
+            tracing::warn!(error = %e, "failed to lift query_only to flush on drop");
+        }
         let result = self.conn.execute(
             "INSERT INTO index_meta (key, value) VALUES ('tags_parse_failures', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?2",
@@ -984,6 +1006,9 @@ impl Drop for Database {
                 error = %e,
                 "failed to flush tags_parse_failures delta to index_meta on drop"
             );
+        }
+        if query_only && let Err(e) = self.set_query_only(true) {
+            tracing::warn!(error = %e, "failed to restore query_only after flush on drop");
         }
     }
 }

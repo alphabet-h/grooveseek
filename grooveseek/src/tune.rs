@@ -835,9 +835,15 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
             opts.kb_path.display()
         );
     }
-    let db = Database::open(&db_path.to_string_lossy())?;
+    let db_str = crate::writer_lease::db_path_utf8(&db_path)?;
+    let db = Database::open_read_only(db_str, &opts.kb_path)?;
     let embedding_model_id = opts.embedding.model_id().to_string();
-    db.verify_embedding_meta(&embedding_model_id, opts.embedding.dimension() as u32)?;
+    db.verify_embedding_meta_or_record(
+        &db_path,
+        &opts.kb_path,
+        &embedding_model_id,
+        opts.embedding.dimension() as u32,
+    )?;
     let mut embedder = Embedder::with_settings(opts.embedding.clone())?;
 
     // 主指標 nDCG@PRIMARY_K は必ず計算対象に含める。`run` は pub なので
