@@ -11,6 +11,7 @@ use crate::db::Database;
 use crate::poison::recover;
 use crate::writer_lease::{
     HEARTBEAT_FRESH, HolderInfo, HolderRelation, LeaseError, Role, WriterLease, holder_relation,
+    kb_shown,
 };
 
 /// The label a poisoned inner mutex is reported under.
@@ -275,7 +276,7 @@ fn reader_notice_text(
                     "pid {} per {info}, which can be stale; {}, kb {}",
                     h.pid,
                     h.role.as_str(),
-                    h.kb_path
+                    kb_shown(&h.kb_path)
                 ),
                 None => format!("no {info} was readable"),
             };
@@ -286,7 +287,8 @@ fn reader_notice_text(
                     role.as_str()
                 ),
                 HolderRelation::OtherKb(kb) => format!(
-                    "That process works on a different knowledge base (kb {kb}) that shares this index file, so nothing keeps this server's knowledge base (kb {}) current: new, edited and deleted files in it are not reflected until that process exits and this server is restarted.",
+                    "That process works on a different knowledge base (kb {}) that shares this index file, so nothing keeps this server's knowledge base (kb {}) current: new, edited and deleted files in it are not reflected until that process exits and this server is restarted.",
+                    kb_shown(kb),
                     own_kb.display()
                 ),
                 HolderRelation::Unknown => "Whether that process keeps this knowledge base current cannot be told, so treat new, edited and deleted files as not reflected until this server is restarted.".to_string(),
@@ -795,7 +797,8 @@ impl WriterSlot {
                             .to_string()
                     }
                     HolderRelation::OtherKb(kb) => format!(
-                        "groove index with --wait can; that process works on a different knowledge base (kb {kb}) that shares this index file, and its rebuild_index would remove this knowledge base's rows."
+                        "groove index with --wait can; that process works on a different knowledge base (kb {}) that shares this index file, and its rebuild_index would remove this knowledge base's rows.",
+                        kb_shown(&kb)
                     ),
                     _ => "groove index with --wait can.".to_string(),
                 };
@@ -1566,9 +1569,50 @@ mod tests {
         let reason = busy(Some(&h), HolderRelation::OtherKb(other.clone()));
         let t = reader_notice_text(&l.db, &l.kb, &reason, Some(&h), SystemTime::now());
         assert!(t.contains("different knowledge base"), "{t}");
-        assert!(t.contains(&other), "{t}");
+        assert!(t.contains(&kb_shown(&other)), "{t}");
         assert!(t.contains(&l.kb.display().to_string()), "{t}");
         assert!(!t.contains("keeps the index current"), "{t}");
+    }
+
+    /// The kb paths writer.json records canonically are shown without the
+    /// Windows verbatim prefix in a reader's notice.
+    #[test]
+    fn reader_notice_shows_recorded_kbs_without_the_verbatim_prefix() {
+        let l = TextLayout::new("txt-plain");
+        let same = holder_info(Role::Serve, &l.canonical_kb(), Some(0), Some(true));
+        let other = l.other_kb();
+        let elsewhere = holder_info(Role::Serve, &other, Some(0), Some(true));
+        let texts = [
+            reader_notice_text(
+                &l.db,
+                &l.kb,
+                &busy(Some(&same), HolderRelation::WatchingSameKb),
+                Some(&same),
+                SystemTime::now(),
+            ),
+            reader_notice_text(
+                &l.db,
+                &l.kb,
+                &busy(Some(&elsewhere), HolderRelation::OtherKb(other.clone())),
+                Some(&elsewhere),
+                SystemTime::now(),
+            ),
+        ];
+        for t in texts {
+            assert!(!t.contains(r"\\?\"), "{t}");
+        }
+        let shown = kb_shown(&l.canonical_kb());
+        assert!(
+            reader_notice_text(
+                &l.db,
+                &l.kb,
+                &busy(Some(&same), HolderRelation::WatchingSameKb),
+                Some(&same),
+                SystemTime::now(),
+            )
+            .contains(&format!("kb {shown}")),
+            "the holder's kb is still named"
+        );
     }
 
     #[test]
@@ -1889,7 +1933,11 @@ mod tests {
         let now = SystemTime::now();
         let gone = format!("Now there is no {info}, so that process has probably exited.");
         let h = holder_info(Role::Serve, &kb, Some(0), Some(true));
-        let at_start_some = format!("pid 4242 per {info}, which can be stale; serve, kb {kb}");
+        let at_start_some = format!(
+            "pid 4242 per {info}, which can be stale; serve, kb {}",
+            kb_shown(&kb)
+        );
+        let other_shown = kb_shown(&other);
         let at_start_none = format!("no {info} was readable");
         let cases = [
             (
@@ -1903,7 +1951,7 @@ mod tests {
             (
                 HolderRelation::OtherKb(other.clone()),
                 format!(
-                    "That process works on a different knowledge base (kb {other}) that shares this index file, so nothing keeps this server's knowledge base (kb {}) current: new, edited and deleted files in it are not reflected until that process exits and this server is restarted.",
+                    "That process works on a different knowledge base (kb {other_shown}) that shares this index file, so nothing keeps this server's knowledge base (kb {}) current: new, edited and deleted files in it are not reflected until that process exits and this server is restarted.",
                     l.kb.display()
                 ),
             ),
@@ -2090,8 +2138,9 @@ mod tests {
         assert_eq!(
             slot.rebuild_refusal(&busy_with(Some(elsewhere))).error,
             format!(
-                "{}groove index with --wait can; that process works on a different knowledge base (kb {other}) that shares this index file, and its rebuild_index would remove this knowledge base's rows.",
-                head.replace("ROLE", "serve")
+                "{}groove index with --wait can; that process works on a different knowledge base (kb {}) that shares this index file, and its rebuild_index would remove this knowledge base's rows.",
+                head.replace("ROLE", "serve"),
+                kb_shown(&other)
             )
         );
 

@@ -103,7 +103,7 @@ fn busy_warning(db_path: &Path, kb_path: &Path, holder: Option<&HolderInfo>) -> 
             h.pid,
             info.display(),
             h.role.as_str(),
-            h.kb_path
+            crate::writer_lease::kb_shown(&h.kb_path)
         ),
         None => format!("pid unknown (no {})", info.display()),
     };

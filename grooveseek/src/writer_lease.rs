@@ -662,6 +662,21 @@ fn suffixed(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A kb path recorded in writer.json, as a server's notice or refusal shows it.
+/// writer.json keeps the canonical form; on Windows that carries the verbatim
+/// prefix `canonicalize` adds, which is dropped here where the plain spelling
+/// names the same path (`\\?\C:\a` -> `C:\a`, `\\?\UNC\srv\share` ->
+/// `\\srv\share`). Anything else is shown as recorded.
+pub(crate) fn kb_shown(kb: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(plain) = crate::config::without_verbatim_prefix(Path::new(kb)) {
+            return plain.display().to_string();
+        }
+    }
+    kb.to_string()
+}
+
 /// The kb path as the holder records it: canonical, else absolute, else as given.
 fn normalized_kb_path(kb_path: &Path) -> String {
     std::fs::canonicalize(kb_path)
@@ -1374,6 +1389,50 @@ mod tests {
         let expected = std::fs::canonicalize(&kb).unwrap().display().to_string();
         assert_eq!(h.kb_path, expected);
         assert!(Path::new(&h.kb_path).is_absolute());
+    }
+
+    /// writer.json keeps the canonical kb, which `holder_relation` still matches
+    /// through either spelling; only the shown form drops the verbatim prefix.
+    #[test]
+    fn the_shown_kb_drops_the_verbatim_prefix_while_writer_json_keeps_the_canonical_form() {
+        let (_dir, kb, spelled) = non_canonical_layout("shown");
+        let db = crate::resolve_db_path(&kb);
+        let _lease = WriterLease::try_acquire(&db, Role::Serve, &spelled).unwrap();
+        let h = WriterLease::read_holder(&db).expect("writer.json is readable");
+        let canonical = std::fs::canonicalize(&kb).unwrap().display().to_string();
+        assert_eq!(h.kb_path, canonical);
+        assert_eq!(
+            holder_relation(Some(&h), &kb),
+            HolderRelation::WatchingSameKb
+        );
+        assert_eq!(
+            holder_relation(Some(&h), &spelled),
+            HolderRelation::WatchingSameKb
+        );
+        let shown = kb_shown(&h.kb_path);
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+        assert!(Path::new(&shown).is_absolute(), "{shown}");
+        assert_eq!(
+            std::fs::canonicalize(&shown).unwrap().display().to_string(),
+            canonical
+        );
+    }
+
+    /// The shown form of drive, UNC and unstrippable verbatim paths.
+    #[cfg(windows)]
+    #[test]
+    fn kb_shown_maps_drive_and_unc_verbatim_paths_and_keeps_the_rest() {
+        assert_eq!(kb_shown(r"\\?\C:\Users\me\kb"), r"C:\Users\me\kb");
+        assert_eq!(kb_shown(r"\\?\UNC\server\share\kb"), r"\\server\share\kb");
+        assert_eq!(kb_shown(r"C:\Users\me\kb"), r"C:\Users\me\kb");
+        // A trailing dot names another path without the prefix, so it is kept.
+        assert_eq!(kb_shown(r"\\?\C:\kb."), r"\\?\C:\kb.");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn kb_shown_keeps_a_unix_path_as_recorded() {
+        assert_eq!(kb_shown("/srv/kb"), "/srv/kb");
     }
 
     #[test]

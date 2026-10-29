@@ -70,9 +70,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **A writing server rewrites `heartbeat_at` and `watching` in `.groove.db.writer.json` every 5
   seconds**; a reader's notice treats a heartbeat older than 15 seconds as a holder that has
   probably exited (the tray's Stop and Restart and systemd's SIGTERM leave the file behind). These
-  are for display only. At shutdown a server no longer aborts its watcher: the running batch
-  finishes, the connection goes back to read-only, then the lock is released; batches queued
-  behind it are dropped as before.
+  are for display only. At a clean shutdown (Ctrl-C on HTTP, stdin closing on stdio) a server no
+  longer aborts its watcher: the running batch finishes, the connection goes back to read-only,
+  then the lock is released; batches queued behind it are dropped as before. SIGTERM and the
+  tray's Stop still end the process, mid-batch included.
 - **Read-only commands open the index read-only.** `status`, `search`, `graph`, `doctor`, `eval`
   and `tune` open the database with `PRAGMA query_only`. When an index still needs a schema upgrade
   or its embedding model recorded, they take the lock for that one write; if another process holds
