@@ -163,5 +163,5 @@ run_index >&2 2>"$err" || rc=$?
 if [[ "$rc" -eq 3 ]]; then
   echo "$guidance" >&2
 fi
-cat "$err" >&2
+cat "$err" >&2 || true
 exit "$rc"

@@ -814,20 +814,45 @@ fn git_bash() -> std::path::PathBuf {
 
 #[test]
 fn the_hook_script_puts_its_guidance_on_the_first_stderr_line_when_the_wait_runs_out() {
-    // T-L13, the script's case: no model is involved (groove stops at the lease).
-    let kb = layout("groove-hook-guidance");
-    let cache = TempRoot::new("groove-hook-guidance-cache");
+    // T-L13, the script's case without GROOVE_CONFIG: groove discovers the
+    // config from its working directory, which is the temp root holding only
+    // the test's groove.toml (never the repository's own).
+    hook_script_exits_3_with_the_guidance_first("groove-hook-guidance", false);
+}
+
+#[test]
+fn the_hook_script_with_groove_config_puts_its_guidance_first_when_the_wait_runs_out() {
+    // T-L13, the script's `--config "$GROOVE_CONFIG"` branch.
+    hook_script_exits_3_with_the_guidance_first("groove-hook-guidance-config", true);
+}
+
+/// Run `rebuild-on-edit.sh` under Git's bash while the test holds a rebuild's
+/// lease, and check that it exits 3 with the guidance on the first stderr line
+/// and groove's own wait and refusal after it. No model is involved: groove
+/// stops at the lease. `named_config` passes the temp root's `groove.toml` as
+/// `GROOVE_CONFIG`; otherwise the script runs with that root as its working
+/// directory, so the same file is the one groove discovers.
+fn hook_script_exits_3_with_the_guidance_first(prefix: &str, named_config: bool) {
+    let kb = layout(prefix);
+    let cache = TempRoot::new(&format!("{prefix}-cache"));
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, "model = \"bge-small-en-v1.5\"\n").expect("write groove.toml");
     let _lease = hold(&kb, Role::Rebuild, kb.kb());
     let mut cmd = Command::new(git_bash());
     cmd.arg(bash_path(&hook_script()))
+        .current_dir(kb.root())
         .env("KB_PATH", bash_path(kb.kb()))
         .env("GROOVE_BIN", bash_path(&grooveseek_bin()))
         .env("GROOVE_INDEX_WAIT", "2")
-        .env_remove("GROOVE_CONFIG")
         .env_remove("KB_EXTENSIONS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if named_config {
+        cmd.env("GROOVE_CONFIG", bash_path(&cfg));
+    } else {
+        cmd.env_remove("GROOVE_CONFIG");
+    }
     hermetic(&mut cmd, cache.path());
     let mut child = cmd.spawn().expect("spawn bash");
     // A payload without a file path takes the unconditional rebuild path.
