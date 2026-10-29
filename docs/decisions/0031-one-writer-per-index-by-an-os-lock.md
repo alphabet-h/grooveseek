@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-29
 - Deciders: project owner
-- Applies to: v1.22.0 for `groove index` and the read-only commands (PR #TBD);
+- Applies to: v1.22.0 for `groove index` and the read-only commands (PR #408);
   `groove serve` takes part from a later release
 
 ## Context and problem

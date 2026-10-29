@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-29
 - Deciders: プロジェクトオーナー
-- Applies to: v1.22.0 では `groove index` と読む command (PR #TBD)。
+- Applies to: v1.22.0 では `groove index` と読む command (PR #408)。
   `groove serve` が加わるのは後の版
 
 ## 背景と課題
