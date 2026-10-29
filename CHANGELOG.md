@@ -17,16 +17,61 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Added
 
 - `groove index --wait <SECONDS>`, and exit code 3 for `groove index`.
+- **`writer_notice`** on MCP `search` (successful replies only) and on every `rebuild_index`
+  reply, and a `writer` object in `/api/admin/status`, while the server is not keeping the index
+  current: it is a reader, its watcher cannot register a watch, or its watcher stopped. The
+  `search` and `rebuild_index` tool descriptions name the field. `groove search --format json`
+  does not carry it. See [docs/mcp-tools.md](docs/mcp-tools.md).
+- Library: new public fields on existing public structs: `server::KbServerShared::writer`,
+  `watcher::WatcherState::watch_status` / `watch_backoff` / `batch_probe`, and
+  `transport::http::AdminStatus::writer`. None of these three structs implements `Default`, so
+  code that builds one with a struct literal stops compiling, and there is no
+  `..Default::default()` to fall back on; `run_watch_loop` keeps its signature. New public items:
+  `writer_lease::HEARTBEAT_FRESH`, `HolderInfo::heartbeat_fresh` / `keeps_current`,
+  `WriterLease::set_role` / `touch_heartbeat`, `server::{WriterSlot, WriterStatus, Claimant,
+  ClaimGuard, ReaderReason, WatchErrorCause, WatchStatusFn}`,
+  `KbServerShared::for_test_with_writer` (under the `test-helpers` feature),
+  `watcher::{WatchBatchProbe, run_watch_loop_until}` and `WatcherState::DEFAULT_WATCH_BACKOFF`.
+  `LeaseError` gains the variants `Closed` and `Reader`; `LeaseError`, `Claimant`, `ReaderReason`,
+  `WatchErrorCause` and `WriterStatus` are `#[non_exhaustive]`, so a downstream `match` on
+  `LeaseError` without a wildcard arm needs one from this release.
 
 ### Changed
 
-- **Only one `groove index` writes an index at a time** (kuriya #259, ADR-0031). A run takes an
-  operating-system lock on `.groove.db.writer-lock` beside the database before it touches the
-  database or the embedding model; a second run on the same index stops with exit code 3 and
-  names the holder (from `.groove.db.writer.json`, which can be stale) instead of writing beside
-  it. `--wait <SECONDS>` waits for the holder first. A database path that is not valid UTF-8
-  is refused with exit code 1 before the lock is taken, where earlier versions opened a
+- **Only one groove process writes an index at a time** (kuriya #259,
+  [ADR-0031](docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)). A `groove serve` whose
+  watcher is on, a `groove index` run and an MCP `rebuild_index` call each take an
+  operating-system lock on `.groove.db.writer-lock` beside the database before they touch the
+  database or the embedding model. A second `groove index` on the same index stops with exit
+  code 3 and names the holder (from `.groove.db.writer.json`, which can be stale) instead of
+  writing beside it; `--wait <SECONDS>` waits for the holder first. A database path that is not
+  valid UTF-8 is refused with exit code 1 before the lock is taken, where earlier versions opened a
   differently spelled file.
+- **`groove index` beside a watching `groove serve` now exits 3**, where it used to run alongside
+  it. The server takes the lock before its model download, so this holds during a first download
+  too. Call the server's `rebuild_index` instead, or stop the server first. A `--no-watch` server
+  takes the lock only during a `rebuild_index` call, so a timer-driven `groove index` (the
+  `nas-shared` recipe) keeps working and exits 3 only when it overlaps one.
+- **A Claude Code PostToolUse hook that runs `groove index` on every edit**
+  ([docs/clients.md](docs/clients.md#keeping-the-index-fresh-via-posttooluse-hook),
+  `grooveseek/examples/hooks/`) exits 3 on every edit beside a watching server. The watcher
+  already picks those edits up; drop the hook in that setup and use it only with `--no-watch`.
+  The bundled `rebuild-on-edit.sh` waits up to `GROOVE_INDEX_WAIT` seconds (default 30) for
+  another writer and returns 3 when the wait runs out, so beside a watching server it would stall
+  every edit for that long.
+- **A second `groove serve` with its watcher on is a reader.** It answers searches but does not
+  update the index and refuses `rebuild_index`, and it stays a reader until it is restarted, even
+  after the writer exits: changes made meanwhile are not reflected, a deleted file keeps showing
+  up in search, and changes made before the restart wait for a rebuild after it. It warns once on
+  stderr and says so in `writer_notice` and `writer.reader_notice` every time. This is the case
+  for several Claude Code sessions on one knowledge base: only the first session's server writes
+  ([docs/clients.md](docs/clients.md#several-sessions-on-one-knowledge-base)).
+- **A writing server rewrites `heartbeat_at` and `watching` in `.groove.db.writer.json` every 5
+  seconds**; a reader's notice treats a heartbeat older than 15 seconds as a holder that has
+  probably exited (the tray's Stop and Restart and systemd's SIGTERM leave the file behind). These
+  are for display only. At shutdown a server no longer aborts its watcher: the running batch
+  finishes, the connection goes back to read-only, then the lock is released; batches queued
+  behind it are dropped as before.
 - **Read-only commands open the index read-only.** `status`, `search`, `graph`, `doctor`, `eval`
   and `tune` open the database with `PRAGMA query_only`. When an index still needs a schema upgrade
   or its embedding model recorded, they take the lock for that one write; if another process holds

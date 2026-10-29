@@ -123,7 +123,10 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
 
 ## 運用上の注意
 
-- **単一 writer**。`serve` が index への唯一の `Mutex<Database>` を保持。
+- **単一 writer**。process の中では `serve` が index への唯一の
+  `Mutex<Database>` を保持し、process の間では、動いている間ずっと DB の隣の
+  `.groove.db.writer-lock` に OS のロックを持つ (v1.22.0+、
+  [ADR-0031](../../../../docs/decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。
   サーバ側 watcher が `kb_path` 配下の編集を拾って増分再インデックス。
   クライアントは決して書き込まない
 - **並行性**。rmcp の Streamable HTTP は接続レベルでは並列だが、`search`
@@ -136,8 +139,11 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
     `/srv/groove/knowledge-base` 配下に `git pull`。watcher が結果のファイル
     変更を検出
 - **再起動安全性**。SQLite WAL + `synchronous = NORMAL` の既定で動く。
-  index 中に kill してもロストするのは現在チャンクの commit 1 件のみ。
-  次の `groove index` がソースファイルから再構築する
+  index 中に kill してもロストするのは現在チャンクの commit 1 件のみで、
+  書き手のロックは OS が process と一緒に外す。ソースファイルから再構築するには、
+  動いている server の MCP `rebuild_index` を呼ぶか、service を止めてから
+  `groove index` を打つ (service が動いている間、同じ index への `groove index` は
+  exit code 3 で止まる)
 
 ## セキュリティモデル
 

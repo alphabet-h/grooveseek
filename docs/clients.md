@@ -83,6 +83,15 @@ Or, if you placed a `groove.toml` somewhere on the [discovery path](configuratio
 
 The server will be started automatically when the client connects.
 
+## Several sessions on one knowledge base
+
+(v1.22.0+) Each Claude Code session starts its own stdio `groove serve`. When several sessions point at the same knowledge base, only the server that started first writes the index and runs the file watcher; the others are readers that answer searches only ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). Closing the first session does not hand the index over: a reader keeps not updating it until it is restarted, so files added, edited or deleted meanwhile are not reflected, and a deleted file keeps showing up in search. A reader also refuses `rebuild_index`. To restart a reader's server in Claude Code, close that session and open it again; the new server writes the index if no other server holds it by then. Even then, changes made before the restart stay out of the index until that server's `rebuild_index` runs.
+<!-- P14 (Task 13): the restart step above is the safe form. If the manual check shows that `/mcp` Reconnect restarts a running reader, name it here as well. -->
+
+A reader says so in the `writer_notice` field of its `search` and `rebuild_index` replies ([MCP tools](mcp-tools.md)), where the agent reads it. It also warns on stderr once at start, but Claude Code does not usually show a server's stderr (estimate). If the first session's server was killed rather than closed, its `.groove.db.writer.json` stays behind: the readers' notice goes on saying that server keeps the index current until its heartbeat in that file is more than 15 seconds old, then says it has probably exited and changes are not reflected until restart.
+
+To use one knowledge base from several sessions and keep it current, let one server write it: run a resident daemon over HTTP (`groove service install`, or [HTTP transport for multiple simultaneous clients](#http-transport-for-multiple-simultaneous-clients)) and point every session at its `/mcp`.
+
 ## Keeping the index fresh via PostToolUse hook
 If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write.
 
@@ -249,9 +258,12 @@ curl http://127.0.0.1:3100/api/admin/status
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
   "kb":       { "documents": 596, "chunks": 8878, "model": "bge-m3" },
-  "config_source": "Cwd"
+  "config_source": "Cwd",
+  "writer":   { "held": true, "role": "serve", "held_since": "2026-07-26T09:12:04+00:00", "reader": false, "reader_notice": null, "watch_error": null, "watcher_stopped": null }
 }
 ```
+
+`writer` (v1.22.0+) is the index's writer lock as this server sees it ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). A server that writes the index holds it (`held: true`). A server that started while another process held it is a reader until it is restarted: `held: false`, `reader: true`, and `reader_notice` carries the same text as the `writer_notice` of its MCP replies. `watch_error` is set while the watcher cannot register a watch, and `watcher_stopped` once the watcher has stopped outside shutdown.
 
 > **`kb.path` was removed.** It carried the knowledge base's absolute path, so
 > on Windows the payload — and the status band that printed it — read

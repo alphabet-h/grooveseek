@@ -83,6 +83,15 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 
 クライアント接続時にサーバが自動起動する。
 
+## 1 つのナレッジベースを複数の session で使う
+
+(v1.22.0+) Claude Code の session はそれぞれ自分の stdio の `groove serve` を起動する。複数の session が同じナレッジベースを指すと、索引を書いてファイルウォッチャを動かすのは最初に起動した server だけで、残りは検索にだけ答える reader になる ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。最初の session を閉じても索引は引き継がれない: reader は restart されるまで索引を更新しないので、その間に足した・編集した・消した file は反映されず、消した file は search に出続ける。reader は `rebuild_index` も断る。Claude Code で reader の server を restart するには、その session を閉じて開き直す。その時点で他の server が索引を持っていなければ、新しい server が索引を書く。それでも、restart の前の変更は、その server の `rebuild_index` を走らせるまで索引に入らない。
+<!-- P14 (Task 13): 上の restart の手は安全な形。手動の確認で `/mcp` の Reconnect が動いている reader を起こし直すと分かれば、ここにそれも書く。 -->
+
+reader であることは、その server の `search` と `rebuild_index` の応答の `writer_notice` field に載り ([MCP ツール](mcp-tools.ja.md))、agent はそこで読む。起動時に stderr にも 1 回 warning を出すが、Claude Code は通常 server の stderr を見せない (推定)。最初の session の server が閉じられたのではなく kill された場合は、その `.groove.db.writer.json` が残る: reader の注記は、その file の heartbeat が 15 秒より古くなるまで「その server が索引を最新に保つ」と言い続け、その後は「終了した見込みで、restart まで反映されない」に替わる。
+
+1 つのナレッジベースを複数の session で使い、最新に保つなら、書く server を 1 つにする: HTTP で常駐する daemon (`groove service install`、または [HTTP トランスポート (複数クライアント同時接続)](#http-トランスポート-複数クライアント同時接続)) を動かし、各 session をその `/mcp` に向ける。
+
 ## PostToolUse hook による index 鮮度保守
 Claude Code セッション内部からナレッジベースを編集する (または Markdown を書く skill を実行する) 場合、MCP サーバは再構築されるまで古い結果を返し続ける。`.claude/settings.json` の `PostToolUse` hook で書込み後に自動再 index できる。
 
@@ -243,9 +252,12 @@ curl http://127.0.0.1:3100/api/admin/status
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
   "kb":       { "documents": 596, "chunks": 8878, "model": "bge-m3" },
-  "config_source": "Cwd"
+  "config_source": "Cwd",
+  "writer":   { "held": true, "role": "serve", "held_since": "2026-07-26T09:12:04+00:00", "reader": false, "reader_notice": null, "watch_error": null, "watcher_stopped": null }
 }
 ```
+
+`writer` (v1.22.0+) は、この server から見た索引の書き手のロック ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。索引を書く server はそれを持つ (`held: true`)。他の process が持っている間に起動した server は restart まで reader で、`held: false`、`reader: true` になり、`reader_notice` に MCP の応答の `writer_notice` と同じ文が入る。`watch_error` は watcher が watch を登録できない間、`watcher_stopped` は watcher が終了処理の外で止まった後に入る。
 
 > **`kb.path` は削除した。** ナレッジベースの絶対パスを持っていたので、Windows では
 > payload も、それを表示していた状態帯も `C:\Users\<名前>\...` と読めていた。

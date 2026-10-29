@@ -68,9 +68,15 @@ stateless な形は**そもそも対象外**である。
 
 ### どちらの形でも成り立つ 3 つ
 
-**ファイル監視は両方の形で動く。** watcher は transport 分岐より前、同じ関数の中で
-spawn される。つまり stdio の子プロセスも常駐 daemon と同じように監視している。
-**「更新監視のために daemon を上げておく」は理由にならない** — 既に動いている。
+**ファイル監視はどちらの形でも動けるが、1 つの索引を監視するのは 1 プロセスだけ。**
+watcher は transport がどちらでも同じ起動の経路で始まるので、単独の stdio の子プロセスも
+常駐 daemon と同じように監視する。子プロセス 1 つなら **「更新監視のために daemon を
+上げておく」は理由にならない**。ただし同じ索引では、書き手のロックを持つ process だけが
+watcher を動かす (v1.22.0+、[ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。
+watcher を有効にして起動した他の server は reader になり、検索に答えるが索引を更新しない。
+reader は書き手が終了しても引き継がず、restart されるまで reader のまま。つまり daemon の
+後に起動した子プロセスは reader で、子プロセスの後に起動 (restart を含む) した daemon も、
+常駐している間ずっと reader のまま。
 (監視は既定で on であって無条件ではない。`--no-watch` と `[watch].enabled` で切れる)
 
 **1 プロセス = 1 モデル。** embedder は分岐より前に 1 度だけ構築され、
@@ -81,17 +87,21 @@ spawn される。つまり stdio の子プロセスも常駐 daemon と同じ�
 **ダウンロードサイズであって常駐サイズではない**。reranker を設定していれば
 それが同一プロセス内のもう 1 つのモデルになる (既定では設定されていない)。
 
-**多重起動ガードは無い。** lock file も PID file も排他 DB モードも無い。
-SQLite は WAL で開かれ、`busy_timeout` が 30 秒に設定されている — これは
-**別プロセスの `search` / `status` が即失敗せずに待つため**で、同時アクセスは
-想定され支援されている。防がれていないのは「**同じ索引作業が 2 プロセスで
-二重に走ること**」の方で、書き先は同じ `.groove.db` になる。
+**1 つの索引の書き手は、process をまたいで 1 つ。** (v1.22.0+) watch する server、
+`groove index` の run、MCP `rebuild_index` の呼び出しは、書いている間 DB の隣の
+`.groove.db.writer-lock` に OS のロックを持つので、索引を書くのは同時にそのうち 1 つだけ
+([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。2 つ目の
+`groove index` は exit code 3 で止まって持ち主を名指し (`--wait` なら待つ)、2 つ目の
+watch する server は restart まで reader になり、ロックを取れない `rebuild_index` は
+即座に断られる。reader も検索はできる: SQLite は WAL で開かれ、`busy_timeout` が 30 秒に
+設定されている — これは**別プロセスの `search` / `status` が即失敗せずに待つため**。
+このロックが効くのはローカルディスク上の DB に限る。
 
-ガードに見えて違うものが 2 つある:
+見た目ほどは守らないものが他に 2 つある:
 
 - **`RebuildSlot`** は `rebuild_index` の同時実行を断るが、**1 プロセスの中**に居る。
-  daemon と子プロセスはスロットを 1 つずつ持つので、同じコーパスの再 embed が
-  両方で同時に走り得る
+  daemon と子プロセスの間で効くのは書き手のロックで、一方がロックを持っている間は
+  他方の `rebuild_index` が即座に断られる
 - **bind 失敗の文言** (*"is another groove instance running, or the port occupied?"*)
   が見えるのは同一ポートの別リスナだけで、**stdio の子プロセスは見えない** —
   ここで問題になるのはまさにその形

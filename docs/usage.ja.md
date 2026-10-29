@@ -24,7 +24,7 @@ groove index --kb-path /path/to/knowledge-base --wait 30   # 他の writer を�
 
 既存インデックスでのモデル切替には `--force` が必須 (DB の `index_meta` テーブルにモデル / 次元が記録されており、不一致時は起動が拒否される)。
 
-1 つの index に書く `groove index` は同時に 1 つだけで (v1.22.0+)、DB の隣の `.groove.db.writer-lock` に OS のロックを持つ。他の groove のプロセスが持っていれば、`groove index` は DB にも embedding モデルにも触れずに exit code 3 で止まり、stderr に持ち主 (pid は `.groove.db.writer.json` による値で、古いことがある) と次の手を出す。代わりに待つなら `--wait <SECONDS>`。`groove serve` はまだこのロックを取らないので、同じ index の `groove serve` の横で `groove index` が走れてしまう。exit code: `0` 成功、`1` 失敗、`2` 使い方の誤り (引数の parser による)、`3` 他の groove プロセスがロックを持っている、または `--wait` の期限が切れた。このロックが効くのはローカルディスク上の DB に限る: network file system 上では、OS のロックが効くかどうかがファイルシステム次第になる。[ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md) を参照。
+1 つの index に書く `groove index` は同時に 1 つだけで (v1.22.0+)、DB の隣の `.groove.db.writer-lock` に OS のロックを持つ。他の groove のプロセスが持っていれば、`groove index` は DB にも embedding モデルにも触れずに exit code 3 で止まり、stderr に持ち主 (pid は `.groove.db.writer.json` による値で、古いことがある) と次の手を出す。代わりに待つなら `--wait <SECONDS>`。watcher が有効な `groove serve` は動いている間ずっと同じロックを持つ (`--no-watch` の server が持つのは MCP `rebuild_index` の間だけ) ので、その間は server の `rebuild_index` を呼ぶか、server を止めてから `groove index` を打つ。exit code: `0` 成功、`1` 失敗、`2` 使い方の誤り (引数の parser による)、`3` 他の groove プロセスがロックを持っている、または `--wait` の期限が切れた。このロックが効くのはローカルディスク上の DB に限る: network file system 上では、OS のロックが効くかどうかがファイルシステム次第になる。[ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md) を参照。
 
 ### 外部の OpenAI 互換 embedding
 

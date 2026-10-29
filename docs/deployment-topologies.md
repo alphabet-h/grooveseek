@@ -72,11 +72,18 @@ PHP application below is not subject to it at all.
 
 ### Three things that hold in both shapes
 
-**The file watcher runs in both.** It is spawned before the transport branch, in
-the same function, so a stdio child watches its knowledge base exactly as a
-resident daemon does. *Keeping a daemon up is not a way to get live indexing* —
-you already have it. (Watching is on by default, not unconditionally: `--no-watch`
-and `[watch].enabled` turn it off.)
+**The file watcher can run in both, but only one process watches an index.**
+The watcher starts in the same startup path whichever transport is chosen, so a
+stdio child on its own watches its knowledge base exactly as a resident daemon
+does; *keeping a daemon up is not a way to get live indexing* for a single
+child. On one index, though, only the process that holds the writer lock runs
+the watcher (v1.22.0+, [ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md));
+any other server started with its watcher on is a reader: it answers searches
+and does not update the index. A reader does not take over when the writer
+exits; it stays a reader until it is restarted. So a child started after a
+daemon is a reader, and a daemon started (or restarted) after a child is a
+reader too, for as long as it stays up. (Watching is on by default, not
+unconditionally: `--no-watch` and `[watch].enabled` turn it off.)
 
 **One process, one model.** The embedder is built once, before the branch, and
 shared through an `Arc<Mutex<_>>`. A second process gets its own. So a resident
@@ -86,18 +93,24 @@ each for `bge-m3`, or ~500 MB each for the default `bge-small-en-v1.5`** (see
 *download* size, not its resident size). A configured reranker is a second model
 again, in the same process; no reranker is configured by default.
 
-**There is no cross-process guard.** No lock file, no PID file, no exclusive
-database mode. SQLite is opened in WAL with a 30-second `busy_timeout`
-specifically so a second process's `search` or `status` waits rather than
-failing — concurrent access is anticipated and supported. What is *not* prevented
-is the same indexing work running twice, in two processes, over the same
-`.groove.db`.
+**One writer per index, across processes.** (v1.22.0+) A watching server, a
+`groove index` run and an MCP `rebuild_index` call each hold an operating-system
+lock on `.groove.db.writer-lock` beside the database while they write, so only
+one of them writes the index at a time
+([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). A second
+`groove index` exits with code 3 and names the holder (`--wait` waits for it
+instead), a second watching server is a reader until it is restarted, and a
+`rebuild_index` that cannot take the lock is refused at once. Readers still
+search: SQLite is opened in WAL with a 30-second `busy_timeout` specifically so
+a second process's `search` or `status` waits rather than failing. The lock
+holds only for a database on a local disk.
 
-Two things look like a guard and are not:
+Two more things guard less than they seem to:
 
 - **`RebuildSlot`**, which refuses a second concurrent `rebuild_index`, lives
-  inside one process. A daemon and a spawned child get one slot each, so both can
-  re-embed the same corpus at once.
+  inside one process. Between a daemon and a spawned child it is the writer lock
+  that counts: a `rebuild_index` in one is refused at once while the other
+  holds the lock.
 - **The bind failure** — *"is another groove instance running, or the port
   occupied?"* — only sees another listener on the same port. It cannot see a
   stdio child, which is exactly the case described here.

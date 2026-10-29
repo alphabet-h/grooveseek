@@ -184,6 +184,10 @@ meaning. This is that set, written out, for the `search` MCP tool and for
 `groove search --format json` — which return the same wrapper and differ in one
 field, noted below. A field not on this list is not part of the promise.
 
+The `search` MCP tool may add `writer_notice` (a string) beside these fields
+when the server is not keeping the index current (v1.22.0+, see
+[mcp-tools.md](mcp-tools.md)); it is advisory and outside this freeze.
+
 Names are given as paths because `topic` appears twice and means something
 different each time.
 
