@@ -198,6 +198,49 @@ pub(crate) fn start_writer_role(
     handles.watcher_stop = Some(stop_tx);
 }
 
+/// The server's shutdown of the writer role (ADR-0031). Later claims are
+/// refused first, so the watcher's release below records no stop. The
+/// janitor is aborted. The watcher is told to stop at its next batch
+/// boundary and awaited, however long the batch it is handling takes, so a
+/// batch never loses the writable connection halfway. Last, under the db
+/// guard, `query_only` goes on and the lease is dropped, with any claim
+/// still marked or queued. A start that failed before the watcher started
+/// passes the janitor only.
+pub(crate) async fn shutdown_writer_role(
+    writer: &Arc<WriterSlot>,
+    db: &Arc<Mutex<Database>>,
+    handles: WriterRoleHandles,
+) {
+    let WriterRoleHandles {
+        janitor,
+        watcher,
+        watcher_stop,
+    } = handles;
+    writer.begin_shutdown();
+    if let Some(janitor) = janitor {
+        janitor.abort();
+        let _ = janitor.await;
+    }
+    if let Some(stop) = &watcher_stop {
+        // An error means the loop has already ended.
+        let _ = stop.send(true);
+    }
+    if let Some(watcher) = watcher {
+        let _ = watcher.await;
+    }
+    drop(watcher_stop);
+    let writer = Arc::clone(writer);
+    let db = Arc::clone(db);
+    let shut = tokio::task::spawn_blocking(move || {
+        let db = recover_db(db.lock());
+        writer.shutdown(&db);
+    })
+    .await;
+    if let Err(e) = shut {
+        tracing::warn!(error = %e, "the writer lease shutdown did not finish");
+    }
+}
+
 /// The end of the watcher's task, under the db guard: record the error
 /// its loop ended with, then release its claim, so the stop the release
 /// records carries that error.
@@ -537,20 +580,10 @@ mod tests {
         (ts, handles)
     }
 
-    /// The end of every test here: no janitor, watcher or lease is left
-    /// behind. Stands in for the server's shutdown until it exists.
+    /// The end of every test here: the server's shutdown, so no janitor,
+    /// watcher or lease is left behind.
     async fn finish(ts: &TestServer, handles: WriterRoleHandles) {
-        if let Some(j) = handles.janitor {
-            j.abort();
-            let _ = j.await;
-        }
-        if let Some(w) = handles.watcher {
-            w.abort();
-            let _ = w.await;
-        }
-        drop(handles.watcher_stop);
-        let db = recover_db(ts.shared.db.lock());
-        ts.writer.shutdown(&db);
+        shutdown_writer_role(&ts.writer, &ts.shared.db, handles).await;
     }
 
     /// Poll `cond` every 250 ms until it holds or `within` passes.
@@ -1281,5 +1314,322 @@ mod tests {
         );
         drop(holder);
         finish(&ts, handles).await;
+    }
+
+    /// `(path, content_hash)` of every row of `documents`, read through a
+    /// connection of its own.
+    fn documents(kb: &TestKb) -> Vec<(String, String)> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &kb.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT path, content_hash FROM documents ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    /// Wait until `started == finished` has held for 2 s, longer than the
+    /// 100 ms debounce window, so no batch is left to come. Up to 10 s.
+    async fn wait_until_quiet(probe: &WatchBatchProbe) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let deadline = Instant::now() + WITHIN;
+        let mut last = None;
+        let mut since = Instant::now();
+        loop {
+            let now = (probe.started.load(SeqCst), probe.finished.load(SeqCst));
+            if now.0 != now.1 || last != Some(now) {
+                last = Some(now);
+                since = Instant::now();
+            } else if since.elapsed() >= Duration::from_secs(2) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the watcher did not go quiet within 10 s: {probe:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The db guard, held on a thread of its own (a `std::sync::Mutex`
+    /// guard cannot cross threads), until [`DbHolder::let_go`].
+    struct DbHolder {
+        ask: std::sync::mpsc::Sender<Option<std::sync::mpsc::Sender<i64>>>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl DbHolder {
+        fn hold(db: Arc<Mutex<Database>>) -> Self {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (ask, asked) = std::sync::mpsc::channel::<Option<std::sync::mpsc::Sender<i64>>>();
+            let thread = std::thread::spawn(move || {
+                let guard = recover_db(db.lock());
+                held_tx.send(()).unwrap();
+                // `Some(reply)` asks for `PRAGMA query_only`; `None` lets go.
+                while let Ok(Some(reply)) = asked.recv() {
+                    let _ = reply.send(guard.query_only_for_test());
+                }
+            });
+            held_rx.recv().unwrap();
+            Self { ask, thread }
+        }
+
+        /// `PRAGMA query_only` read through the held guard.
+        fn query_only(&self) -> i64 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.ask.send(Some(tx)).unwrap();
+            rx.recv().unwrap()
+        }
+
+        fn let_go(self) {
+            self.ask.send(None).unwrap();
+            self.thread.join().unwrap();
+        }
+    }
+
+    /// One case of the shutdown that has to wait for a running batch.
+    struct BatchCase {
+        /// Named in the skip line.
+        name: &'static str,
+        /// Files the writer's watcher indexes before the batch.
+        prepare: fn(&Path),
+        /// Whether the rows of `prepare` are in the index.
+        prepared: fn(&[(String, String)]) -> bool,
+        /// The change whose batch the shutdown has to wait for.
+        trigger: fn(&Path),
+        /// The rows that batch leaves; checked only when it ran alone.
+        rows_after: fn(&[(String, String)]),
+    }
+
+    /// Start a writer, let `case.trigger`'s batch start while the test holds
+    /// the db, and shut down: the shutdown waits for the batch, keeping the
+    /// lease and the writable connection until it has finished. The rows the
+    /// batch leaves are checked only when it was the one batch the change
+    /// made and nothing was left queued at the stop; otherwise a
+    /// `T-L9-11-ROW-SKIPPED` line says why.
+    // Red if the shutdown aborts the watcher instead of stopping it: the
+    // aborted batch is never counted finished, and when the shutdown takes
+    // the db before it, its writes meet a read-only connection.
+    async fn run_batch_probe_shutdown(case: BatchCase) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let probe = Arc::new(WatchBatchProbe::default());
+        let (ts, handles) = start_writer_for_test(
+            TestKb::new(case.name),
+            StartOpts {
+                batch_probe: Some(Arc::clone(&probe)),
+                debounce_ms: Some(100),
+                ..Default::default()
+            },
+        );
+        let armed = eventually(WITHIN, || {
+            ts.kb.holder().is_some_and(|h| h.watching == Some(true))
+        })
+        .await;
+        assert!(armed, "the watch must be registered within 10 s");
+        (case.prepare)(&ts.kb.kb);
+        let indexed = eventually(WITHIN, || (case.prepared)(&documents(&ts.kb))).await;
+        assert!(indexed, "{:?}", documents(&ts.kb));
+        wait_until_quiet(&probe).await;
+        let n0 = probe.started.load(SeqCst);
+        let n0_emitted = probe.emitted.load(SeqCst);
+
+        let held = DbHolder::hold(Arc::clone(&ts.shared.db));
+        (case.trigger)(&ts.kb.kb);
+        let running = eventually(WITHIN, || {
+            probe.started.load(SeqCst) > n0 && probe.finished.load(SeqCst) == n0
+        })
+        .await;
+        assert!(running, "the batch must start within 10 s: {probe:?}");
+
+        let writer = Arc::clone(&ts.writer);
+        let db = Arc::clone(&ts.shared.db);
+        let shutdown =
+            tokio::spawn(async move { shutdown_writer_role(&writer, &db, handles).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "the shutdown must wait for the batch"
+        );
+        assert_eq!(probe.finished.load(SeqCst), n0, "{probe:?}");
+        assert!(!ts.kb.lease_is_free(), "the lease is kept while it waits");
+        assert_eq!(held.query_only(), 0);
+
+        held.let_go();
+        tokio::time::timeout(WITHIN, shutdown)
+            .await
+            .expect("the shutdown must end within 10 s of the db being let go")
+            .expect("the shutdown task panicked");
+        let (started, finished) = (probe.started.load(SeqCst), probe.finished.load(SeqCst));
+        assert_eq!(finished, started, "{probe:?}");
+        assert_eq!(ts.query_only(), 1);
+        assert!(ts.kb.lease_is_free());
+        assert_eq!(ts.writer.status().watcher_stopped, None);
+
+        // A batch the debouncer hands over after the stop is still counted
+        // in `emitted`; 500 ms covers the 100 ms window and its tick.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let emitted = probe.emitted.load(SeqCst);
+        let queued = probe.stopped_with_queued.load(SeqCst);
+        let skipped = if queued {
+            Some("queued")
+        } else if started - n0 != 1 {
+            Some("started")
+        } else if emitted - n0_emitted != 1 {
+            Some("emitted")
+        } else {
+            None
+        };
+        match skipped {
+            None => (case.rows_after)(&documents(&ts.kb)),
+            Some(reason) => eprintln!(
+                "T-L9-11-ROW-SKIPPED {} reason={reason} os={} started={started} n0={n0} emitted={emitted} n0_emitted={n0_emitted} queued={queued}",
+                case.name,
+                std::env::consts::OS
+            ),
+        }
+    }
+
+    /// T-L9 11: the shutdown waits for a running dir-rename batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_waits_for_a_running_dir_rename_batch() {
+        const FILES: [&str; 3] = ["a.md", "b.md", "c.md"];
+        run_batch_probe_shutdown(BatchCase {
+            name: "dir_rename",
+            prepare: |kb| {
+                let dir = kb.join("before");
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in FILES {
+                    std::fs::write(dir.join(f), format!("# {f}\n\nText of {f}.\n")).unwrap();
+                }
+            },
+            prepared: |docs| {
+                FILES
+                    .iter()
+                    .all(|f| docs.iter().any(|(p, _)| *p == format!("before/{f}")))
+            },
+            trigger: |kb| std::fs::rename(kb.join("before"), kb.join("after")).unwrap(),
+            rows_after: |docs| {
+                for f in FILES {
+                    let to = format!("after/{f}");
+                    assert!(docs.iter().any(|(p, _)| *p == to), "{to}: {docs:?}");
+                }
+                assert!(
+                    !docs.iter().any(|(p, _)| p.starts_with("before/")),
+                    "{docs:?}"
+                );
+            },
+        })
+        .await;
+    }
+
+    const SINGLE_BEFORE: &str = "# Single\n\nThe first text.\n";
+    const SINGLE_AFTER: &str = "# Single\n\nThe text after the rewrite.\n";
+
+    /// T-L9 11b: the shutdown waits for a running batch of one rewritten file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_waits_for_a_running_single_file_batch() {
+        run_batch_probe_shutdown(BatchCase {
+            name: "single_file",
+            prepare: |kb| std::fs::write(kb.join("single.md"), SINGLE_BEFORE).unwrap(),
+            prepared: |docs| {
+                let hash = sha256(SINGLE_BEFORE.as_bytes());
+                docs.iter().any(|(p, h)| p == "single.md" && *h == hash)
+            },
+            trigger: |kb| std::fs::write(kb.join("single.md"), SINGLE_AFTER).unwrap(),
+            rows_after: |docs| {
+                let hash = sha256(SINGLE_AFTER.as_bytes());
+                assert!(
+                    docs.iter().any(|(p, h)| p == "single.md" && *h == hash),
+                    "{docs:?}"
+                );
+            },
+        })
+        .await;
+    }
+
+    /// The release of the watcher a shutdown stopped records no stop.
+    // Red if the shutdown stops the watcher before it begins: the watcher's
+    // release records `watcher_stopped`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_stop_does_not_record_watcher_stopped() {
+        let (ts, handles) = start_writer_for_test(TestKb::new("no-stop"), StartOpts::default());
+        let started = eventually(WITHIN, || ts.watcher_active()).await;
+        assert!(started, "the watcher must start within 10 s");
+        shutdown_writer_role(&ts.writer, &ts.shared.db, handles).await;
+        assert_eq!(ts.writer.status().watcher_stopped, None);
+        assert!(matches!(
+            ts.writer.claim(Claimant::Rebuild),
+            Err(LeaseError::Closed)
+        ));
+        assert!(ts.kb.lease_is_free());
+    }
+
+    /// A reader's shutdown only closes the slot: it held no lease.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_of_a_reader_only_closes() {
+        let (mut ts, handles) = start_writer_for_test(
+            TestKb::new("reader-shutdown"),
+            StartOpts {
+                holder: Some(Holder::Serve),
+                ..Default::default()
+            },
+        );
+        assert!(ts.writer.status().reader);
+        drop(ts.holder.take());
+        assert!(ts.kb.lease_is_free());
+        shutdown_writer_role(&ts.writer, &ts.shared.db, handles).await;
+        assert!(ts.kb.lease_is_free());
+        assert_eq!(ts.query_only(), 1);
+        assert!(matches!(
+            ts.writer.claim(Claimant::Rebuild),
+            Err(LeaseError::Closed)
+        ));
+    }
+
+    /// A start that fails before the watcher starts holds the janitor
+    /// only: the shutdown stops it and releases the claim the start took.
+    // Red if the shutdown leaves the janitor running, or keeps the lease or
+    // the queued claim of the dropped start guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_before_the_watcher_starts_releases_the_start_claim_and_stops_the_janitor() {
+        let (mut ts, handles) = start_writer_for_test(
+            TestKb::new("before-start"),
+            StartOpts {
+                skip_watcher: true,
+                ..Default::default()
+            },
+        );
+        assert!(handles.watcher.is_none());
+        assert!(handles.watcher_stop.is_none());
+        let janitor = handles
+            .janitor
+            .as_ref()
+            .expect("the janitor runs")
+            .abort_handle();
+        let Some(StartRole::Writer(guard)) = ts.unstarted.take() else {
+            panic!("the start must make a writer");
+        };
+        assert_eq!(ts.query_only(), 0);
+        // Held so a janitor tick cannot settle the claim before it is seen
+        // queued.
+        let held = DbHolder::hold(Arc::clone(&ts.shared.db));
+        drop(guard);
+        assert!(ts.writer.has_pending());
+        held.let_go();
+        shutdown_writer_role(&ts.writer, &ts.shared.db, handles).await;
+        assert_eq!(ts.query_only(), 1);
+        assert!(ts.kb.lease_is_free());
+        assert!(!ts.writer.has_pending());
+        assert!(janitor.is_finished());
     }
 }
