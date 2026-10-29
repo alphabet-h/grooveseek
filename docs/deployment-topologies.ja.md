@@ -93,7 +93,7 @@ reader は書き手が終了しても引き継がず、restart されるまで r
 ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。2 つ目の
 `groove index` は exit code 3 で止まって持ち主を名指し (`--wait` なら待つ)、2 つ目の
 watch する server は restart まで reader になり、ロックを取れない `rebuild_index` は
-即座に断られる。reader も検索はできる: SQLite は WAL で開かれ、`busy_timeout` が 30 秒に
+embedder・DB・実行中の再構築を待たずに断られる。reader も検索はできる: SQLite は WAL で開かれ、`busy_timeout` が 30 秒に
 設定されている — これは**別プロセスの `search` / `status` が即失敗せずに待つため**。
 このロックが効くのはローカルディスク上の DB に限る。
 
@@ -101,7 +101,7 @@ watch する server は restart まで reader になり、ロックを取れな�
 
 - **`RebuildSlot`** は `rebuild_index` の同時実行を断るが、**1 プロセスの中**に居る。
   daemon と子プロセスの間で効くのは書き手のロックで、一方がロックを持っている間は
-  他方の `rebuild_index` が即座に断られる
+  他方の `rebuild_index` は embedder・DB・実行中の再構築を待たずに断られる
 - **bind 失敗の文言** (*"is another groove instance running, or the port occupied?"*)
   が見えるのは同一ポートの別リスナだけで、**stdio の子プロセスは見えない** —
   ここで問題になるのはまさにその形

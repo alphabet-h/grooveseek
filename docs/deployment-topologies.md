@@ -100,7 +100,8 @@ one of them writes the index at a time
 ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). A second
 `groove index` exits with code 3 and names the holder (`--wait` waits for it
 instead), a second watching server is a reader until it is restarted, and a
-`rebuild_index` that cannot take the lock is refused at once. Readers still
+`rebuild_index` that cannot take the lock is refused, without waiting for the
+embedder, the database or a running rebuild. Readers still
 search: SQLite is opened in WAL with a 30-second `busy_timeout` specifically so
 a second process's `search` or `status` waits rather than failing. The lock
 holds only for a database on a local disk.
@@ -109,8 +110,8 @@ Two more things guard less than they seem to:
 
 - **`RebuildSlot`**, which refuses a second concurrent `rebuild_index`, lives
   inside one process. Between a daemon and a spawned child it is the writer lock
-  that counts: a `rebuild_index` in one is refused at once while the other
-  holds the lock.
+  that counts: a `rebuild_index` in one is refused, without waiting for the
+  embedder, the database or a running rebuild, while the other holds the lock.
 - **The bind failure** — *"is another groove instance running, or the port
   occupied?"* — only sees another listener on the same port. It cannot see a
   stdio child, which is exactly the case described here.

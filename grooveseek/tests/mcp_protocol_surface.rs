@@ -728,8 +728,11 @@ fn the_search_and_rebuild_descriptions_name_writer_notice() {
         );
     }
     assert!(
-        rebuild.contains("Refused at once when another groove process"),
-        "rebuild_index must say it is refused at once while another process writes: {rebuild:?}"
+        rebuild.contains(
+            "The call is refused, without waiting for the embedder, the database or a running \
+             rebuild, when another groove process"
+        ),
+        "rebuild_index must say its refusal does not wait while another process writes: {rebuild:?}"
     );
 }
 

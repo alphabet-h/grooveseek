@@ -1017,10 +1017,11 @@ impl KbServer {
                        running is refused with an error naming how long the \
                        running one has been going. Search is unavailable until \
                        a rebuild finishes, because it holds the embedder and \
-                       the database. Refused at once when another groove \
-                       process (a groove index run, or another server's \
-                       watcher) is writing the same index, or when this \
-                       server started while one was and is reading only. \
+                       the database. The call is refused, without waiting for \
+                       the embedder, the database or a running rebuild, when \
+                       another groove process (a groove index run, or another \
+                       server's watcher) is writing the same index, or when \
+                       this server started while one was and is reading only. \
                        When a reply carries writer_notice, this server is \
                        not keeping the index current and the text says why; \
                        pass it on to the user."
