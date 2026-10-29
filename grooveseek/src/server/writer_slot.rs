@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
+use super::ErrorResponse;
 use crate::db::Database;
 use crate::poison::recover;
 use crate::writer_lease::{
@@ -30,9 +31,8 @@ pub struct WriterSlot {
     inner: Mutex<SlotInner>,
     /// Whether the lease is held, readable without the inner mutex.
     held: AtomicBool,
-    /// Whether the refusal for an I/O failure on the lease was warned about.
-    // Read by the rebuild refusal (a later task of #259 PR2).
-    #[allow(dead_code)]
+    /// Whether the rebuild refusal for an I/O failure on the lease was
+    /// warned about: the reply is given every time, the warning once.
     io_warned: AtomicBool,
 }
 
@@ -763,6 +763,88 @@ impl WriterSlot {
     /// Whether this server started as a reader.
     pub fn is_reader(&self) -> bool {
         self.lock().reader.is_some()
+    }
+
+    /// What `rebuild_index` answers when its claim fails with `e` (ADR-0031).
+    /// Reads no file: a busy holder is the one `e` read from writer.json.
+    /// An I/O failure is warned about once per process; the reply is the
+    /// same every time.
+    pub(crate) fn rebuild_refusal(&self, e: &LeaseError) -> ErrorResponse {
+        let error = match e {
+            LeaseError::Reader => {
+                let why = match self.lock().reader {
+                    Some(ReaderReason::Io { .. }) => {
+                        "it could not take the writer lock when it started"
+                    }
+                    _ => "it started while another groove process was writing it",
+                };
+                format!(
+                    "This server cannot rebuild the index: {why}, so it only answers searches until it is restarted (see writer_notice)."
+                )
+            }
+            LeaseError::Busy { holder, .. } => {
+                let who = match holder {
+                    Some(h) => {
+                        format!("pid {}, {}, since {}", h.pid, h.role.as_str(), h.started_at)
+                    }
+                    None => format!("pid unknown, no {} was readable", self.info_shown()),
+                };
+                let can = match holder_relation(holder.as_ref(), self.kb_path()) {
+                    HolderRelation::WatchingSameKb => {
+                        "that process's own rebuild_index, or groove index with --wait, can."
+                            .to_string()
+                    }
+                    HolderRelation::OtherKb(kb) => format!(
+                        "groove index with --wait can; that process works on a different knowledge base (kb {kb}) that shares this index file, and its rebuild_index would remove this knowledge base's rows."
+                    ),
+                    _ => "groove index with --wait can.".to_string(),
+                };
+                format!(
+                    "Another groove process is writing this index ({who}). This server is reading only and cannot rebuild until that process exits; {can}"
+                )
+            }
+            LeaseError::Io { lock_path, source } => {
+                self.lock_refusal(lock_path, &crate::embedder::ascii_io_error(source), e)
+            }
+            LeaseError::NotUtf8 { db_path, .. } => {
+                let shown = e.to_string();
+                self.lock_refusal(
+                    &WriterLease::lock_path_for(db_path),
+                    shown.trim_end_matches('.'),
+                    e,
+                )
+            }
+            LeaseError::Closed => "This server is shutting down.".to_string(),
+        };
+        ErrorResponse { error }
+    }
+
+    /// The refusal for a lock that could not be taken at all, warned about
+    /// once per process.
+    fn lock_refusal(&self, lock_path: &Path, why: &str, e: &LeaseError) -> String {
+        if !self.io_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(error = %e, "rebuild_index refused: the writer lock could not be taken");
+        }
+        format!(
+            "Could not take the writer lock at {}: {why}. This server is reading only and cannot rebuild until the lock works; groove index on the same index stops with the same error.",
+            lock_path.display()
+        )
+    }
+
+    /// The knowledge base this slot serves (empty for an unmanaged slot).
+    fn kb_path(&self) -> &Path {
+        match &self.mode {
+            SlotMode::Managed { kb_path, .. } => kb_path,
+            SlotMode::Unmanaged => Path::new(""),
+        }
+    }
+
+    /// `<db>.writer.json` as the refusals name it.
+    fn info_shown(&self) -> String {
+        match &self.mode {
+            SlotMode::Managed { db_path, .. } => info_display(db_path),
+            SlotMode::Unmanaged => "writer.json".to_string(),
+        }
     }
 
     /// What admin status shows about the lease and its notices (ADR-0031).
@@ -1955,6 +2037,122 @@ mod tests {
                 "the watcher could not watch {}: no such directory (next retry in 3s); new, edited and deleted files are not being indexed until it succeeds. Fix the cause (on Linux, for example, raise fs.inotify.max_user_watches), or call rebuild_index to index what changed meanwhile.",
                 l.kb.display()
             )
+        );
+    }
+
+    fn slot_for(l: &TextLayout) -> Arc<WriterSlot> {
+        WriterSlot::managed(l.db.clone(), l.kb.clone(), MODEL.to_string(), DIM)
+    }
+
+    #[test]
+    fn reader_refusal_texts_are_pinned() {
+        let l = TextLayout::new("refuse-reader");
+        let slot = slot_for(&l);
+        slot.become_reader(busy(None, HolderRelation::Unknown));
+        assert_eq!(
+            slot.rebuild_refusal(&LeaseError::Reader).error,
+            "This server cannot rebuild the index: it started while another groove process was writing it, so it only answers searches until it is restarted (see writer_notice)."
+        );
+
+        let slot = slot_for(&l);
+        slot.become_reader(ReaderReason::Io {
+            lock_path: WriterLease::lock_path_for(&l.db),
+            error: "access denied".to_string(),
+        });
+        assert_eq!(
+            slot.rebuild_refusal(&LeaseError::Reader).error,
+            "This server cannot rebuild the index: it could not take the writer lock when it started, so it only answers searches until it is restarted (see writer_notice)."
+        );
+    }
+
+    #[test]
+    fn busy_refusal_texts_are_pinned_for_each_relation() {
+        let l = TextLayout::new("refuse-busy");
+        let slot = slot_for(&l);
+        let lock_path = WriterLease::lock_path_for(&l.db);
+        let busy_with = |holder: Option<crate::writer_lease::HolderInfo>| LeaseError::Busy {
+            lock_path: lock_path.clone(),
+            holder,
+        };
+        let head = "Another groove process is writing this index (pid 4242, ROLE, since 2026-01-01T00:00:00+00:00). This server is reading only and cannot rebuild until that process exits; ";
+
+        let same = holder_info(Role::Serve, &l.canonical_kb(), Some(0), Some(true));
+        assert_eq!(
+            slot.rebuild_refusal(&busy_with(Some(same))).error,
+            format!(
+                "{}that process's own rebuild_index, or groove index with --wait, can.",
+                head.replace("ROLE", "serve")
+            )
+        );
+
+        let other = l.other_kb();
+        let elsewhere = holder_info(Role::Serve, &other, Some(0), Some(true));
+        assert_eq!(
+            slot.rebuild_refusal(&busy_with(Some(elsewhere))).error,
+            format!(
+                "{}groove index with --wait can; that process works on a different knowledge base (kb {other}) that shares this index file, and its rebuild_index would remove this knowledge base's rows.",
+                head.replace("ROLE", "serve")
+            )
+        );
+
+        let one_off = holder_info(Role::Index, &l.canonical_kb(), None, None);
+        assert_eq!(
+            slot.rebuild_refusal(&busy_with(Some(one_off))).error,
+            format!(
+                "{}groove index with --wait can.",
+                head.replace("ROLE", "index")
+            )
+        );
+
+        assert_eq!(
+            slot.rebuild_refusal(&busy_with(None)).error,
+            format!(
+                "Another groove process is writing this index (pid unknown, no {} was readable). This server is reading only and cannot rebuild until that process exits; groove index with --wait can.",
+                WriterLease::info_path_for(&l.db).display()
+            )
+        );
+    }
+
+    #[test]
+    fn io_not_utf8_and_closed_refusal_texts_are_pinned() {
+        let l = TextLayout::new("refuse-io");
+        let slot = slot_for(&l);
+        let lock_path = WriterLease::lock_path_for(&l.db);
+        let io = LeaseError::Io {
+            lock_path: lock_path.clone(),
+            source: std::io::Error::from_raw_os_error(5),
+        };
+        let expected = format!(
+            "Could not take the writer lock at {}: {}. This server is reading only and cannot rebuild until the lock works; groove index on the same index stops with the same error.",
+            lock_path.display(),
+            crate::embedder::ascii_io_error(&std::io::Error::from_raw_os_error(5))
+        );
+        assert!(!slot.io_warned.load(Ordering::Relaxed));
+        assert_eq!(slot.rebuild_refusal(&io).error, expected);
+        assert!(
+            slot.io_warned.load(Ordering::Relaxed),
+            "the first I/O refusal warns"
+        );
+        // Answered the same every time; only the warning is once.
+        assert_eq!(slot.rebuild_refusal(&io).error, expected);
+
+        let not_utf8 = LeaseError::NotUtf8 {
+            db_path: l.db.clone(),
+            resolved_path: None,
+        };
+        let shown = not_utf8.to_string();
+        assert_eq!(
+            slot.rebuild_refusal(&not_utf8).error,
+            format!(
+                "Could not take the writer lock at {}: {}. This server is reading only and cannot rebuild until the lock works; groove index on the same index stops with the same error.",
+                lock_path.display(),
+                shown.trim_end_matches('.')
+            )
+        );
+
+        assert_eq!(
+            slot.rebuild_refusal(&LeaseError::Closed).error,
+            "This server is shutting down."
         );
     }
 }
