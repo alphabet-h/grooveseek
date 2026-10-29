@@ -163,6 +163,47 @@ pub struct WatchBatchProbe {
     pub stopped_with_queued: AtomicBool,
 }
 
+#[cfg(test)]
+impl WatchBatchProbe {
+    /// Wait until a batch has started past `started_before` and is still in
+    /// flight, with the counts unchanged for 500 ms: a batch that long in
+    /// handling is one blocked on a lock the test holds. Returns the started
+    /// and finished counts then, or `None` after `within`.
+    ///
+    /// Not "the first batch after `started_before` is in flight": on Linux a
+    /// write is an `IN_OPEN` before its `IN_MODIFY`, and when a debouncer tick
+    /// falls between them the `Access(Open)` comes as a batch of its own that
+    /// takes no lock and finishes at once, ahead of the batch that blocks.
+    pub(crate) async fn wait_for_a_blocked_batch(
+        &self,
+        started_before: u64,
+        within: Duration,
+    ) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let deadline = std::time::Instant::now() + within;
+        let mut last = None;
+        let mut since = std::time::Instant::now();
+        loop {
+            let now = (
+                self.emitted.load(SeqCst),
+                self.started.load(SeqCst),
+                self.finished.load(SeqCst),
+            );
+            let in_flight = now.1 > started_before && now.1 > now.2;
+            if !in_flight || last != Some(now) {
+                last = Some(now);
+                since = std::time::Instant::now();
+            } else if since.elapsed() >= Duration::from_millis(500) {
+                return Some((now.1, now.2));
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 /// Watcher タスク本体。notify の裏スレッドから tokio channel 越しにイベントを
 /// 受け取り、indexer 増分 API にディスパッチする。
 ///
@@ -10747,14 +10788,16 @@ mod tests {
         locked_rx.recv().unwrap();
 
         std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten mid batch\n").unwrap();
-        assert!(
-            poll_until(Duration::from_secs(10), || probe.started.load(SeqCst) == 1).await,
-            "no batch started within 10 s"
-        );
+        // On Linux the write's `Access(Open)` can come as a batch of its own
+        // that takes no lock and finishes first; wait for the one that blocks.
+        let (started, finished) = probe
+            .wait_for_a_blocked_batch(0, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|| panic!("no batch blocked within 10 s: {probe:?}"));
         stop_tx.send(true).unwrap();
         // The batch is blocked on the lock, so the loop must still be running.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(probe.finished.load(SeqCst), 0);
+        assert_eq!(probe.finished.load(SeqCst), finished, "{probe:?}");
         release_tx.send(()).unwrap();
         holder.join().unwrap();
 
@@ -10763,8 +10806,9 @@ mod tests {
             .expect("the loop did not end within 10 s of the lock being let go")
             .expect("the loop task panicked")
             .expect("the loop ended with an error");
-        assert_eq!(probe.started.load(SeqCst), 1);
-        assert_eq!(probe.finished.load(SeqCst), 1);
+        // The stop let the blocked batch finish and started no other.
+        assert_eq!(probe.started.load(SeqCst), started, "{probe:?}");
+        assert_eq!(probe.finished.load(SeqCst), started, "{probe:?}");
     }
 
     /// After the stop, a batch the debouncer hands over finds the channel

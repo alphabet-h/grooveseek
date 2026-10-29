@@ -1453,11 +1453,13 @@ mod tests {
 
         let held = DbHolder::hold(Arc::clone(&ts.shared.db));
         (case.trigger)(&ts.kb.kb);
-        let running = eventually(WITHIN, || {
-            probe.started.load(SeqCst) > n0 && probe.finished.load(SeqCst) == n0
-        })
-        .await;
-        assert!(running, "the batch must start within 10 s: {probe:?}");
+        // Any batch in flight on the held db, not the first after `n0`: on
+        // Linux the write's `Access(Open)` can come as a batch of its own that
+        // takes no db and finishes ahead of the one that blocks.
+        let (s1, f1) = probe
+            .wait_for_a_blocked_batch(n0, WITHIN)
+            .await
+            .unwrap_or_else(|| panic!("a batch must block on the db within 10 s: {probe:?}"));
 
         let writer = Arc::clone(&ts.writer);
         let db = Arc::clone(&ts.shared.db);
@@ -1468,7 +1470,8 @@ mod tests {
             !shutdown.is_finished(),
             "the shutdown must wait for the batch"
         );
-        assert_eq!(probe.finished.load(SeqCst), n0, "{probe:?}");
+        assert_eq!(probe.started.load(SeqCst), s1, "{probe:?}");
+        assert_eq!(probe.finished.load(SeqCst), f1, "{probe:?}");
         assert!(!ts.kb.lease_is_free(), "the lease is kept while it waits");
         assert_eq!(held.query_only(), 0);
 
