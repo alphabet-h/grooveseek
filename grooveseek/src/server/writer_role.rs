@@ -1423,11 +1423,19 @@ mod tests {
     async fn run_batch_probe_shutdown(case: BatchCase) {
         use std::sync::atomic::Ordering::SeqCst;
         let probe = Arc::new(WatchBatchProbe::default());
+        let kb = TestKb::new(case.name);
+        // The watcher gets the canonical kb, as `groove serve` hands it one.
+        // On macOS the temp dir is under `/var`, a link to `/private/var`, and
+        // FSEvents names every path under the latter: against the spelling as
+        // written no event path is under the kb, so nothing is indexed and a
+        // batch finishes without taking the db.
+        let watch_kb = kb.kb.canonicalize().unwrap();
         let (ts, handles) = start_writer_for_test(
-            TestKb::new(case.name),
+            kb,
             StartOpts {
                 batch_probe: Some(Arc::clone(&probe)),
                 debounce_ms: Some(100),
+                kb_path: Some(watch_kb),
                 ..Default::default()
             },
         );

@@ -10721,7 +10721,12 @@ mod tests {
     async fn a_stop_during_a_batch_waits_for_that_batch_to_finish() {
         use std::sync::atomic::Ordering::SeqCst;
         let kb = i549_kb("groove-watcher-until-mid-batch");
-        let (state, probe, armed) = probed_state(&kb.0);
+        // The canonical kb, as `groove serve` hands the watcher one. On macOS
+        // the temp dir is under `/var`, a link to `/private/var`, and FSEvents
+        // names every path under the latter: against the spelling as written
+        // the write is not under the kb, and its batch finishes without
+        // taking the embedder.
+        let (state, probe, armed) = probed_state(&kb.0.canonicalize().unwrap());
         let embedder = Arc::clone(&state.embedder);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
