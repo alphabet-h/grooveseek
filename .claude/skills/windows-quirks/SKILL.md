@@ -427,7 +427,7 @@ subagent に cargo を打たせる指示に貼る:
 - `run_in_background` を使わず foreground + timeout
 - status file は手順ごとに追記させる (途中で落ちても、続きを file から拾える)
 
-全体 test や cold build を打たせる時は、これに 5 点目が付く (script で段に分けて 1 段ずつ打つ。skill `house-rules` の cargo の項)。
+全体 test (cold な target からの build を含む) を打たせる時は、これに 5 点目が付く (script で段に分けて 1 段ずつ打つ。skill `house-rules` の cargo の項)。
 
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
 
