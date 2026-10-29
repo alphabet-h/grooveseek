@@ -3,7 +3,8 @@
 - Status: accepted
 - Date: 2026-10-29
 - Deciders: project owner
-- Applies to: v1.22.0 (PR #TBD; the serve side follows in a later PR)
+- Applies to: v1.22.0 for `groove index` and the read-only commands (PR #TBD);
+  `groove serve` takes part from a later release
 
 ## Context and problem
 
@@ -101,6 +102,14 @@ The three designs were scored by three reviewers on five axes, 10 points each
 
 ## Decision
 
+**What v1.22.0 ships.** Only `groove index` takes the lock, and only the
+read-only commands (`status`, `search`, `graph`, `doctor`, `eval`, `tune`) open
+the database with `query_only`. `groove serve` does not take part yet: it opens
+the database writable without the lock, as before, so a `groove index` can
+still run beside it on the same index and both can write. Where the bullets
+and consequences below describe a server, they are the design for the release
+in which `groove serve` takes the lock, not the behaviour of v1.22.0.
+
 - **The lock.** `.groove.db.writer-lock` beside the database (the database's
   path plus `.writer-lock`), 0 bytes, locked exclusively with std's
   `File::try_lock` (`flock` on Unix, `LockFileEx` on Windows). It is **never
@@ -128,8 +137,9 @@ The three designs were scored by three reviewers on five axes, 10 points each
   counter flush and checkpoint, before the lock is: the function boundary fixes
   the order, where a `drop(lease)` added to the caller later would quietly
   break it.
-- **Readers.** `status`, `search`, `graph`, `doctor`, `eval`, `tune` and a
-  server that is not the writer open the database with `PRAGMA query_only`, so
+- **Readers.** `status`, `search`, `graph`, `doctor`, `eval`, `tune` (and, once
+  `groove serve` takes part, a server that is not the writer) open the database
+  with `PRAGMA query_only`, so
   an unintended write fails instead of landing. A one-time write a reader needs
   (a schema upgrade, recording the embedding model, the context mode) runs under
   a short lock with the role `migration`, waiting up to 2 s; if the lock is
@@ -141,7 +151,8 @@ The three designs were scored by three reviewers on five axes, 10 points each
   `open_or_replace_corrupt_with`), so a scan of the source can check that the
   binary opens a writer nowhere else. The library's `Database::open` keeps its
   meaning: writable, no lock, one writer is the caller's responsibility.
-- **`groove serve` with its watcher on** takes the lock at startup, before the
+- **`groove serve` with its watcher on** (from a later release; see the start
+  of this section) takes the lock at startup, before the
   model download, and keeps it until shutdown. A server that cannot take it
   stays a reader until it is restarted: no watcher, it refuses the MCP tool
   `rebuild_index`, and it says so on every `search` and `rebuild_index` reply
@@ -152,9 +163,14 @@ The three designs were scored by three reviewers on five axes, 10 points each
 
 ## Consequences
 
+The consequences that involve a server holding or waiting for the lock begin
+with the release in which `groove serve` takes part; in v1.22.0 a server does
+neither.
+
 - **`groove index` has exit code `3`**: another groove process is writing the
-  index, or `--wait` ran out. A hook or timer that ran `groove index` beside a
-  watching server, which used to run alongside it, now stops with `3`.
+  index, or `--wait` ran out. Once `groove serve` takes the lock, a hook or
+  timer that runs `groove index` beside a watching server, which used to run
+  alongside it, stops with `3`; in v1.22.0 it still runs beside the server.
 - **A server that started while another process held the lock does not write
   until it is restarted.** Files deleted meanwhile keep their rows until the
   restart and a rebuild after it.

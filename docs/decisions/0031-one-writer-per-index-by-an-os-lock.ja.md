@@ -3,7 +3,8 @@
 - Status: accepted
 - Date: 2026-10-29
 - Deciders: プロジェクトオーナー
-- Applies to: v1.22.0 (PR #TBD。serve の側は後の PR)
+- Applies to: v1.22.0 では `groove index` と読む command (PR #TBD)。
+  `groove serve` が加わるのは後の版
 
 ## 背景と課題
 
@@ -84,6 +85,12 @@ run の間にもう一方の process が書いた、実在する file の row �
 
 ## 決定
 
+**v1.22.0 で入るもの。** lock を取るのは `groove index` だけで、DB を `query_only` で開くのは
+読む command (`status`・`search`・`graph`・`doctor`・`eval`・`tune`) だけである。`groove serve`
+はまだ加わらない: これまでどおり lock を取らずに DB を書ける形で開くので、同じ索引に対して
+`groove index` が並んで走れ、両方が書ける。下の箇条と結果のうち server について書いた所は、
+`groove serve` が lock を取る版の設計であって、v1.22.0 の挙動ではない。
+
 - **lock。** DB の隣の `.groove.db.writer-lock` (DB の path に `.writer-lock` を足したもの)。
   0 byte で、std の `File::try_lock` (Unix は `flock`、Windows は `LockFileEx`) で排他に lock する。
   **消さない**: 消すと、古い file を待っていた process と新しい file を作った process がそれぞれ
@@ -104,8 +111,8 @@ run の間にもう一方の process が書いた、実在する file の row �
   不明。run の本体は lock を受け取る 1 つの関数に置き、書ける接続 (counter の書き出しと checkpoint
   を含む) が lock より先に drop されるようにする: 順序を関数の境界で固定する。呼び出し側に後から
   `drop(lease)` を足すと黙って崩れる形にはしない。
-- **読む側。** `status`・`search`・`graph`・`doctor`・`eval`・`tune` と書き手でない server は、
-  DB を `PRAGMA query_only` で開き、意図しない書き込みを、書かれる代わりに Err にする。読む側に
+- **読む側。** `status`・`search`・`graph`・`doctor`・`eval`・`tune` (と、`groove serve` が
+  加わった後は書き手でない server) は、DB を `PRAGMA query_only` で開き、意図しない書き込みを、書かれる代わりに Err にする。読む側に
   要る 1 回きりの書き込み (schema の upgrade、embedding model の記録、context mode) は role
   `migration` の短い lock の下で行い、最大 2 s 待つ。lock が取られていれば、諦める前に 1 回だけ
   読み直す (その間に holder が同じ書き込みを済ませ得る)。`query_only` に断られた書き込みを他の
@@ -115,7 +122,7 @@ run の間にもう一方の process が書いた、実在する file の row �
   `open_or_replace_corrupt_with`)。source の走査で、binary がそれ以外の場所で書き手を開かない
   ことを確かめられる。library の `Database::open` は意味を変えない: 書けて、lock を取らず、
   書き手を 1 つにするのは呼び出し側の責務。
-- **watcher つきの `groove serve`** は起動時に、model の DL の前に lock を取り、終了まで持つ。
+- **watcher つきの `groove serve`** (後の版から。この節の冒頭を参照) は起動時に、model の DL の前に lock を取り、終了まで持つ。
   取れなかった server は restart まで reader のまま: watcher を持たず、MCP の tool
   `rebuild_index` を断り、そのことを `search` と `rebuild_index` の応答ごと (`writer_notice`) と
   `/api/admin/status` で知らせる。`--no-watch` の server は `rebuild_index` の呼び出しごとにだけ
@@ -124,9 +131,12 @@ run の間にもう一方の process が書いた、実在する file の row �
 
 ## 結果と代償
 
+server が lock を持つ・待つことに関わる結果は、`groove serve` が加わる版から始まる。v1.22.0 の
+server はどちらもしない。
+
 - **`groove index` に exit code `3` ができた**: 他の groove process が索引に書いている、または
-  `--wait` の期限が切れた。watch する server と並んで走っていた hook や timer の `groove index` は、
-  今後 `3` で止まる。
+  `--wait` の期限が切れた。`groove serve` が lock を取るようになると、watch する server と並んで
+  走っていた hook や timer の `groove index` は `3` で止まる。v1.22.0 ではまだ server と並んで走る。
 - **他の process が lock を持っている間に起動した server は、restart まで書かない。** その間に
   削除した file の row は、restart とその後の rebuild まで残る。
 - **watch する server の初回の model の DL の間** (BGE-M3 は約 2.3 GB)、同じ索引への
