@@ -124,9 +124,11 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
 ## 運用上の注意
 
 - **単一 writer**。process の中では `serve` が index への唯一の
-  `Mutex<Database>` を保持し、process の間では、動いている間ずっと DB の隣の
+  `Mutex<Database>` を保持し、process の間では、watcher が動いている間 DB の隣の
   `.groove.db.writer-lock` に OS のロックを持つ (v1.22.0+、
   [ADR-0031](../../../../docs/decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。
+  その間に起動した 2 つ目の server は reader で、`rebuild_index` を断る
+  ([behavior.ja.md](../../../../docs/behavior.ja.md) を参照)。
   サーバ側 watcher が `kb_path` 配下の編集を拾って増分再インデックス。
   クライアントは決して書き込まない
 - **並行性**。rmcp の Streamable HTTP は接続レベルでは並列だが、`search`

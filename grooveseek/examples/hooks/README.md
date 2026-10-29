@@ -131,8 +131,8 @@ hook on every edit.
 ## Notes
 
 - **Concurrency**: only one groove process writes an index at a time. A
-  `groove serve` whose watcher is on (the default) holds that writer lease for
-  as long as it runs, and it already picks up every edit, so **do not pair
+  `groove serve` whose watcher is on (the default) holds that writer lease
+  while its watcher runs, and it already picks up every edit, so **do not pair
   this hook with it**: each `groove index` the hook starts would wait out
   `GROOVE_INDEX_WAIT` seconds on every edit and then exit 3. Drop the hook in
   that setup. Use it beside a server started with `--no-watch`, or with no

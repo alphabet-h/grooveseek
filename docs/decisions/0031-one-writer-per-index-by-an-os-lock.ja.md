@@ -149,6 +149,9 @@ run の間にもう一方の process が書いた、実在する file の row �
 - **助言は持ち主で変わる**: 持ち主が同じナレッジベースを watch する server のときだけ、索引を
   最新に保つと書き、その `rebuild_index` を勧める。1 回きりの run、別のナレッジベース、不明の
   ときは勧めない。今の持ち主は知らせのたびに json から読み直す。
+- **watcher が終了処理の外で止まった server は、その時点で lock を手放す**。終了を待たず、
+  restart まで `writer_notice` と `/api/admin/status` でそのことを知らせる。決定の「終了まで持つ」は、
+  watcher が動いている間に絞られる。
 - **watcher が止まった書き手の server も、自分の `rebuild_index` は断らない**: その設定は watcher
   が止まる前に索引を書いていたものと同じで、断ると restart の他の唯一の手を奪う。断るかは、
   引き継ぎと同じ後の判断に回した。

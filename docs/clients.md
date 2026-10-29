@@ -95,7 +95,7 @@ To use one knowledge base from several sessions and keep it current, let one ser
 ## Keeping the index fresh via PostToolUse hook
 If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write.
 
-**Use the hook only when the server runs without its file watcher** (`groove serve --no-watch`, or `[watch].enabled = false`). A server whose watcher is on — the default — already picks up every edit (see [Live-sync via file watcher](#live-sync-via-file-watcher)), and for as long as it runs it holds the index's writer lease: only one groove process writes an index at a time. Paired with that server, the hook's `groove index` exits 3 on every edit. Drop the hook in that setup. Minimal form:
+**Use the hook only when the server runs without its file watcher** (`groove serve --no-watch`, or `[watch].enabled = false`). A server whose watcher is on — the default — already picks up every edit (see [Live-sync via file watcher](#live-sync-via-file-watcher)), and the writing server holds the index's writer lease while its watcher runs: only one groove process writes an index at a time (a server that started as a reader holds none and refuses `rebuild_index`; see [behavior.md](behavior.md)). Paired with that server, the hook's `groove index` exits 3 on every edit. Drop the hook in that setup. Minimal form:
 
 <!-- groove-pin: posttooluse-hook-snippet -->
 ```json
@@ -263,7 +263,7 @@ curl http://127.0.0.1:3100/api/admin/status
 }
 ```
 
-`writer` (v1.22.0+) is the index's writer lock as this server sees it ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). A server that writes the index holds it (`held: true`). A server that started while another process held it is a reader until it is restarted: `held: false`, `reader: true`, and `reader_notice` carries the same text as the `writer_notice` of its MCP replies. `watch_error` is set while the watcher cannot register a watch, and `watcher_stopped` once the watcher has stopped outside shutdown.
+`writer` (v1.22.0+) is the index's writer lock as this server sees it ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md)). A server that writes the index holds it (`held: true`). A server that started while another process held it, or while the lock could not be taken (an I/O error on the lock file), is a reader until it is restarted: `held: false`, `reader: true`, and `reader_notice` carries the same text as the `writer_notice` of its MCP replies. `watch_error` is set while the watcher cannot register a watch, and is kept as it was if the watcher then stops; `watcher_stopped` is set once the watcher has stopped outside shutdown, and that server releases the lock.
 
 > **`kb.path` was removed.** It carried the knowledge base's absolute path, so
 > on Windows the payload — and the status band that printed it — read

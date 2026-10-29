@@ -144,7 +144,7 @@ max_chunk_chars = 3500
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
 # 増分再インデックスされる。手動編集 / `git pull` / 外部スクリプト /
 # Claude による編集をカバーする。PostToolUse hook とは組まない: watch する
-# server は動いている間ずっと索引の書き手の lease を持つので、hook の
+# server は watcher が動いている間、索引の書き手の lease を持つので、hook の
 # `groove index` は編集のたびに exit 3 になる。hook を使うのは watcher を
 # 切ったとき (`--no-watch`) だけ。CLI の
 # `--no-watch` / `--debounce-ms` で上書き可能。セクション省略時は

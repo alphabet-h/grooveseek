@@ -59,7 +59,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   The bundled `rebuild-on-edit.sh` waits up to `GROOVE_INDEX_WAIT` seconds (default 30) for
   another writer and returns 3 when the wait runs out, so beside a watching server it would stall
   every edit for that long.
-- **A second `groove serve` with its watcher on is a reader.** It answers searches but does not
+- **A `groove serve` with its watcher on that starts while another process holds the lock is a
+  reader** (a second server, or a first one started during a one-off `groove index`). It answers searches but does not
   update the index and refuses `rebuild_index`, and it stays a reader until it is restarted, even
   after the writer exits: changes made meanwhile are not reflected, a deleted file keeps showing
   up in search, and changes made before the restart wait for a rebuild after it. It warns once on

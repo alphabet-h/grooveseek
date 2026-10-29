@@ -154,7 +154,7 @@ max_chunk_chars = 3500
 # under kb_path are detected and the affected files are re-indexed incrementally
 # within `debounce_ms`: manual edits, `git pull`, external scripts, and edits
 # Claude makes. Not paired with the PostToolUse hook: a watching server holds
-# the index's writer lease while it runs, so the hook's `groove index` exits 3
+# the index's writer lease while its watcher runs, so the hook's `groove index` exits 3
 # on every edit. Use the hook only when the watcher is off (`--no-watch`).
 # CLI `--no-watch` / `--debounce-ms` overrides. Omitting the section keeps
 # watcher on with a 500 ms debounce.

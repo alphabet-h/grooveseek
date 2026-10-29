@@ -95,7 +95,7 @@ reader であることは、その server の `search` と `rebuild_index` の�
 ## PostToolUse hook による index 鮮度保守
 Claude Code セッション内部からナレッジベースを編集する (または Markdown を書く skill を実行する) 場合、MCP サーバは再構築されるまで古い結果を返し続ける。`.claude/settings.json` の `PostToolUse` hook で書込み後に自動再 index できる。
 
-**hook を使うのは、server をファイルウォッチャなしで動かすときだけ** (`groove serve --no-watch`、または `[watch].enabled = false`)。watcher が有効な (既定の) server は編集をすべて自分で拾い ([ライブ同期 (file watcher)](#ライブ同期-file-watcher) 参照)、動いている間ずっと索引の書き手の lease を持つ: 1 つの索引を書く groove の process は同時に 1 つだけ。その server と組むと、hook の `groove index` は編集のたびに exit 3 になる。その構成では hook を外す。最小形:
+**hook を使うのは、server をファイルウォッチャなしで動かすときだけ** (`groove serve --no-watch`、または `[watch].enabled = false`)。watcher が有効な (既定の) server は編集をすべて自分で拾い ([ライブ同期 (file watcher)](#ライブ同期-file-watcher) 参照)、書き手の server は watcher が動いている間、索引の書き手の lease を持つ: 1 つの索引を書く groove の process は同時に 1 つだけ (reader として起動した server は lease を持たず `rebuild_index` を断る。[behavior.ja.md](behavior.ja.md) を参照)。その server と組むと、hook の `groove index` は編集のたびに exit 3 になる。その構成では hook を外す。最小形:
 
 <!-- groove-pin: posttooluse-hook-snippet -->
 ```json
@@ -257,7 +257,7 @@ curl http://127.0.0.1:3100/api/admin/status
 }
 ```
 
-`writer` (v1.22.0+) は、この server から見た索引の書き手のロック ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。索引を書く server はそれを持つ (`held: true`)。他の process が持っている間に起動した server は restart まで reader で、`held: false`、`reader: true` になり、`reader_notice` に MCP の応答の `writer_notice` と同じ文が入る。`watch_error` は watcher が watch を登録できない間、`watcher_stopped` は watcher が終了処理の外で止まった後に入る。
+`writer` (v1.22.0+) は、この server から見た索引の書き手のロック ([ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md))。索引を書く server はそれを持つ (`held: true`)。他の process が持っている間、またはロックが取れない状態 (lock file の I/O エラー) で起動した server は restart まで reader で、`held: false`、`reader: true` になり、`reader_notice` に MCP の応答の `writer_notice` と同じ文が入る。`watch_error` は watcher が watch を登録できない間に入り、その後 watcher が止まってもその時の値のまま残る。`watcher_stopped` は watcher が終了処理の外で止まった後に入り、その server はロックを手放す。
 
 > **`kb.path` は削除した。** ナレッジベースの絶対パスを持っていたので、Windows では
 > payload も、それを表示していた状態帯も `C:\Users\<名前>\...` と読めていた。
@@ -281,7 +281,7 @@ peer で、既定の `Host` も allow-list に載るため、`/ui` を proxy す
 
 - **既定 on**。`groove.toml` の `[watch].enabled = false` または CLI `--no-watch` で無効化
 - **Debounce** は既定 500 ms。`[watch].debounce_ms` または `--debounce-ms` で調整
-- **PostToolUse hook とは組まない**。hook の `groove index` は別 process で、この server は watch している間ずっと索引の書き手の lease を持つので、hook は編集のたびに exit 3 になる。その編集は watcher が拾うので hook を外す ([PostToolUse hook による index 鮮度保守](#posttooluse-hook-による-index-鮮度保守) 参照)。この server の中では、watcher と MCP `rebuild_index` が同じ `Mutex<Database>` / `Mutex<Embedder>` をロックするので Rust 層で直列化される
+- **PostToolUse hook とは組まない**。hook の `groove index` は別 process で、この server は watch している間、索引の書き手の lease を持つので、hook は編集のたびに exit 3 になる。その編集は watcher が拾うので hook を外す ([PostToolUse hook による index 鮮度保守](#posttooluse-hook-による-index-鮮度保守) 参照)。この server の中では、watcher と MCP `rebuild_index` が同じ `Mutex<Database>` / `Mutex<Embedder>` をロックするので Rust 層で直列化される
 - **拡張子対応**。watcher は `rebuild_index` と同じ Parser registry を共有し、`[parsers].enabled` で有効化された拡張子のファイルのみを再インデックスする。他イベントは破棄
 - **耐障害性**。watcher タスク内部のエラーは stderr にログされ (黙殺しない)、MCP サーバは動作し続ける。ローカルディスクを想定 — WSL / SMB / ネットワーク共有上の inotify は保証外
 - **バックプレッシャ (v0.6.0+)**。debouncer から indexer task へのブリッジは bounded な 64 batch channel。consumer が追い付けない場合 (embedder が一時停止中など) は無限に queue が伸びることはなく、超過 batch を warn ログ付きで drop する。バースト後に `rebuild_index` を手動実行で取り漏らしを補える

@@ -187,6 +187,10 @@ The three designs were scored by three reviewers on five axes, 10 points each
   and point to its `rebuild_index`. For a one-off run, another knowledge base,
   or an unknown holder it does not. The current holder is read from the json
   again for each message.
+- **A server whose watcher stopped outside shutdown releases the lock then**,
+  without waiting for shutdown, and says so in `writer_notice` and
+  `/api/admin/status` until it is restarted. This narrows "keeps it until
+  shutdown" in the Decision to the time its watcher runs.
 - **A writing server whose watcher stopped still accepts its own
   `rebuild_index`**: its configuration is the one that wrote the index before
   the watcher stopped, and refusing would take away the only remedy short of a
