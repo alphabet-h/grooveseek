@@ -4,10 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use crate::db::Database;
 use crate::poison::recover;
-use crate::writer_lease::{HolderInfo, HolderRelation, LeaseError, Role, WriterLease};
+use crate::writer_lease::{
+    HEARTBEAT_FRESH, HolderInfo, HolderRelation, LeaseError, Role, WriterLease, holder_relation,
+};
 
 /// The label a poisoned inner mutex is reported under.
 const INNER: &str = "writer slot";
@@ -209,9 +212,163 @@ pub struct WatchErrorCause {
 /// The watcher's claim went down outside shutdown; `error` is its
 /// task's error, `None` after a panic.
 pub struct WatcherStopped {
-    // Read by the status of a later task of #259 PR2, and by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     error: Option<String>,
+}
+
+/// What admin status reports about the writer lease (ADR-0031). An
+/// unmanaged slot reports `held: false` and nothing else.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriterStatus {
+    pub held: bool,
+    /// The role writer.json names, while the lease is held.
+    pub role: Option<String>,
+    /// When the lease was taken (RFC3339), while it is held.
+    pub held_since: Option<String>,
+    pub reader: bool,
+    pub reader_notice: Option<String>,
+    /// Kept after the watcher stopped, as it was when it stopped.
+    pub watch_error: Option<String>,
+    pub watcher_stopped: Option<String>,
+}
+
+/// The state the notices are worded from, copied out of the inner mutex.
+struct NoticeState {
+    reader: Option<ReaderReason>,
+    /// `Some(error)` once the watcher stopped; see [`WatcherStopped`].
+    stopped: Option<Option<String>>,
+    watch_error: Option<WatchErrorCause>,
+    lease: Option<(Role, SystemTime)>,
+}
+
+/// The three notices a slot can carry, worded once for both
+/// [`WriterSlot::notice`] and [`WriterSlot::status`].
+struct Notices {
+    reader: Option<String>,
+    watcher_stopped: Option<String>,
+    watch_error: Option<String>,
+}
+
+/// `<db>.writer.json` as the notices name it.
+fn info_display(db: &Path) -> String {
+    WriterLease::info_path_for(db).display().to_string()
+}
+
+/// The notice of a reader server: why it does not update the index, who
+/// kept it then, and what writer.json says now (ADR-0031). It never names
+/// `rebuild_index`: a reader refuses it.
+fn reader_notice_text(
+    db: &Path,
+    own_kb: &Path,
+    reason: &ReaderReason,
+    holder_now: Option<&HolderInfo>,
+    now: SystemTime,
+) -> String {
+    match reason {
+        ReaderReason::Busy {
+            holder_at_start,
+            relation,
+        } => {
+            let info = info_display(db);
+            let at_start = match holder_at_start {
+                Some(h) => format!(
+                    "pid {} per {info}, which can be stale; {}, kb {}",
+                    h.pid,
+                    h.role.as_str(),
+                    h.kb_path
+                ),
+                None => format!("no {info} was readable"),
+            };
+            let keeper = match relation {
+                HolderRelation::WatchingSameKb => "That process is a server for this same knowledge base: while it runs and its watcher is watching files, it keeps the index current; after it exits, new, edited and deleted files are not reflected until this server is restarted.".to_string(),
+                HolderRelation::OneOffRun(role) => format!(
+                    "That process was a one-off {} run that does not watch files, so new, edited and deleted files are not reflected until this server is restarted, even while it runs.",
+                    role.as_str()
+                ),
+                HolderRelation::OtherKb(kb) => format!(
+                    "That process works on a different knowledge base (kb {kb}) that shares this index file, so nothing keeps this server's knowledge base (kb {}) current: new, edited and deleted files in it are not reflected until that process exits and this server is restarted.",
+                    own_kb.display()
+                ),
+                HolderRelation::Unknown => "Whether that process keeps this knowledge base current cannot be told, so treat new, edited and deleted files as not reflected until this server is restarted.".to_string(),
+            };
+            let now_text = match holder_now {
+                None => format!("Now there is no {info}, so that process has probably exited."),
+                Some(h) => match holder_relation(Some(h), own_kb) {
+                    // Staleness first: a killed server leaves a `serve` json behind.
+                    HolderRelation::WatchingSameKb if !h.heartbeat_fresh(now) => format!(
+                        "Now {info} names pid {}, a server watching this same knowledge base (since {}), but its heartbeat is older than {}s, so that process has probably exited without removing the file; treat new, edited and deleted files as not reflected until this server is restarted.",
+                        h.pid,
+                        h.started_at,
+                        HEARTBEAT_FRESH.as_secs()
+                    ),
+                    HolderRelation::WatchingSameKb if h.keeps_current(now) => format!(
+                        "Now {info} names pid {}, a server watching this same knowledge base (since {}): while it runs, it keeps the index current, so searches here see its changes and this server does not need a restart for that. The file can be stale: a process that was killed leaves it behind.",
+                        h.pid, h.started_at
+                    ),
+                    HolderRelation::WatchingSameKb => format!(
+                        "Now {info} names pid {}, a server for this same knowledge base (since {}), but it does not report that its watcher is watching files right now (for example, it could not register a watch and is retrying), so new, edited and deleted files are not being indexed while that lasts. The file can be stale: a process that was killed leaves it behind.",
+                        h.pid, h.started_at
+                    ),
+                    _ => format!(
+                        "Now {info} names pid {} ({}, since {}), which can be stale: a process that was killed leaves the file behind.",
+                        h.pid,
+                        h.role.as_str(),
+                        h.started_at
+                    ),
+                },
+            };
+            format!(
+                "this server is not updating the index at {}: when it started, another groove process held the writer lock ({at_start}). Searches still work and return what has been indexed. {keeper} This server cannot rebuild the index itself. After a restart while no other process holds the lock, it writes the index and watches files, but changes made before the restart need one rebuild after the restart. {now_text}",
+                db.display()
+            )
+        }
+        ReaderReason::Io { lock_path, error } => format!(
+            "this server is not updating the index at {}: it could not take the writer lock at {} ({error}) when it started. Searches still work and return what has been indexed. New, edited and deleted files are not reflected until the lock works and this server is restarted. This server cannot rebuild the index itself.",
+            db.display(),
+            lock_path.display()
+        ),
+    }
+}
+
+/// The notice of a server whose watcher stopped outside shutdown, kept
+/// until restart (ADR-0031). It names another server that keeps the index
+/// current only while this slot holds no lease and that server reports a
+/// running watcher.
+fn watcher_stopped_text(
+    db: &Path,
+    own_kb: &Path,
+    error: Option<&str>,
+    lease_held: bool,
+    holder_now: Option<&HolderInfo>,
+    now: SystemTime,
+) -> String {
+    let why = error.unwrap_or("the watcher task ended without finishing");
+    let mut text = format!(
+        "this server stopped watching files for {} ({why}); new, edited and deleted files are not reflected until this server is restarted.",
+        own_kb.display()
+    );
+    if let Some(h) = holder_now
+        && !lease_held
+        && h.keeps_current(now)
+        && holder_relation(Some(h), own_kb) == HolderRelation::WatchingSameKb
+    {
+        text.push_str(&format!(
+            " Now {} names pid {}, another server watching this same knowledge base (since {}): while it runs, it keeps the index current, so searches here see its changes. The file can be stale: a process that was killed leaves it behind.",
+            info_display(db),
+            h.pid,
+            h.started_at
+        ));
+    }
+    text
+}
+
+/// The notice of a writer whose watcher cannot register its watch (ADR-0031).
+fn watch_error_text(cause: &WatchErrorCause) -> String {
+    format!(
+        "the watcher could not watch {}: {} (next retry in {}s); new, edited and deleted files are not being indexed until it succeeds. Fix the cause (on Linux, for example, raise fs.inotify.max_user_watches), or call rebuild_index to index what changed meanwhile.",
+        cause.kb.display(),
+        cause.error,
+        cause.retry_secs
+    )
 }
 
 /// A live claim. `release` it with the database guard held; dropped without
@@ -605,6 +762,88 @@ impl WriterSlot {
     /// Whether this server started as a reader.
     pub fn is_reader(&self) -> bool {
         self.lock().reader.is_some()
+    }
+
+    /// What admin status shows about the lease and its notices (ADR-0031).
+    pub fn status(&self) -> WriterStatus {
+        let Some((state, notices)) = self.notices() else {
+            return WriterStatus {
+                held: false,
+                role: None,
+                held_since: None,
+                reader: false,
+                reader_notice: None,
+                watch_error: None,
+                watcher_stopped: None,
+            };
+        };
+        WriterStatus {
+            held: state.lease.is_some(),
+            role: state.lease.map(|(role, _)| role.as_str().to_string()),
+            held_since: state
+                .lease
+                .map(|(_, at)| chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()),
+            reader: state.reader.is_some(),
+            reader_notice: notices.reader,
+            watch_error: notices.watch_error,
+            watcher_stopped: notices.watcher_stopped,
+        }
+    }
+
+    /// The one notice a `search` or `rebuild_index` response carries: the
+    /// reader's, else the stopped watcher's, else the watch error's
+    /// (ADR-0031). A stopped watcher comes before its last watch error,
+    /// which admin status still keeps.
+    pub fn notice(&self) -> Option<String> {
+        let (_, n) = self.notices()?;
+        n.reader.or(n.watcher_stopped).or(n.watch_error)
+    }
+
+    /// Copy the state out of the inner mutex, then word every notice with it
+    /// released: writer.json is read outside the mutex, and only when a
+    /// notice names its holder. `None` for an unmanaged slot.
+    fn notices(&self) -> Option<(NoticeState, Notices)> {
+        let SlotMode::Managed {
+            db_path, kb_path, ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        let state = {
+            let inner = self.lock();
+            NoticeState {
+                reader: inner.reader.clone(),
+                stopped: inner.watcher_stopped.as_ref().map(|w| w.error.clone()),
+                watch_error: inner.watch_error.clone(),
+                lease: inner.lease.as_ref().map(|l| (l.role(), l.acquired_at())),
+            }
+        };
+        let needs_holder =
+            matches!(state.reader, Some(ReaderReason::Busy { .. })) || state.stopped.is_some();
+        let holder_now = if needs_holder {
+            WriterLease::read_holder(db_path)
+        } else {
+            None
+        };
+        let now = SystemTime::now();
+        let notices = Notices {
+            reader: state
+                .reader
+                .as_ref()
+                .map(|r| reader_notice_text(db_path, kb_path, r, holder_now.as_ref(), now)),
+            watcher_stopped: state.stopped.as_ref().map(|error| {
+                watcher_stopped_text(
+                    db_path,
+                    kb_path,
+                    error.as_deref(),
+                    state.lease.is_some(),
+                    holder_now.as_ref(),
+                    now,
+                )
+            }),
+            watch_error: state.watch_error.as_ref().map(watch_error_text),
+        };
+        Some((state, notices))
     }
 
     /// Whether the watcher's stop is recorded, and its error: `None` = not
@@ -1132,5 +1371,419 @@ mod tests {
         slot.release(g, &db);
         assert_eq!(db.query_only_for_test(), 0);
         assert!(slot.watch_status_callback(1).is_none());
+    }
+
+    // --- The notice texts (ADR-0031) ---
+
+    /// A temp dir with `kb/`; the db path beside it need not exist for the texts.
+    struct TextLayout {
+        dir: TempDir,
+        kb: PathBuf,
+        db: PathBuf,
+    }
+
+    impl TextLayout {
+        fn new(prefix: &str) -> Self {
+            let dir = TempDir::new(prefix);
+            let kb = dir.path().join("kb");
+            std::fs::create_dir_all(&kb).unwrap();
+            let db = dir.path().join(".groove.db");
+            Self { dir, kb, db }
+        }
+        fn canonical_kb(&self) -> String {
+            std::fs::canonicalize(&self.kb)
+                .unwrap()
+                .display()
+                .to_string()
+        }
+        /// A sibling of `kb/` that exists, canonicalized.
+        fn other_kb(&self) -> String {
+            let other = self.dir.path().join("other");
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::canonicalize(&other).unwrap().display().to_string()
+        }
+    }
+
+    /// A writer.json as a holder writes it; `age` is how old its heartbeat is
+    /// (`None` = no heartbeat field).
+    fn holder_info(
+        role: Role,
+        kb: &str,
+        age: Option<i64>,
+        watching: Option<bool>,
+    ) -> crate::writer_lease::HolderInfo {
+        crate::writer_lease::HolderInfo {
+            pid: 4242,
+            role,
+            started_at: "2026-01-01T00:00:00+00:00".to_string(),
+            version: "0.0.1".to_string(),
+            kb_path: kb.to_string(),
+            heartbeat_at: age
+                .map(|s| (chrono::Utc::now() - chrono::Duration::seconds(s)).to_rfc3339()),
+            watching,
+        }
+    }
+
+    fn busy(
+        at_start: Option<&crate::writer_lease::HolderInfo>,
+        relation: HolderRelation,
+    ) -> ReaderReason {
+        ReaderReason::Busy {
+            holder_at_start: at_start.cloned(),
+            relation,
+        }
+    }
+
+    #[test]
+    fn reader_notice_for_a_server_on_this_kb_says_it_keeps_the_index_current() {
+        let l = TextLayout::new("txt-same");
+        let h = holder_info(Role::Serve, &l.canonical_kb(), Some(0), Some(true));
+        let reason = busy(Some(&h), HolderRelation::WatchingSameKb);
+        let t = reader_notice_text(&l.db, &l.kb, &reason, Some(&h), SystemTime::now());
+        assert!(
+            t.contains("not updating the index")
+                && t.contains("keeps the index current")
+                && t.contains("a process that was killed"),
+            "{t}"
+        );
+        assert!(
+            t.contains("cannot rebuild")
+                && t.contains("after the restart")
+                && !t.contains("rebuild_index"),
+            "{t}"
+        );
+        assert!(t.contains("does not need a restart for that"), "{t}");
+        assert!(
+            !t.contains("which can be stale: a process that was killed"),
+            "{t}"
+        );
+        assert!(t.contains("pid 4242 per"), "{t}");
+    }
+
+    #[test]
+    fn reader_notice_for_a_one_off_holder_never_says_it_keeps_the_index_current() {
+        let l = TextLayout::new("txt-oneoff");
+        let h = holder_info(Role::Index, &l.canonical_kb(), Some(0), Some(false));
+        let reason = busy(Some(&h), HolderRelation::OneOffRun(Role::Index));
+        let t = reader_notice_text(&l.db, &l.kb, &reason, Some(&h), SystemTime::now());
+        assert!(
+            t.contains("one-off index run")
+                && t.contains("even while it runs")
+                && t.contains("which can be stale: a process that was killed"),
+            "{t}"
+        );
+        assert!(!t.contains("keeps the index current"), "{t}");
+    }
+
+    #[test]
+    fn reader_notice_for_another_kb_names_both_kbs() {
+        let l = TextLayout::new("txt-other");
+        let other = l.other_kb();
+        let h = holder_info(Role::Serve, &other, Some(0), Some(true));
+        let reason = busy(Some(&h), HolderRelation::OtherKb(other.clone()));
+        let t = reader_notice_text(&l.db, &l.kb, &reason, Some(&h), SystemTime::now());
+        assert!(t.contains("different knowledge base"), "{t}");
+        assert!(t.contains(&other), "{t}");
+        assert!(t.contains(&l.kb.display().to_string()), "{t}");
+        assert!(!t.contains("keeps the index current"), "{t}");
+    }
+
+    #[test]
+    fn reader_notice_without_a_holder_at_start_cannot_tell() {
+        let l = TextLayout::new("txt-unknown");
+        let reason = busy(None, HolderRelation::Unknown);
+        let t = reader_notice_text(&l.db, &l.kb, &reason, None, SystemTime::now());
+        assert!(t.contains("cannot be told"), "{t}");
+        assert!(t.contains("was readable"), "{t}");
+    }
+
+    #[test]
+    fn reader_notice_now_says_probably_exited_without_writer_json() {
+        let l = TextLayout::new("txt-gone");
+        let h = holder_info(Role::Serve, &l.canonical_kb(), Some(0), Some(true));
+        let reason = busy(Some(&h), HolderRelation::WatchingSameKb);
+        let t = reader_notice_text(&l.db, &l.kb, &reason, None, SystemTime::now());
+        assert!(t.contains("Now there is no"), "{t}");
+        assert!(t.contains("probably exited"), "{t}");
+        assert!(t.contains("restarted"), "{t}");
+        assert!(!t.contains("does not need a restart for that"), "{t}");
+    }
+
+    #[test]
+    fn reader_notice_now_turns_stale_when_the_heartbeat_is_older_than_15s() {
+        let l = TextLayout::new("txt-stale");
+        let kb = l.canonical_kb();
+        let reason = busy(
+            Some(&holder_info(Role::Serve, &kb, Some(0), Some(true))),
+            HolderRelation::WatchingSameKb,
+        );
+        for age in [Some(60), None] {
+            let h = holder_info(Role::Serve, &kb, age, Some(true));
+            let t = reader_notice_text(&l.db, &l.kb, &reason, Some(&h), SystemTime::now());
+            assert!(t.contains("heartbeat is older than"), "{age:?}: {t}");
+            assert!(t.contains("probably exited"), "{age:?}: {t}");
+            assert!(
+                !t.contains("does not need a restart for that"),
+                "{age:?}: {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn reader_notice_now_says_not_indexed_while_the_holder_does_not_report_watching() {
+        let l = TextLayout::new("txt-notwatching");
+        let kb = l.canonical_kb();
+        let reason = busy(
+            Some(&holder_info(Role::Serve, &kb, Some(0), Some(true))),
+            HolderRelation::WatchingSameKb,
+        );
+        for watching in [Some(false), None] {
+            let h = holder_info(Role::Serve, &kb, Some(0), watching);
+            let t = reader_notice_text(&l.db, &l.kb, &reason, Some(&h), SystemTime::now());
+            assert!(
+                t.contains("does not report that its watcher is watching"),
+                "{watching:?}: {t}"
+            );
+            assert!(
+                t.contains("not being indexed while that lasts"),
+                "{watching:?}: {t}"
+            );
+            assert!(
+                !t.contains("does not need a restart for that"),
+                "{watching:?}: {t}"
+            );
+            assert!(!t.contains("heartbeat is older than"), "{watching:?}: {t}");
+        }
+    }
+
+    #[test]
+    fn reader_notice_matches_a_non_canonical_spelling_of_the_same_kb() {
+        let l = TextLayout::new("txt-spelling");
+        std::fs::create_dir_all(l.kb.join("sub")).unwrap();
+        let spelled = l.kb.join("sub").join("..");
+        let h = holder_info(Role::Serve, &l.canonical_kb(), Some(0), Some(true));
+        let reason = busy(Some(&h), HolderRelation::WatchingSameKb);
+        let t = reader_notice_text(&l.db, &spelled, &reason, Some(&h), SystemTime::now());
+        assert!(t.contains("does not need a restart for that"), "{t}");
+    }
+
+    #[test]
+    fn reader_notice_treats_a_broken_writer_json_as_absent() {
+        let f = fixture("txt-broken");
+        let slot = f.slot();
+        slot.become_reader(ReaderReason::Busy {
+            holder_at_start: None,
+            relation: HolderRelation::Unknown,
+        });
+        std::fs::write(WriterLease::info_path_for(&f.db_path), b"{not json").unwrap();
+        let t = slot.notice().expect("a reader always has a notice");
+        assert!(t.contains("Now there is no"), "{t}");
+        assert!(t.contains("probably exited"), "{t}");
+        let s = slot.status();
+        assert!(s.reader);
+        assert_eq!(s.reader_notice.as_deref(), Some(t.as_str()));
+    }
+
+    #[test]
+    fn io_reader_notice_names_the_lock_path() {
+        let l = TextLayout::new("txt-io");
+        let lock_path = WriterLease::lock_path_for(&l.db);
+        let reason = ReaderReason::Io {
+            lock_path: lock_path.clone(),
+            error: "access denied".to_string(),
+        };
+        let t = reader_notice_text(&l.db, &l.kb, &reason, None, SystemTime::now());
+        assert!(t.contains(&lock_path.display().to_string()), "{t}");
+        assert!(t.contains("could not take the writer lock"), "{t}");
+        assert!(t.contains("access denied"), "{t}");
+        assert!(t.contains("cannot rebuild"), "{t}");
+        assert!(!t.contains("rebuild_index"), "{t}");
+    }
+
+    #[test]
+    fn watcher_stopped_text_names_the_error_or_says_it_ended() {
+        let l = TextLayout::new("txt-stopped");
+        let now = SystemTime::now();
+        let t = watcher_stopped_text(&l.db, &l.kb, Some("boom"), false, None, now);
+        assert!(t.contains("stopped watching files"), "{t}");
+        assert!(t.contains("boom"), "{t}");
+        assert!(!t.contains("ended without finishing"), "{t}");
+        let t = watcher_stopped_text(&l.db, &l.kb, None, false, None, now);
+        assert!(t.contains("ended without finishing"), "{t}");
+
+        let kb = l.canonical_kb();
+        let keeper = holder_info(Role::Serve, &kb, Some(0), Some(true));
+        let t = watcher_stopped_text(&l.db, &l.kb, None, false, Some(&keeper), now);
+        assert!(
+            t.contains("another server watching this same knowledge base"),
+            "{t}"
+        );
+        let t = watcher_stopped_text(&l.db, &l.kb, None, true, Some(&keeper), now);
+        assert!(!t.contains("another server watching"), "{t}");
+        let not_watching = holder_info(Role::Serve, &kb, Some(0), Some(false));
+        let t = watcher_stopped_text(&l.db, &l.kb, None, false, Some(&not_watching), now);
+        assert!(!t.contains("another server watching"), "{t}");
+        let stale = holder_info(Role::Serve, &kb, Some(60), Some(true));
+        let t = watcher_stopped_text(&l.db, &l.kb, None, false, Some(&stale), now);
+        assert!(!t.contains("another server watching"), "{t}");
+        let one_off = holder_info(Role::Index, &kb, Some(0), Some(true));
+        let t = watcher_stopped_text(&l.db, &l.kb, None, false, Some(&one_off), now);
+        assert!(!t.contains("another server watching"), "{t}");
+    }
+
+    #[test]
+    fn watch_error_text_says_could_not_watch_and_has_no_catch_up() {
+        let cause = WatchErrorCause {
+            kb: PathBuf::from("/srv/kb"),
+            error: "no such directory".to_string(),
+            retry_secs: 3,
+        };
+        let t = watch_error_text(&cause);
+        assert!(t.contains("could not watch"), "{t}");
+        assert!(t.contains("no such directory"), "{t}");
+        assert!(t.contains("next retry in 3s"), "{t}");
+        assert!(t.contains("rebuild_index"), "{t}");
+        assert!(!t.contains("catch-up"), "{t}");
+    }
+
+    #[test]
+    fn notice_prefers_reader_then_stopped_then_watch_error() {
+        let f = fixture("txt-priority");
+        let slot = f.slot();
+        assert_eq!(slot.notice(), None);
+        let w = slot.claim(Claimant::Watcher).unwrap();
+        let cause = WatchErrorCause {
+            kb: f.kb.clone(),
+            error: "no such directory".to_string(),
+            retry_secs: 1,
+        };
+        slot.set_watch_error(w.generation(), Some(cause));
+        let n = slot.notice().unwrap();
+        assert!(n.contains("could not watch"), "{n}");
+        assert_eq!(slot.status().watch_error.as_deref(), Some(n.as_str()));
+        slot.set_watcher_exit(w.generation(), "boom".to_string());
+        slot.release(w, &f.db);
+        let n = slot.notice().unwrap();
+        assert!(
+            n.contains("stopped watching files") && n.contains("boom"),
+            "{n}"
+        );
+        let s = slot.status();
+        assert_eq!(s.watcher_stopped.as_deref(), Some(n.as_str()));
+        assert!(
+            s.watch_error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not watch")),
+            "{s:?}"
+        );
+        assert!(!s.held);
+
+        let reader = f.slot();
+        reader.become_reader(busy(None, HolderRelation::Unknown));
+        let n = reader.notice().unwrap();
+        assert!(
+            n.starts_with("this server is not updating the index"),
+            "{n}"
+        );
+    }
+
+    #[test]
+    fn status_of_a_writer_reports_held_role_and_since() {
+        let f = fixture("txt-status");
+        let slot = f.slot();
+        let s = slot.status();
+        assert!(
+            !s.held && s.role.is_none() && s.held_since.is_none(),
+            "{s:?}"
+        );
+        let w = slot.claim(Claimant::Watcher).unwrap();
+        let s = slot.status();
+        assert!(s.held, "{s:?}");
+        assert_eq!(s.role.as_deref(), Some("serve"));
+        let since = s.held_since.clone().expect("held_since");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&since).is_ok(),
+            "{since}"
+        );
+        assert!(!s.reader);
+        assert_eq!(s.reader_notice, None);
+        assert_eq!(s.watch_error, None);
+        assert_eq!(s.watcher_stopped, None);
+        assert_eq!(slot.notice(), None);
+        slot.release(w, &f.db);
+
+        let s = WriterSlot::unmanaged().status();
+        assert!(!s.held && s.role.is_none() && s.held_since.is_none() && !s.reader);
+        assert_eq!(WriterSlot::unmanaged().notice(), None);
+    }
+
+    #[test]
+    fn every_notice_text_is_ascii_for_ascii_paths() {
+        let l = TextLayout::new("txt-ascii");
+        let kb = l.canonical_kb();
+        let other = l.other_kb();
+        let now = SystemTime::now();
+        let holders = [
+            None,
+            Some(holder_info(Role::Serve, &kb, Some(0), Some(true))),
+            Some(holder_info(Role::Serve, &kb, Some(60), Some(true))),
+            Some(holder_info(Role::Serve, &kb, Some(0), None)),
+            Some(holder_info(Role::Index, &kb, Some(0), None)),
+            Some(holder_info(Role::Serve, &other, Some(0), Some(true))),
+        ];
+        let relations = [
+            HolderRelation::WatchingSameKb,
+            HolderRelation::OneOffRun(Role::Rebuild),
+            HolderRelation::OtherKb(other.clone()),
+            HolderRelation::Unknown,
+        ];
+        let mut texts = Vec::new();
+        for h in &holders {
+            for r in &relations {
+                let reason = busy(h.as_ref(), r.clone());
+                texts.push(reader_notice_text(&l.db, &l.kb, &reason, h.as_ref(), now));
+            }
+            for error in [Some("boom"), None] {
+                texts.push(watcher_stopped_text(
+                    &l.db,
+                    &l.kb,
+                    error,
+                    false,
+                    h.as_ref(),
+                    now,
+                ));
+            }
+        }
+        texts.push(reader_notice_text(
+            &l.db,
+            &l.kb,
+            &ReaderReason::Io {
+                lock_path: WriterLease::lock_path_for(&l.db),
+                error: "denied".to_string(),
+            },
+            None,
+            now,
+        ));
+        texts.push(watch_error_text(&WatchErrorCause {
+            kb: l.kb.clone(),
+            error: "gone".to_string(),
+            retry_secs: 2,
+        }));
+        // The words are checked, not the paths the temp dir happens to have.
+        let paths = [
+            WriterLease::info_path_for(&l.db).display().to_string(),
+            WriterLease::lock_path_for(&l.db).display().to_string(),
+            l.db.display().to_string(),
+            l.kb.display().to_string(),
+            kb.clone(),
+            other.clone(),
+        ];
+        for t in texts {
+            let mut words = t.clone();
+            for p in &paths {
+                words = words.replace(p.as_str(), "");
+            }
+            assert!(words.is_ascii(), "{t}");
+        }
     }
 }

@@ -46,7 +46,7 @@ mod writer_slot;
 // The writer lease inside one server (ADR-0031): `run_server` and the handlers
 // reach these by `crate::server::X`.
 pub use writer_slot::{
-    ClaimGuard, Claimant, ReaderReason, WatchErrorCause, WatchStatusFn, WriterSlot,
+    ClaimGuard, Claimant, ReaderReason, WatchErrorCause, WatchStatusFn, WriterSlot, WriterStatus,
 };
 
 // (audit L-1 PR-2) `GET_DOCUMENT_MAX_BYTES` is the one name here that
