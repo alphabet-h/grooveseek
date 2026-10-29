@@ -559,6 +559,36 @@ fn non_utf8_name() -> std::ffi::OsString {
     name
 }
 
+/// Create the directory at the given path, which holds [`non_utf8_name`],
+/// with its parents. Returns false, and the test named `test` skips, only when the file system refuses such a
+/// name with `EILSEQ` (macOS's APFS does). This skip is allowed on CI too:
+/// there such a path cannot exist, so there is nothing to check. Any other
+/// error panics.
+fn create_non_utf8_dir_or_skip(path: &Path, test: &str) -> bool {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => true,
+        Err(e) if refuses_non_utf8_names(&e) => {
+            eprintln!("SKIPPED: {test}: the file system refuses names that are not valid UTF-8");
+            false
+        }
+        Err(e) => panic!("create {}: {e}", path.display()),
+    }
+}
+
+/// Whether `e` is the file system refusing a name for its bytes (`EILSEQ`,
+/// "Illegal byte sequence"). Windows takes an unpaired surrogate, so never.
+fn refuses_non_utf8_names(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EILSEQ)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// (local Codex round 3) `groove index` on a knowledge base whose database
 /// path is not UTF-8 stops before the lease with exit 1 (not the busy 3),
 /// says why in ASCII, and creates neither the lock file nor the database.
@@ -568,7 +598,12 @@ fn index_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothin
     let cache = TempRoot::new("groove-lease-not-utf8-cache");
     let bad = root.path().join(non_utf8_name());
     let kb = bad.join("kb");
-    std::fs::create_dir_all(&kb).expect("create the kb");
+    if !create_non_utf8_dir_or_skip(
+        &kb,
+        "index_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothing",
+    ) {
+        return;
+    }
     std::fs::write(
         kb.join("note.md"),
         "---\ntitle: Note\n---\n\n# Note\n\nEnough content here to stand as a chunk.\n",
@@ -612,7 +647,12 @@ fn search_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothi
     let cache = TempRoot::new("groove-read-not-utf8-cache");
     let bad = root.path().join(non_utf8_name());
     let kb = bad.join("kb");
-    std::fs::create_dir_all(&kb).expect("create the kb");
+    if !create_non_utf8_dir_or_skip(
+        &kb,
+        "search_refuses_a_database_path_that_is_not_utf8_with_exit_1_and_creates_nothing",
+    ) {
+        return;
+    }
     std::fs::write(
         kb.join("note.md"),
         "---\ntitle: Note\n---\n\n# Note\n\nEnough content here to stand as a chunk.\n",

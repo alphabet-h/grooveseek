@@ -633,6 +633,38 @@ pub(crate) fn non_utf8_name() -> std::ffi::OsString {
     name
 }
 
+/// Test helper: create the directory at the given path, which holds a name
+/// that is not valid UTF-8 ([`non_utf8_name`]), with its parents. Returns false, and the test named `test`
+/// skips, only when the file system refuses such a name with `EILSEQ` (macOS's
+/// APFS does). This skip is allowed on CI too: there such a path cannot exist,
+/// so there is nothing to check. Any other error panics.
+#[cfg(test)]
+pub(crate) fn create_non_utf8_dir_or_skip(path: &Path, test: &str) -> bool {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => true,
+        Err(e) if refuses_non_utf8_names(&e) => {
+            eprintln!("SKIPPED: {test}: the file system refuses names that are not valid UTF-8");
+            false
+        }
+        Err(e) => panic!("create {}: {e}", path.display()),
+    }
+}
+
+/// Whether `e` is the file system refusing a name for its bytes (`EILSEQ`,
+/// "Illegal byte sequence"). Windows takes an unpaired surrogate, so never.
+#[cfg(test)]
+fn refuses_non_utf8_names(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EILSEQ)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// Test helper: make `link` a file symlink to `target`. Returns false, and the
 /// test skips, only for Windows' "a required privilege is not held" (os error
 /// 1314: no Developer Mode, not elevated) outside CI. On CI (`CI` set, as
@@ -1475,7 +1507,12 @@ mod tests {
         let dir = TempDir::new("not-utf8");
         let bad = dir.path().join(non_utf8_name());
         let kb = bad.join("kb");
-        std::fs::create_dir_all(&kb).unwrap();
+        if !create_non_utf8_dir_or_skip(
+            &kb,
+            "a_database_path_that_is_not_utf8_is_refused_before_anything_is_created",
+        ) {
+            return;
+        }
         let db = crate::resolve_db_path(&kb);
         let tries = [
             WriterLease::try_acquire(&db, Role::Index, &kb),
@@ -1506,7 +1543,12 @@ mod tests {
     fn a_database_path_that_resolves_to_one_that_is_not_utf8_is_refused() {
         let dir = TempDir::new("not-utf8-link");
         let bad = dir.path().join(non_utf8_name());
-        std::fs::create_dir_all(bad.join("kb")).unwrap();
+        if !create_non_utf8_dir_or_skip(
+            &bad.join("kb"),
+            "a_database_path_that_resolves_to_one_that_is_not_utf8_is_refused",
+        ) {
+            return;
+        }
         let alias = dir.path().join("alias");
         if !dir_symlink_or_skip(&bad, &alias) {
             return;

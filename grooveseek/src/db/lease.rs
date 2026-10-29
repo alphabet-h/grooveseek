@@ -1010,7 +1010,12 @@ mod tests {
         let path = db_path_of(&dir);
         make_metaless_db(&path);
         let bad = dir.path().join(crate::writer_lease::non_utf8_name());
-        std::fs::create_dir_all(&bad).unwrap();
+        if !crate::writer_lease::create_non_utf8_dir_or_skip(
+            &bad,
+            "a_one_time_write_on_a_path_that_is_not_utf8_stops_before_the_lease",
+        ) {
+            return;
+        }
         let bad_db = bad.join(".groove.db");
         let r = Database::open_read_only(&path, &kb).unwrap();
         let errors = [
