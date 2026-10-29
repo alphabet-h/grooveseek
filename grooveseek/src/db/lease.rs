@@ -100,7 +100,7 @@ fn classify_attempt_error(path: &str, db: Option<Database>, e: anyhow::Error) ->
 /// connection must not outlive the lease (ADR-0031).
 struct QueryOnlyRestore<'a> {
     db: &'a Database,
-    /// `None` once [`Self::finish`] or [`Drop`] has dealt with it.
+    /// `None` once [`Self::finish`] or `Drop` has dealt with it.
     lease: Option<WriterLease>,
 }
 
