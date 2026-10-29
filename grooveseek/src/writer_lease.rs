@@ -1754,7 +1754,11 @@ mod tests {
             serde_json::to_vec_pretty(&old).unwrap(),
         )
         .unwrap();
-        assert!(!WriterLease::read_holder(&db).unwrap().heartbeat_fresh(SystemTime::now()));
+        assert!(
+            !WriterLease::read_holder(&db)
+                .unwrap()
+                .heartbeat_fresh(SystemTime::now())
+        );
 
         lease.touch_heartbeat(Some(true));
         let h = WriterLease::read_holder(&db).unwrap();
@@ -1774,9 +1778,8 @@ mod tests {
     fn touch_heartbeat_failure_keeps_the_previous_json() {
         let (_dir, db, kb) = layout("touchfail");
         let mut lease = WriterLease::try_acquire(&db, Role::Serve, &kb).unwrap();
-        let fail = |_: &Path, _: &[u8]| -> std::io::Result<()> {
-            Err(std::io::Error::other("injected"))
-        };
+        let fail =
+            |_: &Path, _: &[u8]| -> std::io::Result<()> { Err(std::io::Error::other("injected")) };
         lease.touch_heartbeat_with(Some(true), &fail);
         assert_eq!(
             WriterLease::read_holder(&db).map(|h| h.pid),

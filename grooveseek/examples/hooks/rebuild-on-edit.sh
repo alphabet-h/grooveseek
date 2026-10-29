@@ -28,7 +28,7 @@
 # `[parsers].enabled` in your groove.toml.
 #
 # **Do not pair this hook with a `groove serve` whose watcher is on.** That
-# server holds the index's writer lease for as long as it runs and already
+# server holds the index's writer lease while its watcher runs and already
 # picks up every edit, so each `groove index` here would spend the whole
 # GROOVE_INDEX_WAIT and then exit 3. Use the hook only beside a server started
 # with `--no-watch` (or with no server at all). There, exit 3 means another
