@@ -84,7 +84,9 @@ Or, if you placed a `groove.toml` somewhere on the [discovery path](configuratio
 The server will be started automatically when the client connects.
 
 ## Keeping the index fresh via PostToolUse hook
-If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write. Minimal form:
+If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write.
+
+**Use the hook only when the server runs without its file watcher** (`groove serve --no-watch`, or `[watch].enabled = false`). A server whose watcher is on — the default — already picks up every edit (see [Live-sync via file watcher](#live-sync-via-file-watcher)), and for as long as it runs it holds the index's writer lease: only one groove process writes an index at a time. Paired with that server, the hook's `groove index` exits 3 on every edit. Drop the hook in that setup. Minimal form:
 
 <!-- groove-pin: posttooluse-hook-snippet -->
 ```json
@@ -104,7 +106,9 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 
 > **If your `groove.toml` sits beside the project rather than beside the binary, name it here too**: `groove --config /abs/path/groove.toml index`. A discovered config has `[parsers]` reset to Markdown alone ([Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations)), and `groove index` deletes the documents it did not visit — so a hook that rebuilds with the default parser set removes every `.txt`, PDF, Office document and source file already in the index, on the first edit after you upgrade. A config next to the binary, or one `groove service install` placed, is trusted and needs nothing added.
 
-SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md) — it takes `GROOVE_CONFIG` for exactly this. SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md) — it takes `GROOVE_CONFIG` for exactly this.
+
+Exit code 3 from the hook is not noise to ignore. It means another writer — the server's MCP `rebuild_index`, or an overlapping run of the hook — had the index, and **this edit may not be indexed yet**; run `groove index` again or call `rebuild_index`. To have the hook wait for that writer instead, write the command as `groove index --wait 30`. The bundled script does this through `GROOVE_INDEX_WAIT` (default 30 seconds) and still returns 3 when the wait runs out.
 
 ## Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:
@@ -271,7 +275,7 @@ whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
 
 - **Default on**. `[watch].enabled = false` in `groove.toml` or `--no-watch` on the command line disables it.
 - **Debounce** is 500 ms by default. Tune with `[watch].debounce_ms` or `--debounce-ms`.
-- **Coexists with the PostToolUse hook**. Both paths lock the same `Mutex<Database>` / `Mutex<Embedder>`, so concurrent triggers are serialized at the Rust layer and are idempotent.
+- **Not paired with the PostToolUse hook**. The hook's `groove index` is another process, and while this server watches it holds the index's writer lease, so the hook exits 3 on every edit. The watcher already covers those edits; drop the hook (see [Keeping the index fresh via PostToolUse hook](#keeping-the-index-fresh-via-posttooluse-hook)). Inside this server, the watcher and MCP `rebuild_index` lock the same `Mutex<Database>` / `Mutex<Embedder>`, so they are serialized at the Rust layer.
 - **Extension-aware**. The watcher shares the Parser registry with `rebuild_index`, so only files whose extension is enabled in `[parsers].enabled` are re-indexed; other events are dropped.
 - **Resilience**. Errors inside the watcher task are logged to stderr (not silently dropped) and the MCP server keeps running. Local disk is assumed — inotify on WSL / SMB / network shares is not guaranteed.
 - **Backpressure (v0.6.0+)**. The bridge from the debouncer to the indexer task uses a bounded 64-batch channel; if the consumer cannot keep up (e.g. embedder is paused), excess batches are dropped with a warn log instead of growing the queue indefinitely. Run `rebuild_index` manually after the burst to recover any missed events.
