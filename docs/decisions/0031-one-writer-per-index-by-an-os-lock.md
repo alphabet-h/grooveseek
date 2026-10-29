@@ -111,9 +111,11 @@ and consequences below describe a server, they are the design for the release
 in which `groove serve` takes the lock, not the behaviour of v1.22.0.
 
 - **The lock.** `.groove.db.writer-lock` beside the database (the database's
-  path plus `.writer-lock`), 0 bytes, locked exclusively with std's
-  `File::try_lock` (`flock` on Unix, `LockFileEx` on Windows). It is **never
-  deleted**: if it were, a process waiting on the old file and a new process
+  path plus `.writer-lock`; when `.groove.db` is a symlink, this file and the
+  two below are named after its target and sit beside it, because SQLite opens
+  the target and a lock per alias would put two writers on one database), 0
+  bytes, locked exclusively with std's `File::try_lock` (`flock` on Unix,
+  `LockFileEx` on Windows). It is **never deleted**: if it were, a process waiting on the old file and a new process
   creating a new one would each hold a lock, and there would be two writers.
 - **The holder's details live in a second file**, `.groove.db.writer.json`
   (pid, role, start time, version, the knowledge base as an absolute path),

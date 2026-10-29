@@ -91,7 +91,9 @@ run の間にもう一方の process が書いた、実在する file の row �
 `groove index` が並んで走れ、両方が書ける。下の箇条と結果のうち server について書いた所は、
 `groove serve` が lock を取る版の設計であって、v1.22.0 の挙動ではない。
 
-- **lock。** DB の隣の `.groove.db.writer-lock` (DB の path に `.writer-lock` を足したもの)。
+- **lock。** DB の隣の `.groove.db.writer-lock` (DB の path に `.writer-lock` を足したもの。
+  `.groove.db` が symlink なら、この file と下の 2 つはその先の file の名前で、その隣に置く。
+  SQLite は symlink の先を開くので、別名ごとに lock が分かれると 2 つの書き手が同じ DB に並ぶため)。
   0 byte で、std の `File::try_lock` (Unix は `flock`、Windows は `LockFileEx`) で排他に lock する。
   **消さない**: 消すと、古い file を待っていた process と新しい file を作った process がそれぞれ
   lock を持ち、書き手が 2 つになる。
