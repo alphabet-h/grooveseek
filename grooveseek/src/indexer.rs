@@ -1052,12 +1052,14 @@ pub(crate) const PRUNE_BATCH: usize = 64;
 /// counted is dropped with the `Err`, so no note is printed for it; the next run judges those
 /// rows again. The returned `kept` paths are rows this run did not read; at the end of the run
 /// the caller marks those a stale one-time pass covers, and under `force` every one, with
-/// [`HASH_AWAITING_REPARSE`] (ADR-0031).
+/// [`HASH_AWAITING_REPARSE`] (ADR-0031). With `mark_kept` (a forced run) each batch also marks
+/// its kept rows in its own transaction, so a later batch's `Err` cannot leave them unmarked.
 fn prune_candidates(
     db: &Database,
     snapshot: &PathIdHash,
     candidates: &[String],
     batch: usize,
+    mark_kept: bool,
     on_deleted: &mut dyn FnMut(&str),
 ) -> Result<CasDelete> {
     let mut out = CasDelete::default();
@@ -1071,7 +1073,7 @@ fn prune_candidates(
                     .map(|(id, hash)| (p.as_str(), *id, hash.as_str()))
             })
             .collect();
-        let done = db.delete_documents_if_unchanged(&expected)?;
+        let done = db.delete_documents_if_unchanged(&expected, mark_kept)?;
         for path in &done.deleted {
             on_deleted(path);
         }
@@ -2174,26 +2176,28 @@ pub fn rebuild_index(
     let mut snapshot_paths: Vec<String> = snapshot.keys().cloned().collect();
     snapshot_paths.sort_unstable();
     let candidates = documents_to_delete(&snapshot_paths, &visited_paths, &skipped_paths);
-    let pruned = prune_candidates(db, &snapshot, &candidates, PRUNE_BATCH, &mut |path| {
-        tally.deleted += 1;
-        progress.report_deleted(path);
-    })?;
+    // (ADR-0031) Under `--force` each batch marks the rows it keeps in the transaction that
+    // keeps them: the code chunk policy this forced run recorded before its walk claims every
+    // row, and a kept row is one it never read, so no later failure, a later batch's included,
+    // may leave it unmarked. A run without `--force` marks none here; one that fails before its
+    // end writes no key that would claim the kept rows either.
+    let pruned = prune_candidates(
+        db,
+        &snapshot,
+        &candidates,
+        PRUNE_BATCH,
+        force,
+        &mut |path| {
+            tally.deleted += 1;
+            progress.report_deleted(path);
+        },
+    )?;
     tally.kept_changed = pruned.kept_changed;
     // (ADR-0031) The rows the prune kept for another writer were not read by this run, so
     // nothing below that records a run-wide "settled" may count them: the ones a key written at
     // the end would claim are marked for a re-parse there, and the frontmatter policy and
     // declared-field set wait for a run that keeps none.
     let kept = pruned.kept;
-    // (ADR-0031) Under `--force` they are marked here as well, before any later step can fail:
-    // the code chunk policy this forced run recorded before its walk claims every row, and a
-    // kept row is one it never read. The mark only makes the next run read the row again, so
-    // writing it early costs nothing; the end of the run writes it once more.
-    if force && !kept.is_empty() {
-        let marked: Vec<&str> = kept.iter().map(String::as_str).collect();
-        let tx = db.begin_immediate_transaction()?;
-        db.overwrite_content_hash(&marked, HASH_AWAITING_REPARSE)?;
-        tx.commit()?;
-    }
     // Not through `progress`: a quiet or callback reporter would drop the count.
     if let Some(note) = kept_changed_note(tally.kept_changed) {
         eprintln!("{note}");
@@ -2253,8 +2257,9 @@ pub fn rebuild_index(
     // not hashes, so the marks do not change them. (ADR-0031) The exception is a row the prune
     // kept for another writer, which this run did not read: it is marked as a skipped one is,
     // when a stale pass covers it, and under `--force`, whose keys claim every row, whatever its
-    // format (a forced run already marked it after the prune; this writes it again). The mark
-    // costs it no more than one more read, and a kept row deleted since is skipped by the write.
+    // format (a forced run already marked it in the prune batch that kept it; this writes it
+    // again). The mark costs it no more than one more read, and a kept row deleted since is
+    // skipped by the write.
     if force || any_stale {
         if any_stale {
             for rel in &skipped_paths {
@@ -11082,7 +11087,7 @@ mod tests {
 
             let mut reports: Vec<std::time::Instant> = Vec::with_capacity(DOCS);
             let start = std::time::Instant::now();
-            let done = prune_candidates(&db, &snapshot, &candidates, width, &mut |_| {
+            let done = prune_candidates(&db, &snapshot, &candidates, width, false, &mut |_| {
                 reports.push(std::time::Instant::now());
             })
             .unwrap();
@@ -11346,6 +11351,99 @@ mod tests {
             id_hash(&db, "ghost.md").map(|(_, h)| h).as_deref(),
             Some(HASH_AWAITING_REPARSE),
             "the kept row was left unmarked by a forced run that failed after its prune"
+        );
+    }
+
+    /// A forced run whose prune keeps a row in one batch and fails in a later one still leaves
+    /// that row marked for a re-parse: the batch that keeps it marks it in its own transaction,
+    /// so the `Err` of a later batch cannot drop the mark with the kept paths. The rows reach the
+    /// forced run's snapshot through a trigger, as in the tests above; at the scan the other
+    /// connection changes a row of the first batch and makes the delete of the second batch's
+    /// only row fail.
+    #[test]
+    fn a_forced_run_whose_later_prune_batch_fails_leaves_an_earlier_batchs_kept_row_marked() {
+        let tmp = mk_tmp("pr3-kept-force-batch-fail");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        let rels: Vec<String> = (0..=PRUNE_BATCH)
+            .map(|i| format!("gone-{i:04}.md"))
+            .collect();
+        let inserts: String = rels
+            .iter()
+            .map(|rel| {
+                format!(
+                    concat!(
+                        "INSERT INTO documents (path, tags, content_hash, last_indexed) ",
+                        "VALUES ('{rel}', '[]', 'h-{rel}', '2026-01-01T00:00:00Z'); "
+                    ),
+                    rel = rel
+                )
+            })
+            .collect();
+        db.execute_for_test(&format!(
+            concat!(
+                "CREATE TRIGGER write_rows_after_reset AFTER INSERT ON index_meta ",
+                "WHEN NEW.key = 'declared_fields_pass' BEGIN {}END;"
+            ),
+            inserts
+        ))
+        .unwrap();
+        let first = rels[0].clone();
+        let last = rels.last().unwrap().clone();
+        let (first_cb, last_cb) = (first.clone(), last.clone());
+        let progress = on_first_scanning(move || {
+            other
+                .execute_for_test("DROP TRIGGER write_rows_after_reset;")
+                .unwrap();
+            other
+                .execute_for_test(&format!(
+                    concat!(
+                        "CREATE TRIGGER inject_later_batch_failure BEFORE DELETE ON documents ",
+                        "WHEN OLD.path = '{}' ",
+                        "BEGIN SELECT RAISE(ABORT, 'injected later batch failure'); END;"
+                    ),
+                    last_cb
+                ))
+                .unwrap();
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&[first_cb.as_str()], "changed")
+                    .unwrap(),
+                1,
+                "the trigger did not write the rows before the snapshot"
+            );
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let err = rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb,
+            None,
+            true,
+            None,
+            &[],
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+        .expect_err("the injected failure did not stop the run");
+        assert!(
+            format!("{err:#}").contains("injected later batch failure"),
+            "{err:#}"
+        );
+        assert_eq!(
+            id_hash(&db, &first).map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the row the first batch kept was left unmarked when a later batch failed"
+        );
+        for rel in &rels[1..PRUNE_BATCH] {
+            assert!(id_hash(&db, rel).is_none(), "{rel} was kept");
+        }
+        assert!(
+            id_hash(&db, &last).is_some(),
+            "the failed batch's row was deleted"
         );
     }
 

@@ -9600,7 +9600,7 @@ mod tests {
             .iter()
             .map(|p| (*p, snap[*p].0, snap[*p].1.as_str()))
             .collect();
-        let out = db.delete_documents_if_unchanged(&expected).unwrap();
+        let out = db.delete_documents_if_unchanged(&expected, false).unwrap();
         assert_eq!(out.deleted, vec!["a.md".to_string()]);
         assert_eq!(out.kept_changed, 2);
 
@@ -9616,7 +9616,7 @@ mod tests {
         let (_dir, db, other) = two_connections("cas-delete-empty");
         let tx = other.begin_immediate_transaction().unwrap();
         let t0 = std::time::Instant::now();
-        let out = db.delete_documents_if_unchanged(&[]).unwrap();
+        let out = db.delete_documents_if_unchanged(&[], false).unwrap();
         assert_eq!(out, CasDelete::default());
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(1000),
@@ -9633,7 +9633,7 @@ mod tests {
         {
             let _tx = db.begin_transaction().unwrap();
             assert!(
-                db.delete_documents_if_unchanged(&[("a.md", a, "ha")])
+                db.delete_documents_if_unchanged(&[("a.md", a, "ha")], false)
                     .is_err()
             );
         }
@@ -9652,7 +9652,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             let t0 = std::time::Instant::now();
-            let out = b.delete_documents_if_unchanged(&[("a.md", id, "ha")]);
+            let out = b.delete_documents_if_unchanged(&[("a.md", id, "ha")], false);
             (b, out, t0.elapsed())
         });
         started_rx.recv().unwrap();
@@ -9682,11 +9682,39 @@ mod tests {
         let db = db_with_384();
         let id = upsert_with_hash(&db, "Note.md", "h");
         let out = db
-            .delete_documents_if_unchanged(&[("note.md", id, "h")])
+            .delete_documents_if_unchanged(&[("note.md", id, "h")], false)
             .unwrap();
         assert!(out.deleted.is_empty());
         assert_eq!(out.kept_changed, 0);
         assert!(db.all_path_ids_hashes().unwrap().contains_key("Note.md"));
+    }
+
+    #[test]
+    fn cas_delete_with_mark_kept_marks_the_kept_rows_and_deletes_the_matching_ones() {
+        let (_dir, db, other) = two_connections("cas-delete-mark-kept");
+        for (p, h) in [("a.md", "ha"), ("b.md", "hb"), ("c.md", "hc")] {
+            upsert_with_hash(&db, p, h);
+        }
+        let snap = db.all_path_ids_hashes().unwrap();
+        assert_eq!(
+            other.overwrite_content_hash(&["b.md"], "changed").unwrap(),
+            1
+        );
+
+        let expected: Vec<(&str, i64, &str)> = ["a.md", "b.md", "c.md"]
+            .iter()
+            .map(|p| (*p, snap[*p].0, snap[*p].1.as_str()))
+            .collect();
+        let out = db.delete_documents_if_unchanged(&expected, true).unwrap();
+        assert_eq!(out.deleted, vec!["a.md".to_string(), "c.md".to_string()]);
+        assert_eq!(out.kept, vec!["b.md".to_string()]);
+        assert_eq!(out.kept_changed, 1);
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert!(!after.contains_key("a.md"));
+        assert!(!after.contains_key("c.md"));
+        assert_eq!(after["b.md"].0, snap["b.md"].0);
+        assert_eq!(after["b.md"].1, crate::indexer::HASH_AWAITING_REPARSE);
     }
 
     fn pair(old: &str, new: &str) -> (String, String) {

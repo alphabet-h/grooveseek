@@ -938,9 +938,16 @@ impl Database {
     /// `expected` returns at once without opening a transaction. Refuses more than
     /// 32766 entries (the SQLite host-parameter limit); keeping batches small is the
     /// caller's job. Reads no file and embeds nothing.
+    ///
+    /// With `mark_kept`, the `content_hash` of every kept row (one whose re-read did not match
+    /// `expected`) is overwritten with [`crate::indexer::HASH_AWAITING_REPARSE`] in the same
+    /// transaction, so the row is never kept without its mark: a forced run has recorded the
+    /// code chunk policy as current before its walk, and a kept row is one it never read
+    /// (ADR-0031). The returned `kept` and `kept_changed` are the same either way.
     pub fn delete_documents_if_unchanged(
         &self,
         expected: &[(&str, i64, &str)],
+        mark_kept: bool,
     ) -> Result<CasDelete> {
         if expected.is_empty() {
             return Ok(CasDelete::default());
@@ -993,6 +1000,10 @@ impl Database {
                     out.kept.push((*path).to_string());
                 }
             }
+        }
+        if mark_kept && !out.kept.is_empty() {
+            let kept: Vec<&str> = out.kept.iter().map(String::as_str).collect();
+            self.overwrite_content_hash(&kept, crate::indexer::HASH_AWAITING_REPARSE)?;
         }
         tx.commit()?;
         Ok(out)
