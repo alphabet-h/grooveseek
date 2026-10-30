@@ -714,12 +714,14 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `.git/` や `node_modules/` へ rename すると
                 // `rename_single_file` が **denylist 配下の新パスへ DB を
                 // 書き換えて残す**。除外したはずのファイルが index に居座る。
+                // (kuriya 259) The old end of a deindex is decided inside the database lock of
+                // the delete: a file written back there by then is reindexed and keeps the row.
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
                     RenameAction::Rename => {
                         dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
                     }
                     RenameAction::Deindex => {
-                        dispatch_deindex(state, &old_rel);
+                        dispatch_removal(state, &old_rel, from, RemovalCause::RenamedAway);
                         hand_on_a_link_destination(state, &new_rel, to);
                     }
                     RenameAction::Reindex => dispatch_reindex(state, &new_rel, to),
@@ -6960,6 +6962,133 @@ mod tests {
         assert!(
             finished,
             "a removal of a path still gone waited for the embedder lock"
+        );
+        assert_eq!(
+            db.lock().unwrap().all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 259) A document long enough to give the reindex a chunk to embed (a short body
+    /// would be dropped as nothing to index, which also leaves no row).
+    const I6_DOC: &str = concat!(
+        "---\ntitle: Rename away fixture\ntags: [test]\n---\n",
+        "\n",
+        "## back at the old path\n",
+        "\n",
+        "This file was written at the path a rename had just taken a document\n",
+        "away from. Written long enough to clear the default per-chunk quality\n",
+        "filter, so the reindex that keeps the row has a chunk to embed and\n",
+        "writes the row with the hash of these bytes.\n",
+    );
+
+    /// (kuriya 259) A knowledge base with `node_modules/a.md` (the file a rename moved into an
+    /// excluded directory) and, when `back` is given, `a.md` holding it (a file back at the old
+    /// end of the rename).
+    fn i6_rename_kb(prefix: &str, back: Option<&str>) -> I549Kb {
+        let kb = crate::test_support::unique_temp_path(prefix);
+        std::fs::create_dir_all(kb.join("node_modules")).unwrap();
+        let kb = I549Kb(kb);
+        std::fs::write(kb.0.join("node_modules").join("a.md"), I6_DOC).unwrap();
+        if let Some(body) = back {
+            std::fs::write(kb.0.join("a.md"), body).unwrap();
+        }
+        kb
+    }
+
+    /// The watcher state the kuriya 259 event-loop tests run `handle_events` on.
+    fn i6_state(
+        kb: &Path,
+        db: &Arc<Mutex<Database>>,
+        embedder: &Arc<Mutex<Embedder>>,
+    ) -> WatcherState {
+        WatcherState {
+            kb_path: kb.to_path_buf(),
+            db: Arc::clone(db),
+            embedder: Arc::clone(embedder),
+            registry: Arc::new(Registry::defaults()),
+            exclude_headings: None,
+            rules: crate::exclusion::ExclusionRules::load(kb, default_exclude_dirs()),
+            config: WatchConfig::default(),
+            watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watch_status: None,
+            watch_backoff: WatcherState::DEFAULT_WATCH_BACKOFF,
+            batch_probe: None,
+        }
+    }
+
+    /// The rename of `a.md` into `node_modules/` (an excluded directory), as the debouncer
+    /// stitches it.
+    fn i6_rename_into_excluded(kb: &Path) -> [DebouncedEvent; 1] {
+        [mk_evt(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![kb.join("a.md"), kb.join("node_modules").join("a.md")],
+        )]
+    }
+
+    /// (kuriya 259, invariant I6, spec T-I2) A file written back at the old end of a rename into
+    /// an excluded directory before the batch is handled keeps its row: the old end is looked at
+    /// inside the database lock of the delete and reindexed, so the row holds the new bytes
+    /// (its hash is no longer the one the rename moved away).
+    #[test]
+    fn i6_t_i2_a_file_back_at_the_old_end_of_a_rename_into_an_excluded_dir_keeps_its_row() {
+        let kb = i6_rename_kb("groove-watcher-i6-t-i2", Some(I6_DOC));
+        let db = Arc::new(Mutex::new(dir_rename_db(&["a.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(&kb.0, &db, &embedder);
+
+        handle_events(&mut state, &i6_rename_into_excluded(&kb.0));
+
+        let db = db.lock().unwrap();
+        assert_eq!(db.all_document_paths().unwrap(), vec!["a.md".to_string()]);
+        let hash = db.get_document_hash("a.md").unwrap();
+        assert!(
+            hash.is_some() && hash.as_deref() != Some("h"),
+            "the row was not rewritten by a reindex: {hash:?}"
+        );
+    }
+
+    /// (kuriya 259) The same rename with nothing back at the old path drops the row, as it did
+    /// before the old end was looked at.
+    #[test]
+    fn i6_a_rename_into_an_excluded_dir_with_nothing_back_drops_the_row() {
+        let kb = i6_rename_kb("groove-watcher-i6-nothing-back", None);
+        let db = Arc::new(Mutex::new(dir_rename_db(&["a.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(&kb.0, &db, &embedder);
+
+        handle_events(&mut state, &i6_rename_into_excluded(&kb.0));
+
+        assert!(db.lock().unwrap().all_document_paths().unwrap().is_empty());
+    }
+
+    /// (kuriya 259) The old end of a rename that is gone is settled under the database lock
+    /// alone, so the batch finishes while the embedder lock is held elsewhere (a search embedding
+    /// a query), as a remove event does.
+    #[test]
+    fn i6_a_rename_away_from_a_gone_path_does_not_wait_for_the_embedder_lock() {
+        let kb = i6_rename_kb("groove-watcher-i6-no-embedder-wait", None);
+        let db = Arc::new(Mutex::new(dir_rename_db(&["a.md", "other.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(&kb.0, &db, &embedder);
+        let events = i6_rename_into_excluded(&kb.0);
+
+        let held = embedder.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let finished = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_events(&mut state, &events);
+                let _ = done_tx.send(());
+            });
+            // Generous: the deletion takes milliseconds; the wait only runs out when the
+            // removal is blocked on the held lock.
+            let finished = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+            drop(held);
+            finished
+        });
+        assert!(
+            finished,
+            "the old end of a rename, still gone, waited for the embedder lock"
         );
         assert_eq!(
             db.lock().unwrap().all_document_paths().unwrap(),
