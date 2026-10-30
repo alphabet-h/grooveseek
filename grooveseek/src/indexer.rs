@@ -11285,6 +11285,53 @@ mod tests {
         );
     }
 
+    /// (ADR-0031) What a writer that does not take the lock is *not* protected from, pinned so the range does not
+    /// widen silently: the per-document write of the loop. The public behaviour page says: "against such a writer,
+    /// the prune step still keeps rows the other writer changed during the run and rename detection skips the pairs
+    /// it changed, but the other look-then-write steps are not protected."
+    /// Another case it does not close: such a writer applies a rename into another parser first without
+    /// marking the row (`HASH_AWAITING_REPARSE`); this run's pair is then skipped, the new path is `Unchanged`,
+    /// and the previous parser's chunks stay until `--force`.
+    #[test]
+    fn t_a4_the_loop_writes_back_a_row_another_writer_deleted_mid_run() {
+        let tmp = mk_tmp("pr3-ta4");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        // a.md sorts before b.md, so the loop reaches a.md first.
+        write_file(&kb, "a.md", "# a\n\nfirst body\n");
+        write_file(&kb, "b.md", "# b\n\nsecond body\n");
+        let (db, other) = two_connections(&tmp);
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        // Both indexed under their bytes' hash, so the second run finds both unchanged.
+        let first = prune_run(
+            &db,
+            &kb,
+            &registry,
+            false,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        assert_eq!(first.updated, 2, "{first:?}");
+        let other = std::sync::Mutex::new(Some(other));
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !matches!(
+                event,
+                progress::ProgressEvent::Unchanged { rel: "a.md", .. }
+            ) {
+                return;
+            }
+            if let Some(other) = other.lock().unwrap().take() {
+                other.delete_document("b.md").unwrap();
+            }
+        }));
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert!(
+            id_hash(&db, "b.md").is_some(),
+            "the loop did not write b.md back from disk"
+        );
+        assert_eq!(result.updated, 1, "{result:?}");
+    }
+
     /// A run stopped after its renames still reports the ones it skipped.
     #[test]
     fn a_cancelled_run_still_counts_its_skipped_renames() {
