@@ -11291,9 +11291,10 @@ mod tests {
         assert_eq!(db.read_frontmatter_policy().unwrap(), None);
     }
 
-    /// A forced run marks the rows its prune kept right after the prune, not only at the end:
-    /// a step after the prune that fails still leaves them marked, so the code chunk policy the
-    /// forced run recorded before its walk does not stand over a row it never read. The row
+    /// A forced run marks each row its prune keeps in the transaction of the prune batch that
+    /// keeps it, not only at the end: a step after the prune that fails still leaves it marked,
+    /// so the code chunk policy the forced run recorded before its walk does not stand over a
+    /// row it never read. The row
     /// reaches the snapshot as in the test above; at the scan the other connection also makes
     /// the end of the declared-field pass fail.
     #[test]
