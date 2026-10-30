@@ -3836,7 +3836,8 @@ fn names_a_walked_path(key: &str) -> bool {
 /// skipped leaves the index as it was on purpose, and for such a file the
 /// folded row is the index as it was -- the sweep follows the real key in,
 /// never ahead of it. A removal passes `false`: the file is gone under every
-/// spelling.
+/// spelling. A rename that has already moved the real key away passes `false`
+/// too, without looking at `rel`; the folded spelling is still looked at below.
 ///
 /// **The decision and the delete it justifies share one `BEGIN IMMEDIATE`
 /// transaction** ([`Database::begin_immediate_transaction`]). Other processes
