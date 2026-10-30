@@ -144,6 +144,9 @@ run の間にもう一方の process が書いた、実在する file の row �
   `groove index` は `3` で止まる。
 - **参加しない書き手は止まらない**: 古い binary、library の `Database::open` を呼ぶ program、
   手で打つ `sqlite3`。
+  *(2026-10-30、v1.22.0)* その書き手と重なった `groove index` や `rebuild_index` の run でも、
+  prune は run の間にその書き手が変えた row を残し、rename 検出はその書き手が変えた組を飛ばす。
+  それ以外の「見てから書く」手順は守らない。決定は変わらない。`CHANGELOG.md` の v1.22.0 → Fixed。
 - **固まった holder は lock を持ち続ける**。外すにはその process を止めるしかない。OS は process
   の終了や kill で lock を外す。lock file と古い json は残ってよく、片付けは要らない。
 - **助言は持ち主で変わる**: 持ち主が同じナレッジベースを watch する server のときだけ、索引を

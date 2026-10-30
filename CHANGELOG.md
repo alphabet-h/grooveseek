@@ -35,6 +35,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `LeaseError` gains the variants `Closed` and `Reader`; `LeaseError`, `Claimant`, `ReaderReason`,
   `WatchErrorCause` and `WriterStatus` are `#[non_exhaustive]`, so a downstream `match` on
   `LeaseError` without a wildcard arm needs one from this release.
+- Library: `IndexResult` gains the fields `kept_changed` and `renames_skipped`. It derives
+  `Default`, so a literal that ends in `..Default::default()` keeps compiling; one that names every
+  field needs the two new ones. New public items: `db::{PathIdHash, CasDelete, CheckedRenames}` and
+  `Database::{all_path_ids_hashes, delete_documents_if_unchanged, rename_documents_checked}`.
+  `PathIdHash` is a type alias for the map `all_path_ids_hashes` returns. `CasDelete` and
+  `CheckedRenames` are `#[non_exhaustive]`, so code outside the crate cannot build them with a
+  struct literal.
 
 ### Changed
 
@@ -79,6 +86,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   or its embedding model recorded, they take the lock for that one write; if another process holds
   it, they stop and name it instead of writing beside it.
 - Building from source needs Rust 1.89 or later.
+
+### Fixed
+
+- **A `groove index` or MCP `rebuild_index` run that overlaps a writer that does not take the lock
+  no longer deletes what that writer changed** (kuriya #259,
+  [ADR-0031](docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)). Such a writer is an
+  older groove binary or a program that opens the database through the library's
+  `Database::open`. The prune now keeps a row that writer changed during the run, where it used to
+  delete it even though its file was still on disk; the next run judges the row again. Rename
+  detection skips a pair whose old row that writer changed, or whose new path it wrote, and the
+  run goes on, where the run used to fail; the new path is indexed as a new file. The run prints
+  the two numbers on stderr in `note: kept <N> row(s) ...` and `note: skipped <N> rename(s) ...`
+  lines (also under `--quiet`), and `rebuild_index` returns them as `kept_changed` and
+  `renames_skipped`. A write that reads before it writes is now opened as `BEGIN IMMEDIATE`, so it
+  waits for another writer instead of failing at once with `database is locked`. The run's other
+  look-then-write steps are still not protected against such a writer.
 
 ## [1.21.5] - 2026-10-28
 
