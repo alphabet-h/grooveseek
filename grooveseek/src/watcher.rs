@@ -2990,6 +2990,10 @@ fn log_reindex_result(
     }
 }
 
+/// (kuriya 259) The deindex of a name the index cannot hold, which
+/// [`handle_removed_path`] alone calls: nothing at such a name is ever indexed, so the row
+/// leaves without a look at the disk. Every other event-driven deletion looks at the disk inside
+/// the database lock first ([`dispatch_removal`]).
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
     let db = recover_db(state.lock_for_batch(&state.db));
     match indexer::deindex_single_file(&db, rel) {
@@ -4445,24 +4449,29 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
 ///   [`rename_decision`] and run by the existing [`dispatch_rename`] /
-///   [`dispatch_deindex`] / [`dispatch_reindex`]); then every listed row is
-///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
-///   already moved), so no listed row stays there even when the old directory
-///   was recreated; rows added under the old prefix after the listing are
+///   [`dispatch_removal`] / [`dispatch_reindex`]); then every listed row is
+///   dropped from its old path through [`dispatch_removal`] (not looked at for
+///   one already moved), so no listed row stays there even when the old
+///   directory was recreated; rows added under the old prefix after the listing are
 ///   swept by [`sweep_source_if_gone`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
 /// - [`DirRenameEntry::SweepOnly`]: no move and no scan. When `from` is gone,
 ///   one range sweep by [`sweep_source_if_gone`] drops the listed rows and
 ///   any added since. Otherwise (`from` recreated, or its stat failed) only
 ///   the rows the entry decision listed are dropped, one by one through
-///   [`dispatch_deindex`], so a recreated directory's own rows are kept.
+///   [`dispatch_removal`], so a recreated directory's own rows are kept.
 ///   Renaming the rows onto a destination that no longer exists would drop
 ///   them while logging a rename; the later event for the new name scans it.
 ///
 /// On both paths, the row stored under `old_rel` itself (a file, not under
-/// `old_rel/`) is dropped through [`dispatch_deindex`], once, before the
+/// `old_rel/`) is dropped through [`dispatch_removal`], once, before the
 /// destination scan: the file rename the event may stand for would have
 /// dropped it, and for a real directory rename it is a no-op.
+///
+/// (kuriya 259) Each of these drops is a rename away
+/// ([`RemovalCause::RenamedAway`]): a file back at the old path that the write
+/// gate takes keeps its row (reindexed in place), looked at inside the database
+/// lock of the delete; a path whose row is already gone is not looked at.
 ///
 /// The db is locked only while listing, never across the loop, so the MCP search
 /// tool is not held up for the size of the directory. The listing guard is
@@ -4568,7 +4577,12 @@ fn dispatch_directory_rename(
                     RenameAction::Rename => {
                         dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
                     }
-                    RenameAction::Deindex => dispatch_deindex(state, &step.old_rel),
+                    RenameAction::Deindex => dispatch_removal(
+                        state,
+                        &step.old_rel,
+                        &state.kb_path.join(&step.old_rel),
+                        RemovalCause::RenamedAway,
+                    ),
                     // (#544) No event path for a step (its `new_rel` is built from the
                     // row's), so it is read as not lossy and only whether a file is there
                     // is asked: a lossy row's step looks gone, the answer
@@ -4588,9 +4602,11 @@ fn dispatch_directory_rename(
             // not `from` is gone: a row the pass above did not move (a skip, a
             // reindex of the new path, a rename that failed) would otherwise stay
             // as a hit for a path the old directory may hold again under other
-            // contents. A row already moved is a no-op here.
+            // contents. (kuriya 259) Unless a file the write gate takes is back
+            // there, which is reindexed in place. A row already moved is not
+            // looked at.
             for p in &paths {
-                dispatch_deindex(state, p);
+                dispatch_removal(state, p, &state.kb_path.join(p), RemovalCause::RenamedAway);
             }
         }
     }
@@ -4620,11 +4636,13 @@ fn dispatch_directory_rename(
     };
     if !from_gone && let DirRenameEntry::SweepOnly(paths) = &entry {
         // (local Codex r5, r6) `from` was recreated, or cannot be stat'ed: the
-        // listed rows predate the rename and go, but one by one, so a recreated
-        // directory's own rows are not taken by a prefix sweep. Rare, so the
-        // per-row cost (a lock and a delete each) is paid only here.
+        // listed rows predate the rename and leave their old paths, but one by
+        // one, so a recreated directory's own rows are not taken by a prefix
+        // sweep. (kuriya 259) A listed row whose path holds again a file the
+        // write gate takes stays, reindexed in place. Rare, so the per-row cost
+        // (a lock and a look each) is paid only here.
         for p in paths {
-            dispatch_deindex(state, p);
+            dispatch_removal(state, p, &state.kb_path.join(p), RemovalCause::RenamedAway);
         }
     }
     // (local Codex r6, r7) On both paths, the row stored under the old path
@@ -4634,7 +4652,9 @@ fn dispatch_directory_rename(
     // directory later took. The file rename would have dropped it. For a real
     // directory rename there is no such row and this is a no-op (one deletes
     // the exact row, the sweep what is strictly under it, as in feature-67).
-    dispatch_deindex(state, old_rel);
+    // (kuriya 259) Unless a file the write gate takes is back at the old path,
+    // which is reindexed in place.
+    dispatch_removal(state, old_rel, from, RemovalCause::RenamedAway);
     if entry == DirRenameEntry::ScanDestination && moves {
         dispatch_new_directory(state, to, new_rel);
     }
@@ -7093,6 +7113,154 @@ mod tests {
         assert_eq!(
             db.lock().unwrap().all_document_paths().unwrap(),
             vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 259) A knowledge base holding the empty directories `dirs` and each `(rel, body)`
+    /// of `files` (directories on the way are created).
+    fn i6_dir_kb(prefix: &str, dirs: &[&str], files: &[(&str, &str)]) -> I549Kb {
+        let kb = I549Kb(crate::test_support::unique_temp_path(prefix));
+        std::fs::create_dir_all(&kb.0).unwrap();
+        for dir in dirs {
+            std::fs::create_dir_all(kb.0.join(dir)).unwrap();
+        }
+        for (rel, body) in files {
+            let path = kb.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        kb
+    }
+
+    /// The rename of `old` to `new` (relative to the knowledge base), as the debouncer stitches
+    /// it.
+    fn i6_rename(kb: &Path, old: &str, new: &str) -> [DebouncedEvent; 1] {
+        [mk_evt(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![kb.join(old), kb.join(new)],
+        )]
+    }
+
+    /// Runs `events` on a store holding `rows` over `kb`, and returns the paths left in it.
+    fn i6_paths_after(kb: &Path, rows: &[&str], events: &[DebouncedEvent]) -> Vec<String> {
+        let db = Arc::new(Mutex::new(dir_rename_db(rows)));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(kb, &db, &embedder);
+        handle_events(&mut state, events);
+        db.lock().unwrap().all_document_paths().unwrap()
+    }
+
+    /// (kuriya 259, invariant I6, spec T-I1) A directory renamed to a destination already gone,
+    /// with the old directory recreated and one file written back into it before the batch is
+    /// handled: that file's row stays (reindexed in place), the other listed row leaves.
+    #[test]
+    fn i6_t_i1_a_sweep_only_rename_keeps_the_row_of_a_file_back() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-sweep-keeps",
+            &[],
+            &[("docs/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/b.md"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(paths, vec!["docs/a.md".to_string()]);
+    }
+
+    /// (kuriya 259, invariant I6, spec T-I1) A directory renamed into an excluded directory, with
+    /// a file written back at the old path of one of its rows: the step's deindex looks first,
+    /// so that row stays (reindexed in place).
+    #[test]
+    fn i6_t_i1_a_step_into_an_excluded_dir_keeps_the_row_of_a_file_back() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-step-excluded",
+            &[],
+            &[("node_modules/docs/a.md", I6_DOC), ("docs/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md"],
+            &i6_rename(&kb.0, "docs", "node_modules/docs"),
+        );
+        assert_eq!(paths, vec!["docs/a.md".to_string()]);
+    }
+
+    /// (kuriya 259, invariant I6, spec T-I1) A file renamed onto a name that is a directory by
+    /// the time the event is handled, with a file written back at the old name: the row of the
+    /// old name itself stays (reindexed in place).
+    #[test]
+    fn i6_t_i1_the_old_name_itself_keeps_the_row_of_a_file_back() {
+        let kb = i6_dir_kb("groove-watcher-i6-old-name", &["y"], &[("x.md", I6_DOC)]);
+        let paths = i6_paths_after(&kb.0, &["x.md"], &i6_rename(&kb.0, "x.md", "y"));
+        assert_eq!(paths, vec!["x.md".to_string()]);
+    }
+
+    /// (kuriya 259) A sweep-only directory rename with the old directory recreated: a listed row
+    /// the removal gate would turn away (`.txt`) leaves too, as a rename away does.
+    #[test]
+    fn i6_a_sweep_only_rename_drops_the_listed_rows_the_gate_would_turn_away() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-sweep-gate",
+            &[],
+            &[("docs/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/b.md", "docs/c.txt"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(paths, vec!["docs/a.md".to_string()]);
+    }
+
+    /// (kuriya 259, spec T-I1) A file back under the recreated old directory only under another
+    /// case of its name does not keep the old row, and no row is written for the other spelling
+    /// (no event named it): the same answer on a file system that tells cases apart and on one
+    /// that does not.
+    #[test]
+    fn i6_a_file_back_only_under_another_case_does_not_keep_the_old_row() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-other-case",
+            &[],
+            &[("docs/A.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(&kb.0, &["docs/a.md"], &i6_rename(&kb.0, "docs", "notes"));
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    /// (kuriya 259, kuriya 566) A hard link written back at the old path of a listed row does not
+    /// keep it: the write gate refuses a hard link, so the row leaves.
+    #[test]
+    fn i6_a_hard_link_back_under_the_old_directory_still_loses_its_row() {
+        let kb = i6_dir_kb("groove-watcher-i6-hard-link", &["docs"], &[]);
+        let outside = I549Kb(crate::test_support::unique_temp_path(
+            "groove-watcher-i6-hard-link-outside",
+        ));
+        std::fs::create_dir_all(&outside.0).unwrap();
+        std::fs::write(outside.0.join("a.md"), I6_DOC).unwrap();
+        std::fs::hard_link(outside.0.join("a.md"), kb.0.join("docs").join("a.md"))
+            .expect("hard links need no privilege");
+        let paths = i6_paths_after(&kb.0, &["docs/a.md"], &i6_rename(&kb.0, "docs", "notes"));
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    /// (kuriya 259) The control: a plain directory rename with nothing written back moves every
+    /// row to the new directory, as before.
+    #[test]
+    fn i6_t_i1_a_plain_directory_rename_moves_every_row() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-plain-dir",
+            &[],
+            &[("notes/a.md", I6_DOC), ("notes/b.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/b.md"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(
+            paths,
+            vec!["notes/a.md".to_string(), "notes/b.md".to_string()]
         );
     }
 
