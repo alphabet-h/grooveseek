@@ -225,8 +225,13 @@ fn a_file_moved_into_an_excluded_directory_then_written_again_is_indexed() {
     {
         let lines = stderr_lines(&guard);
         assert!(
-            lines.iter().any(|l| l.contains("watcher: deindexed a.md")),
-            "the end state was reached without a drop of a.md that does not look; stderr:\n{}",
+            !lines.iter().any(|l| l.contains("watcher: deindexed a.md")),
+            "the old name of the rename was dropped without being looked at under the index lock; stderr:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("watcher: reindexed a.md")),
+            "the file written back under the old name was not reindexed; stderr:\n{}",
             lines.join("\n")
         );
     }
