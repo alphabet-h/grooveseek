@@ -12722,7 +12722,7 @@ SOFTWARE.
 Used by:
 
 - pulldown-cmark-escape 0.11.0 (https://github.com/raphlinus/pulldown-cmark)
-- pulldown-cmark 0.13.3 (https://github.com/raphlinus/pulldown-cmark)
+- pulldown-cmark 0.13.6 (https://github.com/raphlinus/pulldown-cmark)
 
 ```text
 The MIT License

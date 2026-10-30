@@ -131,6 +131,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   file written there again is indexed by its own event. A look that cannot tell (access denied, an
   I/O error) keeps the row and says why on stderr, as for a deletion.
 
+### Security
+
+- **`pulldown-cmark` was updated 0.13.3 → 0.13.6 to clear RUSTSEC-2026-0414** (the number of
+  events can grow exponentially with the input when `ENABLE_WIKILINKS` is set). It is a direct
+  dependency of `grooveseek`, but the library and the `groove` binary do not call it: the Markdown
+  parser splits on heading prefixes and does not run `pulldown-cmark`. Only the integration tests
+  that check the docs parse with it, and none of them sets `ENABLE_WIKILINKS`. `Cargo.lock` and
+  `THIRD-PARTY-LICENSES.md` changed; no other crate moved.
+
 ## [1.21.5] - 2026-10-28
 
 ### Fixed
