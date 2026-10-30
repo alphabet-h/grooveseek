@@ -7150,6 +7150,26 @@ mod tests {
         db.lock().unwrap().all_document_paths().unwrap()
     }
 
+    /// (kuriya 259, spec T-I1) A directory rename onto a directory: a listed row its step skips
+    /// (`.txt`, which the registry does not take at either end) leaves its old path through the
+    /// listed loop, as a rename away does, even though the removal gate would turn the path away.
+    /// The old directory is recreated empty so the range sweep of a gone source does not take
+    /// the row instead: only the listed loop can drop it.
+    #[test]
+    fn i6_t_i1_a_scan_destination_rename_drops_the_listed_rows_the_gate_would_turn_away() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-scan-gate",
+            &["docs"],
+            &[("notes/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/c.txt"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(paths, vec!["notes/a.md".to_string()]);
+    }
+
     /// (kuriya 259, invariant I6, spec T-I1) A directory renamed to a destination already gone,
     /// with the old directory recreated and one file written back into it before the batch is
     /// handled: that file's row stays (reindexed in place), the other listed row leaves.
