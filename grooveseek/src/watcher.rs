@@ -714,12 +714,17 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `.git/` や `node_modules/` へ rename すると
                 // `rename_single_file` が **denylist 配下の新パスへ DB を
                 // 書き換えて残す**。除外したはずのファイルが index に居座る。
+                //
+                // (kuriya 259) The old end is looked at before its row is dropped
+                // ([`dispatch_removal`] with [`RemovalCause::RenamedAway`]): a file the write gate
+                // takes back there is reindexed in place; with no row left there, nothing is
+                // looked at.
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
                     RenameAction::Rename => {
                         dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
                     }
                     RenameAction::Deindex => {
-                        dispatch_deindex(state, &old_rel);
+                        dispatch_removal(state, &old_rel, from, RemovalCause::RenamedAway);
                         hand_on_a_link_destination(state, &new_rel, to);
                     }
                     RenameAction::Reindex => dispatch_reindex(state, &new_rel, to),
@@ -836,7 +841,9 @@ fn handle_removed_path(state: &WatcherState, rel: &str, full: &Path) {
         rel,
         removal_outcome(rel, full, &state.registry, &state.rules),
     ) {
-        RemovalDispatch::DecideInLocks => dispatch_removal(state, rel, full),
+        RemovalDispatch::DecideInLocks => {
+            dispatch_removal(state, rel, full, RemovalCause::RemoveEvent)
+        }
         RemovalDispatch::Deindex => dispatch_deindex(state, rel),
         RemovalDispatch::Skip => {}
     }
@@ -1106,6 +1113,20 @@ fn removal_gate_passes_by_name(rel: &str) -> bool {
     !crate::resources::rel_is_indexable_name(rel)
 }
 
+/// Why the row of a path is being decided with the locks held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalCause {
+    /// A remove event named the path: the removal gate decides whether the index tracks it.
+    RemoveEvent,
+    /// (kuriya 259) A rename took the row away from this path: the old end of a file rename the
+    /// gates sent to a deindex, or a row listed under a renamed directory. The caller has decided
+    /// the row leaves, so a removal gate that turns the path away does not keep it; only a file
+    /// back at the path that the write gate takes keeps it (reindexed in place), and only while
+    /// the row is still there: a path whose row is already gone (moved by the rename) is not
+    /// looked at, and a file back there is indexed by its own event.
+    RenamedAway,
+}
+
 /// What [`decide_removal_in_locks`] did.
 #[derive(Debug)]
 enum RemovalInLocks {
@@ -1144,8 +1165,13 @@ enum RemovalInLocks {
 /// alone, for a look that found the path gone: then only the deindex or the skip can come
 /// back, and neither needs the embedder.
 ///
+/// (kuriya 259) `cause` says why the row is being decided: for [`RemovalCause::RenamedAway`] a
+/// skip from the removal gate is read as a deindex (the rename has decided the row leaves), on
+/// the same one look; every other answer is taken as it is.
+///
 /// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`] and an
 /// [`OnDisk::Unknown`] that no file system makes on demand.
+#[allow(clippy::too_many_arguments)]
 fn decide_removal_in_locks(
     db: &Database,
     kb_path: &Path,
@@ -1154,8 +1180,13 @@ fn decide_removal_in_locks(
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
     on_disk: OnDisk,
+    cause: RemovalCause,
 ) -> RemovalInLocks {
-    match removal_decision_for(rel, full, registry, rules, on_disk) {
+    let action = match removal_decision_for(rel, full, registry, rules, on_disk) {
+        RemovalAction::Skip if cause == RemovalCause::RenamedAway => RemovalAction::Deindex,
+        action => action,
+    };
+    match action {
         RemovalAction::Reindex => RemovalInLocks::Reindex,
         RemovalAction::Skip => RemovalInLocks::Skip,
         RemovalAction::Deindex => match on_disk {
@@ -1181,6 +1212,9 @@ enum RemovalUnderDatabaseLock {
     /// A file is at the path or the look could not tell: nothing was touched, and the removal
     /// is decided again with both locks held ([`dispatch_reindex_after_removal`]).
     NeedsBothLocks,
+    /// (kuriya 259) A rename took the row away and no row is under `rel` any more: nothing was
+    /// looked at; only the folded legacy row was swept (the result is that sweep's).
+    NoRowLeft(Result<bool>),
 }
 
 /// (local Codex r2, medium) The part of a removal that needs no embedder, for a caller holding
@@ -1196,6 +1230,7 @@ enum RemovalUnderDatabaseLock {
 /// the same shape.
 ///
 /// Split out of the dispatch so a test can run it with no [`crate::embedder::Embedder`].
+#[allow(clippy::too_many_arguments)]
 fn remove_if_still_gone(
     db: &Database,
     kb_path: &Path,
@@ -1204,11 +1239,12 @@ fn remove_if_still_gone(
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
     on_disk: OnDisk,
+    cause: RemovalCause,
 ) -> RemovalUnderDatabaseLock {
     if on_disk != OnDisk::Gone {
         return RemovalUnderDatabaseLock::NeedsBothLocks;
     }
-    match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk) {
+    match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk, cause) {
         RemovalInLocks::Deindexed(outcome) => RemovalUnderDatabaseLock::Deindexed(outcome),
         RemovalInLocks::Skip => RemovalUnderDatabaseLock::Skip,
         // A gone path is never reindexed nor left on an unknown look; named rather than
@@ -1228,26 +1264,42 @@ fn remove_if_still_gone(
 /// else ([`dispatch_reindex_after_removal`]), where the path is looked at once more and the
 /// decision asked again. Never the embedder lock while holding the database lock: that order
 /// would deadlock against every other reindex.
-fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path) {
+///
+/// (kuriya 259) `cause` goes with the decision both under the database lock and with both
+/// locks; for [`RemovalCause::RenamedAway`] a path with no row under `rel` any more is not
+/// looked at, and only its folded legacy row is swept.
+fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path, cause: RemovalCause) {
     let under_db = {
         let db = recover_db(state.lock_for_batch(&state.db));
-        remove_if_still_gone(
-            &db,
-            &state.kb_path,
-            rel,
-            full,
-            &state.registry,
-            &state.rules,
-            removed_path_on_disk(&state.kb_path, rel),
-        )
+        if cause == RemovalCause::RenamedAway && matches!(db.get_document_hash(rel), Ok(None)) {
+            RemovalUnderDatabaseLock::NoRowLeft(indexer::sweep_legacy_folded_row(
+                &db,
+                &state.kb_path,
+                rel,
+                false,
+            ))
+        } else {
+            let on_disk = removed_path_on_disk(&state.kb_path, rel);
+            remove_if_still_gone(
+                &db,
+                &state.kb_path,
+                rel,
+                full,
+                &state.registry,
+                &state.rules,
+                on_disk,
+                cause,
+            )
+        }
         // `db` is dropped here, before the embedder lock can be taken.
     };
     match under_db {
         RemovalUnderDatabaseLock::Deindexed(outcome) => log_removed_path_deindexed(rel, outcome),
         RemovalUnderDatabaseLock::Skip => {}
         RemovalUnderDatabaseLock::NeedsBothLocks => {
-            dispatch_reindex_after_removal(state, rel, full)
+            dispatch_reindex_after_removal(state, rel, full, cause)
         }
+        RemovalUnderDatabaseLock::NoRowLeft(outcome) => log_folded_sweep(rel, outcome),
     }
 }
 
@@ -2306,8 +2358,9 @@ enum ReindexOrigin<'a> {
     /// A remove event found a file at the path again ([`RemovalAction::Reindex`]), or could not
     /// tell whether it is there (kuriya 548): [`decide_removal_in_locks`] and
     /// [`settle_removal_reindex_looked`]. `full` is the path the event named, which the gates
-    /// judge when asked again inside the locks.
-    Removal { full: &'a Path },
+    /// judge when asked again inside the locks; `cause` is why its row is being decided
+    /// ([`RemovalCause`]).
+    Removal { full: &'a Path, cause: RemovalCause },
     /// A create, modify or rename-to: [`act_on_written_path`] and [`settle_write_reindex`].
     /// `raw` is the path the event named, when the caller has it ([`rel_is_lossy`]); `look` is
     /// how `rel` is looked at ([`written_path_on_disk`]).
@@ -2326,8 +2379,8 @@ fn dispatch_reindex_from(state: &WatcherState, rel: &str, origin: ReindexOrigin<
     let mut embedder = recover(state.lock_for_batch(&state.embedder), "embedder");
     let db = recover_db(state.lock_for_batch(&state.db));
     match origin {
-        ReindexOrigin::Removal { full } => {
-            reindex_after_removal_locked(state, &db, &mut embedder, rel, full)
+        ReindexOrigin::Removal { full, cause } => {
+            reindex_after_removal_locked(state, &db, &mut embedder, rel, full, cause)
         }
         ReindexOrigin::Write { raw, look } => {
             reindex_after_write_locked(state, &db, &mut embedder, rel, raw, look)
@@ -2472,7 +2525,16 @@ fn refused_row_in_locks(
     if on_disk != OnDisk::Present {
         return None;
     }
-    match decide_removal_in_locks(db, kb_path, rel, full, registry, rules, on_disk) {
+    match decide_removal_in_locks(
+        db,
+        kb_path,
+        rel,
+        full,
+        registry,
+        rules,
+        on_disk,
+        RemovalCause::RemoveEvent,
+    ) {
         RemovalInLocks::Deindexed(outcome) => Some(outcome),
         RemovalInLocks::Reindex | RemovalInLocks::Skip | RemovalInLocks::LeftIndexed { .. } => None,
     }
@@ -2562,8 +2624,13 @@ fn sweep_requires_real_key(result: &Result<indexer::SingleResult>) -> bool {
 ///
 /// Only the remove path calls this. (#544) A create, modify or rename-to looks at the disk
 /// inside the locks too, with its own answers ([`ReindexOrigin::Write`]).
-fn dispatch_reindex_after_removal(state: &WatcherState, rel: &str, full: &Path) {
-    dispatch_reindex_from(state, rel, ReindexOrigin::Removal { full });
+fn dispatch_reindex_after_removal(
+    state: &WatcherState,
+    rel: &str,
+    full: &Path,
+    cause: RemovalCause,
+) {
+    dispatch_reindex_from(state, rel, ReindexOrigin::Removal { full, cause });
 }
 
 /// The removal half of [`dispatch_reindex_from`] ([`dispatch_reindex_after_removal`]'s body),
@@ -2574,6 +2641,7 @@ fn reindex_after_removal_locked(
     embedder: &mut Embedder,
     rel: &str,
     full: &Path,
+    cause: RemovalCause,
 ) {
     let look = removed_path_on_disk(&state.kb_path, rel);
     match decide_removal_in_locks(
@@ -2584,6 +2652,7 @@ fn reindex_after_removal_locked(
         &state.registry,
         &state.rules,
         look,
+        cause,
     ) {
         RemovalInLocks::Reindex => {}
         RemovalInLocks::Deindexed(outcome) => {
@@ -2924,6 +2993,10 @@ fn log_reindex_result(
     }
 }
 
+/// (kuriya 259) The deindex of a name the index cannot hold, which
+/// [`handle_removed_path`] alone calls: nothing at such a name is ever indexed, so the row
+/// leaves without a look at the disk. Every other event-driven deletion looks at the disk inside
+/// the database lock first ([`dispatch_removal`]).
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
     let db = recover_db(state.lock_for_batch(&state.db));
     match indexer::deindex_single_file(&db, rel) {
@@ -4379,24 +4452,29 @@ fn stat_unless_gone(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 /// - [`DirRenameEntry::ScanDestination`]: every row under `old_rel/` goes
 ///   through its file rename ([`dir_rename_steps`], judged by the existing
 ///   [`rename_decision`] and run by the existing [`dispatch_rename`] /
-///   [`dispatch_deindex`] / [`dispatch_reindex`]); then every listed row is
-///   dropped from its old path through [`dispatch_deindex`] (a no-op for one
-///   already moved), so no listed row stays there even when the old directory
-///   was recreated; rows added under the old prefix after the listing are
+///   [`dispatch_removal`] / [`dispatch_reindex`]); then every listed row is
+///   dropped from its old path through [`dispatch_removal`] (not looked at for
+///   one already moved), so no listed row stays there even when the old
+///   directory was recreated; rows added under the old prefix after the listing are
 ///   swept by [`sweep_source_if_gone`] once `from` is gone; last,
 ///   [`dispatch_new_directory`] scans `to` for files not indexed yet.
 /// - [`DirRenameEntry::SweepOnly`]: no move and no scan. When `from` is gone,
 ///   one range sweep by [`sweep_source_if_gone`] drops the listed rows and
 ///   any added since. Otherwise (`from` recreated, or its stat failed) only
 ///   the rows the entry decision listed are dropped, one by one through
-///   [`dispatch_deindex`], so a recreated directory's own rows are kept.
+///   [`dispatch_removal`], so a recreated directory's own rows are kept.
 ///   Renaming the rows onto a destination that no longer exists would drop
 ///   them while logging a rename; the later event for the new name scans it.
 ///
 /// On both paths, the row stored under `old_rel` itself (a file, not under
-/// `old_rel/`) is dropped through [`dispatch_deindex`], once, before the
+/// `old_rel/`) is dropped through [`dispatch_removal`], once, before the
 /// destination scan: the file rename the event may stand for would have
 /// dropped it, and for a real directory rename it is a no-op.
+///
+/// (kuriya 259) Each of these drops is a rename away
+/// ([`RemovalCause::RenamedAway`]): a file back at the old path that the write
+/// gate takes keeps its row (reindexed in place), looked at inside the database
+/// lock of the delete; a path whose row is already gone is not looked at.
 ///
 /// The db is locked only while listing, never across the loop, so the MCP search
 /// tool is not held up for the size of the directory. The listing guard is
@@ -4502,7 +4580,12 @@ fn dispatch_directory_rename(
                     RenameAction::Rename => {
                         dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
                     }
-                    RenameAction::Deindex => dispatch_deindex(state, &step.old_rel),
+                    RenameAction::Deindex => dispatch_removal(
+                        state,
+                        &step.old_rel,
+                        &state.kb_path.join(&step.old_rel),
+                        RemovalCause::RenamedAway,
+                    ),
                     // (#544) No event path for a step (its `new_rel` is built from the
                     // row's), so it is read as not lossy and only whether a file is there
                     // is asked: a lossy row's step looks gone, the answer
@@ -4522,9 +4605,11 @@ fn dispatch_directory_rename(
             // not `from` is gone: a row the pass above did not move (a skip, a
             // reindex of the new path, a rename that failed) would otherwise stay
             // as a hit for a path the old directory may hold again under other
-            // contents. A row already moved is a no-op here.
+            // contents. (kuriya 259) Unless a file the write gate takes is back
+            // there, which is reindexed in place. A row already moved is not
+            // looked at.
             for p in &paths {
-                dispatch_deindex(state, p);
+                dispatch_removal(state, p, &state.kb_path.join(p), RemovalCause::RenamedAway);
             }
         }
     }
@@ -4554,11 +4639,13 @@ fn dispatch_directory_rename(
     };
     if !from_gone && let DirRenameEntry::SweepOnly(paths) = &entry {
         // (local Codex r5, r6) `from` was recreated, or cannot be stat'ed: the
-        // listed rows predate the rename and go, but one by one, so a recreated
-        // directory's own rows are not taken by a prefix sweep. Rare, so the
-        // per-row cost (a lock and a delete each) is paid only here.
+        // listed rows predate the rename and leave their old paths, but one by
+        // one, so a recreated directory's own rows are not taken by a prefix
+        // sweep. (kuriya 259) A listed row whose path holds again a file the
+        // write gate takes stays, reindexed in place. Rare, so the per-row cost
+        // (a lock and a look each) is paid only here.
         for p in paths {
-            dispatch_deindex(state, p);
+            dispatch_removal(state, p, &state.kb_path.join(p), RemovalCause::RenamedAway);
         }
     }
     // (local Codex r6, r7) On both paths, the row stored under the old path
@@ -4568,7 +4655,9 @@ fn dispatch_directory_rename(
     // directory later took. The file rename would have dropped it. For a real
     // directory rename there is no such row and this is a no-op (one deletes
     // the exact row, the sweep what is strictly under it, as in feature-67).
-    dispatch_deindex(state, old_rel);
+    // (kuriya 259) Unless a file the write gate takes is back at the old path,
+    // which is reindexed in place.
+    dispatch_removal(state, old_rel, from, RemovalCause::RenamedAway);
     if entry == DirRenameEntry::ScanDestination && moves {
         dispatch_new_directory(state, to, new_rel);
     }
@@ -6364,6 +6453,7 @@ mod tests {
             &reg,
             &rules,
             unknown,
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(
@@ -6389,6 +6479,7 @@ mod tests {
             &reg,
             &rules,
             unknown,
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(
@@ -6415,6 +6506,7 @@ mod tests {
                 &reg,
                 &rules,
                 unknown,
+                RemovalCause::RemoveEvent,
             );
             assert!(
                 matches!(
@@ -6453,7 +6545,16 @@ mod tests {
         let full = kb.0.join("doc.md");
 
         let db = dir_rename_db(&["doc.md", "other.md"]);
-        let gone = decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Gone);
+        let gone = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &full,
+            &reg,
+            &rules,
+            OnDisk::Gone,
+            RemovalCause::RemoveEvent,
+        );
         assert!(
             matches!(gone, RemovalInLocks::Deindexed(Ok(true))),
             "{gone:?}"
@@ -6464,8 +6565,16 @@ mod tests {
         );
 
         let db = dir_rename_db(&["doc.md", "other.md"]);
-        let present =
-            decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Present);
+        let present = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &full,
+            &reg,
+            &rules,
+            OnDisk::Present,
+            RemovalCause::RemoveEvent,
+        );
         assert!(matches!(present, RemovalInLocks::Reindex), "{present:?}");
         assert_eq!(
             db.all_document_paths().unwrap(),
@@ -6489,6 +6598,7 @@ mod tests {
                 &reg,
                 &rules,
                 look,
+                RemovalCause::RemoveEvent,
             );
             assert!(
                 matches!(skipped, RemovalInLocks::Skip),
@@ -6510,6 +6620,7 @@ mod tests {
             &reg,
             &rules,
             OnDisk::Unknown(std::io::ErrorKind::Other),
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(
@@ -6553,6 +6664,7 @@ mod tests {
             &reg,
             &rules,
             OnDisk::Present,
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(linked, RemovalInLocks::Deindexed(Ok(true))),
@@ -6573,6 +6685,7 @@ mod tests {
             &reg,
             &rules,
             OnDisk::Present,
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(unaddressable, RemovalInLocks::Deindexed(Ok(true))),
@@ -6729,7 +6842,16 @@ mod tests {
         let look = removed_path_on_disk(&kb.0, "doc.md");
         assert_eq!(look, OnDisk::Present);
         let db = dir_rename_db(&["doc.md", "other.md"]);
-        let decided = decide_removal_in_locks(&db, &kb.0, "doc.md", &full, &reg, &rules, look);
+        let decided = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &full,
+            &reg,
+            &rules,
+            look,
+            RemovalCause::RemoveEvent,
+        );
         assert!(matches!(decided, RemovalInLocks::Reindex), "{decided:?}");
         assert_eq!(
             db.all_document_paths().unwrap(),
@@ -6749,7 +6871,16 @@ mod tests {
         let full = kb.0.join("doc.md");
 
         let db = dir_rename_db(&["doc.md", "other.md"]);
-        let gone = remove_if_still_gone(&db, &kb.0, "doc.md", &full, &reg, &rules, OnDisk::Gone);
+        let gone = remove_if_still_gone(
+            &db,
+            &kb.0,
+            "doc.md",
+            &full,
+            &reg,
+            &rules,
+            OnDisk::Gone,
+            RemovalCause::RemoveEvent,
+        );
         assert!(
             matches!(gone, RemovalUnderDatabaseLock::Deindexed(Ok(true))),
             "{gone:?}"
@@ -6769,6 +6900,7 @@ mod tests {
             &reg,
             &rules,
             OnDisk::Gone,
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(skipped, RemovalUnderDatabaseLock::Skip),
@@ -6784,7 +6916,16 @@ mod tests {
             OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
         ] {
             let db = dir_rename_db(&["doc.md", "other.md"]);
-            let handed_on = remove_if_still_gone(&db, &kb.0, "doc.md", &full, &reg, &rules, look);
+            let handed_on = remove_if_still_gone(
+                &db,
+                &kb.0,
+                "doc.md",
+                &full,
+                &reg,
+                &rules,
+                look,
+                RemovalCause::RemoveEvent,
+            );
             assert!(
                 matches!(handed_on, RemovalUnderDatabaseLock::NeedsBothLocks),
                 "{look:?}: {handed_on:?}"
@@ -6848,6 +6989,301 @@ mod tests {
         assert_eq!(
             db.lock().unwrap().all_document_paths().unwrap(),
             vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 259) A document long enough to give the reindex a chunk to embed (a short body
+    /// would be dropped as nothing to index, which also leaves no row).
+    const I6_DOC: &str = concat!(
+        "---\ntitle: Rename away fixture\ntags: [test]\n---\n",
+        "\n",
+        "## back at the old path\n",
+        "\n",
+        "This file was written at the path a rename had just taken a document\n",
+        "away from. Written long enough to clear the default per-chunk quality\n",
+        "filter, so the reindex that keeps the row has a chunk to embed and\n",
+        "writes the row with the hash of these bytes.\n",
+    );
+
+    /// (kuriya 259) A knowledge base with `node_modules/a.md` (the file a rename moved into an
+    /// excluded directory) and, when `back` is given, `a.md` holding it (a file back at the old
+    /// end of the rename).
+    fn i6_rename_kb(prefix: &str, back: Option<&str>) -> I549Kb {
+        let kb = crate::test_support::unique_temp_path(prefix);
+        std::fs::create_dir_all(kb.join("node_modules")).unwrap();
+        let kb = I549Kb(kb);
+        std::fs::write(kb.0.join("node_modules").join("a.md"), I6_DOC).unwrap();
+        if let Some(body) = back {
+            std::fs::write(kb.0.join("a.md"), body).unwrap();
+        }
+        kb
+    }
+
+    /// The watcher state the kuriya 259 event-loop tests run [`handle_events`] on.
+    fn i6_state(
+        kb: &Path,
+        db: &Arc<Mutex<Database>>,
+        embedder: &Arc<Mutex<Embedder>>,
+    ) -> WatcherState {
+        WatcherState {
+            kb_path: kb.to_path_buf(),
+            db: Arc::clone(db),
+            embedder: Arc::clone(embedder),
+            registry: Arc::new(Registry::defaults()),
+            exclude_headings: None,
+            rules: crate::exclusion::ExclusionRules::load(kb, default_exclude_dirs()),
+            config: WatchConfig::default(),
+            watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watch_status: None,
+            watch_backoff: WatcherState::DEFAULT_WATCH_BACKOFF,
+            batch_probe: None,
+        }
+    }
+
+    /// The rename of `a.md` into `node_modules/` (an excluded directory), as the debouncer
+    /// stitches it.
+    fn i6_rename_into_excluded(kb: &Path) -> [DebouncedEvent; 1] {
+        [mk_evt(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![kb.join("a.md"), kb.join("node_modules").join("a.md")],
+        )]
+    }
+
+    /// (kuriya 259) A file written back at the old end of a rename into
+    /// an excluded directory before the batch is handled keeps its row: the old end is looked at
+    /// inside the database lock of the delete and reindexed, so the row holds the new bytes
+    /// (its hash is no longer the one the rename moved away).
+    #[test]
+    fn i6_t_i2_a_file_back_at_the_old_end_of_a_rename_into_an_excluded_dir_keeps_its_row() {
+        let kb = i6_rename_kb("groove-watcher-i6-t-i2", Some(I6_DOC));
+        let db = Arc::new(Mutex::new(dir_rename_db(&["a.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(&kb.0, &db, &embedder);
+
+        handle_events(&mut state, &i6_rename_into_excluded(&kb.0));
+
+        let db = db.lock().unwrap();
+        assert_eq!(db.all_document_paths().unwrap(), vec!["a.md".to_string()]);
+        let hash = db.get_document_hash("a.md").unwrap();
+        assert!(
+            hash.is_some() && hash.as_deref() != Some("h"),
+            "the row was not rewritten by a reindex: {hash:?}"
+        );
+    }
+
+    /// (kuriya 259) The same rename with nothing back at the old path drops the row, as it did
+    /// before the old end was looked at.
+    #[test]
+    fn i6_a_rename_into_an_excluded_dir_with_nothing_back_drops_the_row() {
+        let kb = i6_rename_kb("groove-watcher-i6-nothing-back", None);
+        let db = Arc::new(Mutex::new(dir_rename_db(&["a.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(&kb.0, &db, &embedder);
+
+        handle_events(&mut state, &i6_rename_into_excluded(&kb.0));
+
+        assert!(db.lock().unwrap().all_document_paths().unwrap().is_empty());
+    }
+
+    /// (kuriya 259) The old end of a rename that is gone is settled under the database lock
+    /// alone, so the batch finishes while the embedder lock is held elsewhere (a search embedding
+    /// a query), as a remove event does.
+    #[test]
+    fn i6_a_rename_away_from_a_gone_path_does_not_wait_for_the_embedder_lock() {
+        let kb = i6_rename_kb("groove-watcher-i6-no-embedder-wait", None);
+        let db = Arc::new(Mutex::new(dir_rename_db(&["a.md", "other.md"])));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(&kb.0, &db, &embedder);
+        let events = i6_rename_into_excluded(&kb.0);
+
+        let held = embedder.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let finished = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_events(&mut state, &events);
+                let _ = done_tx.send(());
+            });
+            // Generous: the deletion takes milliseconds; the wait only runs out when the
+            // removal is blocked on the held lock.
+            let finished = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+            drop(held);
+            finished
+        });
+        assert!(
+            finished,
+            "the old end of a rename, still gone, waited for the embedder lock"
+        );
+        assert_eq!(
+            db.lock().unwrap().all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
+    }
+
+    /// (kuriya 259) A knowledge base holding the empty directories `dirs` and each `(rel, body)`
+    /// of `files` (directories on the way are created).
+    fn i6_dir_kb(prefix: &str, dirs: &[&str], files: &[(&str, &str)]) -> I549Kb {
+        let kb = I549Kb(crate::test_support::unique_temp_path(prefix));
+        std::fs::create_dir_all(&kb.0).unwrap();
+        for dir in dirs {
+            std::fs::create_dir_all(kb.0.join(dir)).unwrap();
+        }
+        for (rel, body) in files {
+            let path = kb.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        kb
+    }
+
+    /// The rename of the path `old` to another one, both relative to the knowledge base, as the
+    /// debouncer stitches it.
+    fn i6_rename(kb: &Path, old: &str, new: &str) -> [DebouncedEvent; 1] {
+        [mk_evt(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![kb.join(old), kb.join(new)],
+        )]
+    }
+
+    /// Runs `events` on a store holding `rows` over `kb`, and returns the paths left in it.
+    fn i6_paths_after(kb: &Path, rows: &[&str], events: &[DebouncedEvent]) -> Vec<String> {
+        let db = Arc::new(Mutex::new(dir_rename_db(rows)));
+        let embedder = Arc::new(Mutex::new(Embedder::stub_for_tests(384)));
+        let mut state = i6_state(kb, &db, &embedder);
+        handle_events(&mut state, events);
+        db.lock().unwrap().all_document_paths().unwrap()
+    }
+
+    /// (kuriya 259) A directory rename onto a directory: a listed row its step skips
+    /// (`.txt`, which the registry does not take at either end) leaves its old path through the
+    /// listed loop, as a rename away does, even though the removal gate would turn the path away.
+    /// The old directory is recreated empty so the range sweep of a gone source does not take
+    /// the row instead: only the listed loop can drop it.
+    #[test]
+    fn i6_t_i1_a_scan_destination_rename_drops_the_listed_rows_the_gate_would_turn_away() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-scan-gate",
+            &["docs"],
+            &[("notes/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/c.txt"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(paths, vec!["notes/a.md".to_string()]);
+    }
+
+    /// (kuriya 259) A directory renamed to a destination already gone,
+    /// with the old directory recreated and one file written back into it before the batch is
+    /// handled: that file's row stays (reindexed in place), the other listed row leaves.
+    #[test]
+    fn i6_t_i1_a_sweep_only_rename_keeps_the_row_of_a_file_back() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-sweep-keeps",
+            &[],
+            &[("docs/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/b.md"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(paths, vec!["docs/a.md".to_string()]);
+    }
+
+    /// (kuriya 259) A directory renamed into an excluded directory, with
+    /// a file written back at the old path of one of its rows: the step's deindex looks first,
+    /// so that row stays (reindexed in place).
+    #[test]
+    fn i6_t_i1_a_step_into_an_excluded_dir_keeps_the_row_of_a_file_back() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-step-excluded",
+            &[],
+            &[("node_modules/docs/a.md", I6_DOC), ("docs/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md"],
+            &i6_rename(&kb.0, "docs", "node_modules/docs"),
+        );
+        assert_eq!(paths, vec!["docs/a.md".to_string()]);
+    }
+
+    /// (kuriya 259) A file renamed onto a name that is a directory by
+    /// the time the event is handled, with a file written back at the old name: the row of the
+    /// old name itself stays (reindexed in place).
+    #[test]
+    fn i6_t_i1_the_old_name_itself_keeps_the_row_of_a_file_back() {
+        let kb = i6_dir_kb("groove-watcher-i6-old-name", &["y"], &[("x.md", I6_DOC)]);
+        let paths = i6_paths_after(&kb.0, &["x.md"], &i6_rename(&kb.0, "x.md", "y"));
+        assert_eq!(paths, vec!["x.md".to_string()]);
+    }
+
+    /// (kuriya 259) A sweep-only directory rename with the old directory recreated: a listed row
+    /// the removal gate would turn away (`.txt`) leaves too, as a rename away does.
+    #[test]
+    fn i6_a_sweep_only_rename_drops_the_listed_rows_the_gate_would_turn_away() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-sweep-gate",
+            &[],
+            &[("docs/a.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/b.md", "docs/c.txt"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(paths, vec!["docs/a.md".to_string()]);
+    }
+
+    /// (kuriya 259) A file back under the recreated old directory only under another
+    /// case of its name does not keep the old row, and no row is written for the other spelling
+    /// (no event named it): the same answer on a file system that tells cases apart and on one
+    /// that does not.
+    #[test]
+    fn i6_a_file_back_only_under_another_case_does_not_keep_the_old_row() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-other-case",
+            &[],
+            &[("docs/A.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(&kb.0, &["docs/a.md"], &i6_rename(&kb.0, "docs", "notes"));
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    /// (kuriya 259, kuriya 566) A hard link written back at the old path of a listed row does not
+    /// keep it: the write gate refuses a hard link, so the row leaves.
+    #[test]
+    fn i6_a_hard_link_back_under_the_old_directory_still_loses_its_row() {
+        let kb = i6_dir_kb("groove-watcher-i6-hard-link", &["docs"], &[]);
+        let outside = I549Kb(crate::test_support::unique_temp_path(
+            "groove-watcher-i6-hard-link-outside",
+        ));
+        std::fs::create_dir_all(&outside.0).unwrap();
+        std::fs::write(outside.0.join("a.md"), I6_DOC).unwrap();
+        std::fs::hard_link(outside.0.join("a.md"), kb.0.join("docs").join("a.md"))
+            .expect("hard links need no privilege");
+        let paths = i6_paths_after(&kb.0, &["docs/a.md"], &i6_rename(&kb.0, "docs", "notes"));
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    /// (kuriya 259) The control: a plain directory rename with nothing written back moves every
+    /// row to the new directory, as before.
+    #[test]
+    fn i6_t_i1_a_plain_directory_rename_moves_every_row() {
+        let kb = i6_dir_kb(
+            "groove-watcher-i6-plain-dir",
+            &[],
+            &[("notes/a.md", I6_DOC), ("notes/b.md", I6_DOC)],
+        );
+        let paths = i6_paths_after(
+            &kb.0,
+            &["docs/a.md", "docs/b.md"],
+            &i6_rename(&kb.0, "docs", "notes"),
+        );
+        assert_eq!(
+            paths,
+            vec!["notes/a.md".to_string(), "notes/b.md".to_string()]
         );
     }
 
@@ -10228,7 +10664,16 @@ mod tests {
         let db = dir_rename_db(&["a.md", "other.md"]);
         let look = removed_path_on_disk(&kb, "a.md");
         assert_eq!(look, OnDisk::Gone);
-        let removed = remove_if_still_gone(&db, &kb, "a.md", &link, &reg, &rules, look);
+        let removed = remove_if_still_gone(
+            &db,
+            &kb,
+            "a.md",
+            &link,
+            &reg,
+            &rules,
+            look,
+            RemovalCause::RemoveEvent,
+        );
         assert!(
             matches!(removed, RemovalUnderDatabaseLock::Deindexed(Ok(true))),
             "{removed:?}"
@@ -10419,6 +10864,7 @@ mod tests {
             &reg,
             &rules,
             OnDisk::Present,
+            RemovalCause::RemoveEvent,
         );
         assert!(
             matches!(outcome, RemovalInLocks::Deindexed(Ok(true))),
@@ -10830,5 +11276,207 @@ mod tests {
             "no batch counted within 10 s of a write after the stop (emitted {before})"
         );
         assert_eq!(probe.started.load(SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // (#259 PR4) RemovalCause: a rename's removal decided with the locks held
+    // -----------------------------------------------------------------------
+
+    /// (kuriya 259) A row a rename took away goes even where the removal gate turns the path
+    /// away (an excluded path, an extension the registry does not hold); a remove event keeps
+    /// such a row, as before.
+    #[test]
+    fn i6_decide_renamed_away_reads_a_gate_skip_as_a_deindex() {
+        let kb = i549_kb("groove-watcher-i6-gate-skip");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let excluded_full = kb.0.join(".obsidian").join("x.md");
+
+        let db = dir_rename_db(&[".obsidian/x.md"]);
+        let kept = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            ".obsidian/x.md",
+            &excluded_full,
+            &reg,
+            &rules,
+            OnDisk::Gone,
+            RemovalCause::RemoveEvent,
+        );
+        assert!(matches!(kept, RemovalInLocks::Skip), "{kept:?}");
+        assert_eq!(
+            db.all_document_paths().unwrap(),
+            vec![".obsidian/x.md".to_string()]
+        );
+
+        let db = dir_rename_db(&[".obsidian/x.md"]);
+        let dropped = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            ".obsidian/x.md",
+            &excluded_full,
+            &reg,
+            &rules,
+            OnDisk::Gone,
+            RemovalCause::RenamedAway,
+        );
+        assert!(
+            matches!(dropped, RemovalInLocks::Deindexed(Ok(true))),
+            "{dropped:?}"
+        );
+        assert!(db.all_document_paths().unwrap().is_empty());
+
+        let db = dir_rename_db(&["c.txt"]);
+        let dropped = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "c.txt",
+            &kb.0.join("c.txt"),
+            &reg,
+            &rules,
+            OnDisk::Gone,
+            RemovalCause::RenamedAway,
+        );
+        assert!(
+            matches!(dropped, RemovalInLocks::Deindexed(Ok(true))),
+            "{dropped:?}"
+        );
+        assert!(db.all_document_paths().unwrap().is_empty());
+    }
+
+    /// (kuriya 259) A file back at the path a rename left, which the write gate takes, keeps
+    /// its row: it is reindexed in place.
+    #[test]
+    fn i6_decide_renamed_away_reindexes_a_file_the_write_gate_takes() {
+        let kb = i549_kb("groove-watcher-i6-reindex");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+
+        let db = dir_rename_db(&["doc.md"]);
+        let decided = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &kb.0.join("doc.md"),
+            &reg,
+            &rules,
+            OnDisk::Present,
+            RemovalCause::RenamedAway,
+        );
+        assert!(matches!(decided, RemovalInLocks::Reindex), "{decided:?}");
+        assert_eq!(db.all_document_paths().unwrap(), vec!["doc.md".to_string()]);
+    }
+
+    /// (kuriya 259) A file back at the path a rename left, which the index would not hold (an
+    /// excluded path), does not keep the row.
+    #[test]
+    fn i6_decide_renamed_away_drops_a_present_file_the_index_would_not_hold() {
+        let kb = i549_kb("groove-watcher-i6-present-excluded");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let excluded_full = kb.0.join(".obsidian").join("x.md");
+        std::fs::create_dir_all(excluded_full.parent().unwrap()).unwrap();
+        std::fs::write(&excluded_full, "# x").unwrap();
+
+        let db = dir_rename_db(&[".obsidian/x.md"]);
+        let decided = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            ".obsidian/x.md",
+            &excluded_full,
+            &reg,
+            &rules,
+            OnDisk::Present,
+            RemovalCause::RenamedAway,
+        );
+        assert!(
+            matches!(decided, RemovalInLocks::Deindexed(Ok(true))),
+            "{decided:?}"
+        );
+        assert!(db.all_document_paths().unwrap().is_empty());
+    }
+
+    /// (kuriya 259) A look at the path a rename left that cannot tell keeps the row, as a
+    /// remove event does (kuriya 548).
+    #[test]
+    fn i6_decide_renamed_away_leaves_the_row_on_an_unknown_look() {
+        let kb = i549_kb("groove-watcher-i6-unknown");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+
+        let db = dir_rename_db(&["doc.md"]);
+        let decided = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            "doc.md",
+            &kb.0.join("doc.md"),
+            &reg,
+            &rules,
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+            RemovalCause::RenamedAway,
+        );
+        assert!(
+            matches!(
+                decided,
+                RemovalInLocks::LeftIndexed {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    held_row: Ok(true),
+                }
+            ),
+            "{decided:?}"
+        );
+        assert_eq!(db.all_document_paths().unwrap(), vec!["doc.md".to_string()]);
+    }
+
+    /// (kuriya 259, kuriya 566 R7) Reading a gate skip as a deindex takes no second look.
+    #[test]
+    fn i6_decide_renamed_away_takes_one_look() {
+        let kb = i549_kb("groove-watcher-i6-one-look");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb.0, default_exclude_dirs());
+        let excluded_full = kb.0.join(".obsidian").join("x.md");
+        std::fs::create_dir_all(excluded_full.parent().unwrap()).unwrap();
+        std::fs::write(&excluded_full, "# x").unwrap();
+
+        let db = dir_rename_db(&[".obsidian/x.md"]);
+        FACTS_TAKEN.with(|n| n.set(0));
+        let _ = decide_removal_in_locks(
+            &db,
+            &kb.0,
+            ".obsidian/x.md",
+            &excluded_full,
+            &reg,
+            &rules,
+            OnDisk::Present,
+            RemovalCause::RenamedAway,
+        );
+        assert_eq!(FACTS_TAKEN.with(|n| n.get()), 1);
+    }
+
+    /// (kuriya 259) A path a rename has already taken the row away from is not looked at: no
+    /// row is there to drop, and nothing is written for it. A file there under another case of
+    /// its name (`Docs/a.md` for `docs/a.md`) changes neither, on any file system.
+    #[test]
+    fn i6_a_renamed_away_path_with_no_row_takes_no_look() {
+        let kb = i549_kb("groove-watcher-i6-no-row");
+        std::fs::create_dir_all(kb.0.join("Docs")).unwrap();
+        std::fs::write(kb.0.join("Docs").join("a.md"), "# a\n\nbody\n").unwrap();
+        let mut state = until_state(&kb.0);
+        state.db = Arc::new(Mutex::new(dir_rename_db(&["other.md"])));
+
+        LISTINGS.with(|n| n.set(0));
+        FACTS_TAKEN.with(|n| n.set(0));
+        dispatch_removal(
+            &state,
+            "docs/a.md",
+            &kb.0.join("docs/a.md"),
+            RemovalCause::RenamedAway,
+        );
+        assert_eq!(listings(), 0);
+        assert_eq!(FACTS_TAKEN.with(|n| n.get()), 0);
+        assert_eq!(
+            state.db.lock().unwrap().all_document_paths().unwrap(),
+            vec!["other.md".to_string()]
+        );
     }
 }

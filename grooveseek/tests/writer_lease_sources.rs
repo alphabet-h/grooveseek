@@ -269,3 +269,45 @@ fn self_wrapping_writes_open_their_own_transaction_immediate() {
         "reset_for_model opens its own transaction through begin_local_immediate()"
     );
 }
+
+/// (kuriya 259) In [`grooveseek::watcher`], a row leaves on an event without a look at the disk
+/// inside the database lock only for a name the index cannot hold: the one production call of
+/// `dispatch_deindex` (crate-private, in [`grooveseek::watcher`]) is in `handle_removed_path`;
+/// every other event-driven deletion goes through `dispatch_removal`.
+#[test]
+fn only_a_name_the_index_cannot_hold_is_deindexed_without_a_look() {
+    let text = src("watcher.rs");
+    let prod = production_lines(&text);
+    let ranges = fn_ranges(&text, "fn handle_removed_path(");
+    assert_eq!(
+        ranges.len(),
+        1,
+        "exactly one handle_removed_path in watcher.rs: {ranges:?}"
+    );
+    let removed = ranges[0];
+    let deindex: Vec<(usize, &str)> = prod
+        .iter()
+        .filter(|(_, l)| l.contains("dispatch_deindex(") && !l.contains("fn dispatch_deindex("))
+        .map(|(n, l)| (*n, l.trim()))
+        .collect();
+    assert_eq!(
+        deindex.len(),
+        1,
+        "watcher.rs: dispatch_deindex calls in production: {deindex:?}"
+    );
+    assert!(
+        deindex[0].0 >= removed.0 && deindex[0].0 <= removed.1,
+        "watcher.rs: the dispatch_deindex call {deindex:?} is not in handle_removed_path {removed:?}"
+    );
+    // Self-check that the scan sees the replaced call sites at all; a lower bound, so adding a
+    // call does not need this test edited. `dispatch_removal(` and not `dispatch_removal(state`:
+    // rustfmt breaks a long call after the parenthesis.
+    let removal = prod
+        .iter()
+        .filter(|(_, l)| l.contains("dispatch_removal(") && !l.contains("fn dispatch_removal("))
+        .count();
+    assert!(
+        removal >= 6,
+        "watcher.rs: {removal} dispatch_removal( calls in production, expected at least 6"
+    );
+}
