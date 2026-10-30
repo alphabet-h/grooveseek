@@ -1046,7 +1046,7 @@ pub(crate) const PRUNE_BATCH: usize = 64;
 
 /// (ADR-0031) The prune of a completed run: `candidates` (sorted) in batches of `batch`,
 /// each through [`Database::delete_documents_if_unchanged`] against the `(id, content_hash)`
-/// the run read into `snapshot` before its walk. `on_deleted` is called for each deleted
+/// the run read into the snapshot before its walk. `on_deleted` is called for each deleted
 /// path after its batch commits. An `Err` from a batch is returned as is; that batch wrote
 /// nothing, and the batches before it stay committed. The `kept_changed` those earlier batches
 /// counted is dropped with the `Err`, so no note is printed for it; the next run judges those
@@ -10858,7 +10858,7 @@ mod tests {
         (run, other)
     }
 
-    /// `rebuild_index` over `kb` with the stub embedder, no schema, and `registry`.
+    /// [`rebuild_index`] over `kb` with the stub embedder, no schema, and the given registry.
     fn prune_run(
         db: &Database,
         kb: &std::path::Path,
@@ -10881,7 +10881,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The `(id, content_hash)` of `rel`'s row, read on `db`.
+    /// The `(id, content_hash)` of `rel`'s row, read on the given connection.
     fn id_hash(db: &Database, rel: &str) -> Option<(i64, String)> {
         db.all_path_ids_hashes().unwrap().remove(rel)
     }
@@ -11184,7 +11184,7 @@ mod tests {
     const RENAME_BYTES: &[u8] = b"# moved\n\nthe same body\n";
 
     /// A kb holding `new_rel` with [`RENAME_BYTES`] and a database whose only row is
-    /// `old_rel` under those bytes' hash, with `registry`'s chunks for `old_rel`.
+    /// `old_rel` under those bytes' hash, with the given registry's chunks for `old_rel`.
     fn rename_fixture(
         tmp: &TmpDir,
         registry: &Registry,
@@ -11331,7 +11331,7 @@ mod tests {
     /// the prune step still keeps rows the other writer changed during the run and rename detection skips the pairs
     /// it changed, but the other look-then-write steps are not protected."
     /// Another case it does not close: such a writer applies a rename into another parser first without
-    /// marking the row (`HASH_AWAITING_REPARSE`); this run's pair is then skipped, the new path is `Unchanged`,
+    /// marking the row ([`HASH_AWAITING_REPARSE`]); this run's pair is then skipped, the new path is `Unchanged`,
     /// and the previous parser's chunks stay until `--force`.
     #[test]
     fn t_a4_the_loop_writes_back_a_row_another_writer_deleted_mid_run() {

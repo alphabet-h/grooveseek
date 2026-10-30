@@ -1494,14 +1494,14 @@ impl Database {
     }
 
     /// Under one `BEGIN IMMEDIATE`: for each pair, applies it only if the old row's
-    /// `(id, content_hash)` is `snapshot`'s and no row is at the new path; an applied pair
+    /// `(id, content_hash)` is the one the snapshot holds and no row is at the new path; an applied pair
     /// whose old path is in `crossed_old_paths` gets [`crate::indexer::HASH_AWAITING_REPARSE`]
     /// first. Others are skipped, never an error. Refuses inside a caller's transaction.
     ///
     /// The checks and the renames share the immediate transaction, so a row another writer
-    /// changed, moved or created after `snapshot` was read is left as that writer left it.
+    /// changed, moved or created after the snapshot was read is left as that writer left it.
     /// Pairs are checked and applied in order; a later pair sees the rows the earlier ones moved.
-    /// A pair whose old path is not in `snapshot` is skipped. `frontmatter_topics` is keyed
+    /// A pair whose old path is not in the snapshot is skipped. `frontmatter_topics` is keyed
     /// by the new path, as for [`Self::rename_documents_atomic`]. Empty `pairs` return at once
     /// without opening a transaction. Reads no file. On `Err` (a failed statement) nothing
     /// is written.

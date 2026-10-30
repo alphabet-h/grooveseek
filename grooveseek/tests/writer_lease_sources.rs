@@ -219,12 +219,13 @@ fn run_server_with_spawns_the_janitor_before_the_model_download() {
 
 /// The writes that wrap themselves in a transaction when the caller has none
 /// open start it as `BEGIN IMMEDIATE`, through
-/// `Database::begin_local_immediate`: their first statement reads, and a
-/// deferred transaction would read on a snapshot another writer can commit
-/// past before the write takes the lock. In the production lines of
-/// `db/storage.rs` no deferred `unchecked_transaction(` is left, and neither is
-/// one in `reset_for_model` (the rest of `db/meta.rs` keeps its read-only
-/// transactions).
+/// `Database::begin_local_immediate` (crate-private, in [`grooveseek::db`]):
+/// their first statement reads, and a deferred transaction would read on a
+/// snapshot another writer can commit past before the write takes the lock. In
+/// the production lines of the storage submodule of [`grooveseek::db`] no
+/// deferred `unchecked_transaction(` is left, and neither is one in
+/// [`grooveseek::db::Database::reset_for_model`] (the rest of the meta
+/// submodule keeps its read-only transactions).
 #[test]
 fn self_wrapping_writes_open_their_own_transaction_immediate() {
     let storage = src("db/storage.rs");

@@ -523,14 +523,14 @@ pub type PathIdHash = std::collections::HashMap<String, (i64, String)>;
 #[derive(Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CasDelete {
-    /// Deleted, in the order of `expected`.
+    /// Deleted, in the order of its `expected` argument.
     pub deleted: Vec<String>,
     /// Present but with another `(id, content_hash)`: kept.
     pub kept_changed: u32,
 }
 
 /// What [`Database::rename_documents_checked`] did with each `(old, new)` pair, in the
-/// order of `pairs`.
+/// order of its `pairs` argument.
 #[derive(Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CheckedRenames {
@@ -9539,7 +9539,7 @@ mod tests {
         assert!(r.is_err());
     }
 
-    /// Open two connections on one file DB (`verify_embedding_meta` run on the first).
+    /// Open two connections on one file DB ([`Database::verify_embedding_meta`] run on the first).
     fn two_connections(prefix: &str) -> (TempDir, Database, Database) {
         let dir = TempDir::new(prefix);
         let db_path = dir.path().join(".groove.db");

@@ -2097,7 +2097,7 @@ mod tests {
         assert!(plain.get("error").is_none(), "{plain}");
     }
 
-    /// The JSON of each arm `rebuild_reply` builds from `result`: the plain reply with
+    /// The JSON of each arm [`rebuild_reply`] builds from `result`: the plain reply with
     /// `fail_on_frontmatter_error` off, and the error reply from the same result with one
     /// refused embed and nothing embedded.
     fn rebuild_reply_arms(result: indexer::IndexResult) -> [serde_json::Value; 2] {
