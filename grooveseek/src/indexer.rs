@@ -10635,14 +10635,16 @@ mod tests {
         );
     }
 
-    /// #552 (Review Focus 2): a full run marks the crossed pair's old row awaiting a reparse
-    /// and then the rename's transaction fails, so the row stays at `note.txt` under the
-    /// sentinel. The next run must not pair it (no bytes hash to the sentinel): the old row is
-    /// swept with the files the disk no longer holds, and `note.md` is indexed as a new file
-    /// with the Markdown parser's chunks under the hash of its bytes.
+    /// #552: the old parser's chunks are never left under a hash the fast path trusts. (ADR-0031)
+    /// A crossed pair's sentinel and its move share one transaction, so when the move fails
+    /// the rollback takes the sentinel with it: the row stays at `note.txt` with its own hash
+    /// and chunks, and nothing is at `note.md`. Nothing moved, so no stale row exists, and the
+    /// next run pairs the rename again, applies it, and re-reads `note.md` under the Markdown
+    /// parser into the hash of its bytes.
     #[test]
-    fn i552_a_failed_rename_after_the_mark_leaves_the_old_row_unpaired() {
+    fn i552_a_failed_checked_rename_leaves_nothing_and_the_next_run_applies_it() {
         let (dir, db, registry) = i552_crossed_rename("i552-mark-then-fail", I552_BYTES);
+        let txt_bodies = stored_bodies(&db, "note.txt");
         db.execute_for_test(concat!(
             "CREATE TABLE fault (armed INTEGER NOT NULL); INSERT INTO fault VALUES (1); ",
             "CREATE TRIGGER inject_rename_failure BEFORE UPDATE OF path ON documents ",
@@ -10657,9 +10659,14 @@ mod tests {
             "the run failed somewhere other than the rename: {err:#}"
         );
         assert_eq!(
-            db.get_document_hash("note.txt").unwrap().as_deref(),
-            Some(HASH_AWAITING_REPARSE),
-            "the old row was not left under the sentinel by the failed rename"
+            db.get_document_hash("note.txt").unwrap(),
+            Some(sha256_hex_bytes(I552_BYTES)),
+            "the failed rename left the old row's hash changed"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.txt"),
+            txt_bodies,
+            "the failed rename changed the old row's chunks"
         );
         assert_eq!(db.get_document_hash("note.md").unwrap(), None);
 
@@ -10667,17 +10674,18 @@ mod tests {
         let result = i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry)
             .expect("the second run");
         assert_eq!(
-            result.renamed, 0,
-            "the second run paired the sentinel row: {result:?}"
+            result.renamed, 1,
+            "the second run did not apply the rename: {result:?}"
         );
         assert_eq!(
             db.get_document_hash("note.txt").unwrap(),
             None,
-            "the old row was not swept"
+            "the old row is still there"
         );
         assert_eq!(
             db.get_document_hash("note.md").unwrap(),
-            Some(sha256_hex_bytes(I552_BYTES))
+            Some(sha256_hex_bytes(I552_BYTES)),
+            "note.md was not re-read into the hash of its bytes"
         );
         assert_eq!(
             stored_bodies(&db, "note.md"),
