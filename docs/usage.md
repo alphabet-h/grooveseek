@@ -11,7 +11,7 @@ Reference for the `groove` command line: `index`, `status`, `serve`, `search`,
 groove index --kb-path /path/to/knowledge-base
 groove index --kb-path /path/to/knowledge-base --force   # full re-index
 groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # switch to BGE-M3 (1024 dim, multilingual)
-groove index --kb-path /path/to/knowledge-base --wait 30   # wait up to 30 s for another writer
+groove index --kb-path /path/to/knowledge-base --wait 30   # wait up to 30 s for another writer (v1.22.0+)
 ```
 
 Scans source files under the given directory, skipping the default `exclude_dirs` set (`.obsidian`, `.git`, `node_modules`, `target`, `.vscode`, `.idea` — see "Directory exclusion" in [docs/behavior.md](behavior.md)). By default only `.md` is picked up. Add `[parsers].enabled = ["md", "txt"]` to `groove.toml` to also index `.txt` files — their title is derived from the filename (`deep-dive-2026.txt` → `"deep dive 2026"`) and the whole body becomes a single chunk. Put that key in a `groove.toml` groove trusts — one named with `--config`, one beside the binary, or one `groove service install` placed; a config merely discovered next to a knowledge base has `[parsers]` reset to the default ([Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations)). Files whose content hash has not changed since the last run are skipped unless `--force` is passed.
@@ -124,7 +124,7 @@ search refuses `fields` / `fields_not` filters until the file is fixed,
 
 Two flags control how `groove index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
 
-- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang. Warnings are not progress and are never suppressed: `warning: <path>: failed to parse YAML frontmatter: ...` prints under `--quiet` too, and so do the two `note:` lines a run prints when it overlapped a writer that does not take the lock: `note: kept <N> row(s) another writer changed during this run; ...` and `note: skipped <N> rename(s) another writer changed during this run; ...`.
+- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang. Warnings are not progress and are never suppressed: `warning: <path>: failed to parse YAML frontmatter: ...` prints under `--quiet` too, and so do the two `note:` lines (v1.22.0+) a run prints when it overlapped a writer that does not take the lock: `note: kept <N> row(s) another writer changed during this run; ...` and `note: skipped <N> rename(s) another writer changed during this run; ...`.
 - `--progress`: show progress UI. Auto-detects via `IsTerminal` on stderr — TTY gets an `indicatif` bar with elapsed / position / percent / ETA, non-TTY gets periodic `Progress: N/M (P%)` lines (~20 emits per run plus a 100 % anchor) so `tail -f indexing.log` works.
 
 ```bash

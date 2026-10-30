@@ -100,7 +100,7 @@ embedder・DB・実行中の再構築を待たずに断られる。reader も検
 見た目ほどは守らないものが他に 2 つある:
 
 - **`RebuildSlot`** は `rebuild_index` の同時実行を断るが、**1 プロセスの中**に居る。
-  daemon と子プロセスの間で効くのは書き手のロックで、一方がロックを持っている間は
+  daemon と子プロセスの間で効くのは書き手のロック (v1.22.0+) で、一方がロックを持っている間は
   他方の `rebuild_index` は embedder・DB・実行中の再構築を待たずに断られる
 - **bind 失敗の文言** (*"is another groove instance running, or the port occupied?"*)
   が見えるのは同一ポートの別リスナだけで、**stdio の子プロセスは見えない** —

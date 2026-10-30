@@ -142,7 +142,7 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
     変更を検出
 - **再起動安全性**。SQLite WAL + `synchronous = NORMAL` の既定で動く。
   index 中に kill してもロストするのは現在チャンクの commit 1 件のみで、
-  書き手のロックは OS が process と一緒に外す。ソースファイルから再構築するには、
+  書き手のロック (v1.22.0+) は OS が process と一緒に外す。ソースファイルから再構築するには、
   動いている server の MCP `rebuild_index` を呼ぶか、service を止めてから
   `groove index` を打つ (service が動いている間、同じ index への `groove index` は
   exit code 3 で止まる)

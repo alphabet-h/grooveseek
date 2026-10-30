@@ -110,7 +110,7 @@ Two more things guard less than they seem to:
 
 - **`RebuildSlot`**, which refuses a second concurrent `rebuild_index`, lives
   inside one process. Between a daemon and a spawned child it is the writer lock
-  that counts: a `rebuild_index` in one is refused, without waiting for the
+  (v1.22.0+) that counts: a `rebuild_index` in one is refused, without waiting for the
   embedder, the database or a running rebuild, while the other holds the lock.
 - **The bind failure** — *"is another groove instance running, or the port
   occupied?"* — only sees another listener on the same port. It cannot see a

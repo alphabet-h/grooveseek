@@ -152,7 +152,7 @@ machines on the same intranet over Streamable HTTP.
 - **Restart safety**. The DB is written with WAL + `synchronous = NORMAL`
   by SQLite defaults. Killing the process mid-index loses at most the
   current chunk's commit, and the operating system drops the writer lock
-  with the process. To rebuild from the authoritative source files,
+  (v1.22.0+) with the process. To rebuild from the authoritative source files,
   call the running server's MCP `rebuild_index`, or stop the service
   and run `groove index` (while the service runs, a `groove index` on
   the same index exits with code 3).

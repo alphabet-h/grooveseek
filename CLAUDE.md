@@ -53,7 +53,7 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
   - `groove status` の `Documents: N` / `Chunks: N` 統計
   - `groove service status` / `groove service list`
 - **stderr** = progress / 診断 (= 人間向けの進捗 / warning / error)
-  - `groove index` の `Indexing ...` / `Done in ...` 進捗
+  - `groove index` の `Indexing ...` / `Done in ...` 進捗、`note: kept ...` / `note: skipped ...` 行、exit 3 の時の lock の持ち主の error
   - `groove status` の `No index found` (= 答えられないことの報告。stdout は空)
   - `groove service install` / `uninstall` / `tray-install` / `tray-uninstall` の確認
   - すべての warning / info / error メッセージ (`tracing` / `eprintln!`)

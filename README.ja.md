@@ -63,7 +63,7 @@ ONNX runtime と SQLite はバイナリに静的リンクされているので�
 cargo build --release
 ```
 
-ビルドには Rust 1.89 以上が要る (index の writer lock が Rust 1.89 で安定した `std::fs::File::try_lock` を使うため)。
+ビルドには Rust 1.89 以上が要る (v1.22.0+。index の writer lock が Rust 1.89 で安定した `std::fs::File::try_lock` を使うため)。
 
 バイナリは `target/release/groove` (Windows では `groove.exe`) に生成される。
 

@@ -229,9 +229,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         progress: bool,
         /// Seconds to wait for another groove process that holds this index's
-        /// writer lock (another `groove index`, or a read-only command making a
-        /// one-time write). 0 does not wait: if another process holds the lock,
-        /// exit with code 3.
+        /// writer lock (another `groove index`, a watching `groove serve`, a
+        /// `--no-watch` server during an MCP `rebuild_index`, or a read-only
+        /// command making a one-time write). 0 does not wait: if another process
+        /// holds the lock, exit with code 3.
         #[arg(long, default_value_t = 0, value_name = "SECONDS")]
         wait: u64,
     },

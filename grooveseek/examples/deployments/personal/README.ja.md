@@ -45,7 +45,7 @@ Claude Code は stdio 経由で groove を起動する。
 ## 運用上の注意
 
 - **Watcher** は既定で有効。`.md` の保存 / `git pull` / 外部スクリプトによる変更も ~500 ms 以内に自動再インデックス
-- **PostToolUse hook** はこのレシピに足さない。watcher が Claude による編集も含めてすべての編集を拾い、watch している間 server は索引の書き手の lease を持つので、hook の `groove index` は編集のたびに exit 3 になる。[`examples/hooks/`](../../hooks/) の hook は `--no-watch` で起動した server 向け
+- **PostToolUse hook** はこのレシピに足さない。watcher が Claude による編集も含めてすべての編集を拾い、watch している間 server は索引の書き手の lease を持つ (v1.22.0+) ので、hook の `groove index` は編集のたびに exit 3 になる。[`examples/hooks/`](../../hooks/) の hook は `--no-watch` で起動した server 向け
 - **Reranker** は本レシピでは **未設定** — 初回実行で ~2.3 GB のモデルを引かせないため `groove.toml` の `reranker` キーをコメントアウトしてある。コメントを外すまで `search` の `rerank: true` は **silent no-op** (サーバは起動時に reranker をロードしていた場合のみ rerank する)。有効化したら `rerank_by_default = false` のまま per-query で opt-in する運用にする (CPU では再ランク付きの検索に数十秒かかり、素の検索は 1 秒未満。毎回払うコストではない)。実測とその条件は [usage.ja.md](../../../../docs/usage.ja.md#再ランクを有効にすべきケース) にある
 - **1 サーバ : 1 クライアント**。stdio は 1 接続のみ — 個人用途なら十分。複数クライアントが必要なら [`intranet-http/`](../intranet-http/) へ
 - **複数 session でも書き手は 1 つ** (v1.22.0+)。この KB で Claude Code の session を複数開いても、索引を書く server は最初に起動した 1 つだけ。残りは検索に答えるが索引を更新せず、最初の session を閉じた後も restart されるまでそのまま。そのことは `search` の応答の `writer_notice` に載る。[1 つのナレッジベースを複数の session で使う](../../../../docs/clients.ja.md#1-つのナレッジベースを複数の-session-で使う) を参照
