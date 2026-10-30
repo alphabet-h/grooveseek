@@ -1091,6 +1091,19 @@ fn kept_changed_note(n: u32) -> Option<String> {
     })
 }
 
+/// (ADR-0031) The stderr line for skipped renames; `None` for 0. ASCII.
+fn renames_skipped_note(n: u32) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            concat!(
+                "note: skipped {} rename(s) another writer changed during this run; ",
+                "the new paths were indexed as new files."
+            ),
+            n
+        )
+    })
+}
+
 /// (feature-60) The order the per-document loop in [`rebuild_index`] visits `entries`: those
 /// whose `rel` is in `first` (the renames that force a re-parse), then the rest, each group in
 /// the order `entries` already has -- the walk's, which sorts `PathBuf`s component by
@@ -1169,6 +1182,9 @@ pub struct IndexResult {
     /// (their `(id, content_hash)` no longer matched what the run read before its walk). The
     /// next run judges them again. Always 0 for a [`Self::cancelled`] run, which does not prune.
     pub kept_changed: u32,
+    /// Detected renames this run did not apply because another writer had changed the old row or written
+    /// the new path during the run. Each new path is indexed as a new file; each old row goes to the prune.
+    pub renames_skipped: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
     /// (v1.14.0+) The run stopped at a check point because the
@@ -1611,7 +1627,10 @@ pub fn rebuild_index(
     // (local Codex on PR #388) The rows' (path, hash) are read before the scan, not after it,
     // so the scan can tell which files rename detection may pair -- a path the index does not
     // hold whose hash a row does -- and read their frontmatter topic from the bytes it hashes.
-    // Nothing writes between here and the renames below. `force` detects no renames.
+    // (ADR-0031) Under the writer lock no other writer runs between here and the renames
+    // below; against a writer that does not take it, `rename_documents_checked` checks each
+    // pair against the snapshot and skips the ones that writer changed. `force` detects no
+    // renames.
     let db_path_hashes: std::collections::HashMap<String, String> = if force {
         std::collections::HashMap::new()
     } else {
@@ -1681,42 +1700,52 @@ pub fn rebuild_index(
     // nothing) is a pre-existing edit-time gap this round does not touch, not a stale
     // cross-parser row.
     let mut crossed_parser_renames: HashSet<String> = HashSet::new();
-    tally.renamed = if force {
-        0
-    } else {
+    if !force {
         let pairs = detect_renames(&disk_entries, &db_path_hashes, &skipped_paths);
-        // evaluator 指摘 High #2: rename フェーズ全体を単一 transaction に
-        // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
-        let mut crossed_old_paths: Vec<&str> = Vec::new();
-        for (old_path, new_path) in &pairs {
+        let crossed_old_paths: Vec<&str> = pairs
+            .iter()
+            .filter(|(old_path, new_path)| rename_crosses_a_parser(registry, old_path, new_path))
+            .map(|(old_path, _)| old_path.as_str())
+            .collect();
+        // (ADR-0031) One immediate transaction, in which each pair is re-read and applied only
+        // while its old row still has the snapshot's `(id, content_hash)` and no row is at its
+        // new path; a pair another writer changed is skipped, not an error. Empty `pairs` opens
+        // no transaction.
+        // (#552) A pair that crosses a parser is re-read under the new parser below, and until
+        // that read settles it the row holds the old parser's chunks under the hash of the
+        // unchanged bytes. So an applied crossed pair's hash is overwritten with
+        // [`HASH_AWAITING_REPARSE`] in the same transaction, and a run that fails anywhere
+        // after the move leaves a row no fast path keeps; every settlement below rewrites the
+        // hash (the bytes' hash, or the sentinel again for a read that changed under it) or
+        // drops the row.
+        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
+        // its topic comes from the bytes the pair was matched on.
+        let outcome: crate::db::CheckedRenames = db.rename_documents_checked(
+            &pairs,
+            &snapshot,
+            &crossed_old_paths,
+            &frontmatter_topics,
+        )?;
+        // Only the applied pairs force a re-read or a crossed-rename settlement: a skipped
+        // pair's new path holds another writer's row (or none), which the loop indexes as an
+        // ordinary file; settling it as a crossed rename would delete that row.
+        for (old_path, new_path) in &outcome.applied {
             let crossed = rename_crosses_a_parser(registry, old_path, new_path);
             if context_mode == ContextMode::Static || crossed {
                 renamed_new_paths.insert(new_path.clone());
             }
             if crossed {
                 crossed_parser_renames.insert(new_path.clone());
-                crossed_old_paths.push(old_path.as_str());
             }
-        }
-        // (#552) A pair that crosses a parser is re-read under the new parser below, and until
-        // that read settles it the row holds the old parser's chunks under the hash of the
-        // unchanged bytes. Its hash is overwritten with [`HASH_AWAITING_REPARSE`] before the
-        // row moves, so a run that fails anywhere after the move leaves a row no fast path
-        // keeps; every settlement below rewrites the hash (the bytes' hash, or the sentinel
-        // again for a read that changed under it) or drops the row. A failed
-        // rename after the mark leaves the old row under the sentinel, which the next run's
-        // rename detection does not pair; the pair would have been re-embedded in full anyway.
-        if !crossed_old_paths.is_empty() {
-            db.overwrite_content_hash(&crossed_old_paths, HASH_AWAITING_REPARSE)?;
-        }
-        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
-        // its topic comes from the bytes the pair was matched on.
-        db.rename_documents_atomic(&pairs, &frontmatter_topics)?;
-        for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
         }
-        pairs.len() as u32
-    };
+        tally.renamed = outcome.applied.len() as u32;
+        tally.renames_skipped = outcome.skipped.len() as u32;
+    }
+    // Ahead of check point C3, so a run stopped in the loop still says it.
+    if let Some(note) = renames_skipped_note(tally.renames_skipped) {
+        eprintln!("{note}");
+    }
 
     // (feature-51) `documents.size_bytes` の欠損補充。`backfill_fts` と同じ思想で、embedding には触れない。
     //
@@ -11129,6 +11158,165 @@ mod tests {
             concat!(
                 "note: kept 3 row(s) another writer changed during this run; ",
                 "the next run checks them again."
+            )
+        );
+        assert!(note.is_ascii());
+    }
+
+    // -----------------------------------------------------------------------
+    // Renames against a writer that does not take the writer lock (ADR-0031)
+    // -----------------------------------------------------------------------
+
+    /// A Markdown file's bytes, the same for the old and the new path of a detected rename.
+    const RENAME_BYTES: &[u8] = b"# moved\n\nthe same body\n";
+
+    /// A kb holding `new_rel` with [`RENAME_BYTES`] and a database whose only row is
+    /// `old_rel` under those bytes' hash, with `registry`'s chunks for `old_rel`.
+    fn rename_fixture(
+        tmp: &TmpDir,
+        registry: &Registry,
+        old_ext: &str,
+        old_rel: &str,
+        new_rel: &str,
+    ) -> (std::path::PathBuf, Database, Database) {
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join(new_rel), RENAME_BYTES).unwrap();
+        let (db, other) = two_connections(tmp);
+        let chunks = parse_doc(registry, old_ext, old_rel, RENAME_BYTES).chunks;
+        write_row(&db, old_rel, &sha256_hex_bytes(RENAME_BYTES), &chunks);
+        (kb, db, other)
+    }
+
+    /// A reporter that runs `act` once, at the scan's first `Scanning` event: after the run
+    /// read its snapshot and before it applies its renames.
+    fn on_first_scanning(act: impl FnOnce() + Send + 'static) -> progress::ProgressReporter {
+        let act = std::sync::Mutex::new(Some(act));
+        progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !matches!(event, progress::ProgressEvent::Scanning { .. }) {
+                return;
+            }
+            if let Some(act) = act.lock().unwrap().take() {
+                act();
+            }
+        }))
+    }
+
+    /// Another writer applied the same rename first: the run's pair is skipped, the run goes
+    /// on, the moved row stays, and the old path has no row left to prune or keep.
+    #[test]
+    fn t_a3_a_rename_another_writer_applied_first_is_skipped_and_the_run_goes_on() {
+        let tmp = mk_tmp("pr3-ta3a");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let progress = on_first_scanning(move || {
+            other
+                .rename_document("old.md", "new.md", FrontmatterTopic::Unread)
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renamed, 0, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "new.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the row the other writer moved is gone or rewritten"
+        );
+        assert!(id_hash(&db, "old.md").is_none(), "old.md has a row");
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+    }
+
+    /// Another writer wrote the new path first: the pair is skipped, the loop indexes the new
+    /// path as an ordinary file over that row, and the prune deletes the old row.
+    #[test]
+    fn t_a3_a_rename_onto_a_path_another_writer_wrote_is_skipped() {
+        let tmp = mk_tmp("pr3-ta3b");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let progress = on_first_scanning(move || {
+            other
+                .upsert_document("new.md", None, None, None, None, &[], None, "h-other", 1)
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renamed, 0, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "new.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the loop did not index new.md over the other writer's row"
+        );
+        assert!(id_hash(&db, "old.md").is_none(), "old.md was not pruned");
+        assert_eq!(result.deleted, 1, "{result:?}");
+    }
+
+    /// A skipped pair that crosses a parser is not settled as a crossed rename: the row the
+    /// other writer put at the new path stays, and the old row is pruned.
+    #[test]
+    fn a_skipped_crossed_rename_keeps_the_other_writers_row() {
+        let tmp = mk_tmp("pr3-skip-crossed");
+        let registry = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "txt", "note.txt", "note.md");
+        let progress = on_first_scanning(move || {
+            other
+                .upsert_document("note.md", None, None, None, None, &[], None, "h-other", 1)
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert!(
+            id_hash(&db, "note.md").is_some(),
+            "the other writer's note.md row was removed"
+        );
+        assert!(
+            id_hash(&db, "note.txt").is_none(),
+            "note.txt was not pruned"
+        );
+    }
+
+    /// A run stopped after its renames still reports the ones it skipped.
+    #[test]
+    fn a_cancelled_run_still_counts_its_skipped_renames() {
+        let tmp = mk_tmp("pr3-skip-cancel");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let token = progress::CancelToken::new();
+        let token_cb = token.clone();
+        let other = std::sync::Mutex::new(Some(other));
+        let progress =
+            progress::ProgressReporter::with_callback(Box::new(move |event| match event {
+                progress::ProgressEvent::Scanning { .. } => {
+                    if let Some(other) = other.lock().unwrap().take() {
+                        other
+                            .rename_document("old.md", "new.md", FrontmatterTopic::Unread)
+                            .unwrap();
+                    }
+                }
+                progress::ProgressEvent::Indexed { .. }
+                | progress::ProgressEvent::Unchanged { .. } => token_cb.cancel(),
+                _ => {}
+            }))
+            .with_cancel(token);
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert!(result.cancelled, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(result.deleted, 0, "{result:?}");
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+    }
+
+    #[test]
+    fn renames_skipped_note_is_ascii_and_absent_for_zero() {
+        assert_eq!(renames_skipped_note(0), None);
+        let note = renames_skipped_note(2).unwrap();
+        assert_eq!(
+            note,
+            concat!(
+                "note: skipped 2 rename(s) another writer changed during this run; ",
+                "the new paths were indexed as new files."
             )
         );
         assert!(note.is_ascii());
