@@ -1427,7 +1427,7 @@ impl Database {
     ///   ([`crate::indexer::HASH_AWAITING_REPARSE`]) で残し、次の event / run が読み直す (#544 D5、#552)
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
-    /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
+    /// [`Self::rename_documents_checked`] がともにここを通る (1 実装)。
     pub fn rename_document(
         &self,
         old_path: &str,

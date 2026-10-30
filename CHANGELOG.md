@@ -96,12 +96,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `Database::open`. The prune now keeps a row that writer changed during the run, where it used to
   delete it even though its file was still on disk; the next run judges the row again. Rename
   detection skips a pair whose old row that writer changed, or whose new path it wrote, and the
-  run goes on, where the run used to fail; the new path is indexed as a new file. The run prints
-  the two numbers on stderr in `note: kept <N> row(s) ...` and `note: skipped <N> rename(s) ...`
-  lines (also under `--quiet`), and `rebuild_index` returns them as `kept_changed` and
-  `renames_skipped`. A write that reads before it writes is now opened as `BEGIN IMMEDIATE`, so it
-  waits for another writer instead of failing at once with `database is locked`. The run's other
-  look-then-write steps are still not protected against such a writer.
+  run goes on, where the run used to fail; the new path is indexed as an ordinary file. The run
+  prints the two numbers on stderr in `note: kept <N> row(s) ...` and
+  `note: skipped <N> rename(s) ...` lines (also under `--quiet`), and `rebuild_index` returns them
+  as `kept_changed` and `renames_skipped`. A write that reads before it writes is now opened as
+  `BEGIN IMMEDIATE`, so it waits for another writer instead of failing at once with
+  `database is locked`. The run's other look-then-write steps are still not protected against such
+  a writer.
 
 ## [1.21.5] - 2026-10-28
 

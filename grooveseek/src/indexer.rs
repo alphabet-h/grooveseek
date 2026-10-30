@@ -141,7 +141,7 @@ struct DiskScan {
     /// taken from** ([`crate::parser::Parser::frontmatter_topic_inner`]). Rename detection pairs
     /// paths by that hash, so these are the bytes the rename is decided on, and the rename
     /// rebuilds the topic from them without a second read
-    /// ([`Database::rename_documents_atomic`]). Only candidates, because [`DiskEntry`] keeps no
+    /// ([`Database::rename_documents_checked`]). Only candidates, because [`DiskEntry`] keeps no
     /// content and the rest of the run reads each file again.
     frontmatter_topics: std::collections::HashMap<String, Option<String>>,
 }
@@ -1048,7 +1048,9 @@ pub(crate) const PRUNE_BATCH: usize = 64;
 /// each through [`Database::delete_documents_if_unchanged`] against the `(id, content_hash)`
 /// the run read into `snapshot` before its walk. `on_deleted` is called for each deleted
 /// path after its batch commits. An `Err` from a batch is returned as is; that batch wrote
-/// nothing, and the batches before it stay committed.
+/// nothing, and the batches before it stay committed. The `kept_changed` those earlier batches
+/// counted is dropped with the `Err`, so no note is printed for it; the next run judges those
+/// rows again.
 fn prune_candidates(
     db: &Database,
     snapshot: &PathIdHash,
@@ -1097,7 +1099,7 @@ fn renames_skipped_note(n: u32) -> Option<String> {
         format!(
             concat!(
                 "note: skipped {} rename(s) another writer changed during this run; ",
-                "the new paths were indexed as new files."
+                "the new paths are indexed as ordinary files."
             ),
             n
         )
@@ -1182,8 +1184,9 @@ pub struct IndexResult {
     /// (their `(id, content_hash)` no longer matched what the run read before its walk). The
     /// next run judges them again. Always 0 for a [`Self::cancelled`] run, which does not prune.
     pub kept_changed: u32,
-    /// Detected renames this run did not apply because another writer had changed the old row or written
-    /// the new path during the run. Each new path is indexed as a new file; each old row goes to the prune.
+    /// (ADR-0031) Detected renames this run did not apply because another writer had changed the
+    /// old row or written the new path during the run. Each new path is indexed as an ordinary
+    /// file; each old row goes to the prune.
     pub renames_skipped: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
@@ -11262,6 +11265,37 @@ mod tests {
         assert_eq!(result.deleted, 1, "{result:?}");
     }
 
+    /// Another writer rewrote the old row in place: the pair is skipped, the loop indexes the new
+    /// path as an ordinary file, and the prune keeps the old row the other writer changed. The
+    /// one shape in which both counters move.
+    #[test]
+    fn t_a3_a_rename_whose_old_row_another_writer_rewrote_is_skipped_and_kept() {
+        let tmp = mk_tmp("pr3-ta3c");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let progress = on_first_scanning(move || {
+            other
+                .overwrite_content_hash(&["old.md"], "changed")
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renamed, 0, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(result.deleted, 0, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "old.md").map(|(_, h)| h).as_deref(),
+            Some("changed"),
+            "the prune did not keep the old row the other writer rewrote"
+        );
+        assert_eq!(
+            id_hash(&db, "new.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the loop did not index new.md as an ordinary file"
+        );
+    }
+
     /// A skipped pair that crosses a parser is not settled as a crossed rename: the row the
     /// other writer put at the new path stays, and the old row is pruned.
     #[test]
@@ -11280,6 +11314,11 @@ mod tests {
         assert!(
             id_hash(&db, "note.md").is_some(),
             "the other writer's note.md row was removed"
+        );
+        assert_eq!(
+            id_hash(&db, "note.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the loop did not index note.md over the other writer's row"
         );
         assert!(
             id_hash(&db, "note.txt").is_none(),
@@ -11373,7 +11412,7 @@ mod tests {
             note,
             concat!(
                 "note: skipped 2 rename(s) another writer changed during this run; ",
-                "the new paths were indexed as new files."
+                "the new paths are indexed as ordinary files."
             )
         );
         assert!(note.is_ascii());
