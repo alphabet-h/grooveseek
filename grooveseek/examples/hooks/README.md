@@ -130,7 +130,8 @@ hook on every edit.
 
 ## Notes
 
-- **Concurrency**: only one groove process writes an index at a time. A
+- **Concurrency**: only one groove process writes an index at a time
+  (v1.22.0+). A
   `groove serve` whose watcher is on (the default) holds that writer lease
   while its watcher runs, and it already picks up every edit, so **do not pair
   this hook with it**: each `groove index` the hook starts would wait out

@@ -110,7 +110,7 @@ max_chunk_chars = 3500
 # MCP `rebuild_index` tool answers with an `error` alongside the counts. The
 # watcher ignores this key.
 #
-# Optional: the size caps. `max_binary_file_size` (pdf / docx / xlsx / pptx)
+# Optional (v1.15.0+): the size caps. `max_binary_file_size` (pdf / docx / xlsx / pptx)
 # and `max_text_file_size` (md / txt / source code) are the largest file, in raw bytes, that
 # `groove index`, `rebuild_index` and the watcher read; a larger one is skipped
 # with a warning. `max_decompressed_size` is how far an .xlsx / .docx / .pptx
@@ -153,7 +153,7 @@ max_chunk_chars = 3500
 # Live-sync file watcher. When `groove serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally
 # within `debounce_ms`: manual edits, `git pull`, external scripts, and edits
-# Claude makes. Not paired with the PostToolUse hook: a watching server holds
+# Claude makes. Not paired with the PostToolUse hook (v1.22.0+): a watching server holds
 # the index's writer lease while its watcher runs, so the hook's `groove index` exits 3
 # on every edit. Use the hook only when the watcher is off (`--no-watch`).
 # CLI `--no-watch` / `--debounce-ms` overrides. Omitting the section keeps

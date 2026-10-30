@@ -104,7 +104,7 @@ max_chunk_chars = 3500
 # on にしても全ファイルを索引し終えてから exit 1 になる。MCP `rebuild_index` は
 # 件数と一緒に `error` を返す。watcher はこのキーを読まない。
 #
-# 任意: サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
+# 任意 (v1.15.0+): サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
 # `max_text_file_size` (md / txt / ソースコード) は `groove index` / `rebuild_index` / watcher が読む
 # ファイル 1 本の生バイト上限で、超えたファイルは warning 付きで skip される。
 # `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF から取り出す
@@ -143,7 +143,7 @@ max_chunk_chars = 3500
 # ライブ同期ファイルウォッチャ。`groove serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
 # 増分再インデックスされる。手動編集 / `git pull` / 外部スクリプト /
-# Claude による編集をカバーする。PostToolUse hook とは組まない: watch する
+# Claude による編集をカバーする。PostToolUse hook とは組まない (v1.22.0+): watch する
 # server は watcher が動いている間、索引の書き手の lease を持つので、hook の
 # `groove index` は編集のたびに exit 3 になる。hook を使うのは watcher を
 # 切ったとき (`--no-watch`) だけ。CLI の

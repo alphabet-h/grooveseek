@@ -11,7 +11,7 @@
 groove index --kb-path /path/to/knowledge-base
 groove index --kb-path /path/to/knowledge-base --force   # 完全再インデックス
 groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 (1024 dim、多言語) に切替
-groove index --kb-path /path/to/knowledge-base --wait 30   # 他の writer を最大 30 秒待つ
+groove index --kb-path /path/to/knowledge-base --wait 30   # 他の writer を最大 30 秒待つ (v1.22.0+)
 ```
 
 指定ディレクトリ配下のソースファイルを走査し、既定の `exclude_dirs` セット (`.obsidian` / `.git` / `node_modules` / `target` / `.vscode` / `.idea` — [docs/behavior.ja.md](behavior.ja.md) の「ディレクトリ除外」参照) をスキップする。既定では `.md` のみ取り込み。`groove.toml` に `[parsers].enabled = ["md", "txt"]` を追加すると `.txt` もインデックス対象になる (タイトルはファイル名から派生: `deep-dive-2026.txt` → `"deep dive 2026"`、本文全体が 1 チャンク)。このキーは groove が**信頼する** `groove.toml` — `--config` で名指ししたもの、バイナリの隣にあるもの、`groove service install` が置いたもの — に書くこと。KB の隣で見つけただけの config は `[parsers]` が既定へ戻される ([信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所))。前回実行時と content hash が変わっていないファイルは `--force` を渡さない限りスキップされる。
@@ -113,7 +113,7 @@ Markdown ファイルは「読めていない」ものとして数えられる�
 
 `groove index` の進捗表示を切り替える 2 フラグ。**相互排他** + フラグなしの既定動作は不変 (= 既存の per-file `  indexed: foo.md (N chunks)` 出力をそのまま維持)。
 
-- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。warning は進捗ではないので抑止されない: `warning: <path>: failed to parse YAML frontmatter: ...` は `--quiet` でも出る。ロックを取らない書き手と重なった run が出す 2 つの `note:` の行も同じで、`--quiet` でも出る: `note: kept <N> row(s) another writer changed during this run; ...` と `note: skipped <N> rename(s) another writer changed during this run; ...`。
+- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。warning は進捗ではないので抑止されない: `warning: <path>: failed to parse YAML frontmatter: ...` は `--quiet` でも出る。ロックを取らない書き手と重なった run が出す 2 つの `note:` の行 (v1.22.0+) も同じで、`--quiet` でも出る: `note: kept <N> row(s) another writer changed during this run; ...` と `note: skipped <N> rename(s) another writer changed during this run; ...`。
 - `--progress`: 進捗 UI を表示。stderr の `IsTerminal` で自動分岐 — TTY なら `indicatif` バー (経過時間 / 件数 / % / ETA)、非 TTY (pipe / redirect) なら `Progress: N/M (P%)` 行を約 20 回 + 100% アンカー 1 回で flush。`tail -f indexing.log` で監視可能。
 
 ```bash

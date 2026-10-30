@@ -207,7 +207,7 @@ enabled = ["md"]
 # written and every broken file is still named; only the exit code changes.
 # The watcher never reads this one key.
 #
-# The three size caps are read by `groove index`, rebuild_index and the
+# The three size caps (v1.15.0+) are read by `groove index`, rebuild_index and the
 # watcher alike. Each takes a byte count, a size with a unit ("300 MiB",
 # "2 GB"; KB MB GB TB count in 1000s, KiB MiB GiB TiB in 1024s; no fractions)
 # or "unlimited". 0 is an error that points at "unlimited". A file over a raw

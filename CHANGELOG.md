@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-10-31
+
 ### Added
 
 - `groove index --wait <SECONDS>`, and exit code 3 for `groove index`.
@@ -22,19 +24,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   current: it is a reader, its watcher cannot register a watch, or its watcher stopped. The
   `search` and `rebuild_index` tool descriptions name the field. `groove search --format json`
   does not carry it. See [docs/mcp-tools.md](docs/mcp-tools.md).
+- Library: a new public module `writer_lease` holds the lock: `WriterLease` (`try_acquire`,
+  `acquire_with_wait`, `set_role`, `touch_heartbeat`, `read_holder` and the path helpers), `Role`,
+  `HolderInfo` (`heartbeat_fresh`, `keeps_current`), `LeaseError`, `HolderRelation`,
+  `HEARTBEAT_FRESH`, and the functions `db_path_utf8`, `holder_relation`, `index_busy_message` and
+  `index_waiting_line`. `Database` gains `open_read_only`, `open_writer`,
+  `open_or_replace_corrupt_with`, `write_once_under_lease` and `verify_embedding_meta_or_record`,
+  and `db` exports `OneTimeWrite` and `OneTimeWriteBusy` (the error a read-only command's one-time
+  write returns while another process holds the lock). `LeaseError` is `#[non_exhaustive]`, so a
+  downstream `match` on it needs a wildcard arm.
 - Library: new public fields on existing public structs: `server::KbServerShared::writer`,
   `watcher::WatcherState::watch_status` / `watch_backoff` / `batch_probe`, and
   `transport::http::AdminStatus::writer`. None of these three structs implements `Default`, so
   code that builds one with a struct literal stops compiling, and there is no
   `..Default::default()` to fall back on; `run_watch_loop` keeps its signature. New public items:
-  `writer_lease::HEARTBEAT_FRESH`, `HolderInfo::heartbeat_fresh` / `keeps_current`,
-  `WriterLease::set_role` / `touch_heartbeat`, `server::{WriterSlot, WriterStatus, Claimant,
-  ClaimGuard, ReaderReason, WatchErrorCause, WatchStatusFn}`,
-  `KbServerShared::for_test_with_writer` (under the `test-helpers` feature),
+  `server::{WriterSlot, WriterStatus, Claimant, ClaimGuard, ReaderReason, WatchErrorCause,
+  WatchStatusFn}`, `KbServerShared::for_test_with_writer` (under the `test-helpers` feature),
   `watcher::{WatchBatchProbe, run_watch_loop_until}` and `WatcherState::DEFAULT_WATCH_BACKOFF`.
-  `LeaseError` gains the variants `Closed` and `Reader`; `LeaseError`, `Claimant`, `ReaderReason`,
-  `WatchErrorCause` and `WriterStatus` are `#[non_exhaustive]`, so a downstream `match` on
-  `LeaseError` without a wildcard arm needs one from this release.
+  `Claimant`, `ReaderReason`, `WatchErrorCause` and `WriterStatus` are `#[non_exhaustive]`.
 - Library: `IndexResult` gains the fields `kept_changed` and `renames_skipped`. It derives
   `Default`, so a literal that ends in `..Default::default()` keeps compiling; one that names every
   field needs the two new ones. New public items: `db::{PathIdHash, CasDelete, CheckedRenames}` and
@@ -51,9 +58,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   operating-system lock on `.groove.db.writer-lock` beside the database before they touch the
   database or the embedding model. A second `groove index` on the same index stops with exit
   code 3 and names the holder (from `.groove.db.writer.json`, which can be stale) instead of
-  writing beside it; `--wait <SECONDS>` waits for the holder first. A database path that is not
-  valid UTF-8 is refused with exit code 1 before the lock is taken, where earlier versions opened a
-  differently spelled file.
+  writing beside it; `--wait <SECONDS>` waits for the holder first. An MCP `rebuild_index` call
+  that cannot take the lock does not wait: it is refused before it touches the embedder or the
+  database, naming the holder ([docs/mcp-tools.md](docs/mcp-tools.md)). A database path that is
+  not valid UTF-8 is refused with exit code 1 before the lock is taken, where earlier versions
+  opened a differently spelled file; the read-only commands below and `groove serve` refuse it at
+  start too.
 - **`groove index` beside a watching `groove serve` now exits 3**, where it used to run alongside
   it. The server takes the lock before its model download, so this holds during a first download
   too. Call the server's `rebuild_index` instead, or stop the server first. A `--no-watch` server
@@ -6592,7 +6602,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.21.5...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...HEAD
+[1.22.0]: https://github.com/alphabet-h/grooveseek/compare/v1.21.5...v1.22.0
 [1.21.5]: https://github.com/alphabet-h/grooveseek/compare/v1.21.4...v1.21.5
 [1.21.4]: https://github.com/alphabet-h/grooveseek/compare/v1.21.3...v1.21.4
 [1.21.3]: https://github.com/alphabet-h/grooveseek/compare/v1.21.2...v1.21.3
