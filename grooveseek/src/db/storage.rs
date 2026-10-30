@@ -87,11 +87,7 @@ impl Database {
 
         // Open a local tx only if we are in autocommit (no caller-managed tx).
         // Drop guard rolls back automatically; we commit at the end on success.
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
 
         // Check if document already exists
         use rusqlite::OptionalExtension;
@@ -291,11 +287,7 @@ impl Database {
         let token_count = i32::try_from(content.len() / 4).unwrap_or(i32::MAX);
         let table_rows_json = table_rows.map(serde_json::to_string).transpose()?;
 
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
 
         // SQLite has no native u8; widen to i64 for the bind. NULL is stored
         // when `level` is None, matching the column's NULL-able definition
@@ -632,11 +624,7 @@ impl Database {
     /// Positional by `chunk_index`, which is sound precisely because the caller has just
     /// established that the chunk texts match one for one.
     pub fn update_chunk_code_meta(&self, path: &str, metas: &[CodeMeta<'_>]) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         let mut stmt = self.conn.prepare(
             "UPDATE chunks SET start_line = ?1, end_line = ?2, symbol_kind = ?3
              WHERE chunk_index = ?4
@@ -668,11 +656,7 @@ impl Database {
         path: &str,
         rows: &[Option<&[TableRowSpan]>],
     ) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         let mut stmt = self.conn.prepare(
             "UPDATE chunks SET table_rows = ?1
              WHERE chunk_index = ?2
@@ -841,11 +825,7 @@ impl Database {
     /// Autocommit-aware like [`Database::upsert_document`]: it joins the
     /// caller's transaction when one is open and opens its own otherwise.
     pub fn replace_document_fields(&self, path: &str, rows: &[(String, String)]) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         self.conn.execute(
             "DELETE FROM document_fields WHERE document_id IN \
              (SELECT id FROM documents WHERE path = ?1)",
@@ -908,11 +888,7 @@ impl Database {
     /// that already ran stay in it and the caller must roll back, as for
     /// [`Database::delete_documents_under`].
     pub fn delete_document(&self, path: &str) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         // Delete vector entries first (no FK from virtual table)
         self.conn.execute(
             "DELETE FROM vec_chunks WHERE chunk_id IN \
@@ -1049,13 +1025,9 @@ impl Database {
     /// store is left torn (e.g. the vectors gone but the document rows left).
     pub fn delete_documents_under(&self, dir: &str) -> Result<Vec<String>> {
         let (lo, hi) = Self::prefix_range(dir, "delete_documents_under")?;
-        let local_tx = if self.conn.is_autocommit() {
-            // No unlocked pre-check: the read below must be behind the write
-            // lock, or a row a concurrent writer commits after it is missed.
-            Some(self.begin_immediate_transaction()?)
-        } else {
-            None
-        };
+        // No unlocked pre-check: the read below must be behind the write
+        // lock, or a row a concurrent writer commits after it is missed.
+        let local_tx = self.begin_local_immediate()?;
         let paths = self.paths_in_range(&lo, &hi)?;
         if paths.is_empty() {
             // Nothing written: dropping `local_tx` rolls back an empty transaction.

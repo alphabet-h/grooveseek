@@ -1104,11 +1104,7 @@ impl Database {
     /// `force` itself), so this only moves the clear to where it is atomic with the
     /// wipe it belongs to.
     pub fn reset_for_model(&self, model: &str, dim: u32) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         self.conn.execute_batch(
             "DELETE FROM fts_chunks; \
              DELETE FROM document_fields; \

@@ -3374,8 +3374,10 @@ fn index_single_disk_entry(
     // Per-file atomicity (F-32): wrap upsert_document + N x insert_chunk
     // in a single tx so that a partial failure (e.g. vec_chunks dim
     // mismatch on the 3rd chunk) rolls the whole file back instead of
-    // leaving a documents row with M < N chunks.
-    let tx = db.begin_transaction()?;
+    // leaving a documents row with M < N chunks. Immediate because the first
+    // statement (`upsert_document`) reads: a deferred read cannot wait for the
+    // write lock another connection holds.
+    let tx = db.begin_immediate_transaction()?;
     write_parsed_document_with_vectors(
         db,
         &entry.rel,

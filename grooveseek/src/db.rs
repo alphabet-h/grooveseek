@@ -947,6 +947,22 @@ impl Database {
         )?)
     }
 
+    /// `Some(BEGIN IMMEDIATE)` when the connection is in autocommit, `None` inside a caller's transaction
+    /// (which the caller's statements then join). For the self-wrapping writes whose first statement reads.
+    ///
+    /// A deferred transaction that has read cannot wait for the write lock: SQLite does not
+    /// run the busy handler for a read transaction's upgrade to a write, so the write returns
+    /// `SQLITE_BUSY` at once while another connection holds the lock (or
+    /// `SQLITE_BUSY_SNAPSHOT` once it has committed). Taking the lock at `BEGIN` makes the
+    /// call wait on the busy timeout instead, and its reads see what it writes over.
+    pub(crate) fn begin_local_immediate(&self) -> Result<Option<rusqlite::Transaction<'_>>> {
+        if self.conn.is_autocommit() {
+            Ok(Some(self.begin_immediate_transaction()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 開いたまま残った transaction を巻き戻す (BU-18)。
     ///
     /// 通常、unwind は `Transaction` の Drop を走らせるので ROLLBACK は自動で
@@ -1728,6 +1744,50 @@ mod tests {
         );
         assert!(a.all_document_paths().unwrap().is_empty(), "gone on A");
         assert!(b.all_document_paths().unwrap().is_empty(), "gone on B");
+        drop(a);
+        drop(b);
+    }
+
+    /// While connection A holds an immediate transaction, an autocommit
+    /// [`Database::upsert_document`] on connection B (which opens its own
+    /// transaction) waits on the busy timeout and goes through once A commits.
+    #[test]
+    fn t_r1_an_autocommit_upsert_waits_for_an_immediate_writer() {
+        let dir = TempDir::new("upsert-waits");
+        let db_path = dir.path().join(".groove.db");
+        let db_path = db_path.to_str().unwrap();
+        let a = Database::open(db_path).unwrap();
+        a.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let b = Database::open(db_path).unwrap();
+
+        let tx = a.begin_immediate_transaction().unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            let upserted = b.upsert_document("note.md", None, None, None, None, &[], None, "h", 0);
+            (b, upserted, t0.elapsed())
+        });
+        started_rx.recv().unwrap();
+        // Only makes the wait observable; correctness does not depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if handle.is_finished() {
+            let (_, upserted, waited) = handle.join().unwrap();
+            panic!(
+                "the upsert must wait for A's write lock, not return before A commits: \
+                 returned after {waited:?} with {upserted:?}"
+            );
+        }
+        tx.commit().unwrap();
+
+        let (b, upserted, waited) = handle.join().unwrap();
+        upserted.unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "the upsert returned after {waited:?}, so it did not wait for A"
+        );
+        assert_eq!(a.all_document_paths().unwrap(), vec!["note.md".to_string()]);
         drop(a);
         drop(b);
     }
