@@ -1,13 +1,16 @@
-//! (kuriya 560) A rename does not look at its old end, and a file that turns up there again is
-//! indexed all the same.
+//! (kuriya 560) A file that turns up at the old end of a rename is indexed all the same.
 //!
-//! When the watcher handles a paired rename it moves or drops the row of the old end without
-//! looking at that path on disk. A file found there by then is another file: the one that left
-//! took its text along. Its own create event is queued apart from the rename (notify's debouncer
-//! moves the source's queue to the destination, so a later create at the old path starts a new
-//! queue) and comes out after it in time order, so that event writes its row. Nothing in the
-//! code says so beyond that reading; these tests pin it, for a file rename, for a rename into
-//! an excluded directory and for a directory rename.
+//! When the watcher handles a paired rename it moves the row of the old end to the new name, and
+//! there is then no row under the old path to look at. Where it drops the row instead (the new
+//! name is in an excluded directory, or a directory rename left listed rows it did not move), it
+//! first looks at the old name on disk under the index lock, as it does for a deletion, so a file
+//! written back there keeps its row and is re-read in place. A file found at the old end by then
+//! is another file: the one that left took its text along. Where the row moved, the new file's
+//! own create event is queued apart from the rename (notify's debouncer moves the source's queue
+//! to the destination, so a later create at the old path starts a new queue) and comes out after
+//! it in time order, so that event writes its row. These end-to-end tests pin only the end state,
+//! for a file rename, for a rename into an excluded directory and for a directory rename; the
+//! paths that look at the old name are pinned by unit tests in [`grooveseek::watcher`].
 //!
 //! Each test drives `groove serve` with the watcher on against the mock endpoint of
 //! [`crate::common::embed_cli`], so nothing downloads a model, and reads the rows the server left
@@ -136,14 +139,15 @@ fn assert_settles_on(
 /// (E1) A file renamed and then written again under its old name, inside one debounce window:
 /// both names end up indexed, each with its own text.
 ///
-/// The paired rename moves the row of `a.md` (the text of the file that left) to `b.md` without
-/// looking at `a.md`. The new `a.md` has its own create event, queued after the rename, which
-/// writes its row. Pins the old end of the rows N1, N2 and N7 of the table in kuriya 560 (type E).
+/// The paired rename moves the row of `a.md` (the text of the file that left) to `b.md`, so there
+/// is no row under `a.md` for the watcher to look at. The new `a.md` has its own create event,
+/// queued after the rename, which writes its row. Pins the old end of the rows N1, N2 and N7 of
+/// the table in kuriya 560 (type E).
 ///
 /// The paired path is asserted through its stderr line: green through an unpaired removal of
-/// `a.md` would pin nothing about the rename. What is pinned is that the end state is right
-/// while the old end is not looked at, not that it must never be: a look added there later would
-/// keep this green, and would not be wrong.
+/// `a.md` would pin nothing about the rename. What is pinned is the end state, whichever way the
+/// old end is handled: a look at it added there later would keep this green, and would not be
+/// wrong.
 #[test]
 fn a_file_renamed_then_written_again_under_its_old_name_keeps_both() {
     let (fx, guard) = served("i560-file", &[("a.md", &note("Alpha", "alphamarker"))]);
@@ -181,18 +185,17 @@ fn a_file_renamed_then_written_again_under_its_old_name_keeps_both() {
 /// old name is indexed with the new text, and nothing under the excluded directory is.
 ///
 /// `node_modules` is on the watcher's hardcoded denylist, so the paired rename drops the row of
-/// `a.md` without looking at it. The new `a.md` has its own create event, which writes its row.
-/// Pins the row N1 of the table in kuriya 560 (type E). `keep.txt` is there only so that the
-/// directory exists before the server starts; its extension keeps it out of the index.
+/// `a.md`, after it has looked at `a.md` under the index lock: a file written back there keeps
+/// its row. The new `a.md` is also given its own create event, which writes its row. Pins the row
+/// N1 of the table in kuriya 560 (type E). `keep.txt` is there only so that the directory exists
+/// before the server starts; its extension keeps it out of the index.
 ///
-/// On Linux the test also asserts the line of the dropped row. That line is printed by the paired
-/// rename and by an unpaired rename-from event alike, and neither looks at the old name, so it
-/// pins that the old name went through a drop that does not look; it does not tell which of the
-/// two it was. On Windows the watcher printed no such line when this was written: the stderr held
-/// only the reindex of `a.md`, so the old name went through the removal that looks at the path.
-/// The reading (not checked) is that Windows reports a move between directories as a removal and
-/// an addition rather than as the two names of a rename. The end state is the same, and is
-/// asserted on both.
+/// The paired-rename path (the old end looked at, the written-back file reindexed rather than
+/// dropped) is pinned deterministically by the unit test
+/// `i6_t_i2_a_file_back_at_the_old_end_of_a_rename_into_an_excluded_dir_keeps_its_row` in
+/// [`grooveseek::watcher`]. Which of the two events (the rename, or the create of the new file)
+/// reaches the old name first depends on timing, so a stderr assert here would be unreliable:
+/// this test checks the end state only, on every platform.
 #[test]
 fn a_file_moved_into_an_excluded_directory_then_written_again_is_indexed() {
     let (fx, guard) = served(
@@ -221,20 +224,6 @@ fn a_file_moved_into_an_excluded_directory_then_written_again_is_indexed() {
             a.contains("gammamarker") && !a.contains("alphamarker")
         },
     );
-    #[cfg(target_os = "linux")]
-    {
-        let lines = stderr_lines(&guard);
-        assert!(
-            !lines.iter().any(|l| l.contains("watcher: deindexed a.md")),
-            "the old name of the rename was dropped without being looked at under the index lock; stderr:\n{}",
-            lines.join("\n")
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("watcher: reindexed a.md")),
-            "the file written back under the old name was not reindexed; stderr:\n{}",
-            lines.join("\n")
-        );
-    }
     drop(guard);
 }
 
