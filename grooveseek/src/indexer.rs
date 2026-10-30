@@ -2184,6 +2184,16 @@ pub fn rebuild_index(
     // the end would claim are marked for a re-parse there, and the frontmatter policy and
     // declared-field set wait for a run that keeps none.
     let kept = pruned.kept;
+    // (ADR-0031) Under `--force` they are marked here as well, before any later step can fail:
+    // the code chunk policy this forced run recorded before its walk claims every row, and a
+    // kept row is one it never read. The mark only makes the next run read the row again, so
+    // writing it early costs nothing; the end of the run writes it once more.
+    if force && !kept.is_empty() {
+        let marked: Vec<&str> = kept.iter().map(String::as_str).collect();
+        let tx = db.begin_immediate_transaction()?;
+        db.overwrite_content_hash(&marked, HASH_AWAITING_REPARSE)?;
+        tx.commit()?;
+    }
     // Not through `progress`: a quiet or callback reporter would drop the count.
     if let Some(note) = kept_changed_note(tally.kept_changed) {
         eprintln!("{note}");
@@ -2239,11 +2249,12 @@ pub fn rebuild_index(
     // key is never there without the marks (I-1). The marks are written over whatever the
     // rows hold now, unconditionally: a row another process wrote since the loop is marked too,
     // and re-read once more, rather than an old-rule row being kept (ADR-0028). `--force`
-    // rewrote every row, so it marks none. The counts in `result` read rows, not hashes, so the
-    // marks do not change them. (ADR-0031) A row the prune kept for another writer was not read
-    // by this run, so it is marked as a skipped one is: when a stale pass covers it, and under
-    // `--force`, whose keys claim every row, whatever its format. The mark costs it no more than
-    // one more read, and a kept row deleted since is skipped by the write.
+    // rewrote every row it read, so it marks none of those. The counts in `result` read rows,
+    // not hashes, so the marks do not change them. (ADR-0031) The exception is a row the prune
+    // kept for another writer, which this run did not read: it is marked as a skipped one is,
+    // when a stale pass covers it, and under `--force`, whose keys claim every row, whatever its
+    // format (a forced run already marked it after the prune; this writes it again). The mark
+    // costs it no more than one more read, and a kept row deleted since is skipped by the write.
     if force || any_stale {
         if any_stale {
             for rel in &skipped_paths {
@@ -11273,6 +11284,69 @@ mod tests {
         );
         assert_eq!(db.read_declared_fields().unwrap(), None);
         assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+    }
+
+    /// A forced run marks the rows its prune kept right after the prune, not only at the end:
+    /// a step after the prune that fails still leaves them marked, so the code chunk policy the
+    /// forced run recorded before its walk does not stand over a row it never read. The row
+    /// reaches the snapshot as in the test above; at the scan the other connection also makes
+    /// the end of the declared-field pass fail.
+    #[test]
+    fn a_forced_run_that_fails_after_its_prune_has_already_marked_the_kept_rows() {
+        let tmp = mk_tmp("pr3-kept-force-fail");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        db.execute_for_test(concat!(
+            "CREATE TRIGGER write_ghost_after_reset AFTER INSERT ON index_meta ",
+            "WHEN NEW.key = 'declared_fields_pass' ",
+            "BEGIN INSERT INTO documents (path, tags, content_hash, last_indexed) ",
+            "VALUES ('ghost.md', '[]', 'h-ghost', '2026-01-01T00:00:00Z'); END;"
+        ))
+        .unwrap();
+        let progress = on_first_scanning(move || {
+            other
+                .execute_for_test("DROP TRIGGER write_ghost_after_reset;")
+                .unwrap();
+            other
+                .execute_for_test(concat!(
+                    "CREATE TRIGGER inject_pass_end_failure BEFORE DELETE ON index_meta ",
+                    "WHEN OLD.key = 'declared_fields_pass' ",
+                    "BEGIN SELECT RAISE(ABORT, 'injected pass end failure'); END;"
+                ))
+                .unwrap();
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&["ghost.md"], "changed")
+                    .unwrap(),
+                1,
+                "the trigger did not write ghost.md before the snapshot"
+            );
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let err = rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb,
+            None,
+            true,
+            None,
+            &[],
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+        .expect_err("the injected failure did not stop the run");
+        assert!(
+            format!("{err:#}").contains("injected pass end failure"),
+            "{err:#}"
+        );
+        assert_eq!(
+            id_hash(&db, "ghost.md").map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the kept row was left unmarked by a forced run that failed after its prune"
+        );
     }
 
     /// A run that refreshes the frontmatter of unchanged Markdown and keeps a row for another

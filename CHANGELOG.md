@@ -104,7 +104,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `database is locked`. The run's other look-then-write steps are still not protected against such
   a writer, and neither is a forced run (`groove index --force`, or `rebuild_index` with
   `force: true`): it clears the index first and rebuilds it from the files on disk, so a row that
-  writer committed before the reset is replaced by what the run reads, not kept.
+  writer committed before the reset is replaced by what the run reads, not kept. A row the prune
+  keeps is marked to be parsed again when the run is forced or a one-time migration is pending, and
+  after a run that kept any row, the next run repeats the frontmatter and declared-field passes.
 
 ## [1.21.5] - 2026-10-28
 
