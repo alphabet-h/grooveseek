@@ -270,10 +270,10 @@ fn self_wrapping_writes_open_their_own_transaction_immediate() {
     );
 }
 
-/// (kuriya 259) In the watcher, a row leaves on an event without a look at the disk inside the
-/// database lock only for a name the index cannot hold: the one production call of
-/// `dispatch_deindex` is in `handle_removed_path`; every other event-driven deletion goes
-/// through `dispatch_removal`.
+/// (kuriya 259) In [`grooveseek::watcher`], a row leaves on an event without a look at the disk
+/// inside the database lock only for a name the index cannot hold: the one production call of
+/// `dispatch_deindex` (crate-private, in [`grooveseek::watcher`]) is in `handle_removed_path`;
+/// every other event-driven deletion goes through `dispatch_removal`.
 #[test]
 fn only_a_name_the_index_cannot_hold_is_deindexed_without_a_look() {
     let text = src("watcher.rs");

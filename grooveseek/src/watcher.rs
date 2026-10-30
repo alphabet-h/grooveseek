@@ -7019,7 +7019,7 @@ mod tests {
         kb
     }
 
-    /// The watcher state the kuriya 259 event-loop tests run `handle_events` on.
+    /// The watcher state the kuriya 259 event-loop tests run [`handle_events`] on.
     fn i6_state(
         kb: &Path,
         db: &Arc<Mutex<Database>>,
@@ -7135,8 +7135,8 @@ mod tests {
         kb
     }
 
-    /// The rename of `old` to `new` (relative to the knowledge base), as the debouncer stitches
-    /// it.
+    /// The rename of the path `old` to another one, both relative to the knowledge base, as the
+    /// debouncer stitches it.
     fn i6_rename(kb: &Path, old: &str, new: &str) -> [DebouncedEvent; 1] {
         [mk_evt(
             EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
