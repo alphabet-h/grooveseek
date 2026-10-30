@@ -25,7 +25,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `search` and `rebuild_index` tool descriptions name the field. `groove search --format json`
   does not carry it. See [docs/mcp-tools.md](docs/mcp-tools.md).
 - Library: a new public module `writer_lease` holds the lock: `WriterLease` (`try_acquire`,
-  `acquire_with_wait`, `set_role`, `touch_heartbeat`, `read_holder` and the path helpers), `Role`,
+  `acquire_with_wait`, `set_role`, `touch_heartbeat`, `read_holder`, the accessors `role`,
+  `acquired_at`, `db_path` and `resolved_path`, and the path helpers `lock_path_for`,
+  `info_path_for` and `resolved_db_path`), `Role` (`as_str`),
   `HolderInfo` (`heartbeat_fresh`, `keeps_current`), `LeaseError`, `HolderRelation`,
   `HEARTBEAT_FRESH`, and the functions `db_path_utf8`, `holder_relation`, `index_busy_message` and
   `index_waiting_line`. `Database` gains `open_read_only`, `open_writer`,
