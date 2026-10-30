@@ -544,6 +544,79 @@ fn with_chunk_counts<T: Serialize>(body: T, result: &indexer::IndexResult) -> Wi
     }
 }
 
+/// The two counts of a run that overlapped a writer that does not take the lock (ADR-0031), beside the reply.
+/// Flattened, like [`WithChunkCounts`], and not added to [`IndexStats`], whose tests build it as a literal.
+/// Both keys are present even at 0.
+#[derive(Serialize)]
+struct WithForeignWrites<T: Serialize> {
+    #[serde(flatten)]
+    body: T,
+    kept_changed: u32,
+    renames_skipped: u32,
+}
+
+/// `body` with the counts of `result` that another writer caused.
+fn with_foreign_writes<T: Serialize>(
+    body: T,
+    result: &indexer::IndexResult,
+) -> WithForeignWrites<T> {
+    WithForeignWrites {
+        body,
+        kept_changed: result.kept_changed,
+        renames_skipped: result.renames_skipped,
+    }
+}
+
+/// The reply of [`KbServer::rebuild_index`] to a run that completed: an error beside the
+/// counts when the run fails one of the checks (all embeds refused, a forced rebuild with a
+/// refusal, unparsed frontmatter under `fail_on_frontmatter_error`, in that order), the
+/// counts alone otherwise.
+fn rebuild_reply(result: &indexer::IndexResult, fail_on_frontmatter_error: bool) -> RebuildReply {
+    let stats = IndexStats {
+        total_documents: result.total_documents,
+        updated: result.updated,
+        renamed: result.renamed,
+        deleted: result.deleted,
+        skipped: result.skipped,
+        frontmatter_unparsed: result.frontmatter_unparsed,
+        total_chunks: result.total_chunks,
+        duration_ms: result.duration_ms,
+    };
+    let strict = |error: String, stats: IndexStats| {
+        RebuildReply::Strict(with_chunk_counts(
+            with_foreign_writes(StrictIndexFailure { error, stats }, result),
+            result,
+        ))
+    };
+    if result.fails_all_inputs_rejected() {
+        return strict(
+            result.all_inputs_rejected_message(indexer::REJECTIONS_NAMED_ON_SERVER_STDERR),
+            stats,
+        );
+    }
+    if result.fails_forced_rebuild_rejections() {
+        return strict(
+            result.forced_rebuild_rejections_message(indexer::REJECTIONS_NAMED_ON_SERVER_STDERR),
+            stats,
+        );
+    }
+    if result.fails_strict_frontmatter(fail_on_frontmatter_error) {
+        return strict(
+            format!(
+                "{} document(s) have YAML frontmatter that could not be parsed; \
+                 [index].fail_on_frontmatter_error is set. The index was still written; \
+                 each file is named on the server's stderr and carries the tag frontmatter:unparsed.",
+                stats.frontmatter_unparsed
+            ),
+            stats,
+        );
+    }
+    RebuildReply::Stats(with_chunk_counts(
+        with_foreign_writes(stats, result),
+        result,
+    ))
+}
+
 /// Deserialize too: a panicked rebuild's reply is read back to put the
 /// writer notice beside it.
 #[derive(Serialize, Deserialize, Debug)]
@@ -557,8 +630,8 @@ pub(crate) struct ErrorResponse {
 #[serde(untagged)]
 enum RebuildReply {
     Error(ErrorResponse),
-    Strict(WithChunkCounts<StrictIndexFailure>),
-    Stats(WithChunkCounts<IndexStats>),
+    Strict(WithChunkCounts<WithForeignWrites<StrictIndexFailure>>),
+    Stats(WithChunkCounts<WithForeignWrites<IndexStats>>),
 }
 
 /// A reply with the writer notice beside it (ADR-0031): flattened, so the
@@ -821,49 +894,7 @@ impl KbCore {
             indexer::progress::ProgressReporter::new(indexer::progress::ProgressMode::Quiet),
             self.context_mode_desired,
         ) {
-            Ok(result) => {
-                let stats = IndexStats {
-                    total_documents: result.total_documents,
-                    updated: result.updated,
-                    renamed: result.renamed,
-                    deleted: result.deleted,
-                    skipped: result.skipped,
-                    frontmatter_unparsed: result.frontmatter_unparsed,
-                    total_chunks: result.total_chunks,
-                    duration_ms: result.duration_ms,
-                };
-                if result.fails_all_inputs_rejected() {
-                    let reply = StrictIndexFailure {
-                        error: result.all_inputs_rejected_message(
-                            indexer::REJECTIONS_NAMED_ON_SERVER_STDERR,
-                        ),
-                        stats,
-                    };
-                    return RebuildReply::Strict(with_chunk_counts(reply, &result));
-                }
-                if result.fails_forced_rebuild_rejections() {
-                    let reply = StrictIndexFailure {
-                        error: result.forced_rebuild_rejections_message(
-                            indexer::REJECTIONS_NAMED_ON_SERVER_STDERR,
-                        ),
-                        stats,
-                    };
-                    return RebuildReply::Strict(with_chunk_counts(reply, &result));
-                }
-                if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
-                    let reply = StrictIndexFailure {
-                        error: format!(
-                            "{} document(s) have YAML frontmatter that could not be parsed; \
-                             [index].fail_on_frontmatter_error is set. The index was still written; \
-                             each file is named on the server's stderr and carries the tag frontmatter:unparsed.",
-                            stats.frontmatter_unparsed
-                        ),
-                        stats,
-                    };
-                    return RebuildReply::Strict(with_chunk_counts(reply, &result));
-                }
-                RebuildReply::Stats(with_chunk_counts(stats, &result))
-            }
+            Ok(result) => rebuild_reply(&result, self.fail_on_frontmatter_error),
             // (AW-04, AW-16) Through `body_free_message`, like the search tool's embed error:
             // the indexer wraps every embed failure in its own context, and the reply names
             // the cause under it (an HTTP status, malformed JSON, a timeout) without the
@@ -2064,6 +2095,56 @@ mod tests {
         }
         assert_eq!(failure["error"], "boom");
         assert!(plain.get("error").is_none(), "{plain}");
+    }
+
+    /// The JSON of each arm [`rebuild_reply`] builds from `result`: the plain reply with
+    /// `fail_on_frontmatter_error` off, and the error reply from the same result with one
+    /// refused embed and nothing embedded.
+    fn rebuild_reply_arms(result: indexer::IndexResult) -> [serde_json::Value; 2] {
+        let to_json = |reply: &RebuildReply| -> serde_json::Value {
+            serde_json::from_str(&serde_json::to_string(reply).unwrap()).unwrap()
+        };
+        let plain = rebuild_reply(&result, false);
+        assert!(matches!(plain, RebuildReply::Stats(_)));
+        let strict_result = indexer::IndexResult {
+            embed_rejected: 1,
+            ..result
+        };
+        let strict = rebuild_reply(&strict_result, false);
+        assert!(matches!(strict, RebuildReply::Strict(_)));
+        [to_json(&plain), to_json(&strict)]
+    }
+
+    /// (ADR-0031) A run that overlapped a writer that does not take the lock reports how
+    /// many rows it kept and how many renames it skipped, at the top level of both the
+    /// plain reply and the error reply, beside the counters and the chunk counts.
+    #[test]
+    fn rebuild_replies_carry_kept_changed_and_renames_skipped_at_the_top_level() {
+        let [plain, strict] = rebuild_reply_arms(indexer::IndexResult {
+            kept_changed: 2,
+            renames_skipped: 1,
+            total_documents: 3,
+            ..Default::default()
+        });
+        for json in [&plain, &strict] {
+            assert_eq!(json["kept_changed"], 2, "{json}");
+            assert_eq!(json["renames_skipped"], 1, "{json}");
+            assert_eq!(json["total_documents"], 3, "{json}");
+            assert!(json.get("chunks_embedded").is_some(), "{json}");
+            assert!(json.get("body").is_none(), "flattened, not nested: {json}");
+            assert!(json.get("stats").is_none(), "flattened, not nested: {json}");
+        }
+        assert!(plain.get("error").is_none(), "{plain}");
+        assert!(strict.get("error").is_some(), "{strict}");
+    }
+
+    /// (ADR-0031) The two counts are keys even when nothing overlapped the run.
+    #[test]
+    fn rebuild_replies_carry_zero_counts_as_keys() {
+        for json in rebuild_reply_arms(indexer::IndexResult::default()) {
+            assert_eq!(json["kept_changed"], 0, "{json}");
+            assert_eq!(json["renames_skipped"], 0, "{json}");
+        }
     }
 
     /// The half of the naming rule that values are held to: a caller who

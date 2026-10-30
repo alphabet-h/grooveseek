@@ -180,6 +180,14 @@ The three designs were scored by three reviewers on five axes, 10 points each
   2.3 GB), a `groove index` on the same index exits `3`.
 - **Writers that do not take part are not stopped**: an older binary, a program
   that calls the library's `Database::open`, or `sqlite3` by hand.
+  *(2026-10-30, v1.22.0)* A `groove index` or `rebuild_index` run that overlaps
+  such a writer still keeps, in its prune, the rows that writer changed during
+  the run, and its rename detection skips the pairs that writer changed; the
+  other look-then-write steps are not protected. A forced run clears the index
+  before any of this applies and rebuilds it from the files on disk, so a row
+  that writer committed before the reset is replaced, not kept. The decision is
+  unchanged.
+  `CHANGELOG.md`, v1.22.0 → Fixed.
 - **A hung holder keeps the lock**; only stopping it releases it. The operating
   system drops the lock when the process exits or is killed. The lock file and
   a stale json may stay behind and need no cleanup.

@@ -1104,11 +1104,7 @@ impl Database {
     /// `force` itself), so this only moves the clear to where it is atomic with the
     /// wipe it belongs to.
     pub fn reset_for_model(&self, model: &str, dim: u32) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         self.conn.execute_batch(
             "DELETE FROM fts_chunks; \
              DELETE FROM document_fields; \
@@ -1200,6 +1196,28 @@ impl Database {
         for row in rows {
             let (p, h) = row?;
             out.insert(p, h);
+        }
+        Ok(out)
+    }
+
+    /// Every `documents.path` with its `id` and `content_hash`, read in one statement,
+    /// so the three come from one snapshot. The `id` tells a row deleted and written
+    /// again under the same path and hash apart from the row that was read.
+    pub fn all_path_ids_hashes(&self) -> Result<PathIdHash> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, id, content_hash FROM documents")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = PathIdHash::new();
+        for row in rows {
+            let (p, id, h) = row?;
+            out.insert(p, (id, h));
         }
         Ok(out)
     }
@@ -1409,7 +1427,7 @@ impl Database {
     ///   ([`crate::indexer::HASH_AWAITING_REPARSE`]) で残し、次の event / run が読み直す (#544 D5、#552)
     ///
     /// watcher の [`crate::indexer::rename_single_file`] と full run の
-    /// [`Self::rename_documents_atomic`] がともにここを通る (1 実装)。
+    /// [`Self::rename_documents_checked`] がともにここを通る (1 実装)。
     pub fn rename_document(
         &self,
         old_path: &str,
@@ -1473,6 +1491,73 @@ impl Database {
         tx.commit()
             .context("rename_documents_atomic: COMMIT failed")?;
         Ok(())
+    }
+
+    /// Under one `BEGIN IMMEDIATE`: for each pair, applies it only if the old row's
+    /// `(id, content_hash)` is the one the snapshot holds and no row is at the new path; an applied pair
+    /// whose old path is in `crossed_old_paths` gets [`crate::indexer::HASH_AWAITING_REPARSE`]
+    /// first. Others are skipped, never an error. Refuses inside a caller's transaction.
+    ///
+    /// The checks and the renames share the immediate transaction, so a row another writer
+    /// changed, moved or created after the snapshot was read is left as that writer left it.
+    /// Pairs are checked and applied in order; a later pair sees the rows the earlier ones moved.
+    /// A pair whose old path is not in the snapshot is skipped. `frontmatter_topics` is keyed
+    /// by the new path, as for [`Self::rename_documents_atomic`]. Empty `pairs` return at once
+    /// without opening a transaction. Reads no file. On `Err` (a failed statement) nothing
+    /// is written.
+    pub fn rename_documents_checked(
+        &self,
+        pairs: &[(String, String)],
+        snapshot: &PathIdHash,
+        crossed_old_paths: &[&str],
+        frontmatter_topics: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<CheckedRenames> {
+        if pairs.is_empty() {
+            return Ok(CheckedRenames::default());
+        }
+        if !self.conn.is_autocommit() {
+            anyhow::bail!("rename_documents_checked must not run inside a caller's transaction");
+        }
+        let tx = self.begin_immediate_transaction()?;
+        let mut out = CheckedRenames::default();
+        {
+            let mut read_old = self
+                .conn
+                .prepare("SELECT id, content_hash FROM documents WHERE path = ?1")?;
+            let mut read_new = self
+                .conn
+                .prepare("SELECT 1 FROM documents WHERE path = ?1")?;
+            for (old, new) in pairs {
+                let current: Option<(i64, String)> = read_old
+                    .query_map(params![old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .next()
+                    .transpose()?;
+                let new_taken = read_new.exists(params![new])?;
+                let unchanged = match (snapshot.get(old), current) {
+                    (Some(expected), Some(current)) => *expected == current,
+                    _ => false,
+                };
+                if !unchanged || new_taken {
+                    out.skipped.push((old.clone(), new.clone()));
+                    continue;
+                }
+                if crossed_old_paths.contains(&old.as_str()) {
+                    self.overwrite_content_hash(
+                        &[old.as_str()],
+                        crate::indexer::HASH_AWAITING_REPARSE,
+                    )?;
+                }
+                let topic = match frontmatter_topics.get(new) {
+                    Some(fm) => FrontmatterTopic::Read(fm.as_deref()),
+                    None => FrontmatterTopic::Unread,
+                };
+                self.rename_document(old, new, topic)?;
+                out.applied.push((old.clone(), new.clone()));
+            }
+        }
+        tx.commit()
+            .context("rename_documents_checked: COMMIT failed")?;
+        Ok(out)
     }
 }
 

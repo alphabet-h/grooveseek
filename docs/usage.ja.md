@@ -113,7 +113,7 @@ Markdown ファイルは「読めていない」ものとして数えられる�
 
 `groove index` の進捗表示を切り替える 2 フラグ。**相互排他** + フラグなしの既定動作は不変 (= 既存の per-file `  indexed: foo.md (N chunks)` 出力をそのまま維持)。
 
-- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。warning は進捗ではないので抑止されない: `warning: <path>: failed to parse YAML frontmatter: ...` は `--quiet` でも出る。
+- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。warning は進捗ではないので抑止されない: `warning: <path>: failed to parse YAML frontmatter: ...` は `--quiet` でも出る。ロックを取らない書き手と重なった run が出す 2 つの `note:` の行も同じで、`--quiet` でも出る: `note: kept <N> row(s) another writer changed during this run; ...` と `note: skipped <N> rename(s) another writer changed during this run; ...`。
 - `--progress`: 進捗 UI を表示。stderr の `IsTerminal` で自動分岐 — TTY なら `indicatif` バー (経過時間 / 件数 / % / ETA)、非 TTY (pipe / redirect) なら `Progress: N/M (P%)` 行を約 20 回 + 100% アンカー 1 回で flush。`tail -f indexing.log` で監視可能。
 
 ```bash

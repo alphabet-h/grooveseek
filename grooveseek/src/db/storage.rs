@@ -87,11 +87,7 @@ impl Database {
 
         // Open a local tx only if we are in autocommit (no caller-managed tx).
         // Drop guard rolls back automatically; we commit at the end on success.
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
 
         // Check if document already exists
         use rusqlite::OptionalExtension;
@@ -291,11 +287,7 @@ impl Database {
         let token_count = i32::try_from(content.len() / 4).unwrap_or(i32::MAX);
         let table_rows_json = table_rows.map(serde_json::to_string).transpose()?;
 
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
 
         // SQLite has no native u8; widen to i64 for the bind. NULL is stored
         // when `level` is None, matching the column's NULL-able definition
@@ -632,11 +624,7 @@ impl Database {
     /// Positional by `chunk_index`, which is sound precisely because the caller has just
     /// established that the chunk texts match one for one.
     pub fn update_chunk_code_meta(&self, path: &str, metas: &[CodeMeta<'_>]) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         let mut stmt = self.conn.prepare(
             "UPDATE chunks SET start_line = ?1, end_line = ?2, symbol_kind = ?3
              WHERE chunk_index = ?4
@@ -668,11 +656,7 @@ impl Database {
         path: &str,
         rows: &[Option<&[TableRowSpan]>],
     ) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         let mut stmt = self.conn.prepare(
             "UPDATE chunks SET table_rows = ?1
              WHERE chunk_index = ?2
@@ -841,11 +825,7 @@ impl Database {
     /// Autocommit-aware like [`Database::upsert_document`]: it joins the
     /// caller's transaction when one is open and opens its own otherwise.
     pub fn replace_document_fields(&self, path: &str, rows: &[(String, String)]) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         self.conn.execute(
             "DELETE FROM document_fields WHERE document_id IN \
              (SELECT id FROM documents WHERE path = ?1)",
@@ -908,11 +888,7 @@ impl Database {
     /// that already ran stay in it and the caller must roll back, as for
     /// [`Database::delete_documents_under`].
     pub fn delete_document(&self, path: &str) -> Result<()> {
-        let local_tx = if self.conn.is_autocommit() {
-            Some(self.conn.unchecked_transaction()?)
-        } else {
-            None
-        };
+        let local_tx = self.begin_local_immediate()?;
         // Delete vector entries first (no FK from virtual table)
         self.conn.execute(
             "DELETE FROM vec_chunks WHERE chunk_id IN \
@@ -947,6 +923,92 @@ impl Database {
         Ok(())
     }
 
+    /// One batch of the prune: under `BEGIN IMMEDIATE`, re-reads `path, id, content_hash`
+    /// of `expected`'s paths (`WHERE path IN (..)`) and deletes (via
+    /// [`Database::delete_document`], joining the transaction) only the rows whose
+    /// `(id, hash)` equal `expected`'s. A path with no row is neither deleted nor counted.
+    /// Paths compare as stored (BINARY): `note.md` does not match a `Note.md` row.
+    ///
+    /// The re-read and the deletes share the immediate transaction, so a row another
+    /// writer changes or re-creates after `expected` was read is kept, and one it is still
+    /// writing is waited for (busy timeout) and judged as committed.
+    ///
+    /// Refuses to run inside a caller's transaction (bail, nothing written): joining a
+    /// deferred one would re-read on its snapshot and lose the guarantee. An empty
+    /// `expected` returns at once without opening a transaction. Refuses more than
+    /// 32766 entries (the SQLite host-parameter limit); keeping batches small is the
+    /// caller's job. Reads no file and embeds nothing.
+    ///
+    /// With `mark_kept`, the `content_hash` of every kept row (one whose re-read did not match
+    /// `expected`) is overwritten with [`crate::indexer::HASH_AWAITING_REPARSE`] in the same
+    /// transaction, so the row is never kept without its mark: a forced run has recorded the
+    /// code chunk policy as current before its walk, and a kept row is one it never read
+    /// (ADR-0031). The returned `kept` and `kept_changed` are the same either way.
+    pub fn delete_documents_if_unchanged(
+        &self,
+        expected: &[(&str, i64, &str)],
+        mark_kept: bool,
+    ) -> Result<CasDelete> {
+        if expected.is_empty() {
+            return Ok(CasDelete::default());
+        }
+        if !self.conn.is_autocommit() {
+            anyhow::bail!(
+                "delete_documents_if_unchanged must not run inside a caller's transaction"
+            );
+        }
+        const SQLITE_MAX_VARIABLES: usize = 32766;
+        if expected.len() > SQLITE_MAX_VARIABLES {
+            anyhow::bail!(
+                "delete_documents_if_unchanged got {} paths, more than the {SQLITE_MAX_VARIABLES} one statement can bind",
+                expected.len()
+            );
+        }
+        let tx = self.begin_immediate_transaction()?;
+        let mut current: PathIdHash = {
+            let placeholders: String = (1..=expected.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path, id, content_hash FROM documents WHERE path IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params_iter: Vec<&dyn rusqlite::ToSql> = expected
+                .iter()
+                .map(|(p, _, _)| p as &dyn rusqlite::ToSql)
+                .collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut out = CasDelete::default();
+        // `remove`, so a path listed twice is judged once.
+        for (path, id, hash) in expected {
+            match current.remove(*path) {
+                None => {}
+                Some((cur_id, cur_hash)) if cur_id == *id && cur_hash == *hash => {
+                    self.delete_document(path)?;
+                    out.deleted.push((*path).to_string());
+                }
+                Some(_) => {
+                    out.kept_changed += 1;
+                    out.kept.push((*path).to_string());
+                }
+            }
+        }
+        if mark_kept && !out.kept.is_empty() {
+            let kept: Vec<&str> = out.kept.iter().map(String::as_str).collect();
+            self.overwrite_content_hash(&kept, crate::indexer::HASH_AWAITING_REPARSE)?;
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// (feature-67) Delete every document strictly under `dir` (`dir/...`, any depth),
     /// with its chunks / vectors / FTS rows / fields. Returns the deleted paths, sorted.
     /// `dir` itself is not touched. Refuses an empty `dir` and one ending in `/`.
@@ -977,13 +1039,9 @@ impl Database {
     /// store is left torn (e.g. the vectors gone but the document rows left).
     pub fn delete_documents_under(&self, dir: &str) -> Result<Vec<String>> {
         let (lo, hi) = Self::prefix_range(dir, "delete_documents_under")?;
-        let local_tx = if self.conn.is_autocommit() {
-            // No unlocked pre-check: the read below must be behind the write
-            // lock, or a row a concurrent writer commits after it is missed.
-            Some(self.begin_immediate_transaction()?)
-        } else {
-            None
-        };
+        // No unlocked pre-check: the read below must be behind the write
+        // lock, or a row a concurrent writer commits after it is missed.
+        let local_tx = self.begin_local_immediate()?;
         let paths = self.paths_in_range(&lo, &hi)?;
         if paths.is_empty() {
             // Nothing written: dropping `local_tx` rolls back an empty transaction.

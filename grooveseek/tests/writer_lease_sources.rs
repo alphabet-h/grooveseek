@@ -216,3 +216,56 @@ fn run_server_with_spawns_the_janitor_before_the_model_download() {
         "run_server passes the model download in"
     );
 }
+
+/// The writes that wrap themselves in a transaction when the caller has none
+/// open start it as `BEGIN IMMEDIATE`, through
+/// `Database::begin_local_immediate` (crate-private, in [`grooveseek::db`]):
+/// their first statement reads, and a deferred transaction would read on a
+/// snapshot another writer can commit past before the write takes the lock. In
+/// the production lines of the storage submodule of [`grooveseek::db`] no
+/// deferred `unchecked_transaction(` is left, and neither is one in
+/// [`grooveseek::db::Database::reset_for_model`] (the rest of the meta
+/// submodule keeps its read-only transactions).
+#[test]
+fn self_wrapping_writes_open_their_own_transaction_immediate() {
+    let storage = src("db/storage.rs");
+    let storage_prod = production_lines(&storage);
+    let deferred: Vec<usize> = storage_prod
+        .iter()
+        .filter(|(_, l)| l.contains("unchecked_transaction("))
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        deferred.is_empty(),
+        "db/storage.rs: deferred self-wrapping transaction at lines {deferred:?}"
+    );
+    // Self-check that the scan sees the replaced call sites at all; a lower
+    // bound, so adding a call does not need this test edited.
+    let immediate = storage_prod
+        .iter()
+        .filter(|(_, l)| l.contains("begin_local_immediate()"))
+        .count();
+    assert!(
+        immediate >= 7,
+        "db/storage.rs: {immediate} begin_local_immediate() calls, expected at least 7"
+    );
+
+    let meta = src("db/meta.rs");
+    let meta_prod = production_lines(&meta);
+    let ranges = fn_ranges(&meta, "pub fn reset_for_model(");
+    assert_eq!(
+        ranges.len(),
+        1,
+        "exactly one reset_for_model in db/meta.rs: {ranges:?}"
+    );
+    let reset = ranges[0];
+    assert!(
+        lines_with(&meta_prod, reset, "unchecked_transaction(").is_empty(),
+        "reset_for_model opens a deferred transaction"
+    );
+    assert_eq!(
+        lines_with(&meta_prod, reset, "begin_local_immediate()").len(),
+        1,
+        "reset_for_model opens its own transaction through begin_local_immediate()"
+    );
+}

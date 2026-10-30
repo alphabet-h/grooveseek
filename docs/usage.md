@@ -124,7 +124,7 @@ search refuses `fields` / `fields_not` filters until the file is fixed,
 
 Two flags control how `groove index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
 
-- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang. Warnings are not progress and are never suppressed: `warning: <path>: failed to parse YAML frontmatter: ...` prints under `--quiet` too.
+- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang. Warnings are not progress and are never suppressed: `warning: <path>: failed to parse YAML frontmatter: ...` prints under `--quiet` too, and so do the two `note:` lines a run prints when it overlapped a writer that does not take the lock: `note: kept <N> row(s) another writer changed during this run; ...` and `note: skipped <N> rename(s) another writer changed during this run; ...`.
 - `--progress`: show progress UI. Auto-detects via `IsTerminal` on stderr — TTY gets an `indicatif` bar with elapsed / position / percent / ETA, non-TTY gets periodic `Progress: N/M (P%)` lines (~20 emits per run plus a 100 % anchor) so `tail -f indexing.log` works.
 
 ```bash

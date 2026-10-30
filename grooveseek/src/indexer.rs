@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-use crate::db::{ChunkVector, Database, FrontmatterTopic};
+use crate::db::{CasDelete, ChunkVector, Database, FrontmatterTopic, PathIdHash};
 use crate::embedder::Embedder;
 use crate::parser::{ParserExt, Registry};
 use crate::quality;
@@ -141,7 +141,7 @@ struct DiskScan {
     /// taken from** ([`crate::parser::Parser::frontmatter_topic_inner`]). Rename detection pairs
     /// paths by that hash, so these are the bytes the rename is decided on, and the rename
     /// rebuilds the topic from them without a second read
-    /// ([`Database::rename_documents_atomic`]). Only candidates, because [`DiskEntry`] keeps no
+    /// ([`Database::rename_documents_checked`]). Only candidates, because [`DiskEntry`] keeps no
     /// content and the rest of the run reads each file again.
     frontmatter_topics: std::collections::HashMap<String, Option<String>>,
 }
@@ -1030,6 +1030,87 @@ fn documents_to_delete(
         .collect()
 }
 
+/// (ADR-0031) Candidates per immediate transaction of the prune. Wide enough that a large
+/// prune takes the write lock a few times rather than once per row; the aim for one batch's
+/// hold is about 100 ms, since another writer waits it out within the busy timeout.
+///
+/// Measured over 10 000 candidates of 3 chunks each, with 2-dimensional vectors (debug
+/// build, Windows), the longest hold of one batch was 1015 ms at 64, 2084 ms at 128,
+/// 4738 ms at 256, 8584 ms at 512 and 18116 ms at 1024: 16 to 19 ms a row for the longest
+/// batch, and about 8 ms a row for the whole prune divided by its candidates. The aim was
+/// not met: even at 64 one batch held the lock for about 1 s. A waiting writer does not fail
+/// for it, as it keeps trying until the busy timeout runs out. 64 is the narrowest width
+/// measured, and narrowing did not make the whole prune longer: it took 81 to 91 s at
+/// every width.
+pub(crate) const PRUNE_BATCH: usize = 64;
+
+/// (ADR-0031) The prune of a completed run: `candidates` (sorted) in batches of `batch`,
+/// each through [`Database::delete_documents_if_unchanged`] against the `(id, content_hash)`
+/// the run read into the snapshot before its walk. `on_deleted` is called for each deleted
+/// path after its batch commits. An `Err` from a batch is returned as is; that batch wrote
+/// nothing, and the batches before it stay committed. The `kept_changed` those earlier batches
+/// counted is dropped with the `Err`, so no note is printed for it; the next run judges those
+/// rows again. The returned `kept` paths are rows this run did not read; at the end of the run
+/// the caller marks those a stale one-time pass covers, and under `force` every one, with
+/// [`HASH_AWAITING_REPARSE`] (ADR-0031). With `mark_kept` (a forced run) each batch also marks
+/// its kept rows in its own transaction, so a later batch's `Err` cannot leave them unmarked.
+fn prune_candidates(
+    db: &Database,
+    snapshot: &PathIdHash,
+    candidates: &[String],
+    batch: usize,
+    mark_kept: bool,
+    on_deleted: &mut dyn FnMut(&str),
+) -> Result<CasDelete> {
+    let mut out = CasDelete::default();
+    for slice in candidates.chunks(batch.max(1)) {
+        // Every candidate comes from the snapshot's keys; one that does not is not deleted.
+        let expected: Vec<(&str, i64, &str)> = slice
+            .iter()
+            .filter_map(|p| {
+                snapshot
+                    .get(p)
+                    .map(|(id, hash)| (p.as_str(), *id, hash.as_str()))
+            })
+            .collect();
+        let done = db.delete_documents_if_unchanged(&expected, mark_kept)?;
+        for path in &done.deleted {
+            on_deleted(path);
+        }
+        out.kept_changed += done.kept_changed;
+        out.kept.extend(done.kept);
+        out.deleted.extend(done.deleted);
+    }
+    Ok(out)
+}
+
+/// (ADR-0031) The stderr line for the rows the prune kept because another writer changed
+/// them during the run; `None` for 0. ASCII.
+fn kept_changed_note(n: u32) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            concat!(
+                "note: kept {} row(s) another writer changed during this run; ",
+                "the next run checks them again."
+            ),
+            n
+        )
+    })
+}
+
+/// (ADR-0031) The stderr line for skipped renames; `None` for 0. ASCII.
+fn renames_skipped_note(n: u32) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            concat!(
+                "note: skipped {} rename(s) another writer changed during this run; ",
+                "the new paths are indexed as ordinary files."
+            ),
+            n
+        )
+    })
+}
+
 /// (feature-60) The order the per-document loop in [`rebuild_index`] visits `entries`: those
 /// whose `rel` is in `first` (the renames that force a re-parse), then the rest, each group in
 /// the order `entries` already has -- the walk's, which sorts `PathBuf`s component by
@@ -1104,6 +1185,14 @@ pub struct IndexResult {
     /// chunks all match. Always 0 under `force`, which embeds every chunk. For a
     /// [`Self::cancelled`] run, the count up to the stop.
     pub chunks_reused: u32,
+    /// (ADR-0031) Rows the prune kept because another writer changed them during this run
+    /// (their `(id, content_hash)` no longer matched what the run read before its walk). The
+    /// next run judges them again. Always 0 for a [`Self::cancelled`] run, which does not prune.
+    pub kept_changed: u32,
+    /// (ADR-0031) Detected renames this run did not apply because another writer had changed the
+    /// old row or written the new path during the run. Each new path is indexed as an ordinary
+    /// file; each old row goes to the prune.
+    pub renames_skipped: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
     /// (v1.14.0+) The run stopped at a check point because the
@@ -1483,6 +1572,12 @@ pub fn rebuild_index(
     };
     let refresh_any = refresh_frontmatter || refresh_fields;
 
+    // (ADR-0031) Every row's `(id, content_hash)`, read once before the walk, also under
+    // `force`. Under the writer lock no other writer runs; against a writer that does not take
+    // it, the prune below compares each candidate with this snapshot and keeps the rows that
+    // writer changed in the meantime. The rename detection's `(path, hash)` map is built from it.
+    let snapshot: PathIdHash = db.all_path_ids_hashes()?;
+
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
     // 起動時に 1 度解決して焼き込むと、daemon 側だけ古い規則で走り続ける。
@@ -1540,11 +1635,17 @@ pub fn rebuild_index(
     // (local Codex on PR #388) The rows' (path, hash) are read before the scan, not after it,
     // so the scan can tell which files rename detection may pair -- a path the index does not
     // hold whose hash a row does -- and read their frontmatter topic from the bytes it hashes.
-    // Nothing writes between here and the renames below. `force` detects no renames.
-    let db_path_hashes = if force {
+    // (ADR-0031) Under the writer lock no other writer runs between here and the renames
+    // below; against a writer that does not take it, `rename_documents_checked` checks each
+    // pair against the snapshot and skips the ones that writer changed. `force` detects no
+    // renames.
+    let db_path_hashes: std::collections::HashMap<String, String> = if force {
         std::collections::HashMap::new()
     } else {
-        db.all_path_hashes()?
+        snapshot
+            .iter()
+            .map(|(path, (_, hash))| (path.clone(), hash.clone()))
+            .collect()
     };
     let db_hashes: HashSet<&str> = db_path_hashes.values().map(String::as_str).collect();
     let rename_candidate =
@@ -1607,42 +1708,52 @@ pub fn rebuild_index(
     // nothing) is a pre-existing edit-time gap this round does not touch, not a stale
     // cross-parser row.
     let mut crossed_parser_renames: HashSet<String> = HashSet::new();
-    tally.renamed = if force {
-        0
-    } else {
+    if !force {
         let pairs = detect_renames(&disk_entries, &db_path_hashes, &skipped_paths);
-        // evaluator 指摘 High #2: rename フェーズ全体を単一 transaction に
-        // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
-        let mut crossed_old_paths: Vec<&str> = Vec::new();
-        for (old_path, new_path) in &pairs {
+        let crossed_old_paths: Vec<&str> = pairs
+            .iter()
+            .filter(|(old_path, new_path)| rename_crosses_a_parser(registry, old_path, new_path))
+            .map(|(old_path, _)| old_path.as_str())
+            .collect();
+        // (ADR-0031) One immediate transaction, in which each pair is re-read and applied only
+        // while its old row still has the snapshot's `(id, content_hash)` and no row is at its
+        // new path; a pair another writer changed is skipped, not an error. Empty `pairs` opens
+        // no transaction.
+        // (#552) A pair that crosses a parser is re-read under the new parser below, and until
+        // that read settles it the row holds the old parser's chunks under the hash of the
+        // unchanged bytes. So an applied crossed pair's hash is overwritten with
+        // [`HASH_AWAITING_REPARSE`] in the same transaction, and a run that fails anywhere
+        // after the move leaves a row no fast path keeps; every settlement below rewrites the
+        // hash (the bytes' hash, or the sentinel again for a read that changed under it) or
+        // drops the row.
+        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
+        // its topic comes from the bytes the pair was matched on.
+        let outcome: crate::db::CheckedRenames = db.rename_documents_checked(
+            &pairs,
+            &snapshot,
+            &crossed_old_paths,
+            &frontmatter_topics,
+        )?;
+        // Only the applied pairs force a re-read or a crossed-rename settlement: a skipped
+        // pair's new path holds another writer's row (or none), which the loop indexes as an
+        // ordinary file; settling it as a crossed rename would delete that row.
+        for (old_path, new_path) in &outcome.applied {
             let crossed = rename_crosses_a_parser(registry, old_path, new_path);
             if context_mode == ContextMode::Static || crossed {
                 renamed_new_paths.insert(new_path.clone());
             }
             if crossed {
                 crossed_parser_renames.insert(new_path.clone());
-                crossed_old_paths.push(old_path.as_str());
             }
-        }
-        // (#552) A pair that crosses a parser is re-read under the new parser below, and until
-        // that read settles it the row holds the old parser's chunks under the hash of the
-        // unchanged bytes. Its hash is overwritten with [`HASH_AWAITING_REPARSE`] before the
-        // row moves, so a run that fails anywhere after the move leaves a row no fast path
-        // keeps; every settlement below rewrites the hash (the bytes' hash, or the sentinel
-        // again for a read that changed under it) or drops the row. A failed
-        // rename after the mark leaves the old row under the sentinel, which the next run's
-        // rename detection does not pair; the pair would have been re-embedded in full anyway.
-        if !crossed_old_paths.is_empty() {
-            db.overwrite_content_hash(&crossed_old_paths, HASH_AWAITING_REPARSE)?;
-        }
-        // (local Codex on PR #388) Every pair's new path was a rename candidate in the scan, so
-        // its topic comes from the bytes the pair was matched on.
-        db.rename_documents_atomic(&pairs, &frontmatter_topics)?;
-        for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
         }
-        pairs.len() as u32
-    };
+        tally.renamed = outcome.applied.len() as u32;
+        tally.renames_skipped = outcome.skipped.len() as u32;
+    }
+    // Ahead of check point C3, so a run stopped in the loop still says it.
+    if let Some(note) = renames_skipped_note(tally.renames_skipped) {
+        eprintln!("{note}");
+    }
 
     // (feature-51) `documents.size_bytes` の欠損補充。`backfill_fts` と同じ思想で、embedding には触れない。
     //
@@ -2058,11 +2169,38 @@ pub fn rebuild_index(
 
     // 3. Delete documents in DB that no longer exist on disk.
     //    §4.2 統一原則: visited ∪ skipped は保持、それ以外 (= disk から消えた) のみ削除。
-    let all_db_paths = db.all_document_paths()?;
-    for db_path in documents_to_delete(&all_db_paths, &visited_paths, &skipped_paths) {
-        db.delete_document(&db_path)?;
-        tally.deleted += 1;
-        progress.report_deleted(&db_path);
+    //    (ADR-0031) The candidates are the snapshot's paths, sorted as `ORDER BY path` sorts
+    //    them, so the batch boundaries are the same from run to run. A row written after the
+    //    snapshot is not a candidate, and each batch deletes only the rows whose `(id, hash)`
+    //    still match it; a deleted row is counted after its batch commits.
+    let mut snapshot_paths: Vec<String> = snapshot.keys().cloned().collect();
+    snapshot_paths.sort_unstable();
+    let candidates = documents_to_delete(&snapshot_paths, &visited_paths, &skipped_paths);
+    // (ADR-0031) Under `--force` each batch marks the rows it keeps in the transaction that
+    // keeps them: the code chunk policy this forced run recorded before its walk claims every
+    // row, and a kept row is one it never read, so no later failure, a later batch's included,
+    // may leave it unmarked. A run without `--force` marks none here; one that fails before its
+    // end writes no key that would claim the kept rows either.
+    let pruned = prune_candidates(
+        db,
+        &snapshot,
+        &candidates,
+        PRUNE_BATCH,
+        force,
+        &mut |path| {
+            tally.deleted += 1;
+            progress.report_deleted(path);
+        },
+    )?;
+    tally.kept_changed = pruned.kept_changed;
+    // (ADR-0031) The rows the prune kept for another writer were not read by this run, so
+    // nothing below that records a run-wide "settled" may count them: the ones a key written at
+    // the end would claim are marked for a re-parse there, and the frontmatter policy and
+    // declared-field set wait for a run that keeps none.
+    let kept = pruned.kept;
+    // Not through `progress`: a quiet or callback reporter would drop the count.
+    if let Some(note) = kept_changed_note(tally.kept_changed) {
+        eprintln!("{note}");
     }
 
     // (#251, codex P2 round 6 on PR #291) Every unchanged Markdown document has now been
@@ -2078,7 +2216,8 @@ pub fn rebuild_index(
     // (#544, local Codex r2) Read from the rows as they are after the further read of the
     // crossed renames, not as the loop left them.
     let refresh_pending = refresh_pending_scan || !refresh_pending_rows.is_empty();
-    if force || (refresh_frontmatter && !refresh_pending) {
+    // (ADR-0031) Not over a row the prune kept, `--force` included: this build never read it.
+    if kept.is_empty() && (force || (refresh_frontmatter && !refresh_pending)) {
         db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
     }
     // (feature-58, codex P2 round 6 on PR #291) Recorded after the deletion sweep for the same
@@ -2094,13 +2233,15 @@ pub fn rebuild_index(
     // pass. (codex P2 round 12) Recorded through `finish_declared_fields_pass`, which leaves
     // the generation pending instead when a watcher in another process wrote a document
     // under this pass's token -- that document's rows are the previous generation's, and
-    // recording the new set over them would make them current for good.
+    // recording the new set over them would make them current for good. (ADR-0031) Nor over a
+    // row the prune kept, whose fields another writer may have written under any set; that
+    // includes `--force` and the empty-set shortcut. The next run records it.
     finish_declared_fields_pass(
         db,
         pass_token.as_deref(),
         stored_declared.as_deref(),
         &declared_json,
-        force || !refresh_fields || !refresh_pending,
+        kept.is_empty() && (force || !refresh_fields || !refresh_pending),
     )?;
 
     let result = complete_index_result(db, embedder, tally, Some(embedded_since), start, false)?;
@@ -2112,14 +2253,24 @@ pub fn rebuild_index(
     // key is never there without the marks (I-1). The marks are written over whatever the
     // rows hold now, unconditionally: a row another process wrote since the loop is marked too,
     // and re-read once more, rather than an old-rule row being kept (ADR-0028). `--force`
-    // rewrote every row, so it marks none. The counts in `result` read rows, not hashes, so the
-    // marks do not change them.
+    // rewrote every row it read, so it marks none of those. The counts in `result` read rows,
+    // not hashes, so the marks do not change them. (ADR-0031) The exception is a row the prune
+    // kept for another writer, which this run did not read: it is marked as a skipped one is,
+    // when a stale pass covers it, and under `--force`, whose keys claim every row, whatever its
+    // format (a forced run already marked it in the prune batch that kept it; this writes it
+    // again). The mark costs it no more than one more read, and a kept row deleted since is
+    // skipped by the write.
     if force || any_stale {
         if any_stale {
             for rel in &skipped_paths {
                 if stale_row(&passes, db, registry, rel)? {
                     unsettled.insert(rel.clone());
                 }
+            }
+        }
+        for rel in &kept {
+            if force || stale_row(&passes, db, registry, rel)? {
+                unsettled.insert(rel.clone());
             }
         }
         let marked: Vec<&str> = unsettled.iter().map(String::as_str).collect();
@@ -3261,8 +3412,10 @@ fn index_single_disk_entry(
     // Per-file atomicity (F-32): wrap upsert_document + N x insert_chunk
     // in a single tx so that a partial failure (e.g. vec_chunks dim
     // mismatch on the 3rd chunk) rolls the whole file back instead of
-    // leaving a documents row with M < N chunks.
-    let tx = db.begin_transaction()?;
+    // leaving a documents row with M < N chunks. Immediate because the first
+    // statement (`upsert_document`) reads: a deferred read cannot wait for the
+    // write lock another connection holds.
+    let tx = db.begin_immediate_transaction()?;
     write_parsed_document_with_vectors(
         db,
         &entry.rel,
@@ -10522,14 +10675,16 @@ mod tests {
         );
     }
 
-    /// #552 (Review Focus 2): a full run marks the crossed pair's old row awaiting a reparse
-    /// and then the rename's transaction fails, so the row stays at `note.txt` under the
-    /// sentinel. The next run must not pair it (no bytes hash to the sentinel): the old row is
-    /// swept with the files the disk no longer holds, and `note.md` is indexed as a new file
-    /// with the Markdown parser's chunks under the hash of its bytes.
+    /// #552: the old parser's chunks are never left under a hash the fast path trusts. (ADR-0031)
+    /// A crossed pair's sentinel and its move share one transaction, so when the move fails
+    /// the rollback takes the sentinel with it: the row stays at `note.txt` with its own hash
+    /// and chunks, and nothing is at `note.md`. Nothing moved, so no stale row exists, and the
+    /// next run pairs the rename again, applies it, and re-reads `note.md` under the Markdown
+    /// parser into the hash of its bytes.
     #[test]
-    fn i552_a_failed_rename_after_the_mark_leaves_the_old_row_unpaired() {
+    fn i552_a_failed_checked_rename_leaves_nothing_and_the_next_run_applies_it() {
         let (dir, db, registry) = i552_crossed_rename("i552-mark-then-fail", I552_BYTES);
+        let txt_bodies = stored_bodies(&db, "note.txt");
         db.execute_for_test(concat!(
             "CREATE TABLE fault (armed INTEGER NOT NULL); INSERT INTO fault VALUES (1); ",
             "CREATE TRIGGER inject_rename_failure BEFORE UPDATE OF path ON documents ",
@@ -10544,9 +10699,14 @@ mod tests {
             "the run failed somewhere other than the rename: {err:#}"
         );
         assert_eq!(
-            db.get_document_hash("note.txt").unwrap().as_deref(),
-            Some(HASH_AWAITING_REPARSE),
-            "the old row was not left under the sentinel by the failed rename"
+            db.get_document_hash("note.txt").unwrap(),
+            Some(sha256_hex_bytes(I552_BYTES)),
+            "the failed rename left the old row's hash changed"
+        );
+        assert_eq!(
+            stored_bodies(&db, "note.txt"),
+            txt_bodies,
+            "the failed rename changed the old row's chunks"
         );
         assert_eq!(db.get_document_hash("note.md").unwrap(), None);
 
@@ -10554,17 +10714,18 @@ mod tests {
         let result = i552_rebuild(&db, &mut Embedder::stub_for_tests(2), &dir, &registry)
             .expect("the second run");
         assert_eq!(
-            result.renamed, 0,
-            "the second run paired the sentinel row: {result:?}"
+            result.renamed, 1,
+            "the second run did not apply the rename: {result:?}"
         );
         assert_eq!(
             db.get_document_hash("note.txt").unwrap(),
             None,
-            "the old row was not swept"
+            "the old row is still there"
         );
         assert_eq!(
             db.get_document_hash("note.md").unwrap(),
-            Some(sha256_hex_bytes(I552_BYTES))
+            Some(sha256_hex_bytes(I552_BYTES)),
+            "note.md was not re-read into the hash of its bytes"
         );
         assert_eq!(
             stored_bodies(&db, "note.md"),
@@ -10712,5 +10873,845 @@ mod tests {
             parsed_bodies(&registry, "note.md", I552_BYTES),
             "the row's chunks are not the Markdown parser's"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The prune against a writer that does not take the writer lock (ADR-0031)
+    // -----------------------------------------------------------------------
+
+    /// A file database under `dir` opened twice: the run's connection and a second one that
+    /// stands for another writer. Both carry the stub embedder's meta.
+    fn two_connections(dir: &TmpDir) -> (Database, Database) {
+        let db_file = dir.0.join("index.db");
+        let open = || {
+            let db = Database::open(db_file.to_str().unwrap()).unwrap();
+            db.verify_embedding_meta("test-model", 2).unwrap();
+            db
+        };
+        let run = open();
+        let other = open();
+        (run, other)
+    }
+
+    /// [`rebuild_index`] over `kb` with the stub embedder, no schema, and the given registry.
+    fn prune_run(
+        db: &Database,
+        kb: &std::path::Path,
+        registry: &Registry,
+        force: bool,
+        progress: progress::ProgressReporter,
+    ) -> IndexResult {
+        rebuild_index(
+            db,
+            &mut Embedder::stub_for_tests(2),
+            kb,
+            None,
+            force,
+            None,
+            &[],
+            registry,
+            progress,
+            ContextMode::Off,
+        )
+        .unwrap()
+    }
+
+    /// The `(id, content_hash)` of `rel`'s row, read on the given connection.
+    fn id_hash(db: &Database, rel: &str) -> Option<(i64, String)> {
+        db.all_path_ids_hashes().unwrap().remove(rel)
+    }
+
+    /// The last event of the per-document loop: an `Indexed` or `Unchanged` with `done == total`.
+    fn is_last_loop_event(event: &progress::ProgressEvent<'_>) -> bool {
+        matches!(
+            event,
+            progress::ProgressEvent::Indexed { done, total, .. }
+                | progress::ProgressEvent::Unchanged { done, total, .. }
+                if done == total
+        )
+    }
+
+    /// Rows another writer changed after the run read its snapshot are kept, each counted in
+    /// `kept_changed`; the untouched one is pruned; a row written after the snapshot is not a
+    /// candidate at all.
+    #[test]
+    fn t_a1_the_prune_keeps_rows_another_writer_changed_during_the_run() {
+        let tmp = mk_tmp("pr3-ta1");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        for rel in ["g1.md", "g2.md", "g3.md"] {
+            // Not a sha256, so no file on disk pairs with it as a rename.
+            write_row(&db, rel, &format!("h-{}", &rel[..2]), &[]);
+        }
+        let g2_before = id_hash(&db, "g2.md").unwrap();
+        let kb_cb = kb.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !is_last_loop_event(&event) || done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // (a) a new document, on disk and in the index
+            write_file(&kb_cb, "new.md", "# new\n");
+            other
+                .upsert_document("new.md", None, None, None, None, &[], None, "h-new", 1)
+                .unwrap();
+            // (b) a candidate's hash changed
+            other.overwrite_content_hash(&["g1.md"], "changed").unwrap();
+            // (c) a candidate deleted and written again under the same hash: a new id
+            other.delete_document("g2.md").unwrap();
+            other
+                .upsert_document("g2.md", None, None, None, None, &[], None, "h-g2", 1)
+                .unwrap();
+            // (d) g3.md is left alone
+        }));
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        let g2_after = id_hash(&db, "g2.md").expect("g2.md was pruned");
+        assert_ne!(g2_after.0, g2_before.0, "the re-created g2.md kept its id");
+        assert!(id_hash(&db, "new.md").is_some(), "new.md was pruned");
+        assert_eq!(
+            id_hash(&db, "g1.md").map(|(_, h)| h).as_deref(),
+            Some("changed"),
+            "g1.md was pruned or rewritten"
+        );
+        assert!(id_hash(&db, "g3.md").is_none(), "g3.md was kept");
+        assert_eq!(result.kept_changed, 2, "{result:?}");
+        assert_eq!(result.deleted, 1, "{result:?}");
+    }
+
+    /// The batches are separate transactions: a change made after the first batch committed is
+    /// seen by the batch that holds the changed row.
+    #[test]
+    fn t_a2_a_later_batch_sees_a_change_made_after_the_first_batch_committed() {
+        let tmp = mk_tmp("pr3-ta2");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        let rels: Vec<String> = (0..=PRUNE_BATCH)
+            .map(|i| format!("gone-{i:04}.md"))
+            .collect();
+        {
+            let tx = db.begin_transaction().unwrap();
+            for rel in &rels {
+                write_row(&db, rel, &format!("h-{rel}"), &[]);
+            }
+            tx.commit().unwrap();
+        }
+        let last = rels.last().unwrap().clone();
+        let last_cb = last.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            let progress::ProgressEvent::Deleted { rel } = event else {
+                return;
+            };
+            if done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // (i) the first batch has committed before its deletes are reported
+            assert!(
+                other.get_document_hash(rel).unwrap().is_none(),
+                "{rel} was reported before its batch committed"
+            );
+            // (ii) the row the second batch holds changes
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&[last_cb.as_str()], "changed")
+                    .unwrap(),
+                1
+            );
+        }));
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        for rel in &rels[..PRUNE_BATCH] {
+            assert!(id_hash(&db, rel).is_none(), "{rel} was kept");
+        }
+        assert_eq!(
+            id_hash(&db, &last).map(|(_, h)| h).as_deref(),
+            Some("changed"),
+            "the changed row of the second batch was pruned"
+        );
+        assert_eq!(result.deleted as usize, PRUNE_BATCH, "{result:?}");
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+    }
+
+    /// Measures the prune's immediate-transaction hold time over 10 000 candidates. Not a
+    /// check: prints one line per batch width and asserts only that every candidate went.
+    /// Runs only when `GROOVE_MEASURE_PRUNE_BATCH` is set and returns at once otherwise, so
+    /// the nightly `cargo test -- --include-ignored` does not spend minutes on it.
+    ///
+    /// A batch's hold is read off `on_deleted`, which [`prune_candidates`] calls after the
+    /// batch commits: batch k runs from the last report of batch k-1 (the call itself for
+    /// the first) to its own first report.
+    #[test]
+    #[ignore = "measurement: prints prune batch hold times; needs GROOVE_MEASURE_PRUNE_BATCH"]
+    fn measure_prune_batch_hold_times_for_10k_candidates() {
+        if std::env::var_os("GROOVE_MEASURE_PRUNE_BATCH").is_none() {
+            return;
+        }
+        const DOCS: usize = 10_000;
+        const CHUNKS: i32 = 3;
+        for width in [64_usize, 128, 256, 512, 1024] {
+            let tmp = mk_tmp(&format!("pr3-measure-{width}"));
+            let (db, _other) = two_connections(&tmp);
+            {
+                let tx = db.begin_transaction().unwrap();
+                for i in 0..DOCS {
+                    let rel = format!("gone-{i:05}.md");
+                    let id = db
+                        .upsert_document(&rel, None, None, None, None, &[], None, &rel, 1)
+                        .unwrap();
+                    for c in 0..CHUNKS {
+                        db.insert_chunk(
+                            id,
+                            c,
+                            Some("h"),
+                            Some(1),
+                            &format!("body {i} {c}"),
+                            None,
+                            &[0.6_f32, 0.8],
+                            1.0,
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            let snapshot = db.all_path_ids_hashes().unwrap();
+            let mut candidates: Vec<String> = snapshot.keys().cloned().collect();
+            candidates.sort();
+
+            let mut reports: Vec<std::time::Instant> = Vec::with_capacity(DOCS);
+            let start = std::time::Instant::now();
+            let done = prune_candidates(&db, &snapshot, &candidates, width, false, &mut |_| {
+                reports.push(std::time::Instant::now());
+            })
+            .unwrap();
+            assert_eq!(done.deleted.len(), DOCS);
+            assert_eq!(reports.len(), DOCS);
+
+            // Every candidate is deleted, so each batch reports exactly `width` paths (the
+            // last fewer): a batch starts at every `width`-th report.
+            let mut holds: Vec<f64> = (0..DOCS)
+                .step_by(width)
+                .map(|first| {
+                    let from = if first == 0 {
+                        start
+                    } else {
+                        reports[first - 1]
+                    };
+                    (reports[first] - from).as_secs_f64() * 1000.0
+                })
+                .collect();
+            let total_ms = (*reports.last().unwrap() - start).as_secs_f64() * 1000.0;
+            holds.sort_by(f64::total_cmp);
+            println!(
+                "PRUNE-BATCH width={width} batches={} max_ms={:.1} p50_ms={:.1} total_ms={total_ms:.1}",
+                holds.len(),
+                holds.last().unwrap(),
+                holds[holds.len() / 2],
+            );
+            assert!(db.all_document_paths().unwrap().is_empty());
+        }
+    }
+
+    /// A forced run reads its snapshot too: a row written after it is not a candidate.
+    #[test]
+    fn a_forced_run_does_not_prune_rows_written_after_its_snapshot() {
+        let tmp = mk_tmp("pr3-force-late");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !is_last_loop_event(&event) || done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            other
+                .upsert_document("late.md", None, None, None, None, &[], None, "h-late", 1)
+                .unwrap();
+        }));
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, true, progress);
+
+        assert!(id_hash(&db, "late.md").is_some(), "late.md was pruned");
+        assert_eq!(result.deleted, 0, "{result:?}");
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+    }
+
+    /// A run with no other writer keeps nothing it should prune and prunes only what is gone:
+    /// the renames (one within a parser, one across parsers) and an oversized file's row are
+    /// not counted as kept, and the row of a file removed from disk goes.
+    #[test]
+    fn a_run_alone_keeps_nothing_and_prunes_what_is_gone() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let tmp = mk_tmp("pr3-alone");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let (db, _other) = two_connections(&tmp);
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(32),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string()];
+        let registry =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+                .expect("md + txt");
+
+        // a.md -> b.md, the same bytes and the same parser
+        let ab: &[u8] = b"# ab\n\nsame body\n";
+        std::fs::write(kb.join("b.md"), ab).unwrap();
+        let ab_chunks = parse_doc(&registry, "md", "a.md", ab).chunks;
+        write_row(&db, "a.md", &sha256_hex_bytes(ab), &ab_chunks);
+        // c.txt -> c.md, the same bytes across parsers
+        let c: &[u8] = b"# c\n\nmoved body\n";
+        std::fs::write(kb.join("c.md"), c).unwrap();
+        let c_chunks = parse_doc(&registry, "txt", "c.txt", c).chunks;
+        write_row(&db, "c.txt", &sha256_hex_bytes(c), &c_chunks);
+        // gone.md: a row whose file is not on disk
+        write_row(&db, "gone.md", "h-gone", &[]);
+        // big.md: on disk past the text cap, with a row
+        std::fs::write(kb.join("big.md"), [b'x'; 64]).unwrap();
+        write_row(&db, "big.md", "h-big", &[]);
+
+        let result = prune_run(
+            &db,
+            &kb,
+            &registry,
+            false,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+        assert_eq!(result.deleted, 1, "{result:?}");
+        assert!(id_hash(&db, "gone.md").is_none(), "gone.md was kept");
+        assert!(id_hash(&db, "a.md").is_none(), "a.md is still there");
+        assert!(id_hash(&db, "c.txt").is_none(), "c.txt is still there");
+        assert!(id_hash(&db, "b.md").is_some(), "b.md is missing");
+        assert!(id_hash(&db, "c.md").is_some(), "c.md is missing");
+        assert!(id_hash(&db, "big.md").is_some(), "big.md was pruned");
+    }
+
+    #[test]
+    fn kept_changed_note_is_ascii_and_absent_for_zero() {
+        assert_eq!(kept_changed_note(0), None);
+        let note = kept_changed_note(3).unwrap();
+        assert_eq!(
+            note,
+            concat!(
+                "note: kept 3 row(s) another writer changed during this run; ",
+                "the next run checks them again."
+            )
+        );
+        assert!(note.is_ascii());
+    }
+
+    /// A row the prune kept for another writer is one this run did not read: it gets
+    /// [`HASH_AWAITING_REPARSE`] in the transaction that records the `.docx` keys, so the next
+    /// run's fast path cannot keep the old parser's chunks under keys that now read current.
+    #[test]
+    fn a_kept_docx_row_is_marked_for_a_reparse_when_the_docx_keys_are_recorded() {
+        let tmp = mk_tmp("pr3-kept-docx");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        // Not a sha256, so no file on disk pairs with it as a rename.
+        write_row(&db, "gone.docx", "h-gone", &[]);
+        assert_eq!(db.read_docx_heading_policy().unwrap(), None);
+        let progress = on_first_scanning(move || {
+            other
+                .overwrite_content_hash(&["gone.docx"], "changed")
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &docx_registry(), false, progress);
+
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "gone.docx").map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the kept .docx row was not marked for a re-parse"
+        );
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some(DOCX_HEADING_POLICY)
+        );
+        assert_eq!(
+            db.read_docx_table_rows_policy().unwrap().as_deref(),
+            Some(DOCX_TABLE_ROWS_POLICY)
+        );
+    }
+
+    /// A forced run that keeps a row for another writer marks it for a re-parse, and records
+    /// neither the declared-field generation nor the frontmatter policy: the kept row is not
+    /// one this build parsed. The row reaches the forced run's snapshot through a trigger that
+    /// writes it when the run opens its declared-field pass, after the reset and before the
+    /// snapshot; the other connection drops the trigger and changes the row at the scan.
+    #[test]
+    fn a_forced_run_that_keeps_a_row_marks_it_and_leaves_the_run_wide_records_pending() {
+        let tmp = mk_tmp("pr3-kept-force");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        db.execute_for_test(concat!(
+            "CREATE TRIGGER write_ghost_after_reset AFTER INSERT ON index_meta ",
+            "WHEN NEW.key = 'declared_fields_pass' ",
+            "BEGIN INSERT INTO documents (path, tags, content_hash, last_indexed) ",
+            "VALUES ('ghost.md', '[]', 'h-ghost', '2026-01-01T00:00:00Z'); END;"
+        ))
+        .unwrap();
+        let progress = on_first_scanning(move || {
+            other
+                .execute_for_test("DROP TRIGGER write_ghost_after_reset;")
+                .unwrap();
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&["ghost.md"], "changed")
+                    .unwrap(),
+                1,
+                "the trigger did not write ghost.md before the snapshot"
+            );
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, true, progress);
+
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "ghost.md").map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the kept row was not marked for a re-parse"
+        );
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+    }
+
+    /// A forced run marks each row its prune keeps in the transaction of the prune batch that
+    /// keeps it, not only at the end: a step after the prune that fails still leaves it marked,
+    /// so the code chunk policy the forced run recorded before its walk does not stand over a
+    /// row it never read. The row
+    /// reaches the snapshot as in the test above; at the scan the other connection also makes
+    /// the end of the declared-field pass fail.
+    #[test]
+    fn a_forced_run_that_fails_after_its_prune_has_already_marked_the_kept_rows() {
+        let tmp = mk_tmp("pr3-kept-force-fail");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        db.execute_for_test(concat!(
+            "CREATE TRIGGER write_ghost_after_reset AFTER INSERT ON index_meta ",
+            "WHEN NEW.key = 'declared_fields_pass' ",
+            "BEGIN INSERT INTO documents (path, tags, content_hash, last_indexed) ",
+            "VALUES ('ghost.md', '[]', 'h-ghost', '2026-01-01T00:00:00Z'); END;"
+        ))
+        .unwrap();
+        let progress = on_first_scanning(move || {
+            other
+                .execute_for_test("DROP TRIGGER write_ghost_after_reset;")
+                .unwrap();
+            other
+                .execute_for_test(concat!(
+                    "CREATE TRIGGER inject_pass_end_failure BEFORE DELETE ON index_meta ",
+                    "WHEN OLD.key = 'declared_fields_pass' ",
+                    "BEGIN SELECT RAISE(ABORT, 'injected pass end failure'); END;"
+                ))
+                .unwrap();
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&["ghost.md"], "changed")
+                    .unwrap(),
+                1,
+                "the trigger did not write ghost.md before the snapshot"
+            );
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let err = rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb,
+            None,
+            true,
+            None,
+            &[],
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+        .expect_err("the injected failure did not stop the run");
+        assert!(
+            format!("{err:#}").contains("injected pass end failure"),
+            "{err:#}"
+        );
+        assert_eq!(
+            id_hash(&db, "ghost.md").map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the kept row was left unmarked by a forced run that failed after its prune"
+        );
+    }
+
+    /// A forced run whose prune keeps a row in one batch and fails in a later one still leaves
+    /// that row marked for a re-parse: the batch that keeps it marks it in its own transaction,
+    /// so the `Err` of a later batch cannot drop the mark with the kept paths. The rows reach the
+    /// forced run's snapshot through a trigger, as in the tests above; at the scan the other
+    /// connection changes a row of the first batch and makes the delete of the second batch's
+    /// only row fail.
+    #[test]
+    fn a_forced_run_whose_later_prune_batch_fails_leaves_an_earlier_batchs_kept_row_marked() {
+        let tmp = mk_tmp("pr3-kept-force-batch-fail");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        let rels: Vec<String> = (0..=PRUNE_BATCH)
+            .map(|i| format!("gone-{i:04}.md"))
+            .collect();
+        let inserts: String = rels
+            .iter()
+            .map(|rel| {
+                format!(
+                    concat!(
+                        "INSERT INTO documents (path, tags, content_hash, last_indexed) ",
+                        "VALUES ('{rel}', '[]', 'h-{rel}', '2026-01-01T00:00:00Z'); "
+                    ),
+                    rel = rel
+                )
+            })
+            .collect();
+        db.execute_for_test(&format!(
+            concat!(
+                "CREATE TRIGGER write_rows_after_reset AFTER INSERT ON index_meta ",
+                "WHEN NEW.key = 'declared_fields_pass' BEGIN {}END;"
+            ),
+            inserts
+        ))
+        .unwrap();
+        let first = rels[0].clone();
+        let last = rels.last().unwrap().clone();
+        let (first_cb, last_cb) = (first.clone(), last.clone());
+        let progress = on_first_scanning(move || {
+            other
+                .execute_for_test("DROP TRIGGER write_rows_after_reset;")
+                .unwrap();
+            other
+                .execute_for_test(&format!(
+                    concat!(
+                        "CREATE TRIGGER inject_later_batch_failure BEFORE DELETE ON documents ",
+                        "WHEN OLD.path = '{}' ",
+                        "BEGIN SELECT RAISE(ABORT, 'injected later batch failure'); END;"
+                    ),
+                    last_cb
+                ))
+                .unwrap();
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&[first_cb.as_str()], "changed")
+                    .unwrap(),
+                1,
+                "the trigger did not write the rows before the snapshot"
+            );
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let err = rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb,
+            None,
+            true,
+            None,
+            &[],
+            &registry,
+            progress,
+            ContextMode::Off,
+        )
+        .expect_err("the injected failure did not stop the run");
+        assert!(
+            format!("{err:#}").contains("injected later batch failure"),
+            "{err:#}"
+        );
+        assert_eq!(
+            id_hash(&db, &first).map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the row the first batch kept was left unmarked when a later batch failed"
+        );
+        for rel in &rels[1..PRUNE_BATCH] {
+            assert!(id_hash(&db, rel).is_none(), "{rel} was kept");
+        }
+        assert!(
+            id_hash(&db, &last).is_some(),
+            "the failed batch's row was deleted"
+        );
+    }
+
+    /// A run that refreshes the frontmatter of unchanged Markdown and keeps a row for another
+    /// writer records neither the frontmatter policy nor the declared-field set: the kept row was
+    /// not read under them. The next run makes the pass again.
+    #[test]
+    fn a_frontmatter_refresh_that_keeps_a_row_leaves_the_policy_unrecorded() {
+        let tmp = mk_tmp("pr3-kept-fm");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        write_row(&db, "gone.md", "h-gone", &[]);
+        assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+        let progress = on_first_scanning(move || {
+            other
+                .overwrite_content_hash(&["gone.md"], "changed")
+                .unwrap();
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Renames against a writer that does not take the writer lock (ADR-0031)
+    // -----------------------------------------------------------------------
+
+    /// A Markdown file's bytes, the same for the old and the new path of a detected rename.
+    const RENAME_BYTES: &[u8] = b"# moved\n\nthe same body\n";
+
+    /// A kb holding `new_rel` with [`RENAME_BYTES`] and a database whose only row is
+    /// `old_rel` under those bytes' hash, with the given registry's chunks for `old_rel`.
+    fn rename_fixture(
+        tmp: &TmpDir,
+        registry: &Registry,
+        old_ext: &str,
+        old_rel: &str,
+        new_rel: &str,
+    ) -> (std::path::PathBuf, Database, Database) {
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join(new_rel), RENAME_BYTES).unwrap();
+        let (db, other) = two_connections(tmp);
+        let chunks = parse_doc(registry, old_ext, old_rel, RENAME_BYTES).chunks;
+        write_row(&db, old_rel, &sha256_hex_bytes(RENAME_BYTES), &chunks);
+        (kb, db, other)
+    }
+
+    /// A reporter that runs `act` once, at the scan's first `Scanning` event: after the run
+    /// read its snapshot and before it applies its renames.
+    fn on_first_scanning(act: impl FnOnce() + Send + 'static) -> progress::ProgressReporter {
+        let act = std::sync::Mutex::new(Some(act));
+        progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !matches!(event, progress::ProgressEvent::Scanning { .. }) {
+                return;
+            }
+            if let Some(act) = act.lock().unwrap().take() {
+                act();
+            }
+        }))
+    }
+
+    /// Another writer applied the same rename first: the run's pair is skipped, the run goes
+    /// on, the moved row stays, and the old path has no row left to prune or keep.
+    #[test]
+    fn t_a3_a_rename_another_writer_applied_first_is_skipped_and_the_run_goes_on() {
+        let tmp = mk_tmp("pr3-ta3a");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let progress = on_first_scanning(move || {
+            other
+                .rename_document("old.md", "new.md", FrontmatterTopic::Unread)
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renamed, 0, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "new.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the row the other writer moved is gone or rewritten"
+        );
+        assert!(id_hash(&db, "old.md").is_none(), "old.md has a row");
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+    }
+
+    /// Another writer wrote the new path first: the pair is skipped, the loop indexes the new
+    /// path as an ordinary file over that row, and the prune deletes the old row.
+    #[test]
+    fn t_a3_a_rename_onto_a_path_another_writer_wrote_is_skipped() {
+        let tmp = mk_tmp("pr3-ta3b");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let progress = on_first_scanning(move || {
+            other
+                .upsert_document("new.md", None, None, None, None, &[], None, "h-other", 1)
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renamed, 0, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "new.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the loop did not index new.md over the other writer's row"
+        );
+        assert!(id_hash(&db, "old.md").is_none(), "old.md was not pruned");
+        assert_eq!(result.deleted, 1, "{result:?}");
+    }
+
+    /// Another writer rewrote the old row in place: the pair is skipped, the loop indexes the new
+    /// path as an ordinary file, and the prune keeps the old row the other writer changed. The
+    /// one shape in which both counters move.
+    #[test]
+    fn t_a3_a_rename_whose_old_row_another_writer_rewrote_is_skipped_and_kept() {
+        let tmp = mk_tmp("pr3-ta3c");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let progress = on_first_scanning(move || {
+            other
+                .overwrite_content_hash(&["old.md"], "changed")
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renamed, 0, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(result.deleted, 0, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "old.md").map(|(_, h)| h).as_deref(),
+            Some("changed"),
+            "the prune did not keep the old row the other writer rewrote"
+        );
+        assert_eq!(
+            id_hash(&db, "new.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the loop did not index new.md as an ordinary file"
+        );
+    }
+
+    /// A skipped pair that crosses a parser is not settled as a crossed rename: the row the
+    /// other writer put at the new path stays, and the old row is pruned.
+    #[test]
+    fn a_skipped_crossed_rename_keeps_the_other_writers_row() {
+        let tmp = mk_tmp("pr3-skip-crossed");
+        let registry = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "txt", "note.txt", "note.md");
+        let progress = on_first_scanning(move || {
+            other
+                .upsert_document("note.md", None, None, None, None, &[], None, "h-other", 1)
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert!(
+            id_hash(&db, "note.md").is_some(),
+            "the other writer's note.md row was removed"
+        );
+        assert_eq!(
+            id_hash(&db, "note.md").map(|(_, h)| h),
+            Some(sha256_hex_bytes(RENAME_BYTES)),
+            "the loop did not index note.md over the other writer's row"
+        );
+        assert!(
+            id_hash(&db, "note.txt").is_none(),
+            "note.txt was not pruned"
+        );
+    }
+
+    /// (ADR-0031) What a writer that does not take the lock is *not* protected from, pinned so the range does not
+    /// widen silently: the per-document write of the loop. The public behaviour page says: "against such a writer,
+    /// the prune step still keeps rows the other writer changed during the run and rename detection skips the pairs
+    /// it changed, but the other look-then-write steps are not protected."
+    /// Another case it does not close: such a writer applies a rename into another parser first without
+    /// marking the row ([`HASH_AWAITING_REPARSE`]); this run's pair is then skipped, the new path is `Unchanged`,
+    /// and the previous parser's chunks stay until `--force`.
+    #[test]
+    fn t_a4_the_loop_writes_back_a_row_another_writer_deleted_mid_run() {
+        let tmp = mk_tmp("pr3-ta4");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        // a.md sorts before b.md, so the loop reaches a.md first.
+        write_file(&kb, "a.md", "# a\n\nfirst body\n");
+        write_file(&kb, "b.md", "# b\n\nsecond body\n");
+        let (db, other) = two_connections(&tmp);
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        // Both indexed under their bytes' hash, so the second run finds both unchanged.
+        let first = prune_run(
+            &db,
+            &kb,
+            &registry,
+            false,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        assert_eq!(first.updated, 2, "{first:?}");
+        let other = std::sync::Mutex::new(Some(other));
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            if !matches!(
+                event,
+                progress::ProgressEvent::Unchanged { rel: "a.md", .. }
+            ) {
+                return;
+            }
+            if let Some(other) = other.lock().unwrap().take() {
+                other.delete_document("b.md").unwrap();
+            }
+        }));
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert!(
+            id_hash(&db, "b.md").is_some(),
+            "the loop did not write b.md back from disk"
+        );
+        assert_eq!(result.updated, 1, "{result:?}");
+    }
+
+    /// A run stopped after its renames still reports the ones it skipped.
+    #[test]
+    fn a_cancelled_run_still_counts_its_skipped_renames() {
+        let tmp = mk_tmp("pr3-skip-cancel");
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let (kb, db, other) = rename_fixture(&tmp, &registry, "md", "old.md", "new.md");
+        let token = progress::CancelToken::new();
+        let token_cb = token.clone();
+        let other = std::sync::Mutex::new(Some(other));
+        let progress =
+            progress::ProgressReporter::with_callback(Box::new(move |event| match event {
+                progress::ProgressEvent::Scanning { .. } => {
+                    if let Some(other) = other.lock().unwrap().take() {
+                        other
+                            .rename_document("old.md", "new.md", FrontmatterTopic::Unread)
+                            .unwrap();
+                    }
+                }
+                progress::ProgressEvent::Indexed { .. }
+                | progress::ProgressEvent::Unchanged { .. } => token_cb.cancel(),
+                _ => {}
+            }))
+            .with_cancel(token);
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert!(result.cancelled, "{result:?}");
+        assert_eq!(result.renames_skipped, 1, "{result:?}");
+        assert_eq!(result.deleted, 0, "{result:?}");
+        assert_eq!(result.kept_changed, 0, "{result:?}");
+    }
+
+    #[test]
+    fn renames_skipped_note_is_ascii_and_absent_for_zero() {
+        assert_eq!(renames_skipped_note(0), None);
+        let note = renames_skipped_note(2).unwrap();
+        assert_eq!(
+            note,
+            concat!(
+                "note: skipped 2 rename(s) another writer changed during this run; ",
+                "the new paths are indexed as ordinary files."
+            )
+        );
+        assert!(note.is_ascii());
     }
 }

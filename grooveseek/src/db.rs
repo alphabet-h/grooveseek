@@ -515,6 +515,34 @@ pub struct TopicInfo {
     pub children: Vec<TopicNode>,
 }
 
+/// `documents.path` -> `(documents.id, documents.content_hash)`, read in one statement
+/// by [`Database::all_path_ids_hashes`].
+pub type PathIdHash = std::collections::HashMap<String, (i64, String)>;
+
+/// What one batch of [`Database::delete_documents_if_unchanged`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CasDelete {
+    /// Deleted, in the order of its `expected` argument.
+    pub deleted: Vec<String>,
+    /// Present but with another `(id, content_hash)`: kept.
+    pub kept_changed: u32,
+    /// The paths counted in `kept_changed`, in the order of its `expected` argument.
+    pub kept: Vec<String>,
+}
+
+/// What [`Database::rename_documents_checked`] did with each `(old, new)` pair, in the
+/// order of its `pairs` argument.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckedRenames {
+    /// Renamed: the old row still had the snapshot's `(id, content_hash)` and the new
+    /// path was free.
+    pub applied: Vec<(String, String)>,
+    /// Left as they were: the old row was gone or changed, or a row was at the new path.
+    pub skipped: Vec<(String, String)>,
+}
+
 // feature-48: `sanitize_fts_query` はここにあったが、クエリ全体を単一 phrase 化する
 // その規則こそが「自然文クエリで FTS 候補が 0 件になる」原因だったので、
 // `db/fts_query.rs` の `parse_query` に置き換えた。旧規則自体は
@@ -919,6 +947,22 @@ impl Database {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?)
+    }
+
+    /// `Some(BEGIN IMMEDIATE)` when the connection is in autocommit, `None` inside a caller's transaction
+    /// (which the caller's statements then join). For the self-wrapping writes whose first statement reads.
+    ///
+    /// A deferred transaction that has read cannot wait for the write lock: SQLite does not
+    /// run the busy handler for a read transaction's upgrade to a write, so the write returns
+    /// `SQLITE_BUSY` at once while another connection holds the lock (or
+    /// `SQLITE_BUSY_SNAPSHOT` once it has committed). Taking the lock at `BEGIN` makes the
+    /// call wait on the busy timeout instead, and its reads see what it writes over.
+    pub(crate) fn begin_local_immediate(&self) -> Result<Option<rusqlite::Transaction<'_>>> {
+        if self.conn.is_autocommit() {
+            Ok(Some(self.begin_immediate_transaction()?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// 開いたまま残った transaction を巻き戻す (BU-18)。
@@ -1702,6 +1746,50 @@ mod tests {
         );
         assert!(a.all_document_paths().unwrap().is_empty(), "gone on A");
         assert!(b.all_document_paths().unwrap().is_empty(), "gone on B");
+        drop(a);
+        drop(b);
+    }
+
+    /// While connection A holds an immediate transaction, an autocommit
+    /// [`Database::upsert_document`] on connection B (which opens its own
+    /// transaction) waits on the busy timeout and goes through once A commits.
+    #[test]
+    fn t_r1_an_autocommit_upsert_waits_for_an_immediate_writer() {
+        let dir = TempDir::new("upsert-waits");
+        let db_path = dir.path().join(".groove.db");
+        let db_path = db_path.to_str().unwrap();
+        let a = Database::open(db_path).unwrap();
+        a.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let b = Database::open(db_path).unwrap();
+
+        let tx = a.begin_immediate_transaction().unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            let upserted = b.upsert_document("note.md", None, None, None, None, &[], None, "h", 0);
+            (b, upserted, t0.elapsed())
+        });
+        started_rx.recv().unwrap();
+        // Only makes the wait observable; correctness does not depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if handle.is_finished() {
+            let (_, upserted, waited) = handle.join().unwrap();
+            panic!(
+                "the upsert must wait for A's write lock, not return before A commits: \
+                 returned after {waited:?} with {upserted:?}"
+            );
+        }
+        tx.commit().unwrap();
+
+        let (b, upserted, waited) = handle.join().unwrap();
+        upserted.unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "the upsert returned after {waited:?}, so it did not wait for A"
+        );
+        assert_eq!(a.all_document_paths().unwrap(), vec!["note.md".to_string()]);
         drop(a);
         drop(b);
     }
@@ -9451,5 +9539,378 @@ mod tests {
             None,
         );
         assert!(r.is_err());
+    }
+
+    /// Open two connections on one file DB ([`Database::verify_embedding_meta`] run on the first).
+    fn two_connections(prefix: &str) -> (TempDir, Database, Database) {
+        let dir = TempDir::new(prefix);
+        let db_path = dir.path().join(".groove.db");
+        let db_path = db_path.to_str().unwrap();
+        let a = Database::open(db_path).unwrap();
+        a.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let b = Database::open(db_path).unwrap();
+        (dir, a, b)
+    }
+
+    fn upsert_with_hash(db: &Database, path: &str, hash: &str) -> i64 {
+        db.upsert_document(path, None, None, None, None, &[], None, hash, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn all_path_ids_hashes_reads_id_and_hash_of_every_row() {
+        let dir = TempDir::new("path-ids-hashes");
+        let db_path = dir.path().join(".groove.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let a = upsert_with_hash(&db, "a.md", "ha");
+        let b = upsert_with_hash(&db, "b.md", "hb");
+        let map = db.all_path_ids_hashes().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["a.md"], (a, "ha".to_string()));
+        assert_eq!(map["b.md"], (b, "hb".to_string()));
+    }
+
+    #[test]
+    fn cas_delete_removes_only_rows_that_still_match() {
+        let (_dir, db, other) = two_connections("cas-delete-match");
+        for (p, h) in [
+            ("a.md", "ha"),
+            ("b.md", "hb"),
+            ("c.md", "hc"),
+            ("d.md", "hd"),
+        ] {
+            upsert_with_hash(&db, p, h);
+        }
+        let snap = db.all_path_ids_hashes().unwrap();
+        let old_c = snap["c.md"].0;
+
+        // Another connection changes b's hash, re-creates c (new id, same hash), deletes d.
+        assert_eq!(
+            other.overwrite_content_hash(&["b.md"], "changed").unwrap(),
+            1
+        );
+        other.delete_document("c.md").unwrap();
+        // d still holds a larger id here, so the re-created c cannot reuse c's old one.
+        let new_c = upsert_with_hash(&other, "c.md", "hc");
+        assert_ne!(new_c, old_c);
+        other.delete_document("d.md").unwrap();
+
+        let expected: Vec<(&str, i64, &str)> = ["a.md", "b.md", "c.md", "d.md"]
+            .iter()
+            .map(|p| (*p, snap[*p].0, snap[*p].1.as_str()))
+            .collect();
+        let out = db.delete_documents_if_unchanged(&expected, false).unwrap();
+        assert_eq!(out.deleted, vec!["a.md".to_string()]);
+        assert_eq!(out.kept_changed, 2);
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert!(!after.contains_key("a.md"));
+        assert!(!after.contains_key("d.md"));
+        assert_eq!(after["b.md"].1, "changed");
+        assert_eq!(after["c.md"].0, new_c);
+    }
+
+    #[test]
+    fn cas_delete_with_nothing_expected_opens_no_transaction() {
+        let (_dir, db, other) = two_connections("cas-delete-empty");
+        let tx = other.begin_immediate_transaction().unwrap();
+        let t0 = std::time::Instant::now();
+        let out = db.delete_documents_if_unchanged(&[], false).unwrap();
+        assert_eq!(out, CasDelete::default());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1000),
+            "an empty batch waited {:?} for the other writer's lock",
+            t0.elapsed()
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn cas_delete_refuses_inside_a_callers_transaction() {
+        let db = db_with_384();
+        let a = upsert_with_hash(&db, "a.md", "ha");
+        {
+            let _tx = db.begin_transaction().unwrap();
+            assert!(
+                db.delete_documents_if_unchanged(&[("a.md", a, "ha")], false)
+                    .is_err()
+            );
+        }
+        assert!(db.all_path_ids_hashes().unwrap().contains_key("a.md"));
+    }
+
+    #[test]
+    fn cas_delete_waits_for_a_concurrent_writer_and_judges_what_it_committed() {
+        let (_dir, a, b) = two_connections("cas-delete-waits");
+        let id = upsert_with_hash(&a, "a.md", "ha");
+
+        let tx = a.begin_immediate_transaction().unwrap();
+        a.overwrite_content_hash(&["a.md"], "changed").unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            let out = b.delete_documents_if_unchanged(&[("a.md", id, "ha")], false);
+            (b, out, t0.elapsed())
+        });
+        started_rx.recv().unwrap();
+        // Only makes the wait observable; correctness does not depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "the delete must wait for A's write lock, not return before A commits"
+        );
+        tx.commit().unwrap();
+
+        let (b, out, waited) = handle.join().unwrap();
+        let out = out.unwrap();
+        assert!(out.deleted.is_empty());
+        assert_eq!(out.kept_changed, 1);
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "the delete returned after {waited:?}, so it did not wait for A"
+        );
+        assert_eq!(a.all_path_ids_hashes().unwrap()["a.md"].1, "changed");
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn cas_delete_compares_the_stored_spelling_exactly() {
+        let db = db_with_384();
+        let id = upsert_with_hash(&db, "Note.md", "h");
+        let out = db
+            .delete_documents_if_unchanged(&[("note.md", id, "h")], false)
+            .unwrap();
+        assert!(out.deleted.is_empty());
+        assert_eq!(out.kept_changed, 0);
+        assert!(db.all_path_ids_hashes().unwrap().contains_key("Note.md"));
+    }
+
+    #[test]
+    fn cas_delete_with_mark_kept_marks_the_kept_rows_and_deletes_the_matching_ones() {
+        let (_dir, db, other) = two_connections("cas-delete-mark-kept");
+        for (p, h) in [("a.md", "ha"), ("b.md", "hb"), ("c.md", "hc")] {
+            upsert_with_hash(&db, p, h);
+        }
+        let snap = db.all_path_ids_hashes().unwrap();
+        assert_eq!(
+            other.overwrite_content_hash(&["b.md"], "changed").unwrap(),
+            1
+        );
+
+        let expected: Vec<(&str, i64, &str)> = ["a.md", "b.md", "c.md"]
+            .iter()
+            .map(|p| (*p, snap[*p].0, snap[*p].1.as_str()))
+            .collect();
+        let out = db.delete_documents_if_unchanged(&expected, true).unwrap();
+        assert_eq!(out.deleted, vec!["a.md".to_string(), "c.md".to_string()]);
+        assert_eq!(out.kept, vec!["b.md".to_string()]);
+        assert_eq!(out.kept_changed, 1);
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert!(!after.contains_key("a.md"));
+        assert!(!after.contains_key("c.md"));
+        assert_eq!(after["b.md"].0, snap["b.md"].0);
+        assert_eq!(after["b.md"].1, crate::indexer::HASH_AWAITING_REPARSE);
+    }
+
+    fn pair(old: &str, new: &str) -> (String, String) {
+        (old.to_string(), new.to_string())
+    }
+
+    #[test]
+    fn checked_renames_apply_matching_pairs_and_skip_the_rest() {
+        let (_dir, db, other) = two_connections("checked-renames-match");
+        for (p, h) in [
+            ("a.md", "ha"),
+            ("b.md", "hb"),
+            ("c.md", "hc"),
+            ("d.md", "hd"),
+        ] {
+            upsert_with_hash(&db, p, h);
+        }
+        let snap = db.all_path_ids_hashes().unwrap();
+
+        // Another connection changes b's hash, takes c's target path, and moves d first.
+        assert_eq!(
+            other.overwrite_content_hash(&["b.md"], "changed").unwrap(),
+            1
+        );
+        let other_c2 = upsert_with_hash(&other, "c2.md", "hc2");
+        other
+            .rename_document("d.md", "d-moved.md", FrontmatterTopic::Unread)
+            .unwrap();
+
+        let pairs = vec![
+            pair("a.md", "a2.md"),
+            pair("b.md", "b2.md"),
+            pair("c.md", "c2.md"),
+            pair("d.md", "d2.md"),
+        ];
+        let out = db
+            .rename_documents_checked(&pairs, &snap, &[], &HashMap::new())
+            .unwrap();
+        assert_eq!(out.applied, vec![pair("a.md", "a2.md")]);
+        assert_eq!(
+            out.skipped,
+            vec![
+                pair("b.md", "b2.md"),
+                pair("c.md", "c2.md"),
+                pair("d.md", "d2.md")
+            ]
+        );
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert_eq!(after["a2.md"], snap["a.md"]);
+        assert!(!after.contains_key("a.md"));
+        assert_eq!(after["b.md"], (snap["b.md"].0, "changed".to_string()));
+        assert!(!after.contains_key("b2.md"));
+        assert_eq!(after["c.md"], snap["c.md"]);
+        assert_eq!(after["c2.md"], (other_c2, "hc2".to_string()));
+        assert_eq!(after["d-moved.md"], snap["d.md"]);
+        assert!(!after.contains_key("d2.md"));
+    }
+
+    #[test]
+    fn checked_renames_mark_only_applied_crossed_pairs() {
+        let (_dir, db, other) = two_connections("checked-renames-crossed");
+        upsert_with_hash(&db, "x.txt", "hx");
+        upsert_with_hash(&db, "y.txt", "hy");
+        let snap = db.all_path_ids_hashes().unwrap();
+        upsert_with_hash(&other, "y.md", "hy-md");
+
+        let out = db
+            .rename_documents_checked(
+                &[pair("x.txt", "x.md"), pair("y.txt", "y.md")],
+                &snap,
+                &["x.txt", "y.txt"],
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(out.applied, vec![pair("x.txt", "x.md")]);
+        assert_eq!(out.skipped, vec![pair("y.txt", "y.md")]);
+
+        let after = db.all_path_ids_hashes().unwrap();
+        assert_eq!(
+            after["x.md"],
+            (
+                snap["x.txt"].0,
+                crate::indexer::HASH_AWAITING_REPARSE.to_string()
+            )
+        );
+        assert_eq!(after["y.txt"], snap["y.txt"]);
+        assert_eq!(after["y.md"].1, "hy-md");
+    }
+
+    #[test]
+    fn checked_renames_skip_a_pair_whose_old_row_was_recreated() {
+        let (_dir, db, other) = two_connections("checked-renames-recreated");
+        upsert_with_hash(&db, "a.md", "ha");
+        // A later row, so the re-created a.md cannot reuse a's id.
+        upsert_with_hash(&db, "z.md", "hz");
+        let snap = db.all_path_ids_hashes().unwrap();
+
+        other.delete_document("a.md").unwrap();
+        let new_a = upsert_with_hash(&other, "a.md", "ha");
+        assert_ne!(new_a, snap["a.md"].0);
+
+        let out = db
+            .rename_documents_checked(&[pair("a.md", "a2.md")], &snap, &[], &HashMap::new())
+            .unwrap();
+        assert!(out.applied.is_empty());
+        assert_eq!(out.skipped, vec![pair("a.md", "a2.md")]);
+        let after = db.all_path_ids_hashes().unwrap();
+        assert_eq!(after["a.md"], (new_a, "ha".to_string()));
+        assert!(!after.contains_key("a2.md"));
+    }
+
+    #[test]
+    fn checked_renames_with_no_pairs_open_no_transaction() {
+        let (_dir, db, other) = two_connections("checked-renames-empty");
+        let snap = db.all_path_ids_hashes().unwrap();
+        let tx = other.begin_immediate_transaction().unwrap();
+        let t0 = std::time::Instant::now();
+        let out = db
+            .rename_documents_checked(&[], &snap, &[], &HashMap::new())
+            .unwrap();
+        assert_eq!(out, CheckedRenames::default());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1000),
+            "no pairs waited {:?} for the other writer's lock",
+            t0.elapsed()
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn checked_renames_refuse_inside_a_callers_transaction() {
+        let db = db_with_384();
+        upsert_with_hash(&db, "a.md", "ha");
+        let snap = db.all_path_ids_hashes().unwrap();
+        {
+            let _tx = db.begin_transaction().unwrap();
+            assert!(
+                db.rename_documents_checked(&[pair("a.md", "a2.md")], &snap, &[], &HashMap::new())
+                    .is_err()
+            );
+        }
+        let after = db.all_path_ids_hashes().unwrap();
+        assert!(after.contains_key("a.md"));
+        assert!(!after.contains_key("a2.md"));
+    }
+
+    #[test]
+    fn checked_renames_carry_the_scanned_topic_like_the_atomic_one() {
+        let db = db_with_384();
+        db.upsert_document(
+            "a/x/d.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
+        db.upsert_document(
+            "a/x/e.md",
+            None,
+            Some("x"),
+            Some("a"),
+            None,
+            &[],
+            None,
+            "h2",
+            0,
+        )
+        .unwrap();
+        let snap = db.all_path_ids_hashes().unwrap();
+        let topics: HashMap<String, Option<String>> =
+            [("b/y/d.md".to_string(), Some("t".to_string()))]
+                .into_iter()
+                .collect();
+        let out = db
+            .rename_documents_checked(
+                &[pair("a/x/d.md", "b/y/d.md"), pair("a/x/e.md", "b/y/e.md")],
+                &snap,
+                &[],
+                &topics,
+            )
+            .unwrap();
+        assert_eq!(out.applied.len(), 2);
+        assert_eq!(
+            category_topic_of(&db, "b/y/d.md"),
+            (Some("b".to_string()), Some("t".to_string()))
+        );
+        // A pair with no scanned topic is unread: the stored topic stays.
+        assert_eq!(
+            category_topic_of(&db, "b/y/e.md"),
+            (Some("b".to_string()), Some("x".to_string()))
+        );
     }
 }
