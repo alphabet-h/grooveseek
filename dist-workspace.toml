@@ -44,10 +44,12 @@ github-attestations = true
 #
 # Move aarch64-apple-darwin off cargo-dist 0.31.0's default macos-14: GitHub
 # retires the macOS 14 images on 2026-11-02 (actions/runner-images#13518) and
-# its brownouts already cancelled the v1.22.0 release run. macos-15 is a pinned
-# label (macos-latest moves with each new macOS); the ort-sys prebuilt is chosen
-# by target triple alone, so the runner's macOS version does not change it.
+# its brownouts already cancelled the v1.22.0 release run. macos-26 is a pinned
+# label (macos-latest moves with each new macOS) and the one this repo already
+# builds ort-sys on (ci.yml's macos-latest currently resolves to
+# macos-26-arm64); the ort-sys prebuilt is chosen by target triple alone, so
+# the runner's macOS version does not change it.
 [dist.github-custom-runners]
 x86_64-unknown-linux-gnu = "ubuntu-24.04"
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
-aarch64-apple-darwin = "macos-15"
+aarch64-apple-darwin = "macos-26"

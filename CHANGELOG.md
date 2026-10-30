@@ -16,7 +16,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
-- **The release build for Apple Silicon (`aarch64-apple-darwin`) runs on `macos-15`.** It ran on
+- **The release build for Apple Silicon (`aarch64-apple-darwin`) runs on `macos-26`.** It ran on
   cargo-dist's default `macos-14`, which GitHub retires on 2026-11-02
   ([actions/runner-images#13518](https://github.com/actions/runner-images/issues/13518)); its
   scheduled brownouts already cancelled the v1.22.0 release run. Set in
