@@ -219,6 +219,32 @@ node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --ba
   default branch を検出する別経路なので、`--base main` と並べて書かない (ローカル r1 の medium)。
   **未 commit の変更は対象外** — commit してから打つ。`.md` だけの diff でも動く
 
+### round を打ち終えたら、この checkout の broker の木を止める
+
+local round は、終わっても plugin の broker (`app-server-broker.mjs serve`) とその下の木
+(`codex.js app-server` → `codex.exe app-server` → review ごとに 1 組増える `node_repl` / `node`) を残す。
+1 本でおよそ 300 MB で、plugin の SessionEnd の後始末もすり抜ける (kuriya issue #594、grooveseek)。
+**round ごとに** — `Verdict` が `approve` でも `needs-attention` でも、exit ≠ 0 でも — 結果を file から
+読み終えたら、次の round を打つ前に止める (次の round は plugin が broker を立て直す):
+
+```bash
+python "C:/Users/yabushita/.claude/hooks/codex_broker_reap.py" --cwd "<abs repo>" --apply
+```
+
+- 止めるのは、`--cwd` がこの checkout (`git rev-parse --show-toplevel`) かその下の broker の木だけ。
+  checkout の下に置いた worktree (`.worktrees\…`) と入れ子の repo (`.dev`) の broker は止まる。
+  隣の worktree や別 repo の broker、desktop app (`ChatGPT.exe`、`\WindowsApps\OpenAI.Codex_…`、
+  `AppData\Local\OpenAI\Codex\bin\…`) の木は止めない。git の checkout でない dir を渡すと、その dir と
+  完全に一致する broker だけになる
+- `skip: companion alive` が出たら、どこかで `codex-companion.mjs` が動いている (別の review の途中かもしれない)。
+  **打ち直さない** — 止めないのが正しい結果。SessionEnd / SessionStart の hook が後で拾う
+- 出力の行: `stopped: broker <pid> tree=…` / `stopped leftover: <pid>` / `removed: <broker.json>` /
+  `skip: companion alive (…)` / `skip: protected exe in tree (…)` / `skip: changed since plan (broker <pid>)` /
+  `skip: target too broad (…)` (ドライブ root や home dir を渡した。何も止めない) / `no plugin broker for …` /
+  `other-cwd brokers (not touched): …`。`--apply` を外すと `would stop: …` を出すだけ (dry-run)
+- **`codex` / `node` を名前で止めない** (`taskkill /IM`、`Stop-Process -Name`)。desktop app の
+  `codex.exe` と、別の session の review を巻き込む。木の選び方は script 冒頭の docstring
+
 ### focus の書き方
 
 plugin の `prompts/adversarial-review.md` の `User focus:` に差し込まれ、「weight it heavily」で読まれる。
