@@ -988,7 +988,10 @@ impl Database {
                     self.delete_document(path)?;
                     out.deleted.push((*path).to_string());
                 }
-                Some(_) => out.kept_changed += 1,
+                Some(_) => {
+                    out.kept_changed += 1;
+                    out.kept.push((*path).to_string());
+                }
             }
         }
         tx.commit()?;

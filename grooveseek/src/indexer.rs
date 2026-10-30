@@ -1050,7 +1050,9 @@ pub(crate) const PRUNE_BATCH: usize = 64;
 /// path after its batch commits. An `Err` from a batch is returned as is; that batch wrote
 /// nothing, and the batches before it stay committed. The `kept_changed` those earlier batches
 /// counted is dropped with the `Err`, so no note is printed for it; the next run judges those
-/// rows again.
+/// rows again. The returned `kept` paths are rows this run did not read; at the end of the run
+/// the caller marks those a stale one-time pass covers, and under `force` every one, with
+/// [`HASH_AWAITING_REPARSE`] (ADR-0031).
 fn prune_candidates(
     db: &Database,
     snapshot: &PathIdHash,
@@ -1074,6 +1076,7 @@ fn prune_candidates(
             on_deleted(path);
         }
         out.kept_changed += done.kept_changed;
+        out.kept.extend(done.kept);
         out.deleted.extend(done.deleted);
     }
     Ok(out)
@@ -2176,6 +2179,11 @@ pub fn rebuild_index(
         progress.report_deleted(path);
     })?;
     tally.kept_changed = pruned.kept_changed;
+    // (ADR-0031) The rows the prune kept for another writer were not read by this run, so
+    // nothing below that records a run-wide "settled" may count them: the ones a key written at
+    // the end would claim are marked for a re-parse there, and the frontmatter policy and
+    // declared-field set wait for a run that keeps none.
+    let kept = pruned.kept;
     // Not through `progress`: a quiet or callback reporter would drop the count.
     if let Some(note) = kept_changed_note(tally.kept_changed) {
         eprintln!("{note}");
@@ -2194,7 +2202,8 @@ pub fn rebuild_index(
     // (#544, local Codex r2) Read from the rows as they are after the further read of the
     // crossed renames, not as the loop left them.
     let refresh_pending = refresh_pending_scan || !refresh_pending_rows.is_empty();
-    if force || (refresh_frontmatter && !refresh_pending) {
+    // (ADR-0031) Not over a row the prune kept, `--force` included: this build never read it.
+    if kept.is_empty() && (force || (refresh_frontmatter && !refresh_pending)) {
         db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
     }
     // (feature-58, codex P2 round 6 on PR #291) Recorded after the deletion sweep for the same
@@ -2210,13 +2219,15 @@ pub fn rebuild_index(
     // pass. (codex P2 round 12) Recorded through `finish_declared_fields_pass`, which leaves
     // the generation pending instead when a watcher in another process wrote a document
     // under this pass's token -- that document's rows are the previous generation's, and
-    // recording the new set over them would make them current for good.
+    // recording the new set over them would make them current for good. (ADR-0031) Nor over a
+    // row the prune kept, whose fields another writer may have written under any set; that
+    // includes `--force` and the empty-set shortcut. The next run records it.
     finish_declared_fields_pass(
         db,
         pass_token.as_deref(),
         stored_declared.as_deref(),
         &declared_json,
-        force || !refresh_fields || !refresh_pending,
+        kept.is_empty() && (force || !refresh_fields || !refresh_pending),
     )?;
 
     let result = complete_index_result(db, embedder, tally, Some(embedded_since), start, false)?;
@@ -2229,13 +2240,21 @@ pub fn rebuild_index(
     // rows hold now, unconditionally: a row another process wrote since the loop is marked too,
     // and re-read once more, rather than an old-rule row being kept (ADR-0028). `--force`
     // rewrote every row, so it marks none. The counts in `result` read rows, not hashes, so the
-    // marks do not change them.
+    // marks do not change them. (ADR-0031) A row the prune kept for another writer was not read
+    // by this run, so it is marked as a skipped one is: when a stale pass covers it, and under
+    // `--force`, whose keys claim every row, whatever its format. The mark costs it no more than
+    // one more read, and a kept row deleted since is skipped by the write.
     if force || any_stale {
         if any_stale {
             for rel in &skipped_paths {
                 if stale_row(&passes, db, registry, rel)? {
                     unsettled.insert(rel.clone());
                 }
+            }
+        }
+        for rel in &kept {
+            if force || stale_row(&passes, db, registry, rel)? {
+                unsettled.insert(rel.clone());
             }
         }
         let marked: Vec<&str> = unsettled.iter().map(String::as_str).collect();
@@ -11174,6 +11193,111 @@ mod tests {
             )
         );
         assert!(note.is_ascii());
+    }
+
+    /// A row the prune kept for another writer is one this run did not read: it gets
+    /// [`HASH_AWAITING_REPARSE`] in the transaction that records the `.docx` keys, so the next
+    /// run's fast path cannot keep the old parser's chunks under keys that now read current.
+    #[test]
+    fn a_kept_docx_row_is_marked_for_a_reparse_when_the_docx_keys_are_recorded() {
+        let tmp = mk_tmp("pr3-kept-docx");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        // Not a sha256, so no file on disk pairs with it as a rename.
+        write_row(&db, "gone.docx", "h-gone", &[]);
+        assert_eq!(db.read_docx_heading_policy().unwrap(), None);
+        let progress = on_first_scanning(move || {
+            other
+                .overwrite_content_hash(&["gone.docx"], "changed")
+                .unwrap();
+        });
+        let result = prune_run(&db, &kb, &docx_registry(), false, progress);
+
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "gone.docx").map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the kept .docx row was not marked for a re-parse"
+        );
+        assert_eq!(
+            db.read_docx_heading_policy().unwrap().as_deref(),
+            Some(DOCX_HEADING_POLICY)
+        );
+        assert_eq!(
+            db.read_docx_table_rows_policy().unwrap().as_deref(),
+            Some(DOCX_TABLE_ROWS_POLICY)
+        );
+    }
+
+    /// A forced run that keeps a row for another writer marks it for a re-parse, and records
+    /// neither the declared-field generation nor the frontmatter policy: the kept row is not
+    /// one this build parsed. The row reaches the forced run's snapshot through a trigger that
+    /// writes it when the run opens its declared-field pass, after the reset and before the
+    /// snapshot; the other connection drops the trigger and changes the row at the scan.
+    #[test]
+    fn a_forced_run_that_keeps_a_row_marks_it_and_leaves_the_run_wide_records_pending() {
+        let tmp = mk_tmp("pr3-kept-force");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        db.execute_for_test(concat!(
+            "CREATE TRIGGER write_ghost_after_reset AFTER INSERT ON index_meta ",
+            "WHEN NEW.key = 'declared_fields_pass' ",
+            "BEGIN INSERT INTO documents (path, tags, content_hash, last_indexed) ",
+            "VALUES ('ghost.md', '[]', 'h-ghost', '2026-01-01T00:00:00Z'); END;"
+        ))
+        .unwrap();
+        let progress = on_first_scanning(move || {
+            other
+                .execute_for_test("DROP TRIGGER write_ghost_after_reset;")
+                .unwrap();
+            assert_eq!(
+                other
+                    .overwrite_content_hash(&["ghost.md"], "changed")
+                    .unwrap(),
+                1,
+                "the trigger did not write ghost.md before the snapshot"
+            );
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, true, progress);
+
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(
+            id_hash(&db, "ghost.md").map(|(_, h)| h).as_deref(),
+            Some(HASH_AWAITING_REPARSE),
+            "the kept row was not marked for a re-parse"
+        );
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+    }
+
+    /// A run that refreshes the frontmatter of unchanged Markdown and keeps a row for another
+    /// writer records neither the frontmatter policy nor the declared-field set: the kept row was
+    /// not read under them. The next run makes the pass again.
+    #[test]
+    fn a_frontmatter_refresh_that_keeps_a_row_leaves_the_policy_unrecorded() {
+        let tmp = mk_tmp("pr3-kept-fm");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "x.md", "# x\n\nbody\n");
+        let (db, other) = two_connections(&tmp);
+        write_row(&db, "gone.md", "h-gone", &[]);
+        assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+        let progress = on_first_scanning(move || {
+            other
+                .overwrite_content_hash(&["gone.md"], "changed")
+                .unwrap();
+        });
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        let result = prune_run(&db, &kb, &registry, false, progress);
+
+        assert_eq!(result.kept_changed, 1, "{result:?}");
+        assert_eq!(db.read_frontmatter_policy().unwrap(), None);
+        assert_eq!(db.read_declared_fields().unwrap(), None);
     }
 
     // -----------------------------------------------------------------------

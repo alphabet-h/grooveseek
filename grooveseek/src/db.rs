@@ -527,6 +527,8 @@ pub struct CasDelete {
     pub deleted: Vec<String>,
     /// Present but with another `(id, content_hash)`: kept.
     pub kept_changed: u32,
+    /// The paths counted in `kept_changed`, in the order of its `expected` argument.
+    pub kept: Vec<String>,
 }
 
 /// What [`Database::rename_documents_checked`] did with each `(old, new)` pair, in the
