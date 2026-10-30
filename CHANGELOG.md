@@ -102,7 +102,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   as `kept_changed` and `renames_skipped`. A write that reads before it writes is now opened as
   `BEGIN IMMEDIATE`, so it waits for another writer instead of failing at once with
   `database is locked`. The run's other look-then-write steps are still not protected against such
-  a writer.
+  a writer, and neither is a forced run (`groove index --force`, or `rebuild_index` with
+  `force: true`): it clears the index first and rebuilds it from the files on disk, so a row that
+  writer committed before the reset is replaced by what the run reads, not kept.
 
 ## [1.21.5] - 2026-10-28
 
