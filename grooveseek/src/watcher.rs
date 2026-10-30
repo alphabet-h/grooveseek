@@ -714,8 +714,11 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `.git/` や `node_modules/` へ rename すると
                 // `rename_single_file` が **denylist 配下の新パスへ DB を
                 // 書き換えて残す**。除外したはずのファイルが index に居座る。
-                // (kuriya 259) The old end of a deindex is decided inside the database lock of
-                // the delete: a file written back there by then is reindexed and keeps the row.
+                //
+                // (kuriya 259) The old end is looked at before its row is dropped
+                // ([`dispatch_removal`] with [`RemovalCause::RenamedAway`]): a file the write gate
+                // takes back there is reindexed in place; with no row left there, nothing is
+                // looked at.
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
                     RenameAction::Rename => {
                         dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
@@ -7046,7 +7049,7 @@ mod tests {
         )]
     }
 
-    /// (kuriya 259, invariant I6, spec T-I2) A file written back at the old end of a rename into
+    /// (kuriya 259) A file written back at the old end of a rename into
     /// an excluded directory before the batch is handled keeps its row: the old end is looked at
     /// inside the database lock of the delete and reindexed, so the row holds the new bytes
     /// (its hash is no longer the one the rename moved away).
@@ -7150,7 +7153,7 @@ mod tests {
         db.lock().unwrap().all_document_paths().unwrap()
     }
 
-    /// (kuriya 259, spec T-I1) A directory rename onto a directory: a listed row its step skips
+    /// (kuriya 259) A directory rename onto a directory: a listed row its step skips
     /// (`.txt`, which the registry does not take at either end) leaves its old path through the
     /// listed loop, as a rename away does, even though the removal gate would turn the path away.
     /// The old directory is recreated empty so the range sweep of a gone source does not take
@@ -7170,7 +7173,7 @@ mod tests {
         assert_eq!(paths, vec!["notes/a.md".to_string()]);
     }
 
-    /// (kuriya 259, invariant I6, spec T-I1) A directory renamed to a destination already gone,
+    /// (kuriya 259) A directory renamed to a destination already gone,
     /// with the old directory recreated and one file written back into it before the batch is
     /// handled: that file's row stays (reindexed in place), the other listed row leaves.
     #[test]
@@ -7188,7 +7191,7 @@ mod tests {
         assert_eq!(paths, vec!["docs/a.md".to_string()]);
     }
 
-    /// (kuriya 259, invariant I6, spec T-I1) A directory renamed into an excluded directory, with
+    /// (kuriya 259) A directory renamed into an excluded directory, with
     /// a file written back at the old path of one of its rows: the step's deindex looks first,
     /// so that row stays (reindexed in place).
     #[test]
@@ -7206,7 +7209,7 @@ mod tests {
         assert_eq!(paths, vec!["docs/a.md".to_string()]);
     }
 
-    /// (kuriya 259, invariant I6, spec T-I1) A file renamed onto a name that is a directory by
+    /// (kuriya 259) A file renamed onto a name that is a directory by
     /// the time the event is handled, with a file written back at the old name: the row of the
     /// old name itself stays (reindexed in place).
     #[test]
@@ -7233,7 +7236,7 @@ mod tests {
         assert_eq!(paths, vec!["docs/a.md".to_string()]);
     }
 
-    /// (kuriya 259, spec T-I1) A file back under the recreated old directory only under another
+    /// (kuriya 259) A file back under the recreated old directory only under another
     /// case of its name does not keep the old row, and no row is written for the other spelling
     /// (no event named it): the same answer on a file system that tells cases apart and on one
     /// that does not.

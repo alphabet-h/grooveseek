@@ -110,10 +110,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **The live watcher no longer drops the row of a file that is back at the old name of a rename**
   (kuriya #259). When it handles a rename, the watcher now looks at the old name while it holds the
   index, as it does for a deletion, before it drops the row there: the old name of a file renamed
-  into an excluded directory, the documents listed under a renamed directory that the rename did
-  not move, and a row stored at the directory's own old name. A file back there by then (written
-  again under the old name, or in a directory made again where the renamed one stood) keeps its
-  row and is re-read in place, so its unchanged chunks keep their stored vectors. Where the rename
+  to a name the index does not take (into an excluded directory, or to an extension no parser
+  reads), the documents listed under a renamed directory that the rename did not move, and a row
+  stored at the directory's own old name. A file the index takes back there by then (written again
+  under the old name, or in a directory made again where the renamed one stood) keeps its row and
+  is re-read in place, so its unchanged chunks keep their stored vectors. Where the rename
   has already moved the row to the new name there is no row to look at under the old path, and a
   file written there again is indexed by its own event. A look that cannot tell (access denied, an
   I/O error) keeps the row and says why on stderr, as for a deletion.
