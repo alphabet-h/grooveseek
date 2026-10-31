@@ -459,7 +459,7 @@ pub fn raised_limits_warning(limits: &FileSizeLimits) -> String {
             "decompressed {decompressed} (default {default_decompressed}). ",
             "A file being indexed is held in memory whole, and an .xlsx also holds its ",
             "shared-strings table expanded; an allocation failure aborts the process ",
-            "instead of skipping the file. PDF text extraction still stops after ",
+            "instead of skipping the file. PDF and .xlsx text extraction still stop after ",
             "{timeout} s whatever the cap."
         ),
         binary = limits.binary,
@@ -492,8 +492,12 @@ pub(crate) fn join_chunk_bodies(chunks: &[Chunk]) -> String {
         .iter()
         .map(|c| c.content.as_str())
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join(CHUNK_BODY_SEPARATOR)
 }
+
+/// What [`join_chunk_bodies`] puts between two chunk bodies. The `.xlsx` parser counts it
+/// toward a workbook's text budget, so it reads the same constant rather than a copy.
+pub(crate) const CHUNK_BODY_SEPARATOR: &str = "\n\n";
 
 /// (AU-33) One spreadsheet sheet as a chunk.
 ///

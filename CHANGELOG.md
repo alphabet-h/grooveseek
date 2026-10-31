@@ -22,6 +22,48 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   scheduled brownouts already cancelled the v1.22.0 release run. Set in
   `[dist.github-custom-runners]` of `dist-workspace.toml`; the other targets keep their runners.
 
+### Fixed
+
+- **An `.xlsx` whose sheets share one worksheet part is read once.** calamine re-inflates the
+  part for every `<sheet>` that names it, through the same `r:id`, another `r:id` with the same
+  `Target`, or another spelling of the path, so a 4 KB workbook listing one sheet 200 times was
+  extracted 200 times over (200 chunks of the same text). Sheets with different names on one
+  part now make one chunk whose heading lists their names in workbook order
+  (`Sheet: Alpha, Beta`), so every name still finds the text. The names in a heading are capped
+  at 200 bytes, a single sheet's name included: a longer name is cut on a character boundary
+  and ends in `...`, and names that do not fit are counted as `, and N more`. A sheet that
+  repeats an earlier sheet's name is skipped (calamine can only open the first of them). One
+  warning line counts both.
+- **The 1 MiB per-sheet cap of `.xlsx` is checked per cell, not per row.** One row whose cells
+  all reference the same long shared string grew past the cap without bound, because the cap
+  was only checked between rows. The cell that crosses the cap is kept whole, then the sheet
+  stops.
+
+### Security
+
+- **`.xlsx` text extraction is bounded per document.** The text a workbook yields is not
+  proportional to its size: shared strings can be referenced from any number of cells and
+  sheets. A workbook now yields at most `[index].max_decompressed_size` of text (50 MiB by
+  default), counted as the stored headings (`Sheet: ...`), the chunk bodies and the blank
+  lines between bodies in the document's raw content, and stops after 120 s, the same bounds
+  as PDF; past either it is skipped with a `decompression-bomb guard` error, on the index path
+  and on `get_document` alike. The clock is read while the decompression preflight inflates
+  each entry, while the sheets are resolved to their parts, between the steps that open the
+  workbook, at every cell and at every sheet boundary. Opening the zip archive, calamine
+  opening the workbook, reading the title from `docProps/core.xml` and reading a single cell
+  cannot be interrupted; that work is bounded by the decompression budget instead. With
+  `max_decompressed_size = "unlimited"`, which lifts that budget, nothing bounds those steps:
+  the 120 s does not reach inside them.
+- **An `.xlsx` that declares more shared strings than it can hold no longer aborts the
+  process.** calamine reserves the `uniqueCount` of `xl/sharedStrings.xml` before reading a
+  string ([tafia/calamine#684](https://github.com/tafia/calamine/issues/684)), so a workbook of
+  under 2 KB declaring 100,000,000,000 failed a multi-terabyte allocation. The decompression
+  preflight now refuses any `uniqueCount` above a fifth of the inflated size of the zip entry
+  it is written in (a shared string takes at least 5 bytes), before calamine opens the
+  workbook. The limit follows the file, not `[index].max_decompressed_size`, so raising the
+  key (or setting it to `"unlimited"`) does not raise it, and a form feed around the `=` does
+  not hide the attribute.
+
 ## [1.22.0] - 2026-10-31
 
 ### Added
