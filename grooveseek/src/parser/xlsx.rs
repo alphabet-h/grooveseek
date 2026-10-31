@@ -134,7 +134,10 @@ const SHEET_MAX_BYTES: usize = 1024 * 1024;
 
 /// `<si/>` (5 bytes) が共有文字列 1 本の最短の書き方。正直な sharedStrings part は
 /// `uniqueCount` 件の `<si>` を持つので、展開後 `n` bytes の part に入る件数は `n / 5` 以下。
-/// [`unique_count_limit`] がこれで `uniqueCount` の上限を出す。
+/// [`preflight_xlsx_decompression_budget_capped`] は、`uniqueCount` が書かれていた entry の実展開
+/// bytes をこれで割った数を上限にする。reserve はその entry の大きさの 24 / 5 倍以内に収まり
+/// (calamine は 1 件 24 bytes)、`[index].max_decompressed_size` を上げても (`"unlimited"` でも)
+/// 上限は file の中身で決まる。
 const MIN_SHARED_STRING_BYTES: u64 = 5;
 
 /// xlsx 1 本の抽出に掛ける上限の組 (cap 注入版の [`parse_xlsx_bytes_limited`] が受け取る)。
@@ -284,19 +287,20 @@ fn parse_xlsx_bytes_limited(
     let parts = resolve_sheet_parts(bytes, &names);
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut seen_parts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // 読み飛ばしたシートの数。1 枚ずつ warn すると、`<sheet>` を何千枚も並べた file が
+    // stderr を同じ数の行で埋めるので、最後に 1 行でまとめる。
+    let mut skipped: usize = 0;
     for (i, name) in names.iter().enumerate() {
-        if !seen_names.insert(name.as_str()) {
-            eprintln!(
-                "{path_hint}: sheet {name:?} repeats an earlier sheet name, which reads the same part; skipping it"
-            );
-            continue;
-        }
-        if let Some(index) = parts.as_ref().and_then(|parts| parts[i])
-            && !seen_parts.insert(index)
-        {
-            eprintln!(
-                "{path_hint}: sheet {name:?} points at a part an earlier sheet already read; skipping it"
-            );
+        let repeats_a_name = !seen_names.insert(name.as_str());
+        let repeats_a_part = !repeats_a_name
+            && parts
+                .as_ref()
+                .and_then(|parts| parts[i])
+                .is_some_and(|index| !seen_parts.insert(index));
+        if repeats_a_name || repeats_a_part {
+            skipped += 1;
+            // 読み飛ばすだけの経路でも時間を見る (シートの数は file の大きさに比例しない)。
+            guard.check(0)?;
             continue;
         }
         guard.sheets += 1;
@@ -319,6 +323,11 @@ fn parse_xlsx_bytes_limited(
             continue; // 空シートは chunk を作らない
         }
         chunks.push(super::sheet_chunk(chunks.len(), title, name, &text));
+    }
+    if skipped > 0 {
+        eprintln!(
+            "{path_hint}: skipped {skipped} sheet(s) that repeat an earlier sheet's name or part"
+        );
     }
 
     let raw_content = super::join_chunk_bodies(&chunks);
@@ -833,9 +842,10 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// 残すより、この誤検知を受け入れる方を選ぶ (skip は理由付きの warn として
 /// 出るので silent failure ではない)。
 ///
-/// 層 2 で読んだバイトは [`UniqueCountScan`] にも渡し、どこかに [`unique_count_limit`] を超える
-/// `uniqueCount` が書かれていれば `Err` にする (AX-41。calamine が申告件数を先に reserve して
-/// abort するのを、calamine を呼ぶ前に止める)。
+/// 層 2 で読んだバイトは entry ごとに [`UniqueCountScan`] にも渡し、その entry の実展開 bytes /
+/// [`MIN_SHARED_STRING_BYTES`] を超える `uniqueCount` が書かれていれば `Err` にする (AX-41。
+/// calamine が申告件数を先に reserve して abort するのを、calamine を呼ぶ前に止める)。この拒否は
+/// cap に依らないので、`[index].max_decompressed_size` を上げる案内は付けない。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -854,9 +864,6 @@ fn preflight_xlsx_decompression_budget_capped(
     };
     // 全 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
     let mut total: u64 = 0;
-    // 層 2 で読んだバイトに書かれた `uniqueCount` (AX-41、[`UniqueCountScan`])。
-    let (unique_basis, unique_limit) = unique_count_limit(cap);
-    let mut unique_counts = UniqueCountScan::default();
     for i in 0..zip.len() {
         // 申告 size は metadata だけで取れる (`by_index_raw` は圧縮データを
         // そのまま返す reader = 展開しない)。
@@ -900,6 +907,8 @@ fn preflight_xlsx_decompression_budget_capped(
             // 読めないため、budget には数えず次へ進む。
             continue;
         };
+        // entry ごとに新しく数える (上限がその entry の大きさで決まるため)。
+        let mut unique_counts = UniqueCountScan::default();
         let actual = match count_decompressed_bytes_scanning(
             &mut entry,
             declared,
@@ -912,21 +921,19 @@ fn preflight_xlsx_decompression_budget_capped(
             ),
         };
         unique_counts.finish();
-        if unique_counts.largest > unique_limit {
-            let largest = unique_counts.largest;
-            let raise = if unique_basis == cap {
-                "; raise [index].max_decompressed_size to admit this file"
-            } else {
-                ""
-            };
-            anyhow::bail!(
-                "{path_hint}: entry {name:?} declares uniqueCount {largest}, more shared strings than {unique_basis} bytes can hold (at most {unique_limit}) (zip-bomb guard; the workbook reader reserves memory for the declared count up front{raise})"
-            );
-        }
         total = total.saturating_add(actual);
         if total > cap {
             anyhow::bail!(
                 "{path_hint}: actual decompressed size of the archive exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declared {declared} bytes but expands past the remaining budget; raise [index].max_decompressed_size to admit this file)"
+            );
+        }
+        // `uniqueCount` の上限はそれが書かれていた entry の実展開 bytes / 5 (`actual` は
+        // 上の判定を通ったので打ち切られていない)。cap に依らないので、上げる案内は付けない。
+        let unique_limit = actual / MIN_SHARED_STRING_BYTES;
+        if unique_counts.largest > unique_limit {
+            let largest = unique_counts.largest;
+            anyhow::bail!(
+                "{path_hint}: entry {name:?} declares uniqueCount {largest}, more shared strings than its {actual} bytes can hold (at most {unique_limit}) (zip-bomb guard; the workbook reader reserves memory for the declared count up front; the archive is rejected whatever [index].max_decompressed_size is)"
             );
         }
     }
@@ -1028,17 +1035,21 @@ fn count_decompressed_bytes_scanning(
 /// **プロセスが abort する** (catch できない)。preflight は全 entry の全 byte を既に読んでいる
 /// ので、そこで値を見る。
 ///
-/// **part を name で選ばない** (`preflight_xlsx_decompression_budget_capped` の「なぜ全 entry
+/// **part を name で選ばない** ([`preflight_xlsx_decompression_budget_capped`] の「なぜ全 entry
 /// なのか」と同じ理由): calamine は sharedStrings の path を rels の xl_path から作るので、
 /// どの entry が sharedStrings かを言い当てる代わりに、全 entry のどこに書かれた `uniqueCount`
-/// も数える。その代わりの偽陽性は、セルの本文に `uniqueCount="<上限を超える数>"` という文字列
-/// そのものを書いた workbook だけ (推定、実害は無視できる)。
+/// も数える。上限はその値が書かれていた entry の実展開 bytes / 5 ([`MIN_SHARED_STRING_BYTES`])
+/// なので、偽陽性は、その entry の大きさに見合わない `uniqueCount="<数>"` という文字列そのものを
+/// セルの本文に書いた workbook だけ (推定、実害は無視できる)。
 ///
-/// 読み方は calamine (`raw_attr` は key の完全一致、値は raw、`atoi_simd` で先頭の `0` を
-/// 飛ばし `+` を受けない) の上位集合: `uniqueCount` の後に XML の空白、`=`、空白、引用符
-/// (`"` か `'`) と続けば、先頭の `0` を飛ばして数字を飽和しながら読む。数字の後に何が来ても
-/// (calamine なら数字でないので reserve しない値でも) 数える。状態は呼び出しをまたいで持つので、
-/// 読み出しバッファの境目で切れた属性も拾う。entry の境目では [`UniqueCountScan::finish`] する。
+/// 読み方は calamine (`RawAttrIter` は key の前と `=` の前後の `is_ascii_whitespace` を飛ばし、
+/// key は `=` までを末尾の空白を削って完全一致で比べ、値は raw。`atoi_simd` で先頭の `0` を
+/// 飛ばし `+` を受けない) の上位集合: `uniqueCount` の後に ASCII 空白 (form feed を含む)、`=`、
+/// ASCII 空白、引用符 (`"` か `'`) と続けば、先頭の `0` を飛ばして数字を飽和しながら読む。
+/// `uniqueCount` の前に何があっても (calamine なら key が一致しない `xuniqueCount` でも)、数字の
+/// 後に何が来ても (calamine なら数字でないので reserve しない値でも) 数える。状態は呼び出しを
+/// またいで持つので、読み出しバッファの境目で切れた属性も拾う。entry の境目では
+/// [`UniqueCountScan::finish`] する。
 #[derive(Default)]
 struct UniqueCountScan {
     state: UniqueCountState,
@@ -1093,7 +1104,8 @@ impl UniqueCountScan {
                         self.state = if border == 0 { Idle } else { Name(border) };
                     }
                 }
-                BeforeEq | AfterEq if matches!(b, b' ' | b'\t' | b'\r' | b'\n') => i += 1,
+                // calamine の `RawAttrIter` と同じ `is_ascii_whitespace` (form feed を含む)。
+                BeforeEq | AfterEq if b.is_ascii_whitespace() => i += 1,
                 BeforeEq if b == b'=' => {
                     i += 1;
                     self.state = AfterEq;
@@ -1140,28 +1152,6 @@ impl UniqueCountScan {
             .find(|&len| Self::NEEDLE[..len] == Self::NEEDLE[matched - len..matched])
             .unwrap_or(0)
     }
-}
-
-/// `uniqueCount` の上限を `(上限の基になった bytes, 上限の件数)` で返す。
-///
-/// 上限は `基 / 5` ([`MIN_SHARED_STRING_BYTES`]): 正直な sharedStrings part は展開後 `cap` bytes
-/// 以内 (preflight が archive 全体をそう縛る) なので、`<si>` は高々 `cap / 5` 件。基は通常
-/// `cap` そのもの。既定 50 MiB で 10,485,760 件 = reserve 240 MiB (計算値。AX-41 の正直な最悪、
-/// 空の `<si/>` 1000 万件で 229 MiB と同じ桁)。
-///
-/// `cap` が `"unlimited"` の時だけ、基を既定の展開 budget
-/// ([`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]) に固定する: `cap / 5` のままでは上限が無いのと同じで、
-/// 1.7 KB の file で abort する穴が開いたままになる。代償として、`"unlimited"` の下でも 1000 万件を
-/// 超える共有文字列を持つ workbook は拒まれる (`"unlimited"` を選んだ運用者でも、その件数の
-/// workbook は reserve だけで数百 MiB を確保する)。`"unlimited"` かどうかは
-/// [`super::FileSizeLimit::cap_bytes`] の値と比べて決める (sentinel の値をここに書かない)。
-fn unique_count_limit(cap: u64) -> (u64, u64) {
-    let basis = if cap == super::FileSizeLimit::Unlimited.cap_bytes() {
-        super::DEFAULT_MAX_DECOMPRESSED_BYTES
-    } else {
-        cap
-    };
-    (basis, basis / MIN_SHARED_STRING_BYTES)
 }
 
 /// `docProps/core.xml` から frontmatter を取る。読めなければ (zip でない xls、core.xml が
@@ -2815,11 +2805,17 @@ mod tests {
         }
     }
 
-    fn workbook_with_unique_count(count_attr: &str, padding: usize) -> Vec<u8> {
-        let shared = format!(
+    /// The sharedStrings part [`workbook_with_unique_count`] writes (stored, so its entry size
+    /// is this string's length).
+    fn shared_strings_with_unique_count(count_attr: &str, padding: usize) -> String {
+        format!(
             r#"<?xml version="1.0"?><!--{}--><sst {SPREADSHEET_NS} {count_attr}><si><t>x</t></si></sst>"#,
             "p".repeat(padding)
-        );
+        )
+    }
+
+    fn workbook_with_unique_count(count_attr: &str, padding: usize) -> Vec<u8> {
+        let shared = shared_strings_with_unique_count(count_attr, padding);
         make_wired_xlsx(
             "xl/",
             &owned_pairs([("S".to_string(), "rId1".to_string())]),
@@ -2853,7 +2849,10 @@ mod tests {
                 msg.contains("uniqueCount 100000000000") && msg.contains("zip-bomb guard"),
                 "{msg}"
             );
-            assert!(msg.contains("raise [index].max_decompressed_size"), "{msg}");
+            assert!(
+                !msg.contains("raise [index]"),
+                "the limit follows the entry, not the budget: {msg}"
+            );
             assert!(msg.is_ascii(), "{msg}");
         }
         // Stored entries are read in 8 KiB pieces: put the attribute across that boundary.
@@ -2878,22 +2877,78 @@ mod tests {
         assert!(err.to_string().contains("uniqueCount"), "{err}");
     }
 
-    /// The limit is `budget / 5` on the index path: exactly the limit is admitted, one more is
-    /// refused (a 64 KiB budget allows 13,107).
+    /// Review of 5b965f9: calamine skips any ASCII whitespace around `=` (`is_ascii_whitespace`,
+    /// which includes the form feed), so the scanner must too.
     #[test]
-    fn test_xlsx_unique_count_limit_follows_the_parser_budget() {
-        let budget = 64 * 1024;
-        assert_eq!(unique_count_limit(budget), (budget, 13_107));
-        let at = workbook_with_unique_count(r#"uniqueCount="13107""#, 0);
-        let doc = XlsxParser::with_budget(budget)
+    fn unique_count_scan_treats_a_form_feed_as_whitespace() {
+        for input in [
+            &b"<sst uniqueCount\x0C=\"100000000000\">"[..],
+            &b"<sst uniqueCount=\x0C\"100000000000\">"[..],
+        ] {
+            let mut scan = UniqueCountScan::default();
+            scan.feed(input);
+            scan.finish();
+            assert_eq!(scan.largest, 100_000_000_000, "{input:?}");
+        }
+    }
+
+    /// ...and the preflight refuses both spellings (each would abort the process in calamine).
+    #[test]
+    fn test_xlsx_preflight_rejects_a_unique_count_spelled_with_a_form_feed() {
+        let cap = crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES;
+        for attr in [
+            "uniqueCount\u{c}=\"100000000000\"",
+            "uniqueCount=\u{c}\"100000000000\"",
+        ] {
+            let bytes = workbook_with_unique_count(attr, 0);
+            let err =
+                preflight_xlsx_decompression_budget_capped(&bytes, "ff.xlsx", cap).expect_err(attr);
+            assert!(
+                err.to_string().contains("uniqueCount 100000000000"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Review of 5b965f9: the limit follows the entry that declares the count, not the
+    /// budget -- a sharedStrings part of `n` bytes holds at most `n / 5` strings, whatever
+    /// `[index].max_decompressed_size` says. Exactly `n / 5` is admitted, one more refused,
+    /// under the default budget and under `"unlimited"` alike.
+    #[test]
+    fn test_xlsx_unique_count_limit_follows_the_entry_that_declares_it() {
+        // Three-digit counts keep the part the same length for `at` and `over`.
+        const AT: usize = 500;
+        let base = shared_strings_with_unique_count(&format!(r#"uniqueCount="{AT}""#), 0).len();
+        let padding = AT * 5 - base;
+        assert_eq!(
+            shared_strings_with_unique_count(&format!(r#"uniqueCount="{AT}""#), padding).len(),
+            AT * 5,
+            "premise: the part is exactly 5 bytes per declared string"
+        );
+        let at = workbook_with_unique_count(&format!(r#"uniqueCount="{AT}""#), padding);
+        let over = workbook_with_unique_count(&format!(r#"uniqueCount="{}""#, AT + 1), padding);
+        for cap in [
+            crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES,
+            crate::parser::FileSizeLimit::Unlimited.cap_bytes(),
+        ] {
+            preflight_xlsx_decompression_budget_capped(&at, "at.xlsx", cap)
+                .expect("a count of exactly the part's bytes / 5 is admitted");
+            let err = preflight_xlsx_decompression_budget_capped(&over, "over.xlsx", cap)
+                .expect_err("one more than the part can hold is refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("uniqueCount 501") && msg.contains("zip-bomb guard"),
+                "{msg}"
+            );
+            assert!(!msg.contains("raise [index]"), "raising cannot help: {msg}");
+            assert!(msg.is_ascii(), "{msg}");
+        }
+        XlsxParser::default()
             .parse_bytes(&at, "at.xlsx", &[])
-            .expect("exactly the limit is admitted");
-        assert!(doc.chunks[0].content.contains('x'));
-        let over = workbook_with_unique_count(r#"uniqueCount="13108""#, 0);
-        let err = XlsxParser::with_budget(budget)
-            .parse_bytes(&over, "over.xlsx", &[])
-            .expect_err("one over the limit is refused");
-        assert!(err.to_string().contains("at most 13107"), "{err}");
+            .expect("the index path reads it");
+        XlsxParser::default()
+            .parse_bytes_for_read(&over, "over.xlsx", &[])
+            .expect_err("the read path refuses it too");
     }
 
     /// A truthful `uniqueCount` is admitted and the shared strings read as before.
@@ -2926,14 +2981,11 @@ mod tests {
         );
     }
 
-    /// `"unlimited"` keeps a fixed limit (the default budget / 5) instead of none, on the index
-    /// path, and the read path (MCP `get_document`) keeps the default budget's limit too.
+    /// `"unlimited"` lifts no part of the `uniqueCount` limit (it follows the entry), on the
+    /// index path, and the read path (MCP `get_document`) refuses the same file.
     #[test]
     fn test_xlsx_unique_count_limit_holds_under_unlimited_and_on_the_read_path() {
         let unlimited = crate::parser::FileSizeLimit::Unlimited.cap_bytes();
-        let default = crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES;
-        assert_eq!(unique_count_limit(unlimited), (default, default / 5));
-        assert_eq!(unique_count_limit(default), (default, 10_485_760));
 
         let over = workbook_with_unique_count(r#"uniqueCount="10485761""#, 0);
         let err = XlsxParser::with_budget(unlimited)
@@ -2948,10 +3000,117 @@ mod tests {
         XlsxParser::default()
             .parse_bytes_for_read(&over, "over.xlsx", &[])
             .expect_err("the read path refuses it too");
+    }
 
-        let at = workbook_with_unique_count(r#"uniqueCount="10485760""#, 0);
-        preflight_xlsx_decompression_budget_capped(&at, "at.xlsx", unlimited)
-            .expect("exactly the fixed limit is admitted");
+    /// `bytes` with the entry `name` rewritten to `body` (the other entries copied raw).
+    fn replace_entry(bytes: &[u8], name: &str, body: &[u8]) -> Vec<u8> {
+        let mut source = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..source.len() {
+            let entry = source.by_index_raw(i).unwrap();
+            if entry.name().unwrap() == name {
+                drop(entry);
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(body).unwrap();
+            } else {
+                zip.raw_copy_file(entry).unwrap();
+            }
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Review of 5b965f9: when [`resolve_sheet_parts`] cannot vouch for its copy (here a
+    /// `<sheet>` inside `<definedName>`, which calamine reads as the name's text and the copy
+    /// counts as a sheet), every sheet is read -- and the document budget still holds.
+    #[test]
+    fn test_xlsx_document_budget_holds_when_the_sheet_parts_cannot_be_resolved() {
+        const SHEETS: usize = 200;
+        let sheets = owned_pairs((0..SHEETS).map(|i| (format!("S{i}"), "rId1".to_string())));
+        let rels = owned_pairs([("rId1".to_string(), "worksheets/sheet1.xml".to_string())]);
+        let wired = make_wired_xlsx(
+            "xl/",
+            &sheets,
+            &rels,
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                one_cell_worksheet("aaaa"),
+            )],
+            None,
+            false,
+        );
+        let mut workbook = format!(r#"<?xml version="1.0"?><workbook {SPREADSHEET_NS}><sheets>"#);
+        for (i, (name, rid)) in sheets.iter().enumerate() {
+            workbook.push_str(&format!(
+                r#"<sheet name="{name}" sheetId="{}" r:id="{rid}"/>"#,
+                i + 1
+            ));
+        }
+        workbook.push_str(r#"</sheets><definedNames><definedName name="n"><sheet name="Ghost" sheetId="999" r:id="rId1"/></definedName></definedNames></workbook>"#);
+        let bytes = replace_entry(&wired, "xl/workbook.xml", workbook.as_bytes());
+
+        let names: Vec<String> = sheets.iter().map(|(n, _)| n.clone()).collect();
+        let xlsx = calamine::Xlsx::new(Cursor::new(bytes.as_slice())).unwrap();
+        assert_eq!(
+            xlsx.sheet_names(),
+            names,
+            "premise: calamine skips the ghost"
+        );
+        assert_eq!(
+            resolve_sheet_parts(&bytes, &names),
+            None,
+            "premise: the copy sees one sheet more, so it gives up"
+        );
+
+        let doc = parse_xlsx_bytes_limited(
+            &bytes,
+            "ghost.xlsx",
+            limits(usize::MAX, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect("parse");
+        assert_eq!(doc.chunks.len(), SHEETS, "the fallback reads every sheet");
+
+        // Each sheet yields "aaaa\n" (5 bytes): a 50-byte budget stops the 11th.
+        let err = parse_xlsx_bytes_limited(
+            &bytes,
+            "ghost.xlsx",
+            limits(50, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect_err("the document budget does not depend on the copy");
+        assert_eq!(
+            err.to_string(),
+            "ghost.xlsx: extracted text exceeds 50 bytes across 11 sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)"
+        );
+    }
+
+    /// Review of 5b965f9: sheets whose parts hold no cell never reach the per-cell check, so
+    /// the time limit is also checked at each sheet boundary.
+    #[test]
+    fn test_xlsx_time_budget_is_checked_between_sheets_that_hold_no_cell() {
+        let sheets = owned_pairs((1..=3).map(|i| (format!("S{i}"), format!("rId{i}"))));
+        let rels =
+            owned_pairs((1..=3).map(|i| (format!("rId{i}"), format!("worksheets/sheet{i}.xml"))));
+        let parts: Vec<(String, Vec<u8>)> = (1..=3)
+            .map(|i| (format!("xl/worksheets/sheet{i}.xml"), worksheet_xml("")))
+            .collect();
+        let bytes = make_wired_xlsx("xl/", &sheets, &rels, &parts, None, false);
+        let doc = parse_xlsx_bytes_limited(
+            &bytes,
+            "empty.xlsx",
+            limits(usize::MAX, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect("premise: the workbook reads, with no chunk");
+        assert!(doc.chunks.is_empty());
+        let err = parse_xlsx_bytes_limited(
+            &bytes,
+            "empty.xlsx",
+            limits(usize::MAX, std::time::Duration::ZERO),
+        )
+        .expect_err("the sheet boundary checks the time");
+        assert!(
+            err.to_string()
+                .contains("xlsx text extraction exceeded 0 s after 1 sheet(s)"),
+            "{err}"
+        );
     }
 
     /// The read path goes through the same per-document guards: a workbook whose sheets all

@@ -45,9 +45,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   process.** calamine reserves the `uniqueCount` of `xl/sharedStrings.xml` before reading a
   string ([tafia/calamine#684](https://github.com/tafia/calamine/issues/684)), so a workbook of
   under 2 KB declaring 100,000,000,000 failed a multi-terabyte allocation. The decompression
-  preflight now refuses any `uniqueCount` above a fifth of `[index].max_decompressed_size` (a
-  shared string takes at least 5 bytes), or of the default 50 MiB when the key is
-  `"unlimited"`, before calamine opens the workbook.
+  preflight now refuses any `uniqueCount` above a fifth of the inflated size of the zip entry
+  it is written in (a shared string takes at least 5 bytes), before calamine opens the
+  workbook. The limit follows the file, not `[index].max_decompressed_size`, so raising the
+  key (or setting it to `"unlimited"`) does not raise it, and a form feed around the `=` does
+  not hide the attribute.
 
 ## [1.22.0] - 2026-10-31
 
