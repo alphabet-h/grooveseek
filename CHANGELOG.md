@@ -14,6 +14,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Documentation
+
+- **`groove service` flags explain themselves, and pages that had fallen behind the code are
+  corrected.** `groove service install --help` (and `uninstall` / `tray-install`) now describes
+  `--kb-path`, `--bind`, `--no-auto-start`, `--force`, `--i-know`, `--purge` and `--yes`, and
+  `docs/usage.md` says what `--no-auto-start` and `service install --force` do. `docs/ARCHITECTURE.md`
+  covers chunk-vector reuse, the once-per-format re-read, the embedder's counters and the
+  `code_chunk_policy` key; `CONTRIBUTING.md` counts the binary's test modules and the nightly legs
+  as they are and lists the source files it had missed. Smaller fixes: the docs badge names the real
+  host, two Japanese ADR paragraphs no longer start with `#`, and some lines are rewrapped (kuriya
+  #617, #618, #619, #622, #623, #628).
+
 ## [1.23.0] - 2026-10-31
 
 ### Changed
@@ -363,7 +375,7 @@ they land in a minor release and are called out here. Details are in the Securit
 
 - **Re-indexing a changed document re-embeds only the chunks whose text changed.** Chunks whose
   embedding input is unchanged keep their stored vectors, byte for byte; `groove index` reports
-  `this run: N embedded, M reused` after its chunk count, MCP `rebuild_index` returns
+  `(this run: N embedded, M reused)` after its chunk count, MCP `rebuild_index` returns
   `chunks_embedded` / `chunks_reused`, and the watcher's reindex line names the reused chunks.
   `--force` still recomputes everything. A run in which the endpoint refused a file's input and
   every other changed document was served from stored vectors now exits 1 (MCP: an `error`), since
@@ -468,10 +480,10 @@ they land in a minor release and are called out here. Details are in the Securit
   directory rename.** FSEvents reports every flag a path has collected, so a deletion arrived as a
   stale "created" followed by "removed", and the debouncer discarded the pair as a file created and
   deleted within its window; a rename was lost the same way. Removed or renamed documents stayed
-  searchable under their old paths until the next full index (the limitation noted in 1.20.3). The watcher now drops such stale events before the debouncer sees them. One case remains:
-  a directory renamed and then created again under its old name before the watcher handles the event
-  keeps its old rows until the next full index, because FSEvents does not say which end of a rename
-  a path is.
+  searchable under their old paths until the next full index (the limitation noted in 1.20.3). The
+  watcher now drops such stale events before the debouncer sees them. One case remains: a directory
+  renamed and then created again under its old name before the watcher handles the event keeps its
+  old rows until the next full index, because FSEvents does not say which end of a rename a path is.
 
 ### Security
 

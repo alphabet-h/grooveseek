@@ -151,6 +151,7 @@ groove serve --kb-path /path/to/knowledge-base --model bge-m3   # index 時と�
 groove serve --kb-path ... --model bge-m3 --reranker bge-v2-m3  # + cross-encoder 再ランク
 groove serve --kb-path ... --transport http --port 3100         # HTTP、複数クライアント
 groove serve --kb-path ... --no-watch                           # ライブ同期無効
+groove serve --kb-path ... --debounce-ms 2000                   # watcher の debounce (既定 500 ms)
 ```
 
 既定では stdio トランスポート (1 クライアント / サーバ) で MCP サーバを起動する。複数クライアントを同時接続するには `--transport http --port <PORT>` (または `--bind <SOCKETADDR>`) を渡し Streamable HTTP に切り替える — 詳細は [HTTP トランスポート (複数クライアント同時接続)](clients.ja.md#http-トランスポート-複数クライアント同時接続) 参照。loopback 外の `--bind` は、groove が認証を持たないため追加で `--i-know` が必要。Linux で `LISTEN_FDS` を渡す service manager (systemd、または同じ protocol を話すもの) がある環境では、`--systemd-socket` でその service manager が既に bind した待ち受け socket をそのまま受け取れる。`--bind` / `--port` とは同時に指定できず、socket が渡されていない場合は TCP に落ちずに起動に失敗する。abstract socket — 名前が `@` で始まる `ListenStream=` — も拒否する。`SocketMode=` を効かせるファイルが無いためである。他の OS 向けビルドはこのフラグ自体を拒否する。trusted config の `[transport.http].systemd_socket` も同じ扱いで、実効 transport が socket を受け取れない stdio に解決されたときは、キーを無視せず起動を拒否する。ただし自分で `--transport stdio` を指定した場合は例外で、その 1 回に限りその config を stdio で動かせる。
@@ -203,8 +204,10 @@ groove service status                              # default 'groove'
 groove service status --service-name personal      # 名前付き instance
 groove service list                                # 全 instance
 groove service uninstall --service-name personal               # unit のみ削除、config + DB 残す
-groove service uninstall --service-name personal --purge --yes # config + DB も削除
+groove service uninstall --service-name personal --purge --yes # config + .groove.db も削除
 ```
+
+`uninstall --purge --yes` が消すのは、その instance の config home (`groove.toml` とサービスのファイル) と、`kb_path` が指す `.groove.db` ファイル。隣の `.groove.db-wal` / `.groove.db-shm` は消さない。
 
 OS 別バックエンド:
 - **Linux**: systemd-user (`~/.config/systemd/user/groove-<name>.service`)。ログアウト後も daemon を生かしたい場合は `sudo loginctl enable-linger $USER` を実行。
@@ -214,6 +217,10 @@ OS 別バックエンド:
 Installer は config home を `<dirs::config_dir()>/groove/<service-name>/` に作成し、`groove.toml` (`kb_path` / `bind` 含む) を配置。base directory は `GROOVE_CONFIG_HOME` env var で override 可能。登録される launch line はこのファイルを `--config` で名指しする (v0.20.0+) ので、daemon は working directory から探し当てたものではなく installer が書いた config を読む。詳細は [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
 
 非 loopback の bind (例: `0.0.0.0:3100`) は groove が認証機構を持たないため `--i-know` 明示が必要。
+
+新規の install では、`--no-auto-start` はサービスを登録するが、その場でもログイン時にも起動しない: Linux では unit を書くが enable しない、macOS では plist の `RunAtLoad` と `KeepAlive` を false にして load しない、Windows では task のログオン trigger を無効のまま登録する。起動したい時は OS のサービス管理から手で起動する。既存の install に (`--force` で) 重ねた場合、Linux と macOS では既にある設定を外さない: Linux では unit を disable しないので、前に enable した unit はログイン時に起動し続け、動いている unit は新しい unit で再起動される。macOS では読み込み済みの agent には触れず、前の launch line のまま動き続け、変わるのはディスク上の plist だけ。Windows では新規の install と同じく、ログオン trigger を無効にした task に置き換える。
+
+`service install` は、インストール済みの instance (config home に既にある `groove.toml`、または既にある unit / plist / task) を上書きせずに止まる。`--force` を付けると両方を上書きする。既存の `groove.toml` は置き換えではなく書き換えで、`kb_path` と `[transport.http].bind` だけを書き直し、他の設定とコメントは残す。このとき `--kb-path` を省けば、既にある `kb_path` をそのまま使う。その `groove.toml` が TOML として壊れている、または `transport` / `[transport.http]` が table でない場合、`--force` でも上書きしない: サービスを登録する前に止まり、ファイルを手で直すよう求める。アップグレード後に既存のサービスへ新しい launch line を拾わせるのも `service install --force` の打ち直しで行う。`--with-tray` と併せると、既存の tray の自動起動エントリの確認も飛ばす。
 
 > **v0.7.x personal-http レシピからの移行**: `grooveseek/examples/deployments/personal-http/` のテンプレートは v0.8.0 で削除。手動 install 済の unit を `groove service install` 実行前に削除すること:
 > - Linux: `systemctl --user disable groove.service && rm ~/.config/systemd/user/groove.service`

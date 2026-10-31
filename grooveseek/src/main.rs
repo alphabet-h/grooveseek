@@ -390,14 +390,32 @@ enum ServiceSubcommand {
         /// Name this instance, so several knowledge bases can run side by side
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
+        /// Knowledge base directory the service indexes and serves. Stored
+        /// as an absolute path in the service's groove.toml. Optional on a
+        /// re-install with --force, where the existing groove.toml's
+        /// `kb_path` is kept
         #[arg(long)]
         kb_path: Option<PathBuf>,
+        /// HTTP bind address the daemon listens on (an IP and a port). A
+        /// non-loopback address is refused unless --i-know is also given
         #[arg(long, default_value = "127.0.0.1:3100")]
         bind: String,
+        /// On a new install, register the service without starting it now or
+        /// at login. Over an existing install (--force) it does not undo
+        /// auto-start already set up on Linux or macOS; see docs/usage.md
         #[arg(long)]
         no_auto_start: bool,
+        /// Overwrite an existing installation of this instance instead of
+        /// refusing: its service registration, and its groove.toml, where only
+        /// `kb_path` and the bind are rewritten and every other setting is
+        /// kept. A groove.toml it cannot parse stops the install, to be
+        /// repaired by hand. With --with-tray, also skips the check for an existing tray
+        /// autostart entry
         #[arg(long)]
         force: bool,
+        /// Acknowledge that --bind points at a non-loopback address. groove
+        /// has no authentication, so the bind address is the only access
+        /// control
         #[arg(long = "i-know")]
         i_know_non_loopback: bool,
         /// (Windows-only) Also install the groove-tray.exe shell:startup
@@ -417,8 +435,13 @@ enum ServiceSubcommand {
         // used to work.
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
+        /// Also delete the instance's config home (groove.toml and service
+        /// files) and the `.groove.db` file its `kb_path` names; the
+        /// `.groove.db-wal` / `-shm` sidecars are left in place. Irreversible;
+        /// refused unless --yes is also given
         #[arg(long)]
         purge: bool,
+        /// Confirm --purge. Has no effect without it
         #[arg(long)]
         yes: bool,
     },
@@ -438,6 +461,9 @@ enum ServiceSubcommand {
         /// Which installed instance the shortcut should start
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
+        /// Skip the check that refuses when this instance already has a tray
+        /// autostart entry (a shell:startup shortcut, an HKCU Run value or a
+        /// scheduled task); the shortcut is written over
         #[arg(long)]
         force: bool,
     },

@@ -48,7 +48,7 @@ admin は同じ文から接頭辞を落としたもの。さらに **groove 自�
 同一ではなかった** — `healthz_host_check` は HTTP/2 の `:authority` fallback を
 読み、`admin_host_check` は読まない。
 
-#193 のコードレビューはこの一般形を 2 度指摘し、`Origin` matcher の統合を求めた。
+PR #193 のコードレビューはこの一般形を 2 度指摘し、`Origin` matcher の統合を求めた。
 調査して分かったのはより有用な事実で、**実在する食い違いは `Host` 側**だった —
 `Origin` だけ統合すれば、**一致している方を直して、していない方を残す**ことになる。
 
