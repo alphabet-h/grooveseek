@@ -34,8 +34,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   The purge now holds the index's writer lock from before it lists the files until the config
   home is gone, waiting up to 10 seconds for a server the backend has told to stop (Windows'
   `schtasks /End` does not wait for it to exit); a process still holding the lock after that
-  leaves the database and the config home in place, and the command fails saying to run it again
-  once that process has exited. It used to delete while such a server could still put a `-wal`
+  leaves the database and the config home in place, and the command fails naming that process's
+  pid and role and saying to stop it (`taskkill /PID <pid>` on Windows, `kill <pid>` on Linux /
+  macOS) and run it again. A lock file that cannot be created or opened at all (permissions, a
+  read-only or network filesystem) has no holder to wait for: the purge warns and deletes without
+  the lock, as before. It used to delete while such a server could still put a `-wal`
   back, then delete the config home that named it. The files removed are named from the database
   path resolved once, the directory symlinks and junctions above it included, so a directory link
   repointed during the purge no longer moves the removal to another database, and a `.groove.db`

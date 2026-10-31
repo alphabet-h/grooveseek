@@ -439,9 +439,9 @@ enum ServiceSubcommand {
         /// files) and the `.groove.db` its `kb_path` names, with its
         /// `.groove.db-wal` / `-shm` sidecars. Irreversible; refused unless
         /// --yes is also given. While a groove process still holds the
-        /// index's writer lock, neither is deleted: the command waits a few
-        /// seconds for it to exit, then stops with an error saying to run it
-        /// again
+        /// index's writer lock, neither is deleted: the command waits up to
+        /// 10 seconds for it to exit, then stops with an error naming its pid;
+        /// stop that process and run the command again
         #[arg(long)]
         purge: bool,
         /// Confirm --purge. Has no effect without it
