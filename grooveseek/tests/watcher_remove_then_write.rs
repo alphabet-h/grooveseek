@@ -292,7 +292,8 @@ const EDITED_VERIFY: &str =
 /// no removal, no rename -- and require the reindex to embed that one chunk and reuse the stored
 /// vectors of the others (feature-69). The removal path's reuse is pinned by
 /// [`a_file_removed_and_written_again_is_reindexed_with_its_vectors_reused`]; this one walks
-/// `dispatch_reindex` -> `reindex_after_write_locked` and edits a section instead of adding one.
+/// `dispatch_reindex` -> `reindex_after_write_locked` (private, in [`grooveseek::watcher`]) and
+/// edits a section instead of adding one.
 ///
 /// Not on macOS: FSEvents folds and reorders events there (kuriya traps #525 / #591), so how
 /// many reindexes an in-place write produces, and what each one finds stored, is not what this
