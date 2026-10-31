@@ -408,7 +408,8 @@ enum ServiceSubcommand {
         /// Overwrite an existing installation of this instance instead of
         /// refusing: its service registration, and its groove.toml, where only
         /// `kb_path` and the bind are rewritten and every other setting is
-        /// kept. With --with-tray, also skips the check for an existing tray
+        /// kept. A groove.toml it cannot parse stops the install, to be
+        /// repaired by hand. With --with-tray, also skips the check for an existing tray
         /// autostart entry
         #[arg(long)]
         force: bool,
@@ -435,8 +436,9 @@ enum ServiceSubcommand {
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
         /// Also delete the instance's config home (groove.toml and service
-        /// files) and the index database (.groove.db) its `kb_path` names.
-        /// Irreversible; refused unless --yes is also given
+        /// files) and the `.groove.db` file its `kb_path` names; the
+        /// `.groove.db-wal` / `-shm` sidecars are left in place. Irreversible;
+        /// refused unless --yes is also given
         #[arg(long)]
         purge: bool,
         /// Confirm --purge. Has no effect without it

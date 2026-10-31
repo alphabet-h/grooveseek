@@ -215,8 +215,10 @@ groove service status                              # default 'groove'
 groove service status --service-name personal      # a named instance
 groove service list                                # all instances
 groove service uninstall --service-name personal               # remove unit, keep config + DB
-groove service uninstall --service-name personal --purge --yes # also remove config + DB
+groove service uninstall --service-name personal --purge --yes # also remove config + .groove.db
 ```
+
+`uninstall --purge --yes` deletes the instance's config home (`groove.toml` and the service files) and the `.groove.db` file its `kb_path` names. The `.groove.db-wal` / `.groove.db-shm` files beside it are not deleted.
 
 OS-specific backends:
 - **Linux**: systemd-user (`~/.config/systemd/user/groove-<name>.service`). Run `sudo loginctl enable-linger $USER` to keep the daemon running after logout.
@@ -229,7 +231,7 @@ Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since groov
 
 On a new install, `--no-auto-start` registers the service without starting it, now or at login: on Linux the unit is written but not enabled, on macOS the plist sets `RunAtLoad` and `KeepAlive` to false and is not loaded, and on Windows the task's logon trigger is registered disabled. Start it by hand from the OS service manager when you want it. Over an existing install (with `--force`) it does not undo what is already set up on Linux or macOS: on Linux the unit is not disabled, so a unit enabled before still starts at login, and a running one is restarted on the new unit; on macOS an agent already loaded is left as it is, still running the previous launch line, and only the plist on disk changes. On Windows the task is replaced with its logon trigger disabled, as on a new install.
 
-`service install` refuses to overwrite an instance that is already installed — an existing `groove.toml` in its config home, or an existing unit / plist / task. `--force` overwrites both instead. The existing `groove.toml` is edited rather than replaced: only `kb_path` and `[transport.http].bind` are rewritten, and every other setting and comment is kept; `--kb-path` may then be left out to keep the `kb_path` already there. Re-running `service install --force` is how an existing service picks up a new launch line after an upgrade. With `--with-tray`, `--force` also skips the check for an existing tray autostart entry.
+`service install` refuses to overwrite an instance that is already installed — an existing `groove.toml` in its config home, or an existing unit / plist / task. `--force` overwrites both instead. The existing `groove.toml` is edited rather than replaced: only `kb_path` and `[transport.http].bind` are rewritten, and every other setting and comment is kept; `--kb-path` may then be left out to keep the `kb_path` already there. If that `groove.toml` is not valid TOML, or its `transport` / `[transport.http]` is not a table, `--force` does not overwrite it: the install stops before the service is registered and asks you to repair the file by hand. Re-running `service install --force` is how an existing service picks up a new launch line after an upgrade. With `--with-tray`, `--force` also skips the check for an existing tray autostart entry.
 
 > **Migration from v0.7.x personal-http recipe**: The `grooveseek/examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `groove service install`:
 > - Linux: `systemctl --user disable groove.service && rm ~/.config/systemd/user/groove.service`
