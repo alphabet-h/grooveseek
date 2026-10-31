@@ -14,6 +14,45 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **`groove service uninstall --purge --yes` deletes the `.groove.db-wal` / `.groove.db-shm`
+  beside the index database.** It removed `.groove.db` alone, so the WAL, which holds committed
+  pages not yet checkpointed into the database, stayed on disk with part of the index; and when
+  `.groove.db` itself was already gone, the sidecars were not looked at. The three files are now
+  removed `-shm` first and the database last, so a file that will not go leaves the database whole.
+  Every file is named on stderr as removed or left in place, and the purge goes on to the config
+  home as before. `.groove.db.writer-lock`, `.groove.db.writer.json` and `.groove.db.replace-lock`
+  are kept and named when present: they hold no index content, and the writer lock is never
+  deleted ([ADR-0031](docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)) (kuriya #645).
+  A leftover `.groove.db.writer.json.tmp-<pid>` is named too. When `.groove.db` is a symlink, the
+  purge now removes the file it points to with the `-wal` / `-shm` beside it, then the link; it
+  used to remove the link alone and say the database was removed. A relative `kb_path` is read
+  against the config home, as the server reads it, not against the directory `uninstall` runs
+  in. When the database cannot be located (a `kb_path` that is a filesystem root, or a
+  `groove.toml` that is there but cannot be read), the purge used to skip the database without a
+  word and then delete the config home, the only record of where the database was; it now
+  deletes nothing more and fails, naming the reason, the config home and its `groove.toml`, and
+  saying to fix `groove.toml` and run it again or delete the database and the config home by hand.
+  A config home with no `groove.toml` at all names no database, so it is removed alone with a
+  warning. `groove.toml` is read the
+  way the server reads its `--config`: over the 1 MiB config limit, or not a regular file (a named
+  pipe or a device in its place), it is not read and counts as a config that cannot be read.
+  The purge now holds the index's writer lock from before it lists the files until the config
+  home is gone, waiting up to 10 seconds for a server the backend has told to stop (Windows'
+  `schtasks /End` does not wait for it to exit); a process still holding the lock after that
+  leaves the database and the config home in place, and the command fails naming that process's
+  pid and role as `.groove.db.writer.json` records them (when it can be read; the record can be
+  stale, so the pid may be an earlier holder's, reused since) and saying to confirm the pid is
+  groove first (`tasklist /FI "PID eq <pid>"` on Windows, `ps -p <pid>` on Linux / macOS),
+  stop it only if it is (`taskkill /PID <pid>`, `kill <pid>`), and run it again. A lock file that cannot be created or opened at all (permissions, a
+  read-only or network filesystem) has no holder to wait for: the purge warns and deletes without
+  the lock, as before. It used to delete while such a server could still put a `-wal`
+  back, then delete the config home that named it. The files removed are named from the database
+  path resolved once, the directory symlinks and junctions above it included, so a directory link
+  repointed during the purge no longer moves the removal to another database, and a `.groove.db`
+  symlink repointed meanwhile is left in place with a warning.
+
 ### Documentation
 
 - **`groove service` flags explain themselves, and pages that had fallen behind the code are
