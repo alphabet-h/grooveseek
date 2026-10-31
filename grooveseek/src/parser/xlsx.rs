@@ -153,6 +153,13 @@ struct XlsxLimits {
     /// 展開 budget (`[index].max_decompressed_size`)。preflight と frontmatter が使う。
     decompressed_budget: u64,
     /// 文書全体のテキスト上限。超えたら `Err` (file ごと skip)。本番は展開 budget と同じ値。
+    ///
+    /// 約束するのは、出す chunk の保存される見出し (`Sheet: ` を含む `Chunk.heading`) と本文
+    /// (`Chunk.content`) と、`raw_content` で本文の間に入る区切り
+    /// ([`super::CHUNK_BODY_SEPARATOR`]) の合計がこれ以下であること。context (見出しから作る
+    /// パンくず) は数えない。読み途中のシートはセルごとに、それまでに出した chunk の合計 +
+    /// 読み途中のテキスト (改行込み) で判定し、見出しと区切りはそのシートが chunk を出すと
+    /// 決まった後に足す。
     doc_text_cap: usize,
     /// 文書 1 本の実時間上限。超えたら `Err`。本番は
     /// [`super::pdf::PDF_DOC_EXTRACT_TIMEOUT`] (PDF と同じ 120 秒)。
@@ -256,8 +263,8 @@ fn parse_xlsx_bytes_capped(
 /// - シート 1 枚: [`SHEET_MAX_BYTES`] をセル単位で (truncate)
 /// - 文書全体のテキスト: [`XlsxLimits::doc_text_cap`] をセル単位で (`Err`)。共有文字列はセルから
 ///   何度でも参照できるので、出力テキストは入力の大きさに比例しない。重複の無い 200 枚の part が
-///   それぞれ同じ 1 MiB の共有文字列を参照するだけで 200 MiB になった (`distinct200`)。各 chunk の
-///   見出しの名前の部分 (最大 [`SHARED_PART_LABEL_MAX_BYTES`]) もここに数える
+///   それぞれ同じ 1 MiB の共有文字列を参照するだけで 200 MiB になった (`distinct200`)。何を数えるかは
+///   [`XlsxLimits::doc_text_cap`] (出した chunk の見出しと本文と区切り)
 /// - 実時間: [`XlsxLimits::timeout`] を、preflight の展開の読み出しごと (8 KiB)、
 ///   [`resolve_sheet_parts`] の entry 名と XML の event ごと、workbook を開く段の境目、セルごと、
 ///   シートの境目ごとに (`Err`)。テキストを出さない part を重複させずに並べる形 (出力ゼロのまま
@@ -358,10 +365,6 @@ fn extract_xlsx_workbook(
 
     for (name, aliases) in groups {
         let label = shared_part_label(name, &aliases);
-        // 見出し (シート名の部分) も文書のテキストに数える。chunk ごとに最大
-        // [`SHARED_PART_LABEL_MAX_BYTES`] 付くので、テキストの少ないシートを大量に並べた file では
-        // 見出しの方が本文より大きくなり得る (別名の分だけを数えていた前の版では漏れていた)。
-        guard.used = guard.used.saturating_add(label.len());
         guard.check(0)?;
         guard.sheets += 1;
         let extracted = extract_xlsx_sheet_text_streaming(
@@ -378,11 +381,27 @@ fn extract_xlsx_workbook(
             // (旧実装の `worksheet_range()` エラー時と同じ挙動)。
             continue;
         };
-        guard.used = guard.used.saturating_add(text.len());
         if text.trim().is_empty() {
-            continue; // 空シートは chunk を作らない
+            continue; // 空シートは chunk を作らない (出さないものは数えない)
         }
-        chunks.push(super::sheet_chunk(chunks.len(), title, &label, &text));
+        let chunk = super::sheet_chunk(chunks.len(), title, &label, &text);
+        drop(text);
+        // 文書のテキストの約束 ([`XlsxLimits::doc_text_cap`]) は、出す chunk の保存される見出し
+        // (`Sheet: ` を含む) と本文、`raw_content` で本文の間に入る区切りの合計。出すと決めた
+        // chunk だけをここで数える。
+        let separator = if chunks.is_empty() {
+            0
+        } else {
+            super::CHUNK_BODY_SEPARATOR.len()
+        };
+        let heading = chunk.heading.as_deref().map_or(0, str::len);
+        guard.used = guard
+            .used
+            .saturating_add(separator)
+            .saturating_add(heading)
+            .saturating_add(chunk.content.len());
+        guard.check(0)?;
+        chunks.push(chunk);
     }
     if same_name > 0 || aliased > 0 {
         eprintln!(
@@ -487,10 +506,15 @@ fn extract_xlsx_sheet_text_streaming(
 }
 
 /// 文書 1 本の抽出に掛ける上限 (テキスト量と実時間) の帳簿。[`parse_xlsx_bytes_limited`] が
-/// 持ち、シートを読み終えるごとに `used` を足す。
+/// 持ち、chunk を出すと決めるごとに `used` を足す。
+///
+/// 時間の上限は、groove が判定を挟める所 (preflight の展開、sheet の解決、段の境目、セル、
+/// シート) でしか効かない。zip の central directory を開く処理と `calamine::Xlsx::new` の内側は
+/// 縛れず、そこを縛るのは preflight の展開 budget だけなので、`[index].max_decompressed_size` が
+/// `"unlimited"` の時は、その内側は時間でも展開量でも縛られない (運用者が展開量の守りを外す設定)。
 struct DocumentGuard<'a> {
     path_hint: &'a str,
-    /// 読み終えたシートのテキストの合計 (bytes)。
+    /// 出すと決めた chunk の見出し・本文・区切りの合計 (bytes。[`XlsxLimits::doc_text_cap`])。
     used: usize,
     /// 文書全体のテキスト上限。
     cap: usize,
@@ -2935,18 +2959,30 @@ mod tests {
         }
     }
 
-    /// AX-03 P2: three sheets of `"aaaa\n"` (5 bytes each) under headings `S1`..`S3` (2 bytes
-    /// each, counted since the codex review of fd695ec) fit a 21-byte document budget exactly
-    /// (the boundary test in [`crate::parser::pdf`] has the same shape).
+    /// What the document budget promises (codex review of 81f0999): the stored headings, the
+    /// chunk bodies and the separators `raw_content` puts between them.
+    fn promised_bytes(doc: &ParsedDocument) -> usize {
+        let headings: usize = doc
+            .chunks
+            .iter()
+            .map(|c| c.heading.as_deref().map_or(0, str::len))
+            .sum();
+        headings + doc.raw_content.len()
+    }
+
+    /// AX-03 P2: three sheets `S1`..`S3` of one cell `aaaa` store 3 x `Sheet: Sx` (27 bytes)
+    /// and a raw content of `aaaa\n\naaaa\n\naaaa` (16 bytes): they fit a 43-byte budget
+    /// exactly (the boundary test in [`crate::parser::pdf`] has the same shape).
     #[test]
     fn test_xlsx_document_text_budget_admits_exactly_the_budget() {
         let doc = parse_xlsx_bytes_limited(
             &three_small_sheets(),
             "three.xlsx",
-            limits(21, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+            limits(43, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
         )
-        .expect("15 bytes of text and 6 of headings fit a 21-byte budget");
+        .expect("43 bytes of headings, bodies and separators fit a 43-byte budget");
         assert_eq!(doc.chunks.len(), 3);
+        assert_eq!(promised_bytes(&doc), 43, "the budget counts what is stored");
     }
 
     /// ...and one byte less is refused, naming the budget and how to raise it.
@@ -2955,13 +2991,51 @@ mod tests {
         let err = parse_xlsx_bytes_limited(
             &three_small_sheets(),
             "three.xlsx",
-            limits(20, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+            limits(42, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
         )
-        .expect_err("21 bytes do not fit 20");
+        .expect_err("43 bytes do not fit 42");
         assert_eq!(
             err.to_string(),
-            "three.xlsx: extracted text exceeds 20 bytes across 3 sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)"
+            "three.xlsx: extracted text exceeds 42 bytes across 3 sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)"
         );
+    }
+
+    /// Codex review of 81f0999: a sheet that yields no chunk (empty, or unreadable) adds
+    /// nothing to the budget -- its heading is not stored, so it is not counted. A one-letter
+    /// sheet name around empty sheets fits exactly what it stores.
+    #[test]
+    fn test_xlsx_document_text_budget_counts_only_the_chunks_it_emits() {
+        let sheets = owned_pairs((1..=4).map(|i| (format!("E{i}"), format!("rId{i}"))));
+        let sheets = {
+            let mut sheets = sheets;
+            sheets.push(("A".to_string(), "rId5".to_string()));
+            sheets
+        };
+        let rels =
+            owned_pairs((1..=5).map(|i| (format!("rId{i}"), format!("worksheets/sheet{i}.xml"))));
+        let mut parts: Vec<(String, Vec<u8>)> = (1..=4)
+            .map(|i| (format!("xl/worksheets/sheet{i}.xml"), worksheet_xml("")))
+            .collect();
+        parts.push((
+            "xl/worksheets/sheet5.xml".to_string(),
+            one_cell_worksheet("x"),
+        ));
+        let bytes = make_wired_xlsx("xl/", &sheets, &rels, &parts, None, false);
+        // `Sheet: A` (8) + `x` (1).
+        let doc = parse_xlsx_bytes_limited(
+            &bytes,
+            "empty.xlsx",
+            limits(9, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect("the empty sheets' headings are not counted");
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(promised_bytes(&doc), 9);
+        parse_xlsx_bytes_limited(
+            &bytes,
+            "empty.xlsx",
+            limits(8, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect_err("one byte over is refused");
     }
 
     /// The wall-clock backstop: a zero timeout stops the extraction with the guard's error.
@@ -3470,9 +3544,8 @@ mod tests {
         .expect("parse");
         assert_eq!(doc.chunks.len(), SHEETS, "the fallback reads every sheet");
 
-        // Each sheet yields "aaaa\n" (5 bytes) under a 2-byte heading (`S0`..`S9`): 7 bytes a
-        // sheet, so seven sheets take 49 bytes and the eighth heading crosses a 50-byte budget,
-        // before that sheet is opened.
+        // Each chunk stores `Sheet: Sx` (9 bytes) and `aaaa` (4), with a 2-byte separator from
+        // the second on: 13, 28, 43, then 58 crosses a 50-byte budget at the fourth sheet.
         let err = parse_xlsx_bytes_limited(
             &bytes,
             "ghost.xlsx",
@@ -3481,7 +3554,7 @@ mod tests {
         .expect_err("the document budget does not depend on the copy");
         assert_eq!(
             err.to_string(),
-            "ghost.xlsx: extracted text exceeds 50 bytes across 7 sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)"
+            "ghost.xlsx: extracted text exceeds 50 bytes across 4 sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)"
         );
     }
 

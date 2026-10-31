@@ -492,8 +492,12 @@ pub(crate) fn join_chunk_bodies(chunks: &[Chunk]) -> String {
         .iter()
         .map(|c| c.content.as_str())
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join(CHUNK_BODY_SEPARATOR)
 }
+
+/// What [`join_chunk_bodies`] puts between two chunk bodies. The `.xlsx` parser counts it
+/// toward a workbook's text budget, so it reads the same constant rather than a copy.
+pub(crate) const CHUNK_BODY_SEPARATOR: &str = "\n\n";
 
 /// (AU-33) One spreadsheet sheet as a chunk.
 ///
