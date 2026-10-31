@@ -281,3 +281,74 @@ fn a_file_cut_down_to_its_frontmatter_in_place_is_deindexed() {
         "---\ntitle: Runbook\n---\n",
     );
 }
+
+/// The body that replaces the `Verify` section's in
+/// [`the_watcher_sends_only_the_edited_chunk_and_names_the_reused_ones`].
+#[cfg(not(target_os = "macos"))]
+const EDITED_VERIFY: &str =
+    "Run the smoke check against the canary endpoint and diff the latency charts.";
+
+/// (kuriya 606, AX-07) Edit one section's body in place -- the same file truncated and written,
+/// no removal, no rename -- and require the reindex to embed that one chunk and reuse the stored
+/// vectors of the others (feature-69). The removal path's reuse is pinned by
+/// [`a_file_removed_and_written_again_is_reindexed_with_its_vectors_reused`]; this one walks
+/// `dispatch_reindex` -> `reindex_after_write_locked` and edits a section instead of adding one.
+///
+/// Not on macOS: FSEvents folds and reorders events there (kuriya traps #525 / #591), so how
+/// many reindexes an in-place write produces, and what each one finds stored, is not what this
+/// test pins. The reuse planning itself is the same code on every OS.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn the_watcher_sends_only_the_edited_chunk_and_names_the_reused_ones() {
+    let (fx, guard) = served_runbook("ax07-edit");
+    let before = fx.mock.requests().len();
+
+    let mut sections = SECTIONS.to_vec();
+    sections[2].1 = EDITED_VERIFY;
+    // `std::fs::write` truncates and writes the same file: a modify, not a remove and create.
+    std::fs::write(fx.kb().join(RUNBOOK), runbook(&sections)).expect("edit the runbook");
+
+    let reindexed = wait_until(Duration::from_secs(30), || {
+        stderr_lines(&guard)
+            .iter()
+            .any(|l| l.contains("watcher: reindexed runbook.md"))
+    });
+    let lines = stderr_lines(&guard);
+    assert!(
+        reindexed,
+        "no `watcher: reindexed runbook.md` line:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("watcher: deindexed runbook.md") || l.contains(NOT_INDEXED_LINE)),
+        "an in-place edit went down the removal path:\n{}",
+        lines.join("\n")
+    );
+    let line = lines
+        .iter()
+        .find(|l| l.contains("watcher: reindexed runbook.md"))
+        .expect("checked above");
+    let expected = format!("({} chunks, {} reused)", SECTIONS.len(), SECTIONS.len() - 1);
+    assert!(
+        line.contains(&expected),
+        "the unedited sections were not reused, want `{expected}`: {line}\n{}",
+        lines.join("\n")
+    );
+
+    let sent: Vec<String> = fx
+        .requests_since(before)
+        .iter()
+        .filter(|r| r.model() == Some(DOC_MODEL))
+        .flat_map(|r| r.inputs())
+        .collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "only the edited section is embedded: {sent:?}"
+    );
+    assert!(sent[0].contains(EDITED_VERIFY), "{sent:?}");
+    drop(guard);
+    assert_eq!(fx.documents(), 1, "the edited document is not indexed");
+}
