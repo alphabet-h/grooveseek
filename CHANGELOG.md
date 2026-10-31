@@ -24,7 +24,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `code_chunk_policy` key; `CONTRIBUTING.md` counts the binary's test modules and the nightly legs
   as they are and lists the source files it had missed. Smaller fixes: the docs badge names the real
   host, two Japanese ADR paragraphs no longer start with `#`, and some lines are rewrapped (kuriya
-  617, 618, 619, 622, 623, 628).
+  #617, #618, #619, #622, #623, #628).
 
 ## [1.23.0] - 2026-10-31
 

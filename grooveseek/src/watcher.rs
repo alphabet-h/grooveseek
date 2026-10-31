@@ -632,8 +632,8 @@ fn is_ignore_file(kb_path: &Path, p: &Path) -> bool {
 
 /// (feature-49) `.grooveignore` が書き換わったら判定器を組み直す。
 ///
-/// `&mut` で済むのは `WatcherState` を所有しているのが [`run_watch_loop`] 1 本
-/// だけだから。ロックを足さずに済むこの形が一番強い排他で、BU-32 の
+/// `&mut` で済むのは `WatcherState` を所有しているのが [`run_watch_loop_until`]
+/// 1 本だけだから ([`run_watch_loop`] はそれに state を渡すだけ)。ロックを足さずに済むこの形が一番強い排他で、BU-32 の
 /// 「並行の不変条件は論証でなく排他で閉じる」をコストゼロで満たす。
 ///
 /// **効くのはこれ以降のイベントだけ**。すでに index に入っている文書は次の

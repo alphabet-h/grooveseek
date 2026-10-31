@@ -400,8 +400,9 @@ enum ServiceSubcommand {
         /// non-loopback address is refused unless --i-know is also given
         #[arg(long, default_value = "127.0.0.1:3100")]
         bind: String,
-        /// Register the service without starting it now or at login. It
-        /// can still be started by hand from the OS service manager
+        /// On a new install, register the service without starting it now or
+        /// at login. Over an existing install (--force) it does not undo
+        /// auto-start already set up on Linux or macOS; see docs/usage.md
         #[arg(long)]
         no_auto_start: bool,
         /// Overwrite an existing installation of this instance instead of

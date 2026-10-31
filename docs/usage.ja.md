@@ -216,7 +216,7 @@ Installer は config home を `<dirs::config_dir()>/groove/<service-name>/` に�
 
 非 loopback の bind (例: `0.0.0.0:3100`) は groove が認証機構を持たないため `--i-know` 明示が必要。
 
-`--no-auto-start` はサービスを登録するが、その場でもログイン時にも起動しない: Linux では unit を書くが enable しない、macOS では plist の `RunAtLoad` と `KeepAlive` を false にして load しない、Windows では task のログオン trigger を無効のまま登録する。起動したい時は OS のサービス管理から手で起動する。
+新規の install では、`--no-auto-start` はサービスを登録するが、その場でもログイン時にも起動しない: Linux では unit を書くが enable しない、macOS では plist の `RunAtLoad` と `KeepAlive` を false にして load しない、Windows では task のログオン trigger を無効のまま登録する。起動したい時は OS のサービス管理から手で起動する。既存の install に (`--force` で) 重ねた場合、Linux と macOS では既にある設定を外さない: Linux では unit を disable しないので、前に enable した unit はログイン時に起動し続け、動いている unit は新しい unit で再起動される。macOS では読み込み済みの agent には触れず、前の launch line のまま動き続け、変わるのはディスク上の plist だけ。Windows では新規の install と同じく、ログオン trigger を無効にした task に置き換える。
 
 `service install` は、インストール済みの instance (config home に既にある `groove.toml`、または既にある unit / plist / task) を上書きせずに止まる。`--force` を付けると両方を上書きする。既存の `groove.toml` は置き換えではなく書き換えで、`kb_path` と `[transport.http].bind` だけを書き直し、他の設定とコメントは残す。このとき `--kb-path` を省けば、既にある `kb_path` をそのまま使う。アップグレード後に既存のサービスへ新しい launch line を拾わせるのも `service install --force` の打ち直しで行う。`--with-tray` と併せると、既存の tray の自動起動エントリの確認も飛ばす。
 
