@@ -177,7 +177,7 @@ fn purge_under_writer_lock(
 /// the main file alone left them on disk.
 ///
 /// Called from [`purge_under_writer_lock`] with the index's writer lock held,
-/// so no process that writes under the lock (`index`, a server's watcher or
+/// so no process that writes under the lock (`groove index`, a server's watcher or
 /// rebuild, a reader's one-time write) can put a file back between the
 /// listing, the removal and the last check below; or, when the lock could not
 /// be taken at all, after a warning that says so.
@@ -1091,7 +1091,7 @@ mod tests {
 
     /// kuriya #645 review (I1). The backend stops a server without waiting
     /// for it to exit, so purge waits for the writer lock before it gives up.
-    /// [`hold_writer_lock`] is called directly: through `run_with_backend`,
+    /// [`hold_writer_lock`] is called directly: through [`super::run_with_backend`],
     /// the Windows tray cleanup before it can take longer than the hold below,
     /// and the test would pass without waiting.
     #[test]
