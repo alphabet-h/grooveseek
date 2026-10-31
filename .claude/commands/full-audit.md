@@ -13,8 +13,8 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 ## 前提
 
 - `.dev/knowledge/` の運用ルールと、「audit は kuriya の親子で持ち、大改修の cycle は今まで通り Markdown」の方針
-  (共有 rules の `workflow.md`、「新 feature の流れ」節) が有効
-- kuriya の MCP (`mcp__kuriya__capture` / `find` / `report`) が使えること。使えなければ Phase 3-2 の手前で止まり、user に伝える
+  (`CLAUDE.local.md` が import する `../grooveseek-shared/rules/workflow.md`、「新 feature の流れ」節) が有効
+- kuriya の MCP (`mcp__kuriya__capture` / `find` / `report`) が使えること。使えなければ Phase 0 で止まり、user に伝える
 - subagent type: `feature-dev:code-reviewer` (plugin `feature-dev` の agent で、`.claude/agents/` には無い) と `general-purpose` が available。4 軸とも `model: opus` を明示して起動する。`/next-work` Phase 2 の表は**作業の種類で行を引く** — 4 軸はどれもレビューなので `opus` の行で、
   `general-purpose` で起動する軸も `opus` (表の `sonnet` / `general-purpose` はテスト実行の行。fallback は「`general-purpose` + 元の行の `model` を明示」)。
   **project agent の `reviewer` はここでは使わない** — `maxTurns: 40` (`.claude/agents/reviewer.md:6`) は diff のレビューに合わせた上限で、tree 全体の監査では尽きる恐れがある。
@@ -26,9 +26,14 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 ## 実行フロー
 
-### Phase 0 — Scope 確認
+### Phase 0 — 前の audit 親の確認と Scope 確認
 
-1 行で確認する:
+**最初に前の audit 親を確かめる** (subagent を出す前、audit ノートを書く前)。kuriya の直前の audit 親
+(`mcp__kuriya__find` で `audit-<YYYY-MM-DD>` tag の子を引き、その `parent_id`。2026-10-22 分は task #536) の下に
+`release-blocker` か high の未了 (`open` / `doing` / `pending`) の子が残っていたら、**ここで止まり、新しい audit は回さない**
+(`.dev/release-checklist.md` の「release 後の full-audit」節)。残っている子の番号を user に示して終わる。
+
+通ったら 1 行で確認する:
 
 > Audit を始めます。対象ブランチは `main` で、4 軸 (コード品質 / セキュリティ / テスト / docs) の並列 subagent でよいですか? 軸の追加・削除や対象範囲の限定があれば教えてください。
 
@@ -255,8 +260,8 @@ kuriya へ起票する前に、ここに当たるものは指摘された場所�
 Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10-22 まで) は
 `.dev/archive/2026-10-22-cycle/` で凍結し、その未了は kuriya の task #536 の子へ移した。
 
-1. **前の親を確かめる** — 前の audit 親に `release-blocker` / high の未了の子が残っていたら、新しい audit は回さない
-   (`.dev/release-checklist.md` の「release 後の full-audit」節)。low / medium の未了は、新しい親へ移すか前の親に残すかをここで決める
+1. **前の親の残りを決める** — 前の audit 親に残った low / medium の未了は、新しい親へ移すか前の親に残すかをここで決める
+   (`release-blocker` / high の未了が残っていれば Phase 0 で止まっているので、ここには来ない)
 2. **親を 1 つ作る** — `mcp__kuriya__capture` に `kind: issue`、title `full-audit YYYY-MM-DD`、
    body に出典 (Phase 3-1 の `.dev/knowledge/review-YYYY-MM-DD-full-audit.md`、対象 commit) と ID の接頭辞
 3. **指摘ごとに子 task を作る** — `capture` に `kind: task`・`parent_id: <親の番号>`。
@@ -316,6 +321,7 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
 
 ## 関連
 
-- 共有 rules の `knowledge-notes.md` (`.dev/knowledge/` への書き込み) と `workflow.md` (audit と cycle の置き場)
+- `CLAUDE.local.md` が import する `../grooveseek-shared/rules/knowledge-notes.md` (`.dev/knowledge/` への書き込み) と
+  `../grooveseek-shared/rules/workflow.md` (audit と cycle の置き場)。どちらも owner 側の private repo で、公開 repo の checkout には無い
 - `.dev/release-checklist.md` の「release 直前の確認」節と「release 後の full-audit」節
 - `.dev/feature-ideas.md` の「優先度ピック」 (= 既知の長期計画)、本コマンドが登録する todo は実装可能性の高い具体 issue
