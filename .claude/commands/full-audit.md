@@ -260,10 +260,11 @@ kuriya へ起票する前に、ここに当たるものは指摘された場所�
 Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10-22 まで) は
 `.dev/archive/2026-10-22-cycle/` で凍結し、その未了は kuriya の task #536 の子へ移した。
 
-1. **前の親の残りを決める** — 前の audit 親に残った low / medium の未了は、新しい親へ移すか前の親に残すかをここで決める
-   (`release-blocker` / high の未了が残っていれば Phase 0 で止まっているので、ここには来ない)
-2. **親を 1 つ作る** — `mcp__kuriya__capture` に `kind: issue`、title `full-audit YYYY-MM-DD`、
+1. **親を 1 つ作る** — `mcp__kuriya__capture` に `kind: issue`、title `full-audit YYYY-MM-DD`、
    body に出典 (Phase 3-1 の `.dev/knowledge/review-YYYY-MM-DD-full-audit.md`、対象 commit) と ID の接頭辞
+2. **前の親の残りを付け替えるか決める** — 前の audit 親に残った low / medium の未了を、新しい親へ移すか前の親に残すかを決める
+   (`release-blocker` / high の未了が残っていれば Phase 0 で止まっているので、ここには来ない)。移すものは
+   `mcp__kuriya__update` に `item_id` と `parent_id: <新しい親の番号>` を渡して付け替える (木は 4 段まで。audit の子は 2 段目なので収まる)
 3. **指摘ごとに子 task を作る** — `capture` に `kind: task`・`parent_id: <親の番号>`。
    - title: `<接頭辞>-NN: 要旨` (接頭辞は audit ごとに決める。`AU` / `BU` … の続き)
    - priority: 重大度 (Critical → `highest`、High → `high`、Medium → `medium`、Low → `low`、Info → `lowest`)
