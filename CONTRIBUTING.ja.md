@@ -31,7 +31,7 @@ cargo test -p grooveseek --lib <name>  # 名前指定で 1 本だけ実行 (work
 ```
 
 **`--lib` は `main.rs` も除外する。** バイナリ側にも `#[cfg(test)]` モジュールが
-3 つあり (CLI 表面のテストはそちら)、`--lib` では 1 本も走らない。そちらは
+4 つあり (CLI 表面のテストはそちら)、`--lib` では 1 本も走らない。そちらは
 `--bin groove` で拾う。どのターゲットにあるか分からない時は、絞り込みを外して
 `cargo test <name>` に全部を探させる。
 
@@ -75,10 +75,18 @@ intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.
 - `grooveseek/src/mmr.rs` — MMR 多様性再ランク (`mmr_select`、v0.7.0+)
 - `grooveseek/src/parent.rs` — Parent retriever 表示時 content 展開 (`apply_parent_retriever`、v0.7.0+)
 - `grooveseek/src/server.rs` — `rmcp::ServerHandler`、6 つの MCP ツール
+- `grooveseek/src/server/` — `server.rs` から分けた半分 (v1.0.0+): `search.rs` (`search` ツール本体とパイプライン) / `documents.rs` (`get_document` / `get_best_practice` と読み出し経路の検査) / `kb_uri.rs` (`kb://` resource のコーパス側) / `writer_slot.rs`・`writer_role.rs` (1 つの `groove serve` の中で writer lease を誰が持つか、v1.22.0+)
+- `grooveseek/src/prompts.rs` — MCP の `prompts` 面 (v0.22.0+)
+- `grooveseek/src/resources.rs` — MCP の `resources` 面: `kb://` URI の codec と `resources/list` のグルーピング (v0.22.0+)
+- `grooveseek/src/schema_compat.rs` — MCP ツールとして広告する JSON Schema の正規化 (v0.14.0+)
+- `grooveseek/src/writer_lease.rs` — 1 索引 1 書き手: `.groove.db.writer-lock` の OS ロック (v1.22.0+、ADR-0031)
 - `grooveseek/src/transport/` — stdio と Streamable HTTP
 - `grooveseek/src/watcher.rs` — `notify-debouncer-full` ベースの増分再インデックス
 - `grooveseek/src/schema.rs` — frontmatter スキーマ検証
 - `grooveseek/src/quality.rs` / `grooveseek/src/graph.rs` — 品質フィルタ + BFS connection graph
+- `grooveseek/src/graph_render.rs` — connection graph を Graphviz DOT か単体で開ける SVG に描く
+- `grooveseek/src/doctor.rs` — `groove doctor` の検査 (v0.23.0+)
+- `grooveseek/src/exclusion.rs` — knowledge base の path が対象外かを決める唯一の場所。index の walk・`validate` の walk・watcher が共有する (v0.21.0+)
 - `grooveseek/src/eval.rs` — `groove eval` 用の retrieval 品質評価 (任意)
 - `grooveseek/src/config.rs` — `groove.toml` 4 階層探索 + CLI 引数とのマージ
 - `grooveseek/src/markdown.rs` — `parser::markdown` を再公開する後方互換 shim
@@ -100,7 +108,7 @@ intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.
 ## テストの 2 層構造
 
 - **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**PR を gate する*テスト*はこの層だけ** (`ci.yml` は他のテストを回さない。テスト以外は上に挙げた検査 — fmt / clippy / check / `cargo doc` — を回す)
-- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest と windows-latest の両方で `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows leg は ~2.3 GB のモデルを要する 3 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
+- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest / windows-latest / macos-latest の 3 つで `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows と macOS の leg は ~2.3 GB のモデルを要する 5 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
   - **モデル DL** — 初回に ONNX モデルを取得する (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker-v2-m3 ~2.3 GB)。以降は OS 標準キャッシュに残る。ネットワーク都合で DL が失敗する場合は [docs/clients.ja.md](docs/clients.ja.md) の「HuggingFace の TLS 失敗への対処」節を参照
   - **マシンの状態を実際に変える** — 一部のテストは OS のサービスを本当に登録・解除する。`grooveseek/tests/service_install_integration.rs` は Windows で `Register-ScheduledTask` を呼び、`crates/groove-tray/tests/install_integration.rs` は `%APPDATA%\…\Start Menu\Programs\Startup\` にショートカットを書く。PID ごとに固有のサービス名を使い後始末もするが、**途中で kill すると scheduled task や startup ショートカットが残る**。途中で落ちたら `Get-ScheduledTask -TaskName 'groove*'` で確認すること
 

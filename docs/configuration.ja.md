@@ -104,32 +104,34 @@ max_chunk_chars = 3500
 # on にしても全ファイルを索引し終えてから exit 1 になる。MCP `rebuild_index` は
 # 件数と一緒に `error` を返す。watcher はこのキーを読まない。
 #
-# 任意 (v1.15.0+): サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
-# `max_text_file_size` (md / txt / ソースコード) は `groove index` / `rebuild_index` / watcher が読む
-# ファイル 1 本の生バイト上限で、超えたファイルは warning 付きで skip される。
-# `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF / .xlsx (v1.23.0+) から取り出す
-# テキスト量の上限。どれも既定は 50 MiB で、バイト数、単位付きの大きさ ("300 MiB"、
-# "2 GB"。KB / MB / GB / TB は 1000 進、KiB / MiB / GiB / TiB は 1024 進、小数は不可)、
-# または "unlimited" を書ける。`0` はエラーで、メッセージが "unlimited" を案内する —
-# 0 を「無制限」「既定」「全拒否」のどれと読むかが製品ごとに違うため。
-# 300 MB の workbook には `max_binary_file_size` と `max_decompressed_size` の両方が
-# 要る: 中の XML はファイルの数倍に展開されるので、ファイル側の上限だけを上げても
-# zip-bomb の検査は残る。既定を超える値は 1 回だけ警告される: 索引中はファイルを
-# まるごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF と
-# .xlsx (v1.23.0+) の抽出は上限に関係なく 120 秒で打ち切られる (.xlsx で時間を見るのは entry の展開中、
-# シートを part に対応付けている間、セルごと・シートごと。アーカイブを開く処理、calamine が
-# workbook を開く処理、1 セルの読み出しの途中では止めず、そこを縛るのは展開 budget だけ)。
-# `max_decompressed_size` の "unlimited" は運用者が展開量の守りを外す設定で、その時は .xlsx の
-# 120 秒もアーカイブと workbook を開く処理の内側までは保証しない。
-# 上限を下げても、索引済みの文書は
-# `groove index --force` を打つか、ファイルが上限の下まで縮むまで残る。上限を超えたままの
-# 編集では古いテキストが検索に出続ける。読み出しは連動しない:
-# `get_document` / `resources/read` はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、
-# それを超えて索引した文書は検索には出るが `uri` を持たない。読み出しは組み込みの
-# 展開 budget (50 MiB) でも parse するので、`max_decompressed_size` をそれより上げて
-# いる間はバイナリ文書のどれにも `uri` が付かず、`resources/list` も提示しない
-# (検索には出る)。この 3 キーは watcher も
-# 読み、KB の隣で見つかった config からは設定できない (下の表)。根拠: ADR-0026。
+# 任意 (v1.15.0+): サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx)
+# と `max_text_file_size` (md / txt / ソースコード) は `groove index` /
+# `rebuild_index` / watcher が読むファイル 1 本の生バイト上限で、超えたファイルは
+# warning 付きで skip される。`max_decompressed_size` は .xlsx / .docx / .pptx
+# の展開後合計と、PDF / .xlsx (v1.23.0+) から取り出すテキスト量の上限。
+# どれも既定は 50 MiB で、バイト数、単位付きの大きさ ("300 MiB"、"2 GB"。KB / MB /
+# GB / TB は 1000 進、KiB / MiB / GiB / TiB は 1024 進、小数は不可)、または
+# "unlimited" を書ける。`0` はエラーで、メッセージが "unlimited" を案内する — 0
+# を「無制限」「既定」「全拒否」のどれと読むかが製品ごとに違うため。300 MB の
+# workbook には `max_binary_file_size` と `max_decompressed_size` の両方が要る:
+# 中の XML はファイルの数倍に展開されるので、ファイル側の上限だけを上げても
+# zip-bomb の検査は残る。既定を超える値は 1 回だけ警告される: 索引中はファイルをま
+# るごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF と
+# .xlsx (v1.23.0+) の抽出は上限に関係なく 120 秒で打ち切られる (.xlsx
+# で時間を見るのは entry の展開中、シートを part に対応付けている間、
+# セルごと・シートごと。アーカイブを開く処理、calamine が workbook を開く処理、1
+# セルの読み出しの途中では止めず、そこを縛るのは展開 budget だけ)。
+# `max_decompressed_size` の "unlimited" は運用者が展開量の守りを外す設定で、
+# その時は .xlsx の 120 秒もアーカイブと workbook を開く処理の内側までは保証しな
+# い。上限を下げても、索引済みの文書は `groove index --force` を打つか、
+# ファイルが上限の下まで縮むまで残る。上限を超えたままの編集では古いテキストが検索
+# に出続ける。読み出しは連動しない: `get_document` / `resources/read`
+# はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、それを超えて索引した文書は検
+# 索には出るが `uri` を持たない。読み出しは組み込みの展開 budget (50 MiB) でも
+# parse するので、`max_decompressed_size` をそれより上げている間はバイナリ文書のど
+# れにも `uri` が付かず、`resources/list` も提示しない (検索には出る)。この 3
+# キーは watcher も読み、KB の隣で見つかった config からは設定できない (下の表)。
+# 根拠: ADR-0026。
 # [index]
 # fail_on_frontmatter_error = true
 # max_binary_file_size = "unlimited"

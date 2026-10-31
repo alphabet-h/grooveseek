@@ -149,10 +149,6 @@ groove-grammar-abi = { path = "../crates/groove-grammar-abi" }
 # dependencies, and the default search order includes the current directory.
 libloading = "0.9"
 
-# (feature-44 PR-3) Windows-only path dep on the tray crate so
-# `groove service install --with-tray` can call into the tray's
-# shell:startup shortcut installer. Library API only — the
-# `groove-tray.exe` binary is shipped separately via cargo-dist.
 # (BU-20) `O_NOFOLLOW` / `O_NONBLOCK` for the read-time open in `src/links.rs`,
 # and `ELOOP` to tell a refused symlink from a real I/O failure. The constants
 # differ per target OS, which is exactly what this crate exists to get right —
@@ -164,6 +160,10 @@ libloading = "0.9"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# (feature-44 PR-3) Windows-only path dep on the tray crate so
+# `groove service install --with-tray` can call into the tray's
+# shell:startup shortcut installer. Library API only — the
+# `groove-tray.exe` binary is shipped separately via cargo-dist.
 groove-tray = { path = "../crates/groove-tray" }
 # (BU-20) `GetFileInformationByHandle` for the hard-link count. The stable
 # alternative does not exist: `MetadataExt::number_of_links` is still unstable,

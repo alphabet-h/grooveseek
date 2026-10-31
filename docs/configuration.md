@@ -110,37 +110,38 @@ max_chunk_chars = 3500
 # MCP `rebuild_index` tool answers with an `error` alongside the counts. The
 # watcher ignores this key.
 #
-# Optional (v1.15.0+): the size caps. `max_binary_file_size` (pdf / docx / xlsx / pptx)
-# and `max_text_file_size` (md / txt / source code) are the largest file, in raw bytes, that
-# `groove index`, `rebuild_index` and the watcher read; a larger one is skipped
-# with a warning. `max_decompressed_size` is how far an .xlsx / .docx / .pptx
-# may inflate in total and how much text a PDF or an .xlsx (v1.23.0+) may yield. Each defaults to
-# 50 MiB and takes a byte count, a size with a unit ("300 MiB", "2 GB"; KB, MB,
-# GB and TB count in 1000s, KiB, MiB, GiB and TiB in 1024s; no fractions), or
-# "unlimited". `0` is refused and the message points at "unlimited", because
-# tools disagree on whether 0 means no limit, the default, or nothing at all.
-# A 300 MB workbook needs both `max_binary_file_size` and
-# `max_decompressed_size`: the XML inside inflates to several times the file,
-# and raising the file cap alone keeps the zip-bomb check in place. A value
-# above the default is announced once with a warning: a file is held in memory
-# whole while it is indexed, an allocation failure aborts the process instead
-# of skipping the file, and PDF and .xlsx (v1.23.0+) extraction still stop after 120 s
-# (for .xlsx, checked while its entries are inflated, while its sheets are matched
-# to their parts, and at each cell and sheet; opening the archive, calamine
-# opening the workbook or reading one cell is not interrupted, and only the
-# decompression budget bounds them). "unlimited" for `max_decompressed_size`
-# lifts that guard on purpose: the 120 s for .xlsx then does not reach inside
-# opening the archive and the workbook either. Lowering a
-# cap leaves documents already indexed in place until `groove index --force`
-# runs or the file shrinks under the cap; an edit that leaves it over the cap
-# keeps the old text searchable. Reads do not follow: `get_document` and
-# `resources/read` stop at 50 MiB for binary formats and 1 MiB for text, so a
-# document indexed past that is searchable but carries no `uri`. Reads also
-# parse with the built-in 50 MiB decompression budget, so while
-# `max_decompressed_size` is above it no binary document carries a `uri` or is
-# offered by `resources/list`; it stays searchable. The watcher
-# reads these three keys; a config found beside a knowledge base cannot set
-# them (see the table below). Reasoning: ADR-0026.
+# Optional (v1.15.0+): the size caps. `max_binary_file_size` (pdf / docx /
+# xlsx / pptx) and `max_text_file_size` (md / txt / source code) are the
+# largest file, in raw bytes, that `groove index`, `rebuild_index` and the
+# watcher read; a larger one is skipped with a warning.
+# `max_decompressed_size` is how far an .xlsx / .docx / .pptx may inflate in
+# total and how much text a PDF or an .xlsx (v1.23.0+) may yield. Each
+# defaults to 50 MiB and takes a byte count, a size with a unit ("300 MiB",
+# "2 GB"; KB, MB, GB and TB count in 1000s, KiB, MiB, GiB and TiB in 1024s; no
+# fractions), or "unlimited". `0` is refused and the message points at
+# "unlimited", because tools disagree on whether 0 means no limit, the
+# default, or nothing at all. A 300 MB workbook needs both
+# `max_binary_file_size` and `max_decompressed_size`: the XML inside inflates
+# to several times the file, and raising the file cap alone keeps the zip-bomb
+# check in place. A value above the default is announced once with a warning:
+# a file is held in memory whole while it is indexed, an allocation failure
+# aborts the process instead of skipping the file, and PDF and .xlsx
+# (v1.23.0+) extraction still stop after 120 s (for .xlsx, checked while its
+# entries are inflated, while its sheets are matched to their parts, and at
+# each cell and sheet; opening the archive, calamine opening the workbook or
+# reading one cell is not interrupted, and only the decompression budget
+# bounds them). "unlimited" for `max_decompressed_size` lifts that guard on
+# purpose: the 120 s for .xlsx then does not reach inside opening the archive
+# and the workbook either. Lowering a cap leaves documents already indexed in
+# place until `groove index --force` runs or the file shrinks under the cap;
+# an edit that leaves it over the cap keeps the old text searchable. Reads do
+# not follow: `get_document` and `resources/read` stop at 50 MiB for binary
+# formats and 1 MiB for text, so a document indexed past that is searchable
+# but carries no `uri`. Reads also parse with the built-in 50 MiB
+# decompression budget, so while `max_decompressed_size` is above it no binary
+# document carries a `uri` or is offered by `resources/list`; it stays
+# searchable. The watcher reads these three keys; a config found beside a
+# knowledge base cannot set them (see the table below). Reasoning: ADR-0026.
 # [index]
 # fail_on_frontmatter_error = true
 # max_binary_file_size = "unlimited"
