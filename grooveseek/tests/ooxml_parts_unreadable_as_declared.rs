@@ -21,7 +21,7 @@ use common::embed_cli::{DIM, Fixture, fixture, stderr_of};
 use common::embed_mock::{assert_dir_empty, openai_config_toml};
 
 use grooveseek::parser::{DocxParser, ParsedDocument, ParserExt, PptxParser};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 
 /// The WordprocessingML namespace.
@@ -124,16 +124,26 @@ fn forge(zip: &[u8], name: &str, forgery: Forgery) -> Vec<u8> {
         .unwrap_or_else(|e| panic!("premise: a {forgery:?} archive still opens: {e}"));
     match forgery {
         Forgery::DeclaresLess => {
-            let part = archive.by_name(name).expect("premise: the part opens");
+            let mut part = archive.by_name(name).expect("premise: the part opens");
             assert_eq!(part.size(), 1, "premise: {name} declares 1 byte");
             assert_eq!(
                 part.compression(),
                 zip::CompressionMethod::Deflated,
                 "premise: {name} is deflated"
             );
+            assert!(
+                part.read_to_end(&mut Vec::new()).is_err(),
+                "premise: zip refuses to read {name} through when it holds more than it declares \
+                 (if this fails, zip itself changed: zip-rs/zip2#1022)"
+            );
         }
         Forgery::BadCrc => {
-            archive.by_name(name).expect("premise: the part opens");
+            let mut part = archive.by_name(name).expect("premise: the part opens");
+            assert!(
+                part.read_to_end(&mut Vec::new()).is_err(),
+                "premise: zip refuses to read {name} through when its CRC does not match \
+                 (if this fails, zip itself changed)"
+            );
         }
         Forgery::Encrypted => {
             assert!(
@@ -520,6 +530,7 @@ fn groove_index_drops_an_encrypted_ooxml_part_without_a_word() {
         SLIDE_2,
         "cannot be read as declared",
         "warning: sealed.docx",
+        "warning: locked.pptx",
     ] {
         assert!(
             !stderr.contains(quiet),
