@@ -45,11 +45,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 - **`.xlsx` text extraction is bounded per document.** The text a workbook yields is not
   proportional to its size: shared strings can be referenced from any number of cells and
-  sheets. A workbook now yields at most `[index].max_decompressed_size` of text (50 MiB by
-  default), counted as the stored headings (`Sheet: ...`), the chunk bodies and the blank
-  lines between bodies in the document's raw content, and stops after 120 s, the same bounds
-  as PDF; past either it is skipped with a `decompression-bomb guard` error, on the index path
-  and on `get_document` alike. The clock is read while the decompression preflight inflates
+  sheets. A workbook now yields at most `[index].max_decompressed_size` of text when it is
+  indexed (50 MiB by default), counted as the stored headings (`Sheet: ...`), the chunk bodies
+  and the blank lines between bodies in the document's raw content, and stops after 120 s, the
+  same bounds as PDF; past either it is skipped with a `decompression-bomb guard` error.
+  `get_document` and `resources/read` apply the same bounds with the built-in 50 MiB, whatever
+  the key says, as they already do for PDF. The clock is read while the decompression preflight inflates
   each entry, while the sheets are resolved to their parts, between the steps that open the
   workbook, at every cell and at every sheet boundary. Opening the zip archive, calamine
   opening the workbook, reading the title from `docProps/core.xml` and reading a single cell
