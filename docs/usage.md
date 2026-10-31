@@ -218,7 +218,7 @@ groove service uninstall --service-name personal               # remove unit, ke
 groove service uninstall --service-name personal --purge --yes # also remove config + .groove.db
 ```
 
-`uninstall --purge --yes` deletes the instance's config home (`groove.toml` and the service files) and the `.groove.db` its `kb_path` names, together with the `.groove.db-wal` / `.groove.db-shm` files beside it. The lock and holder files beside it (`.groove.db.writer-lock` and, if a process left them, `.groove.db.writer.json` / `.groove.db.replace-lock`) are kept and listed on stderr; they hold no index content. A file that cannot be removed is reported on stderr as left in place, and the rest of the purge goes on.
+`uninstall --purge --yes` deletes the instance's config home (`groove.toml` and the service files) and the `.groove.db` its `kb_path` names, together with the `.groove.db-wal` / `.groove.db-shm` files beside it. When `.groove.db` is a symlink, the file it points to and the `-wal` / `-shm` beside that file are removed, then the link. A `kb_path` that is relative is read against the config home, as the server reads it; when `groove.toml` cannot be read or names no usable `kb_path`, the database is left alone and a warning says so. The lock and holder files beside it (`.groove.db.writer-lock` and, if a process left them, `.groove.db.writer.json`, `.groove.db.writer.json.tmp-<pid>` / `.groove.db.replace-lock`) are kept and listed on stderr; they hold no index content. A file that cannot be removed is reported on stderr as left in place, and the rest of the purge goes on.
 
 OS-specific backends:
 - **Linux**: systemd-user (`~/.config/systemd/user/groove-<name>.service`). Run `sudo loginctl enable-linger $USER` to keep the daemon running after logout.

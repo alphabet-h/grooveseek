@@ -576,7 +576,7 @@ const MAX_SYMLINK_HOPS: usize = 40;
 /// symlink, and keeps its path; a dangling symlink is followed to where
 /// SQLite would create the file. A link that cannot be read, or a chain
 /// longer than [`MAX_SYMLINK_HOPS`], leaves the last path reached.
-fn sidecar_base(db_path: &Path) -> PathBuf {
+pub(crate) fn sidecar_base(db_path: &Path) -> PathBuf {
     let mut path = db_path.to_path_buf();
     for _ in 0..MAX_SYMLINK_HOPS {
         let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());

@@ -817,7 +817,8 @@ pub(crate) const DATABASE_FILE_SUFFIXES: [&str; 3] = ["-shm", "-wal", ""];
 /// callers: [`Database::open_or_replace_corrupt`], so it can create the
 /// database afresh, and `groove service uninstall --purge`, which must not
 /// leave the WAL's committed pages behind (kuriya #645). A missing file is
-/// fine; any other failure to remove one stops the run and names it.
+/// fine; any other failure stops at that file and returns the error, naming
+/// the file.
 ///
 /// Least to most valuable (codex P2 on #284, twice): the `-shm` index is
 /// rebuilt from the WAL, the WAL carries committed pages, the database is

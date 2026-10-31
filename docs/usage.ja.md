@@ -207,7 +207,7 @@ groove service uninstall --service-name personal               # unit のみ削�
 groove service uninstall --service-name personal --purge --yes # config + .groove.db も削除
 ```
 
-`uninstall --purge --yes` が消すのは、その instance の config home (`groove.toml` とサービスのファイル) と、`kb_path` が指す `.groove.db` とその隣の `.groove.db-wal` / `.groove.db-shm`。隣の lock と持ち主のファイル (`.groove.db.writer-lock` と、プロセスが残していれば `.groove.db.writer.json` / `.groove.db.replace-lock`) は消さずに stderr に名前を出す。これらは索引の中身を持たない。消せなかったファイルは stderr に残したものとして出し、purge の残りは続ける。
+`uninstall --purge --yes` が消すのは、その instance の config home (`groove.toml` とサービスのファイル) と、`kb_path` が指す `.groove.db` とその隣の `.groove.db-wal` / `.groove.db-shm`。`.groove.db` が symlink なら、その先の file とその隣の `-wal` / `-shm` を消してから link を消す。相対の `kb_path` は、サーバと同じく config home を基準に読む。`groove.toml` が読めない、または使える `kb_path` が無いときは、DB には触らず警告を出す。隣の lock と持ち主のファイル (`.groove.db.writer-lock` と、プロセスが残していれば `.groove.db.writer.json`、`.groove.db.writer.json.tmp-<pid>` / `.groove.db.replace-lock`) は消さずに stderr に名前を出す。これらは索引の中身を持たない。消せなかったファイルは stderr に残したものとして出し、purge の残りは続ける。
 
 OS 別バックエンド:
 - **Linux**: systemd-user (`~/.config/systemd/user/groove-<name>.service`)。ログアウト後も daemon を生かしたい場合は `sudo loginctl enable-linger $USER` を実行。

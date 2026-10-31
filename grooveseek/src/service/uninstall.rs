@@ -1,7 +1,7 @@
 //! Uninstall orchestration for groove service backends.
 use crate::service::{ServiceBackend, backend, resolve_config_home, validate_service_name};
 use anyhow::{Result, anyhow};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct UninstallParams {
     pub service_name: String,
@@ -75,18 +75,14 @@ pub(crate) fn run_with_backend(
         // NOT inside config_home. Read the configured `kb_path` from the
         // install-generated toml before deleting config_home so that the
         // advertised `--purge` cleanup actually removes the index database.
-        let db_path = std::fs::read_to_string(home.join("groove.toml"))
-            .ok()
-            .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
-            .and_then(|v| {
-                v.get("kb_path")
-                    .and_then(|p| p.as_str())
-                    .map(std::path::PathBuf::from)
-            })
-            .map(|kb| crate::resolve_db_path(&kb));
-
-        if let Some(db) = db_path.as_ref() {
-            purge_database(db);
+        // When it cannot be read, say so: the config home about to be removed
+        // is the last place that names the database.
+        match database_named_by(&home) {
+            Ok(db) => purge_database(&db),
+            Err(why) => eprintln!(
+                "Warning: {why}; the index database (.groove.db with its -wal / -shm) \
+                 was not removed"
+            ),
         }
 
         if home.exists() {
@@ -125,24 +121,33 @@ pub(crate) fn run_with_backend(
 /// `<db>.writer-lock` is never deleted (ADR-0031: deleting it while another
 /// process waits on it lets two writers in), and `<db>.writer.json` /
 /// `<db>.replace-lock` belong to whichever process holds them, which removes
-/// them itself when it finishes.
+/// them itself when it finishes. So is `<db>.writer.json.tmp-<pid>`, which a
+/// failed replacement of `writer.json` can leave behind.
+///
+/// When `.groove.db` is a symlink, the files removed are the ones it points
+/// to: SQLite opens the database through the link and puts `-wal` / `-shm`
+/// beside the target (the writer lease resolves it the same way), so removing
+/// the link alone would leave the whole index on disk. The target is resolved
+/// once, before anything is removed, and every path printed -- removed, left
+/// in place or kept -- is named from it. The link itself goes last, and only
+/// once its target's files are gone, so a partial purge keeps the way to them.
 fn purge_database(db: &Path) {
-    let files: Vec<std::path::PathBuf> = crate::db::DATABASE_FILE_SUFFIXES
+    let base = crate::writer_lease::sidecar_base(db);
+    let kept = kept_sidecars(db, &base);
+    let files: Vec<PathBuf> = crate::db::DATABASE_FILE_SUFFIXES
         .iter()
-        .map(|suffix| with_suffix(db, suffix))
+        .map(|suffix| with_suffix(&base, suffix))
         .collect();
-    let present: Vec<&std::path::PathBuf> = files
-        .iter()
-        .filter(|p| std::fs::symlink_metadata(p).is_ok())
-        .collect();
+    let present: Vec<&PathBuf> = files.iter().filter(|p| exists_no_follow(p)).collect();
 
+    let mut removed_all = true;
     if !present.is_empty() {
-        let result = crate::db::remove_database_files(db);
-        if let Err(e) = &result {
+        if let Err(e) = crate::db::remove_database_files(&base) {
+            removed_all = false;
             eprintln!("Warning: failed to remove the index database: {e:#}");
         }
         for p in present {
-            if std::fs::symlink_metadata(p).is_ok() {
+            if exists_no_follow(p) {
                 eprintln!("Warning: left in place: {}", p.display());
             } else {
                 eprintln!("Removed index database file: {}", p.display());
@@ -150,17 +155,109 @@ fn purge_database(db: &Path) {
         }
     }
 
-    let kept = [
-        crate::writer_lease::WriterLease::lock_path_for(db),
-        crate::writer_lease::WriterLease::info_path_for(db),
-        with_suffix(db, ".replace-lock"),
-    ];
-    for p in kept.iter().filter(|p| std::fs::symlink_metadata(p).is_ok()) {
+    if base != db && is_symlink(db) {
+        if !removed_all {
+            eprintln!(
+                "Warning: left in place: {} (symlink to {}, kept with its target)",
+                db.display(),
+                base.display()
+            );
+        } else {
+            match std::fs::remove_file(db) {
+                Ok(()) => eprintln!(
+                    "Removed symlink to the index database: {} -> {}",
+                    db.display(),
+                    base.display()
+                ),
+                Err(e) => eprintln!("Warning: left in place: {} ({e})", db.display()),
+            }
+        }
+    }
+
+    for p in kept {
         eprintln!(
             "Kept: {} (lock / holder file, not index content)",
             p.display()
         );
     }
+}
+
+/// The lock and holder files `--purge` leaves beside the database, as they
+/// are on disk now: `<db>.writer-lock`, `<db>.writer.json`, any
+/// `<db>.writer.json.tmp-<pid>`, and `<db>.replace-lock`. Looked up beside
+/// `base` (the database file, symlink followed) and, when the caller's
+/// spelling differs, beside `db` as well, where a caller that passed the
+/// link's path would have put its `replace-lock`.
+fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for root in [base, db] {
+        let mut candidates = vec![
+            with_suffix(root, ".writer-lock"),
+            with_suffix(root, ".writer.json"),
+            with_suffix(root, ".replace-lock"),
+        ];
+        if let (Some(dir), Some(name)) = (root.parent(), root.file_name()) {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            let prefix = format!("{}.writer.json.tmp-", name.to_string_lossy());
+            let mut tmps: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                .map(|e| root.with_file_name(e.file_name()))
+                .collect();
+            tmps.sort();
+            candidates.extend(tmps);
+        }
+        for p in candidates {
+            if exists_no_follow(&p) && !found.contains(&p) {
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// The database a service's `groove.toml` names, or why it cannot be told.
+///
+/// `kb_path` is resolved the way the server resolves it when it loads that
+/// file: a relative one against the directory holding `groove.toml` (the
+/// config home), not against wherever `uninstall` was run. A `kb_path` with
+/// no parent (a filesystem root) is refused: [`crate::resolve_db_path`] would
+/// fall back to `./.groove.db`, a path relative to the current directory that
+/// need not be this service's database at all.
+fn database_named_by(home: &Path) -> std::result::Result<PathBuf, String> {
+    let toml_path = home.join("groove.toml");
+    let text = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("could not read {}: {e}", toml_path.display()))?;
+    let value = toml::from_str::<toml::Value>(&text)
+        .map_err(|e| format!("could not parse {}: {e}", toml_path.display()))?;
+    let kb = value
+        .get("kb_path")
+        .and_then(|p| p.as_str())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{} names no kb_path", toml_path.display()))?;
+    let kb = if kb.is_absolute() { kb } else { home.join(kb) };
+    if kb.parent().is_none() {
+        return Err(format!(
+            "kb_path {} in {} has no parent directory to hold .groove.db",
+            kb.display(),
+            toml_path.display()
+        ));
+    }
+    Ok(crate::resolve_db_path(&kb))
+}
+
+fn exists_no_follow(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
+fn is_symlink(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// `path` with `suffix` appended to its last component, the way the database
@@ -398,6 +495,126 @@ mod tests {
             b"main",
             "the database is kept whole"
         );
+        assert!(!home.path().exists(), "the config home is still removed");
+    }
+
+    /// ADR-0031: `<db>.writer-lock` is never deleted, and the holder files
+    /// belong to whichever process holds them. `--purge` removes the index
+    /// and leaves all of them, and lists every one of them -- the leftover
+    /// `writer.json.tmp-<pid>` included -- so none stays behind unnamed.
+    #[test]
+    fn purge_keeps_the_lock_and_holder_files_and_names_them() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let lock = with_suffix(&db, ".writer-lock");
+        let info = with_suffix(&db, ".writer.json");
+        let tmp = with_suffix(&db, ".writer.json.tmp-4242");
+        let replace = with_suffix(&db, ".replace-lock");
+        for p in [&lock, &info, &tmp, &replace] {
+            std::fs::write(p, b"").unwrap();
+        }
+
+        let named = kept_sidecars(&db, &db);
+        for p in [&lock, &info, &tmp, &replace] {
+            assert!(
+                named.contains(p),
+                "{} must be named: {named:?}",
+                p.display()
+            );
+        }
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("purge should succeed");
+
+        assert!(!db.exists(), "the database must be deleted");
+        for p in [&lock, &info, &tmp, &replace] {
+            assert!(p.exists(), "{} must be kept", p.display());
+        }
+    }
+
+    /// The server opens `.groove.db` through a symlink, so its pages and its
+    /// `-wal` / `-shm` sit beside the target. Removing the link alone used to
+    /// leave the whole index on disk while stderr said it was removed.
+    #[test]
+    fn purge_removes_what_a_symlinked_database_points_to() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let elsewhere = TempHome::new();
+        let target = elsewhere.path().join("real.db");
+        let wal = with_suffix(&target, "-wal");
+        let shm = with_suffix(&target, "-shm");
+        let lock = with_suffix(&target, ".writer-lock");
+        std::fs::write(&target, b"main").unwrap();
+        std::fs::write(&wal, b"uncheckpointed pages").unwrap();
+        std::fs::write(&shm, b"wal index").unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        if !crate::writer_lease::file_symlink_or_skip(&target, &db) {
+            return;
+        }
+
+        assert!(
+            kept_sidecars(&db, &crate::writer_lease::sidecar_base(&db)).contains(&lock),
+            "the lock beside the target must be named"
+        );
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("purge should succeed");
+
+        assert!(!target.exists(), "the database the link points to must go");
+        assert!(!wal.exists(), "its WAL must go: {}", wal.display());
+        assert!(!shm.exists(), "its shm must go: {}", shm.display());
+        assert!(
+            std::fs::symlink_metadata(&db).is_err(),
+            "the link itself must go once its target is gone"
+        );
+        assert!(lock.exists(), "the writer-lock beside the target is kept");
+    }
+
+    /// The server resolves a relative `kb_path` against the directory holding
+    /// `groove.toml`; `--purge` used to resolve it against its own working
+    /// directory and could name another instance's database.
+    #[test]
+    fn a_relative_kb_path_is_resolved_against_the_config_home() {
+        let home = TempHome::new();
+        std::fs::write(home.path().join("groove.toml"), "kb_path = 'kb'\n").unwrap();
+
+        let db = database_named_by(home.path()).expect("a relative kb_path names a database");
+
+        assert_eq!(db, crate::resolve_db_path(&home.path().join("kb")));
+    }
+
+    /// A `kb_path` that is a filesystem root has no parent to hold
+    /// `.groove.db`; `resolve_db_path` would fall back to `./.groove.db` in
+    /// the current directory, which `--purge` must not delete.
+    #[test]
+    fn a_root_kb_path_names_no_database() {
+        let home = TempHome::new();
+        let root = home.path().ancestors().last().unwrap().to_path_buf();
+        std::fs::write(
+            home.path().join("groove.toml"),
+            format!("kb_path = '{}'\n", root.display()),
+        )
+        .unwrap();
+
+        let why = database_named_by(home.path()).expect_err("a root has no parent");
+
+        assert!(why.contains("no parent directory"), "{why}");
+    }
+
+    /// A `groove.toml` that cannot be read used to skip the database without
+    /// a word and then delete the only file that named it. It is now a
+    /// reason (printed as a warning), and the rest of the purge goes on.
+    #[test]
+    fn an_unparsable_config_names_no_database_and_the_home_still_goes() {
+        let home = TempHome::new();
+        std::fs::write(home.path().join("groove.toml"), "kb_path = [unclosed\n").unwrap();
+
+        let why = database_named_by(home.path()).expect_err("broken toml");
+        assert!(why.contains("could not parse"), "{why}");
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("purge is best-effort past the service unit");
         assert!(!home.path().exists(), "the config home is still removed");
     }
 

@@ -25,6 +25,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   home as before. `.groove.db.writer-lock`, `.groove.db.writer.json` and `.groove.db.replace-lock`
   are kept and named when present: they hold no index content, and the writer lock is never
   deleted ([ADR-0031](docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)) (kuriya #645).
+  A leftover `.groove.db.writer.json.tmp-<pid>` is named too. When `.groove.db` is a symlink, the
+  purge now removes the file it points to with the `-wal` / `-shm` beside it, then the link; it
+  used to remove the link alone and say the database was removed. A relative `kb_path` is read
+  against the config home, as the server reads it, not against the directory `uninstall` runs
+  in; a `kb_path` that is a filesystem root, or a `groove.toml` that cannot be read, leaves the
+  database alone with a warning instead of skipping it without a word.
 
 ### Documentation
 
