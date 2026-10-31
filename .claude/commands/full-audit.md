@@ -252,7 +252,7 @@ kuriya へ起票する前に、ここに当たるものは指摘された場所�
 - 横断テーマ
 - 個別の高優先度 Issue
 - レビューで確認できた良い点
-- TODO 化マッピング (3-2 で kuriya に起票する ID・重大度と、起票後の kuriya の item 番号)
+- TODO 化マッピング (3-2 で kuriya に起票する ID・重大度。kuriya の item 番号は 3-2 の step 4 で書き足す)
 - 推奨着手順序
 
 #### 3-2. kuriya に audit 親と子 task を起票
@@ -270,7 +270,9 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
    - tags: `audit-<YYYY-MM-DD>`、重大度 (`critical` / `high` …)、軸 (`code` / `security` / `test` / `docs`)、
      該当時は `release-blocker` (定義 = security の High 以上 / 使う人に見える回帰 / 秘密の漏洩)
    - body: 対象 `file:line`、何が / なぜ壊れるか / どう直すか、完了条件 (実装後に何を見れば直ったと言えるか)
-4. **状態は kuriya の `report` で動かす** — 着手は `doing`、直したら `done` (summary に PR 番号)、
+4. **ノートに番号を書き足して閉じる** — 3-1 のノートの TODO 化マッピングに、親と各子の kuriya の item 番号を書き足す。
+   ノートはこの書き足しで完成とし、以後は凍結する (状態は kuriya だけが持つ)
+5. **状態は kuriya の `report` で動かす** — 着手は `doing`、直したら `done` (summary に PR 番号)、
    直さないと決めた low は `dropped` (summary に理由)。子が全部 `done` / `dropped` になったら親を `done` にする
 
 `release-blocker` 以外の指摘は release を止めない (次の minor の候補)。tag の前に見る形は
