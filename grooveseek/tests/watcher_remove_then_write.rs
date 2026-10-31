@@ -349,7 +349,54 @@ fn the_watcher_sends_only_the_edited_chunk_and_names_the_reused_ones() {
         1,
         "only the edited section is embedded: {sent:?}"
     );
-    assert!(sent[0].contains(EDITED_VERIFY), "{sent:?}");
+    // The one input must be exactly the edited chunk's: the `Verify` input the first index sent,
+    // with the old body swapped for the new one. A regression that packed the unchanged sections
+    // into the same input would still send one input, so `contains` alone would not catch it.
+    let indexed: Vec<String> = fx.mock.requests()[..before]
+        .iter()
+        .filter(|r| r.model() == Some(DOC_MODEL))
+        .flat_map(|r| r.inputs())
+        .collect();
+    let old_verify: Vec<&String> = indexed
+        .iter()
+        .filter(|i| i.contains(SECTIONS[2].1))
+        .collect();
+    assert_eq!(
+        old_verify.len(),
+        1,
+        "the first index sent one `Verify` input: {indexed:?}"
+    );
+    let want = old_verify[0].replace(SECTIONS[2].1, EDITED_VERIFY);
+    assert_eq!(sent[0], want, "the input is not exactly the edited chunk");
+    for (heading, body) in SECTIONS.iter().filter(|(h, _)| *h != "Verify") {
+        assert!(
+            !sent[0].contains(body),
+            "the unchanged `{heading}` section was sent again: {sent:?}"
+        );
+    }
     drop(guard);
+
+    // The reindex replaced the edited chunk rather than adding one beside the old text.
     assert_eq!(fx.documents(), 1, "the edited document is not indexed");
+    assert_eq!(
+        fx.chunks(),
+        SECTIONS.len() as u64,
+        "the edit left stale or duplicate chunks in the index"
+    );
+    let hits = fx.search_json("smoke check endpoint");
+    let contents: Vec<&str> = hits
+        .pointer("/results")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no results array: {hits}"))
+        .iter()
+        .filter_map(|h| h.pointer("/content").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        contents.iter().any(|c| c.contains(EDITED_VERIFY)),
+        "the edited `Verify` text is not searchable: {hits}"
+    );
+    assert!(
+        !contents.iter().any(|c| c.contains(SECTIONS[2].1)),
+        "the old `Verify` text is still indexed: {hits}"
+    );
 }
