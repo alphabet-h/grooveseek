@@ -486,28 +486,51 @@ impl BareWriterLock {
         Ok(Self { file })
     }
 
-    /// Retry [`BareWriterLock::try_hold`] every 250 ms until it succeeds or
-    /// `wait` has passed, as [`WriterLease::acquire_with_wait`] does; then
-    /// return the last `Busy`. An `Io` error returns at once.
-    pub(crate) fn hold_with_wait(resolved: &Path, wait: Duration) -> Result<Self, LeaseError> {
-        let deadline = Instant::now().checked_add(wait);
-        loop {
-            match Self::try_hold(resolved) {
-                Err(busy @ LeaseError::Busy { .. }) => {
-                    let pause = match deadline {
-                        None => RETRY_INTERVAL,
-                        Some(deadline) => {
-                            let left = deadline.saturating_duration_since(Instant::now());
-                            if left.is_zero() {
-                                return Err(busy);
-                            }
-                            left.min(RETRY_INTERVAL)
-                        }
-                    };
-                    std::thread::sleep(pause);
+    /// After `seen`, the `Busy` a [`BareWriterLock::try_hold`] just returned,
+    /// retry it every 250 ms until it succeeds or `wait` has passed, as
+    /// [`WriterLease::acquire_with_wait`] does; then return the last `Busy`.
+    /// See [`retry_while_busy`] for a retry that fails some other way.
+    pub(crate) fn hold_with_wait(
+        resolved: &Path,
+        wait: Duration,
+        seen: LeaseError,
+    ) -> Result<Self, LeaseError> {
+        retry_while_busy(wait, seen, || Self::try_hold(resolved))
+    }
+}
+
+/// [`BareWriterLock::hold_with_wait`]'s loop, with the attempt injected so a
+/// test can make a retry fail. `seen` is the `Busy` the caller already got.
+///
+/// A retry that fails other than `Busy` (an `Io` error: the lock file went
+/// away or became unopenable while the holder was there) returns the last
+/// `Busy`, not that error: a writer was holding the lock a moment ago, and a
+/// caller that treats an `Io` error as "no holder is known" (purge deletes
+/// without the lock then) must not get that answer here (kuriya #645 review).
+#[allow(clippy::result_large_err)]
+fn retry_while_busy<T>(
+    wait: Duration,
+    seen: LeaseError,
+    mut attempt: impl FnMut() -> Result<T, LeaseError>,
+) -> Result<T, LeaseError> {
+    let deadline = Instant::now().checked_add(wait);
+    let mut busy = seen;
+    loop {
+        let pause = match deadline {
+            None => RETRY_INTERVAL,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(busy);
                 }
-                other => return other,
+                left.min(RETRY_INTERVAL)
             }
+        };
+        std::thread::sleep(pause);
+        match attempt() {
+            Ok(held) => return Ok(held),
+            Err(again @ LeaseError::Busy { .. }) => busy = again,
+            Err(_) => return Err(busy),
         }
     }
 }
@@ -1445,6 +1468,40 @@ mod tests {
         assert_eq!(lease.role(), Role::Index);
         assert!(lease.acquired_at() <= std::time::SystemTime::now());
         t.join().unwrap();
+    }
+
+    /// kuriya #645 review. The lock was seen held, and a retry then fails to
+    /// open the lock file: that is still a refusal (the last `Busy`), not an
+    /// `Io` error, which purge would read as "no holder is known" and delete
+    /// without the lock while a writer was there a moment ago.
+    #[test]
+    #[allow(clippy::result_large_err)] // the closure returns `LeaseError`, as `try_hold` does
+    fn a_retry_that_fails_after_the_lock_was_seen_held_is_still_busy() {
+        // The lock path tells the Busy results apart.
+        let busy = |name: &str| LeaseError::Busy {
+            lock_path: PathBuf::from(name),
+            holder: None,
+        };
+        let mut attempts = 0;
+        let got: Result<(), LeaseError> =
+            retry_while_busy(Duration::from_secs(10), busy("first"), || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(busy("second"))
+                } else {
+                    Err(LeaseError::Io {
+                        lock_path: PathBuf::from("io"),
+                        source: std::io::Error::other("lock file went away"),
+                    })
+                }
+            });
+        assert_eq!(attempts, 2, "the Io error ends the wait");
+        match got {
+            Err(LeaseError::Busy { lock_path, .. }) => {
+                assert_eq!(lock_path, PathBuf::from("second"), "the last Busy seen")
+            }
+            other => panic!("an Io error after a Busy must stay Busy: {other:?}"),
+        }
     }
 
     #[test]

@@ -35,7 +35,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   home is gone, waiting up to 10 seconds for a server the backend has told to stop (Windows'
   `schtasks /End` does not wait for it to exit); a process still holding the lock after that
   leaves the database and the config home in place, and the command fails naming that process's
-  pid and role and saying to stop it (`taskkill /PID <pid>` on Windows, `kill <pid>` on Linux /
+  pid and role (when `.groove.db.writer.json` can be read) and saying to stop it (`taskkill /PID <pid>` on Windows, `kill <pid>` on Linux /
   macOS) and run it again. A lock file that cannot be created or opened at all (permissions, a
   read-only or network filesystem) has no holder to wait for: the purge warns and deletes without
   the lock, as before. It used to delete while such a server could still put a `-wal`

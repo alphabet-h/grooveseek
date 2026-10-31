@@ -211,11 +211,7 @@ fn purge_under_writer_lock(
 /// only while it still holds the target it held when it was resolved
 /// ([`remove_link_if_unchanged`]).
 fn purge_database(target: &PurgeTarget) {
-    let PurgeTarget {
-        link,
-        link_target,
-        resolved,
-    } = target;
+    let PurgeTarget { link, resolved, .. } = target;
     let kept = kept_sidecars(link, resolved);
     let files: Vec<PathBuf> = crate::db::DATABASE_FILE_SUFFIXES
         .iter()
@@ -241,16 +237,10 @@ fn purge_database(target: &PurgeTarget) {
         }
     }
 
-    if link_target.is_some() {
-        if !removed_all {
-            eprintln!(
-                "Warning: left in place: {} (symlink to {}, kept with its target)",
-                link.display(),
-                resolved.display()
-            );
-        } else {
-            remove_link_if_unchanged(target);
-        }
+    match link_step(target, removed_all) {
+        LinkStep::NotALink => {}
+        LinkStep::Remove => remove_link_if_unchanged(target),
+        LinkStep::Keep(warning) => eprintln!("{warning}"),
     }
 
     for p in kept {
@@ -269,9 +259,12 @@ struct PurgeTarget {
     /// symlink is when `.groove.db` is one, and otherwise the database file
     /// itself (then equal to `resolved`).
     link: PathBuf,
+    /// Whether `link` was a symlink when it was resolved.
+    is_link: bool,
     /// What the symlink at `link` held when it was resolved, as
-    /// `std::fs::read_link` spells it; `None` when `link` was not a symlink
-    /// (or could not be read). [`remove_link_if_unchanged`] removes the link
+    /// `std::fs::read_link` spells it; `None` when `link` was not a symlink,
+    /// or was one that could not be read (then the link is left in place and
+    /// named, [`link_step`]). [`remove_link_if_unchanged`] removes the link
     /// only while it still holds this.
     link_target: Option<PathBuf>,
     /// The database file, every symlink and junction in its path resolved,
@@ -284,8 +277,9 @@ impl PurgeTarget {
     /// Resolve `db`'s directory once and build both paths from it: `link` is
     /// that directory joined with the file name, and `resolved` is `link`
     /// itself, or, when `link` is a symlink, the file it leads to, resolved
-    /// from `link` (whose directories are resolved already, so none of them
-    /// is looked up again through a link that may have been repointed).
+    /// from the contents read once for `link_target` (and `link`'s
+    /// directories are resolved already, so none of them is looked up again
+    /// through a link that may have been repointed).
     fn new(db: &Path) -> Self {
         let (link, dir_resolved) = match (db.parent(), db.file_name()) {
             (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
@@ -301,17 +295,71 @@ impl PurgeTarget {
         } else {
             None
         };
-        let resolved = if dir_resolved && !is_link {
-            link.clone()
-        } else {
-            WriterLease::resolved_db_path(&link)
+        let resolved = match &link_target {
+            // Resolved from the link's contents as read once above, not by
+            // reading the link again: a link repointed in between would
+            // otherwise make `resolved` and `link_target` name two files.
+            // The rest is what `resolved_db_path(&link)` does after its
+            // first hop: a relative target is taken from the link's
+            // directory, and further links are followed from there.
+            Some(target) => {
+                let first_hop = match link.parent() {
+                    Some(dir) if target.is_relative() => dir.join(target),
+                    _ => target.clone(),
+                };
+                WriterLease::resolved_db_path(&first_hop)
+            }
+            None if dir_resolved && !is_link => link.clone(),
+            None => WriterLease::resolved_db_path(&link),
         };
         Self {
             link,
+            is_link,
             link_target,
             resolved,
         }
     }
+}
+
+/// What [`purge_database`] does with `target.link` once the database files
+/// are dealt with.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkStep {
+    /// `link` is the database file itself, already handled.
+    NotALink,
+    /// Remove the link, if it is unchanged ([`remove_link_if_unchanged`]).
+    Remove,
+    /// Leave the link, and print this warning about it.
+    Keep(String),
+}
+
+/// Decide [`LinkStep`] for `target`, given whether every database file is gone.
+fn link_step(target: &PurgeTarget, removed_all: bool) -> LinkStep {
+    let PurgeTarget {
+        link,
+        is_link,
+        link_target,
+        resolved,
+    } = target;
+    if !is_link {
+        return LinkStep::NotALink;
+    }
+    if link_target.is_none() {
+        // A symlink whose contents could not be read: nothing to compare it
+        // with before removing it, so it stays, named like any file kept.
+        return LinkStep::Keep(format!(
+            "Warning: left in place: {} (a symlink that could not be read)",
+            link.display()
+        ));
+    }
+    if !removed_all {
+        return LinkStep::Keep(format!(
+            "Warning: left in place: {} (symlink to {}, kept with its target)",
+            link.display(),
+            resolved.display()
+        ));
+    }
+    LinkStep::Remove
 }
 
 /// What [`hold_writer_lock`] found when it went for the index's writer lock.
@@ -391,13 +439,13 @@ fn hold_writer_lock(
 ) -> std::result::Result<WriterCheck, WriterBusy> {
     let resolved = &target.resolved;
     let first = match BareWriterLock::try_hold(resolved) {
-        Err(LeaseError::Busy { .. }) if !wait.is_zero() => {
+        Err(busy @ LeaseError::Busy { .. }) if !wait.is_zero() => {
             eprintln!(
                 "Waiting up to {}s for the groove process holding the writer lock of {} to exit...",
                 wait.as_secs(),
                 resolved.display()
             );
-            BareWriterLock::hold_with_wait(resolved, wait)
+            BareWriterLock::hold_with_wait(resolved, wait, busy)
         }
         other => other,
     };
@@ -1361,5 +1409,77 @@ mod tests {
         assert!(shown.starts_with("failed to remove x: "), "{shown}");
         assert!(shown.contains("(os error 2)"), "{shown}");
         assert!(shown.is_ascii(), "{shown}");
+    }
+
+    /// kuriya #645 review. `resolved` is built from the link's contents as
+    /// read for `link_target`, not from a second read of the link; a relative
+    /// target is taken from the link's directory, as the writer lease takes it.
+    #[test]
+    fn a_relative_database_link_resolves_from_the_target_read_once() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        let real = kb_root.path().join("real.db");
+        std::fs::write(&real, b"main").unwrap();
+        if !crate::writer_lease::file_symlink_or_skip(Path::new("real.db"), &db) {
+            return;
+        }
+
+        let target = PurgeTarget::new(&db);
+
+        assert!(target.is_link, "{target:?}");
+        assert_eq!(
+            target.link_target.as_deref(),
+            Some(Path::new("real.db")),
+            "{target:?}"
+        );
+        assert_eq!(
+            target.resolved,
+            WriterLease::resolved_db_path(&real),
+            "{target:?}"
+        );
+        assert_eq!(
+            target.resolved,
+            WriterLease::resolved_db_path(&db),
+            "the same file the writer lease on the link locks: {target:?}"
+        );
+    }
+
+    /// kuriya #645 review. A `.groove.db` that is a symlink whose contents
+    /// could not be read used to be passed over without a word, since only a
+    /// link with known contents was looked at. It is now named as left in
+    /// place, as every file purge does not remove is.
+    #[test]
+    fn a_database_link_that_could_not_be_read_is_named_as_left_in_place() {
+        let link = PathBuf::from("kb-root").join(".groove.db");
+        let target = PurgeTarget {
+            link: link.clone(),
+            is_link: true,
+            link_target: None,
+            resolved: link.clone(),
+        };
+
+        for removed_all in [true, false] {
+            match link_step(&target, removed_all) {
+                LinkStep::Keep(warning) => {
+                    assert!(warning.starts_with("Warning: left in place: "), "{warning}");
+                    assert!(warning.contains(&link.display().to_string()), "{warning}");
+                    assert!(warning.is_ascii(), "{warning}");
+                }
+                other => panic!("an unreadable link must be named as kept: {other:?}"),
+            }
+        }
+
+        let not_a_link = PurgeTarget {
+            is_link: false,
+            ..target
+        };
+        assert_eq!(link_step(&not_a_link, true), LinkStep::NotALink);
+        let readable = PurgeTarget {
+            is_link: true,
+            link_target: Some(PathBuf::from("real.db")),
+            ..not_a_link
+        };
+        assert_eq!(link_step(&readable, true), LinkStep::Remove);
+        assert!(matches!(link_step(&readable, false), LinkStep::Keep(_)));
     }
 }
