@@ -8363,9 +8363,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn event_with(kind: EventKind, paths: &[&Path]) -> notify::Event {
-        paths
-            .iter()
-            .fold(notify::Event::new(kind), |ev, p| ev.add_path(p.to_path_buf()))
+        paths.iter().fold(notify::Event::new(kind), |ev, p| {
+            ev.add_path(p.to_path_buf())
+        })
     }
 
     /// A scratch dir holding one existing file `a.md` and one existing
@@ -8375,7 +8375,12 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("a.md"), "# a\n").unwrap();
         let guard = RemoveDirOnDrop(root.clone());
-        (root.join("a.md"), root.join("sub"), root.join("gone.md"), guard)
+        (
+            root.join("a.md"),
+            root.join("sub"),
+            root.join("gone.md"),
+            guard,
+        )
     }
 
     #[test]
@@ -8445,7 +8450,11 @@ mod tests {
     fn is_stale_create_keeps_an_event_whose_stat_fails_other_than_not_found() {
         let odd = PathBuf::from("kb-stale-create\0nul.md");
         let err = std::fs::symlink_metadata(&odd).expect_err("a NUL in a path cannot be stat'ed");
-        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "precondition: {err:?}");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "precondition: {err:?}"
+        );
         for kind in [
             EventKind::Create(CreateKind::File),
             EventKind::Modify(ModifyKind::Data(
@@ -8453,7 +8462,10 @@ mod tests {
             )),
         ] {
             let ev = event_with(kind, &[&odd]);
-            assert!(!is_stale_create(&ev), "must keep on a non-NotFound stat failure: {ev:?}");
+            assert!(
+                !is_stale_create(&ev),
+                "must keep on a non-NotFound stat failure: {ev:?}"
+            );
         }
     }
 
@@ -8464,7 +8476,10 @@ mod tests {
             EventKind::Modify(ModifyKind::Any),
         ] {
             let ev = event_with(kind, &[]);
-            assert!(!is_stale_create(&ev), "nothing to stat, so nothing to drop: {ev:?}");
+            assert!(
+                !is_stale_create(&ev),
+                "nothing to stat, so nothing to drop: {ev:?}"
+            );
         }
     }
 
@@ -8491,7 +8506,11 @@ mod tests {
         notify::EventHandler::handle_event(&mut handler, Ok(event_with(create, &[&file])));
         drop(handler);
         let got: Vec<_> = rx.iter().collect();
-        assert_eq!(got.len(), 2, "error + kept Create, stale Create dropped: {got:?}");
+        assert_eq!(
+            got.len(),
+            2,
+            "error + kept Create, stale Create dropped: {got:?}"
+        );
         assert!(got[0].is_err(), "the error must be forwarded: {got:?}");
         assert_eq!(
             got[1].as_ref().unwrap().paths,
