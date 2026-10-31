@@ -777,21 +777,6 @@ impl std::fmt::Display for CorruptDatabase {
 
 impl std::error::Error for CorruptDatabase {}
 
-/// Delete the database at `path` and its `-wal` / `-shm` sidecars, so that
-/// [`Database::open_or_replace_corrupt`] can create it afresh. A missing
-/// file is fine; any other failure to remove one stops the run and names it.
-///
-/// Least to most valuable (codex P2 on #284, twice): the `-shm` index is
-/// rebuilt from the WAL, the WAL carries committed pages, the database is
-/// the file itself. A removal that fails (locked, or owned by someone else)
-/// then leaves everything more valuable still on disk instead of a
-/// half-deleted set -- and a stale WAL beside a recreated database is the
-/// one leftover that could poison the replacement.
-///
-/// Separate from the open so the order can be tested without SQLite in the
-/// way: on unix, SQLite opens the WAL before it reads the header, so a
-/// directory where `-wal` should be makes the open fail as "cannot open"
-/// rather than "not a database", and the removal is never reached.
 /// The file `<db>.replace-lock`, held while [`Database::open_or_replace_corrupt`]
 /// deletes and recreates a database. `create_new` is atomic on every
 /// platform, so exactly one process gets past [`ReplaceLock::acquire`];
@@ -824,15 +809,40 @@ impl Drop for ReplaceLock {
     }
 }
 
-fn remove_database_files(path: &str) -> Result<()> {
-    for suffix in ["-shm", "-wal", ""] {
-        let victim = format!("{path}{suffix}");
+/// The suffixes [`remove_database_files`] appends to the database path, in
+/// the order it removes them: `-shm`, `-wal`, then the database itself.
+pub(crate) const DATABASE_FILE_SUFFIXES: [&str; 3] = ["-shm", "-wal", ""];
+
+/// Delete the database at `path` and its `-wal` / `-shm` sidecars. Two
+/// callers: [`Database::open_or_replace_corrupt`], so it can create the
+/// database afresh, and `groove service uninstall --purge`, which must not
+/// leave the WAL's committed pages behind (kuriya #645). A missing file is
+/// fine; any other failure to remove one stops the run and names it.
+///
+/// Least to most valuable (codex P2 on #284, twice): the `-shm` index is
+/// rebuilt from the WAL, the WAL carries committed pages, the database is
+/// the file itself. A removal that fails (locked, or owned by someone else)
+/// then leaves everything more valuable still on disk instead of a
+/// half-deleted set -- and a stale WAL beside a recreated database is the
+/// one leftover that could poison the replacement.
+///
+/// Separate from the open so the order can be tested without SQLite in the
+/// way: on unix, SQLite opens the WAL before it reads the header, so a
+/// directory where `-wal` should be makes the open fail as "cannot open"
+/// rather than "not a database", and the removal is never reached.
+pub(crate) fn remove_database_files(path: impl AsRef<std::path::Path>) -> Result<()> {
+    let path = path.as_ref();
+    for suffix in DATABASE_FILE_SUFFIXES {
+        let mut victim = path.as_os_str().to_os_string();
+        victim.push(suffix);
+        let victim = std::path::PathBuf::from(victim);
         match std::fs::remove_file(&victim) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("failed to remove {victim} so it could be replaced")));
+                return Err(
+                    anyhow::Error::new(e).context(format!("failed to remove {}", victim.display()))
+                );
             }
         }
     }
@@ -902,7 +912,8 @@ impl Database {
         }
         // The failed `open` dropped its connection with the error, so the
         // file is closed here -- Windows refuses to delete an open one.
-        remove_database_files(path)?;
+        remove_database_files(path)
+            .with_context(|| format!("could not clear {path} so it could be replaced"))?;
         let db = Self::open(path)
             .with_context(|| format!("failed to create a replacement database at {path}"))?;
         Ok((db, true))

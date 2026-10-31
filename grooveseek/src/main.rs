@@ -436,9 +436,9 @@ enum ServiceSubcommand {
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
         /// Also delete the instance's config home (groove.toml and service
-        /// files) and the `.groove.db` file its `kb_path` names; the
-        /// `.groove.db-wal` / `-shm` sidecars are left in place. Irreversible;
-        /// refused unless --yes is also given
+        /// files) and the `.groove.db` its `kb_path` names, with its
+        /// `.groove.db-wal` / `-shm` sidecars. Irreversible; refused unless
+        /// --yes is also given
         #[arg(long)]
         purge: bool,
         /// Confirm --purge. Has no effect without it

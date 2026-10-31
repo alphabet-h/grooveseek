@@ -14,6 +14,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **`groove service uninstall --purge --yes` deletes the `.groove.db-wal` / `.groove.db-shm`
+  beside the index database.** It removed `.groove.db` alone, so the WAL, which holds committed
+  pages not yet checkpointed into the database, stayed on disk with part of the index; and when
+  `.groove.db` itself was already gone, the sidecars were not looked at. The three files are now
+  removed `-shm` first and the database last, so a file that will not go leaves the database whole.
+  Every file is named on stderr as removed or left in place, and the purge goes on to the config
+  home as before. `.groove.db.writer-lock`, `.groove.db.writer.json` and `.groove.db.replace-lock`
+  are kept and named when present: they hold no index content, and the writer lock is never
+  deleted ([ADR-0031](docs/decisions/0031-one-writer-per-index-by-an-os-lock.md)) (kuriya #645).
+
 ### Documentation
 
 - **`groove service` flags explain themselves, and pages that had fallen behind the code are

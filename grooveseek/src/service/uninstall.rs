@@ -42,7 +42,7 @@ pub(crate) fn run_with_backend(
 
     if params.purge && !params.yes {
         return Err(anyhow!(
-            "--purge will delete the index database (.groove.db) and groove.toml.\n\
+            "--purge will delete the index database (.groove.db with its -wal / -shm) and groove.toml.\n\
              Re-installing will require a full re-index (~minutes to hours for large KBs).\n\
              This is destructive and irreversible. Re-run with --yes to confirm."
         ));
@@ -67,7 +67,7 @@ pub(crate) fn run_with_backend(
                 anyhow!(
                     "--purge needs the config home, but neither GROOVE_CONFIG_HOME nor the OS \
                      config directory could be resolved. The service unit has been removed; \
-                     delete groove.toml and .groove.db by hand."
+                     delete groove.toml and .groove.db (with its -wal / -shm) by hand."
                 )
             })?
             .to_path_buf();
@@ -85,18 +85,8 @@ pub(crate) fn run_with_backend(
             })
             .map(|kb| crate::resolve_db_path(&kb));
 
-        if let Some(db) = db_path.as_ref()
-            && db.exists()
-        {
-            if let Err(e) = std::fs::remove_file(db) {
-                eprintln!(
-                    "Warning: failed to remove .groove.db at {}: {}",
-                    db.display(),
-                    e
-                );
-            } else {
-                eprintln!("Removed index database: {}", db.display());
-            }
+        if let Some(db) = db_path.as_ref() {
+            purge_database(db);
         }
 
         if home.exists() {
@@ -115,6 +105,70 @@ pub(crate) fn run_with_backend(
         );
     }
     Ok(())
+}
+
+/// The `--purge` half that deletes the index database: `.groove.db` and its
+/// `-wal` / `-shm` sidecars (kuriya #645). The database runs in WAL mode, so
+/// committed pages that were never checkpointed live only in `-wal`; removing
+/// the main file alone left them on disk.
+///
+/// Best-effort, like the rest of `--purge` after the service unit is gone:
+/// the unit cannot be put back, so a file that will not go (on Windows, a
+/// server `schtasks /End` has not finished stopping still holds it) is a
+/// warning, and the config home is still removed. Every file is accounted
+/// for on stderr, removed or left in place, so a partial purge is never
+/// silent. The removal order is [`crate::db::remove_database_files`]'s: least
+/// valuable first, so a failure leaves the database whole rather than a
+/// database without its WAL.
+///
+/// Sidecars that are not index content are left alone and named when present:
+/// `<db>.writer-lock` is never deleted (ADR-0031: deleting it while another
+/// process waits on it lets two writers in), and `<db>.writer.json` /
+/// `<db>.replace-lock` belong to whichever process holds them, which removes
+/// them itself when it finishes.
+fn purge_database(db: &Path) {
+    let files: Vec<std::path::PathBuf> = crate::db::DATABASE_FILE_SUFFIXES
+        .iter()
+        .map(|suffix| with_suffix(db, suffix))
+        .collect();
+    let present: Vec<&std::path::PathBuf> = files
+        .iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .collect();
+
+    if !present.is_empty() {
+        let result = crate::db::remove_database_files(db);
+        if let Err(e) = &result {
+            eprintln!("Warning: failed to remove the index database: {e:#}");
+        }
+        for p in present {
+            if std::fs::symlink_metadata(p).is_ok() {
+                eprintln!("Warning: left in place: {}", p.display());
+            } else {
+                eprintln!("Removed index database file: {}", p.display());
+            }
+        }
+    }
+
+    let kept = [
+        crate::writer_lease::WriterLease::lock_path_for(db),
+        crate::writer_lease::WriterLease::info_path_for(db),
+        with_suffix(db, ".replace-lock"),
+    ];
+    for p in kept.iter().filter(|p| std::fs::symlink_metadata(p).is_ok()) {
+        eprintln!(
+            "Kept: {} (lock / holder file, not index content)",
+            p.display()
+        );
+    }
+}
+
+/// `path` with `suffix` appended to its last component, the way the database
+/// sidecars are named (`.groove.db` -> `.groove.db-wal`).
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    s.into()
 }
 
 #[cfg(target_os = "windows")]
@@ -262,6 +316,89 @@ mod tests {
             "the config home must be deleted: {}",
             home.path().display()
         );
+    }
+
+    /// A KB root outside `home` with a `groove.toml` in `home` naming its KB;
+    /// returns the KB root guard and the database path. Outside, for the
+    /// reason the test above gives: nested, `remove_dir_all(home)` would
+    /// delete the files and the assertions would hold for the wrong reason.
+    fn kb_outside(home: &TempHome) -> (TempHome, PathBuf) {
+        let kb_root = TempHome::new();
+        let kb = kb_root.path().join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let db = crate::resolve_db_path(&kb);
+        assert!(!db.starts_with(home.path()));
+        std::fs::write(
+            home.path().join("groove.toml"),
+            format!("kb_path = '{}'\n", kb.display()),
+        )
+        .unwrap();
+        (kb_root, db)
+    }
+
+    /// kuriya #645. The database runs in WAL mode, so committed pages that
+    /// were never checkpointed live only in `-wal`. `--purge` used to remove
+    /// the main file alone and leave both sidecars, and with them part of the
+    /// index it promised to delete.
+    #[test]
+    fn purge_removes_the_wal_and_shm_beside_the_database() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let wal = with_suffix(&db, "-wal");
+        let shm = with_suffix(&db, "-shm");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"uncheckpointed pages").unwrap();
+        std::fs::write(&shm, b"wal index").unwrap();
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("purge should succeed");
+
+        assert!(!db.exists(), "the database must be deleted");
+        assert!(!wal.exists(), "the WAL must be deleted: {}", wal.display());
+        assert!(!shm.exists(), "the shm must be deleted: {}", shm.display());
+    }
+
+    /// kuriya #645. The guard used to test the main file alone, so sidecars
+    /// whose database was already gone were never looked at.
+    #[test]
+    fn purge_removes_sidecars_whose_database_is_already_gone() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let wal = with_suffix(&db, "-wal");
+        let shm = with_suffix(&db, "-shm");
+        std::fs::write(&wal, b"uncheckpointed pages").unwrap();
+        std::fs::write(&shm, b"wal index").unwrap();
+        assert!(!db.exists());
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("purge should succeed");
+
+        assert!(!wal.exists(), "the WAL must be deleted: {}", wal.display());
+        assert!(!shm.exists(), "the shm must be deleted: {}", shm.display());
+    }
+
+    /// kuriya #645. A file that will not go is a warning, not an abort: the
+    /// service unit is already gone, so the config home is still removed --
+    /// and the order leaves the database whole rather than without its WAL.
+    #[test]
+    fn a_wal_that_will_not_go_keeps_the_database_and_still_removes_the_config_home() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let wal = with_suffix(&db, "-wal");
+        std::fs::write(&db, b"main").unwrap();
+        // A directory where `-wal` goes is the portable way to make
+        // `remove_file` fail (see the same trick in `db.rs`).
+        std::fs::create_dir_all(&wal).unwrap();
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("purge is best-effort past the service unit");
+
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"main",
+            "the database is kept whole"
+        );
+        assert!(!home.path().exists(), "the config home is still removed");
     }
 
     /// A backend that refuses must abort before anything is deleted. Deleting
