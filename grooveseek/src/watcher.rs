@@ -8356,6 +8356,150 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // (kuriya #605, AX-06) is_stale_create keeps what it must not drop. The
+    // predicate compiles on every OS, so these run everywhere; the two tests
+    // above only drive it through the debouncer with FSEvents-shaped records.
+    // -----------------------------------------------------------------------
+
+    fn event_with(kind: EventKind, paths: &[&Path]) -> notify::Event {
+        paths
+            .iter()
+            .fold(notify::Event::new(kind), |ev, p| ev.add_path(p.to_path_buf()))
+    }
+
+    /// A scratch dir holding one existing file `a.md` and one existing
+    /// subdirectory `sub`, plus the path of a file that does not exist.
+    fn stale_create_scratch(tag: &str) -> (PathBuf, PathBuf, PathBuf, RemoveDirOnDrop) {
+        let root = crate::test_support::unique_temp_path(tag);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.md"), "# a\n").unwrap();
+        let guard = RemoveDirOnDrop(root.clone());
+        (root.join("a.md"), root.join("sub"), root.join("gone.md"), guard)
+    }
+
+    #[test]
+    fn is_stale_create_keeps_a_create_for_an_existing_path() {
+        let (file, dir, _gone, _cleanup) = stale_create_scratch("kb-stale-create-keep-create");
+        for (kind, path) in [
+            (EventKind::Create(CreateKind::File), &file),
+            (EventKind::Create(CreateKind::Any), &file),
+            (EventKind::Create(CreateKind::Folder), &dir),
+        ] {
+            let ev = event_with(kind, &[path]);
+            assert!(
+                !is_stale_create(&ev),
+                "a Create for a path that exists announces an arrival and must be kept: {ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_stale_create_keeps_a_data_modify_for_an_existing_path() {
+        let (file, _dir, gone, _cleanup) = stale_create_scratch("kb-stale-create-keep-modify");
+        let data = EventKind::Modify(ModifyKind::Data(
+            notify_debouncer_full::notify::event::DataChange::Content,
+        ));
+        for kind in [data, EventKind::Modify(ModifyKind::Any)] {
+            let ev = event_with(kind, &[&file]);
+            assert!(
+                !is_stale_create(&ev),
+                "a Modify for a path that exists must be kept: {ev:?}"
+            );
+        }
+        // Contrast: the same Modify for a path that is gone is the one the
+        // filter exists to drop.
+        assert!(is_stale_create(&event_with(data, &[&gone])));
+    }
+
+    /// Rename halves, Remove and every other kind pass through even when the
+    /// path is gone: they are what the debouncer must still see.
+    #[test]
+    fn is_stale_create_passes_renames_removes_and_other_kinds_for_a_gone_path() {
+        let (_file, _dir, gone, _cleanup) = stale_create_scratch("kb-stale-create-pass-through");
+        assert!(!gone.exists());
+        for kind in [
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Remove(RemoveKind::Any),
+            EventKind::Access(notify_debouncer_full::notify::event::AccessKind::Any),
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            let ev = event_with(kind, &[&gone]);
+            assert!(
+                !is_stale_create(&ev),
+                "only a Create or a non-rename Modify may be dropped: {ev:?}"
+            );
+        }
+    }
+
+    /// A stat failure other than NotFound may hide a path that is there, so
+    /// the event is kept. An interior NUL makes the stat fail with
+    /// `InvalidInput` before any syscall, on every OS.
+    #[test]
+    fn is_stale_create_keeps_an_event_whose_stat_fails_other_than_not_found() {
+        let odd = PathBuf::from("kb-stale-create\0nul.md");
+        let err = std::fs::symlink_metadata(&odd).expect_err("a NUL in a path cannot be stat'ed");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "precondition: {err:?}");
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(
+                notify_debouncer_full::notify::event::DataChange::Content,
+            )),
+        ] {
+            let ev = event_with(kind, &[&odd]);
+            assert!(!is_stale_create(&ev), "must keep on a non-NotFound stat failure: {ev:?}");
+        }
+    }
+
+    #[test]
+    fn is_stale_create_keeps_an_event_without_paths() {
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            let ev = event_with(kind, &[]);
+            assert!(!is_stale_create(&ev), "nothing to stat, so nothing to drop: {ev:?}");
+        }
+    }
+
+    /// Only the first path decides: a gone second path does not drop a Create
+    /// whose first path exists.
+    #[test]
+    fn is_stale_create_looks_only_at_the_first_path() {
+        let (file, _dir, gone, _cleanup) = stale_create_scratch("kb-stale-create-first-path");
+        let kind = EventKind::Create(CreateKind::File);
+        assert!(!is_stale_create(&event_with(kind, &[&file, &gone])));
+        assert!(is_stale_create(&event_with(kind, &[&gone, &file])));
+    }
+
+    /// The handler forwards errors and kept events, and swallows only a stale
+    /// Create.
+    #[test]
+    fn stale_create_handler_forwards_errors_and_kept_events() {
+        let (file, _dir, gone, _cleanup) = stale_create_scratch("kb-stale-create-handler");
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut handler = StaleCreateHandler(tx);
+        let create = EventKind::Create(CreateKind::File);
+        notify::EventHandler::handle_event(&mut handler, Err(notify::Error::generic("boom")));
+        notify::EventHandler::handle_event(&mut handler, Ok(event_with(create, &[&gone])));
+        notify::EventHandler::handle_event(&mut handler, Ok(event_with(create, &[&file])));
+        drop(handler);
+        let got: Vec<_> = rx.iter().collect();
+        assert_eq!(got.len(), 2, "error + kept Create, stale Create dropped: {got:?}");
+        assert!(got[0].is_err(), "the error must be forwarded: {got:?}");
+        assert_eq!(
+            got[1].as_ref().unwrap().paths,
+            vec![file.clone()],
+            "the Create for an existing path must be forwarded: {got:?}"
+        );
+    }
+
     /// (feature-69) The reindex line names the chunks whose stored vector was kept, beside
     /// the total, and stays ASCII for a CP932 console.
     #[test]
