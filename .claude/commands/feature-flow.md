@@ -144,22 +144,23 @@ phase が **release を構成する最終 PR** だった場合のみ:
 1. `CHANGELOG.md` の release 化 — `[Unreleased]` を `[X.Y.Z] - YYYY-MM-DD` に rename、空 `[Unreleased]` を再 seed、最下部に compare link を追加、並行 PR が重複させた `### Added` / `### Changed` 等を節ごとにまとめ直す。順序と畳み方は `.dev/release-checklist.md` の「ドキュメント同期」節にあり、ここには写さない (step 3 と同じ理由)
 2. `Cargo.toml` の `version` を bump (`cargo check` で `Cargo.lock` 自動追従)
 3. `.dev/release-checklist.md` の「ドキュメント同期」節を実行 (README / ARCHITECTURE / 各 docs)
-4. `/full-audit` 起動判断 (CLAUDE.local.md の trigger 該当時のみ)
+4. release 直前の確認 — **確認の前に、この cycle で直して merge 済みの audit の子 task を `report` で `done` にする** (summary に PR 番号。Phase 8 まで待つと、直した `release-blocker` が未了のまま残って自分で tag を止める)。そのうえで CI が緑 / 依存の脆弱性検査 / kuriya で `release-blocker` の未了の子 task が無い。手順は `.dev/release-checklist.md` の「release 直前の確認」節にあり、ここには写さない。**`/full-audit` は tag の前の gate ではない**
 5. tag 作成: `git tag -a vX.Y.Z -m "..."` → `git push origin vX.Y.Z`
 6. `release.yml` (cargo-dist) が auto で binary build + GH Release を作成 (手動の `gh release create` は禁止)
 7. release run を待つ間に **disk を測って user に見せる** — `powershell -NoProfile -File .dev/tools/disk-sweep.ps1` (引数なし = 報告のみ、何も消さない) の空きと `target` の TOTAL を伝え、「消すなら `/disk-sweep apply` と打ってください」と添える。**controller は `-Apply` を付けて実行しない** — `/disk-sweep` は `disable-model-invocation` で、削除は user が打った時にしか始まらない (この step がそれを迂回したら gate の意味が無い)。**`.dev/tools/disk-sweep.ps1` が無い checkout (前提の節) では測れない** — release は止めず、user に「disk: 未計測 (script なし)」と伝えて次へ進む。PowerShell を手で組んで代用しない、「クリーンアップした」とも言わない。release を切った直後は、直前まで大量に build していて次の build 予定が最も薄い。**`target` は次の release までに数十 GB 単位で戻る**ので、日数ではなく release を契機にする。何を消し何を残すかの判定は script が持ち、ここには写さない
+8. (任意) minor / major を出した後は `/full-audit` を回して次の minor の候補を洗い出す。回す時機は `.dev/release-checklist.md` の「release 後の full-audit」節。結果は kuriya の audit 親と子 task に置く
 
-途中で release-blocker な audit findings が出たら、Phase 5-6 にループバックして fix。
+step 4 で kuriya に `release-blocker` の tag が付いた未了の子 task が残っていたら、tag を打たずに Phase 5-6 にループバックして fix し、merge したらその子を `done` にしてから step 4 をやり直す。それ以外の audit 指摘は release を止めない。
 
-### Phase 8 — Knowledge note + audit todo 更新
+### Phase 8 — Knowledge note + audit の子 task 更新
 
 cycle 完了時に必ず:
 
 - `.dev/knowledge/<feature-NN>-summary.md` 作成 (結果サマリ / 設計判断 / ハマりどころ / 工程まとめ / 後続候補)。**controller が書く** (この指示を受け取り、かつ書けるのは controller だけ。subagent の Write は名前に `summary` を含む file で拒否され得る。anthropics/claude-code#44657)
 - `.dev/feature-ideas.md` の対応 ID を `done` マーク + done line に PR 番号と merge 日付を追記
-- `/full-audit` を回した場合は `.dev/archive/<date>-cycle/audit-todos.md` に deferred items を整理
+- この cycle で kuriya の audit の子 task を直したなら、その子が `done` になっているかを確かめる (release した cycle では Phase 7 step 4 の前に済んでいる。release しない cycle ではここで `report` の `done`、summary に PR 番号)。先送りは `open` のまま親の下に残す (Markdown の台帳は作らない)
 
-上の 3 つはどれも `.dev/` 配下 = git untracked なので commit には乗らない (subagent に渡す後の 2 つは、そのことを subagent prompt で必ず明示する)。
+上の 1 つ目と 2 つ目は `.dev/` 配下 = git untracked なので commit には乗らない (subagent に渡す 2 つ目は、そのことを subagent prompt で必ず明示する)。3 つ目の kuriya の更新は repo の外で、commit とは関係しない。
 
 `CHANGELOG.md` はこの Phase では触らない。entry は変更した PR 自身が `[Unreleased]` に足し、`[X.Y.Z]` への畳み込みは Phase 7 step 1 が持つ。**release 見出しにも entry にも PR 番号は付けない** — 付いている行は無い (via: `grep -c '^## .*(#' CHANGELOG.md` / `grep -c '^- .*(#[0-9]' CHANGELOG.md`)。PR 番号は散文の中で経緯として書く時だけ現れる。`.claude/` だけを触る PR は entry 自体を書かない (#220 / #222 / #238 の型)。
 
@@ -213,7 +214,7 @@ cycle 完了時に必ず:
 
 - `.dev/release-checklist.md` (= Phase 7 step 1 / step 3 の元。`CLAUDE.local.md` の「リリース運用」から辿れる)
 - `CLAUDE.local.md` の「feature-flow の常時 guardrail」節 (= 本 command の常時 guardrail)
-- `/full-audit` command (Phase 7 で起動判断。KB の repo にだけある)
+- `/full-audit` command (Phase 7 step 8、tag の後に任意。KB の repo にだけある)
 - skill `codex-review` とその scripts の `codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke。push 前の sweep とローカル Codex 前掃除の節も同じ SKILL.md)
 - `.dev/knowledge/codex-review-loop-pitfalls.md` (KB の記録。DT には無い) (Phase 6 の運用 reference。罠の番号はここに写さない — 引き方は Phase 6 の参照行)
 - `.dev/knowledge/index-progress-buffering-pitfall.md` (KB の記録。DT には無い) (background bash の罠 reference)
