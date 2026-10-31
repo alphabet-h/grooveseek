@@ -141,8 +141,8 @@ const SHEET_MAX_BYTES: usize = 1024 * 1024;
 const MIN_SHARED_STRING_BYTES: u64 = 5;
 
 /// 1 つの part を共有するシートの名前を、chunk の見出しに並べる時の上限 (bytes、区切りの `", "`
-/// を含む)。見出しは embedding に渡る context (`build_context` が 200 文字で切る) にも入るので、
-/// 同じ 200 に揃える。最初の名前 (実際に読んだシート) は長さに関係なく必ず出す。
+/// を含む)。見出しは embedding に渡る context ([`crate::parser::build_context`] が 200 文字で切る)
+/// にも入るので、同じ 200 に揃える。最初の名前 (実際に読んだシート) は長さに関係なく必ず出す。
 const SHARED_PART_LABEL_MAX_BYTES: usize = 200;
 
 /// xlsx 1 本の抽出に掛ける上限の組 (cap 注入版の [`parse_xlsx_bytes_limited`] が受け取る)。
