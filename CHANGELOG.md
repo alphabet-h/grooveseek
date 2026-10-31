@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-10-31
+
 ### Changed
 
 - **The release build for Apple Silicon (`aarch64-apple-darwin`) runs on `macos-26`.** It ran on
@@ -6663,7 +6665,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.23.0...HEAD
+[1.23.0]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/alphabet-h/grooveseek/compare/v1.21.5...v1.22.0
 [1.21.5]: https://github.com/alphabet-h/grooveseek/compare/v1.21.4...v1.21.5
 [1.21.4]: https://github.com/alphabet-h/grooveseek/compare/v1.21.3...v1.21.4

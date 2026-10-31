@@ -107,7 +107,7 @@ max_chunk_chars = 3500
 # 任意 (v1.15.0+): サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
 # `max_text_file_size` (md / txt / ソースコード) は `groove index` / `rebuild_index` / watcher が読む
 # ファイル 1 本の生バイト上限で、超えたファイルは warning 付きで skip される。
-# `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF / .xlsx から取り出す
+# `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF / .xlsx (v1.23.0+) から取り出す
 # テキスト量の上限。どれも既定は 50 MiB で、バイト数、単位付きの大きさ ("300 MiB"、
 # "2 GB"。KB / MB / GB / TB は 1000 進、KiB / MiB / GiB / TiB は 1024 進、小数は不可)、
 # または "unlimited" を書ける。`0` はエラーで、メッセージが "unlimited" を案内する —
@@ -116,7 +116,7 @@ max_chunk_chars = 3500
 # 要る: 中の XML はファイルの数倍に展開されるので、ファイル側の上限だけを上げても
 # zip-bomb の検査は残る。既定を超える値は 1 回だけ警告される: 索引中はファイルを
 # まるごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF と
-# .xlsx の抽出は上限に関係なく 120 秒で打ち切られる (.xlsx で時間を見るのは entry の展開中、
+# .xlsx (v1.23.0+) の抽出は上限に関係なく 120 秒で打ち切られる (.xlsx で時間を見るのは entry の展開中、
 # シートを part に対応付けている間、セルごと・シートごと。アーカイブを開く処理、calamine が
 # workbook を開く処理、1 セルの読み出しの途中では止めず、そこを縛るのは展開 budget だけ)。
 # `max_decompressed_size` の "unlimited" は運用者が展開量の守りを外す設定で、その時は .xlsx の
