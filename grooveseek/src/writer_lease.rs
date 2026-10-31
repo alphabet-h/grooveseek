@@ -270,36 +270,7 @@ impl WriterLease {
         let lock_path = suffixed(&resolved, ".writer-lock");
         let info_path = suffixed(&resolved, ".writer.json");
         let shown_lock_path = suffixed(&shown, ".writer-lock");
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(source) => {
-                return Err(LeaseError::Io {
-                    lock_path: shown_lock_path,
-                    source,
-                });
-            }
-        };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(LeaseError::Busy {
-                    lock_path: shown_lock_path,
-                    holder: read_holder_at(&info_path),
-                });
-            }
-            Err(TryLockError::Error(source)) => {
-                return Err(LeaseError::Io {
-                    lock_path: shown_lock_path,
-                    source,
-                });
-            }
-        }
+        let file = open_and_try_lock(&lock_path, shown_lock_path, &info_path)?;
 
         let acquired_at = SystemTime::now();
         let now = chrono::Utc::now().to_rfc3339();
@@ -447,6 +418,103 @@ impl Drop for WriterLease {
                 crate::embedder::ascii_io_error(&e)
             );
         }
+    }
+}
+
+/// Open `lock_path` (creating it, never truncating) and take its exclusive
+/// lock without waiting: the step [`WriterLease::try_acquire`] and
+/// [`BareWriterLock::try_hold`] share, so both lock the same file the same
+/// way. `shown_lock_path` is what an error names; `info_path` is read for a
+/// [`LeaseError::Busy`]'s holder.
+#[allow(clippy::result_large_err)]
+fn open_and_try_lock(
+    lock_path: &Path,
+    shown_lock_path: PathBuf,
+    info_path: &Path,
+) -> Result<File, LeaseError> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(source) => {
+            return Err(LeaseError::Io {
+                lock_path: shown_lock_path,
+                source,
+            });
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(LeaseError::Busy {
+            lock_path: shown_lock_path,
+            holder: read_holder_at(info_path),
+        }),
+        Err(TryLockError::Error(source)) => Err(LeaseError::Io {
+            lock_path: shown_lock_path,
+            source,
+        }),
+    }
+}
+
+/// The writer lock on `<db>.writer-lock` held without a [`WriterLease`]'s
+/// `<db>.writer.json`: for `groove service uninstall --purge`, which must keep
+/// every writer out while it deletes the index but writes nothing into the
+/// index's directory beyond the lock file a lease would create. A
+/// [`WriterLease`] would publish `writer.json` and remove it on drop, deleting
+/// a holder file another process left there, which purge keeps.
+///
+/// Takes the database path already resolved whole
+/// ([`WriterLease::resolved_db_path`]), so the caller resolves once and
+/// deletes from that same resolution. Dropping it releases the lock; the lock
+/// file stays (ADR-0031).
+#[derive(Debug)]
+pub(crate) struct BareWriterLock {
+    file: File,
+}
+
+#[allow(clippy::result_large_err)]
+impl BareWriterLock {
+    /// Take the lock on `<resolved>.writer-lock` now, or report who holds it.
+    pub(crate) fn try_hold(resolved: &Path) -> Result<Self, LeaseError> {
+        let lock_path = suffixed(resolved, ".writer-lock");
+        let info_path = suffixed(resolved, ".writer.json");
+        let file = open_and_try_lock(&lock_path, lock_path.clone(), &info_path)?;
+        Ok(Self { file })
+    }
+
+    /// Retry [`BareWriterLock::try_hold`] every 250 ms until it succeeds or
+    /// `wait` has passed, as [`WriterLease::acquire_with_wait`] does; then
+    /// return the last `Busy`. An `Io` error returns at once.
+    pub(crate) fn hold_with_wait(resolved: &Path, wait: Duration) -> Result<Self, LeaseError> {
+        let deadline = Instant::now().checked_add(wait);
+        loop {
+            match Self::try_hold(resolved) {
+                Err(busy @ LeaseError::Busy { .. }) => {
+                    let pause = match deadline {
+                        None => RETRY_INTERVAL,
+                        Some(deadline) => {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            if left.is_zero() {
+                                return Err(busy);
+                            }
+                            left.min(RETRY_INTERVAL)
+                        }
+                    };
+                    std::thread::sleep(pause);
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+impl Drop for BareWriterLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 

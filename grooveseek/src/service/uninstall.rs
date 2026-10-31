@@ -1,7 +1,9 @@
 //! Uninstall orchestration for groove service backends.
 use crate::service::{ServiceBackend, backend, resolve_config_home, validate_service_name};
+use crate::writer_lease::{BareWriterLock, LeaseError, WriterLease};
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct UninstallParams {
     pub service_name: String,
@@ -37,6 +39,24 @@ pub(crate) fn run_with_backend(
     be: &dyn ServiceBackend,
     config_home: Option<&Path>,
     params: UninstallParams,
+) -> Result<()> {
+    run_with_backend_waiting(be, config_home, params, PURGE_WRITER_WAIT)
+}
+
+/// How long `--purge` waits for the index's writer lock before it gives up
+/// and deletes nothing. The backends stop the server without waiting for it
+/// to exit (Windows' `schtasks /End` returns at once), so a server that is
+/// stopping still holds the lock for a moment; one that is still holding it
+/// after this long is taken to be running.
+const PURGE_WRITER_WAIT: Duration = Duration::from_secs(10);
+
+/// [`run_with_backend`] with the wait for the writer lock passed in, so a
+/// test of the refusal need not sit out [`PURGE_WRITER_WAIT`].
+fn run_with_backend_waiting(
+    be: &dyn ServiceBackend,
+    config_home: Option<&Path>,
+    params: UninstallParams,
+    writer_wait: Duration,
 ) -> Result<()> {
     let name = validate_service_name(&params.service_name).map_err(|e| anyhow!(e))?;
 
@@ -78,19 +98,37 @@ pub(crate) fn run_with_backend(
         // When it cannot be read, say so: the config home about to be removed
         // is the last place that names the database.
         match database_named_by(&home) {
-            Ok(db) => purge_database(&db),
-            Err(why) => eprintln!(
-                "Warning: {why}; the index database (.groove.db with its -wal / -shm) \
-                 was not removed"
-            ),
-        }
-
-        if home.exists() {
-            std::fs::remove_dir_all(&home)?;
-            eprintln!(
-                "Removed config home: {} (groove.toml + service files)",
-                home.display()
-            );
+            Ok(db) => {
+                // Resolved once, whole; everything removed below is named
+                // from this resolution (kuriya #645 review).
+                let target = PurgeTarget::new(&db);
+                // Held from before the files are listed until after the config
+                // home is gone: a writer that took the lock in between could
+                // put a `-wal` back after the last check, and the config home
+                // is the last place that names the database.
+                let _lock = match hold_writer_lock(&target, writer_wait) {
+                    Ok(lock) => lock,
+                    Err(why) => {
+                        return Err(anyhow!(
+                            "{why}. Neither the index database ({}) nor the config home ({}) \
+                             was removed. The service unit is already gone; once that process \
+                             has exited, run `groove service uninstall --service-name {name} \
+                             --purge --yes` again to finish the purge.",
+                            target.resolved.display(),
+                            home.display()
+                        ));
+                    }
+                };
+                purge_database(&target);
+                remove_config_home(&home)?;
+            }
+            Err(why) => {
+                eprintln!(
+                    "Warning: {why}; the index database (.groove.db with its -wal / -shm) \
+                     was not removed"
+                );
+                remove_config_home(&home)?;
+            }
         }
     } else if let Some(home) = config_home
         && home.exists()
@@ -108,10 +146,16 @@ pub(crate) fn run_with_backend(
 /// committed pages that were never checkpointed live only in `-wal`; removing
 /// the main file alone left them on disk.
 ///
+/// Called with the index's writer lock held ([`hold_writer_lock`]), so no
+/// process that writes under the lock (`index`, a server's watcher or
+/// rebuild, a reader's one-time write) can put a file back between the
+/// listing, the removal and the last check below.
+///
 /// Best-effort, like the rest of `--purge` after the service unit is gone:
 /// the unit cannot be put back, so a file that will not go (on Windows, a
-/// server `schtasks /End` has not finished stopping still holds it) is a
-/// warning, and the config home is still removed. Every file is accounted
+/// process that has the database open without the writer lock, such as a
+/// server that never took it, still holds it) is a warning, and the config
+/// home is still removed. Every file is accounted
 /// for on stderr, removed or left in place, so a partial purge is never
 /// silent. The removal order is [`crate::db::remove_database_files`]'s: least
 /// valuable first, so a failure leaves the database whole rather than a
@@ -127,22 +171,26 @@ pub(crate) fn run_with_backend(
 /// When `.groove.db` is a symlink, the files removed are the ones it points
 /// to: SQLite opens the database through the link and puts `-wal` / `-shm`
 /// beside the target (the writer lease resolves it the same way), so removing
-/// the link alone would leave the whole index on disk. The target is resolved
-/// once, before anything is removed, and every path printed -- removed, left
-/// in place or kept -- is named from it. The link itself goes last, and only
-/// once its target's files are gone, so a partial purge keeps the way to them.
-fn purge_database(db: &Path) {
-    let base = crate::writer_lease::sidecar_base(db);
-    let kept = kept_sidecars(db, &base);
+/// the link alone would leave the whole index on disk. The whole path is
+/// resolved once ([`PurgeTarget::new`]), the directory links above the file
+/// included, and every file removed or printed is named from that one
+/// resolution: a directory link repointed during the purge does not move the
+/// removal into another directory. The link itself goes last, only once its
+/// target's files are gone (so a partial purge keeps the way to them), and
+/// only while it still resolves to the file that was removed
+/// ([`remove_link_if_unchanged`]).
+fn purge_database(target: &PurgeTarget) {
+    let PurgeTarget { link, resolved } = target;
+    let kept = kept_sidecars(link, resolved);
     let files: Vec<PathBuf> = crate::db::DATABASE_FILE_SUFFIXES
         .iter()
-        .map(|suffix| with_suffix(&base, suffix))
+        .map(|suffix| with_suffix(resolved, suffix))
         .collect();
     let present: Vec<&PathBuf> = files.iter().filter(|p| exists_no_follow(p)).collect();
 
     let mut removed_all = true;
     if !present.is_empty() {
-        if let Err(e) = crate::db::remove_database_files(&base) {
+        if let Err(e) = crate::db::remove_database_files(resolved) {
             removed_all = false;
             eprintln!("Warning: failed to remove the index database: {e:#}");
         }
@@ -155,22 +203,15 @@ fn purge_database(db: &Path) {
         }
     }
 
-    if base != db && is_symlink(db) {
+    if link != resolved && is_symlink(link) {
         if !removed_all {
             eprintln!(
                 "Warning: left in place: {} (symlink to {}, kept with its target)",
-                db.display(),
-                base.display()
+                link.display(),
+                resolved.display()
             );
         } else {
-            match std::fs::remove_file(db) {
-                Ok(()) => eprintln!(
-                    "Removed symlink to the index database: {} -> {}",
-                    db.display(),
-                    base.display()
-                ),
-                Err(e) => eprintln!("Warning: left in place: {} ({e})", db.display()),
-            }
+            remove_link_if_unchanged(link, resolved);
         }
     }
 
@@ -180,6 +221,133 @@ fn purge_database(db: &Path) {
             p.display()
         );
     }
+}
+
+/// The database `--purge` deletes, resolved once before anything is locked or
+/// removed (kuriya #645 review).
+#[derive(Debug)]
+struct PurgeTarget {
+    /// The path `groove.toml` names, its directory resolved whole: where the
+    /// symlink is when `.groove.db` is one, and otherwise the database file
+    /// itself (then equal to `resolved`).
+    link: PathBuf,
+    /// The database file, every symlink and junction in its path resolved,
+    /// the directories above it included ([`WriterLease::resolved_db_path`],
+    /// the file a writer lease on `db` locks and its writer opens).
+    resolved: PathBuf,
+}
+
+impl PurgeTarget {
+    fn new(db: &Path) -> Self {
+        let resolved = WriterLease::resolved_db_path(db);
+        let link = match (db.parent(), db.file_name()) {
+            (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
+                WriterLease::resolved_db_path(dir).join(name)
+            }
+            _ => db.to_path_buf(),
+        };
+        Self { link, resolved }
+    }
+}
+
+/// Take the writer lock on `target`'s database, waiting up to `wait` for a
+/// server the backend has told to stop to let go of it, or say why not.
+///
+/// `Ok(None)` when the database's directory does not exist: no file of the
+/// index can be there for a writer to hold, and there is nothing to lock.
+///
+/// What the lock does not cover: a process that opens the database without
+/// it (a server that never took the lock or gave it up and goes on as a
+/// reader, or a read-only command such as `groove search`). On Windows its
+/// open files will not go and are reported as left in place; on unix they
+/// are unlinked under it.
+fn hold_writer_lock(
+    target: &PurgeTarget,
+    wait: Duration,
+) -> std::result::Result<Option<BareWriterLock>, String> {
+    let resolved = &target.resolved;
+    let first = match BareWriterLock::try_hold(resolved) {
+        Err(LeaseError::Busy { .. }) if !wait.is_zero() => {
+            eprintln!(
+                "Waiting up to {}s for the groove process holding the writer lock of {} to exit...",
+                wait.as_secs(),
+                resolved.display()
+            );
+            BareWriterLock::hold_with_wait(resolved, wait)
+        }
+        other => other,
+    };
+    match first {
+        Ok(lock) => Ok(Some(lock)),
+        Err(LeaseError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound
+                && !resolved.parent().is_some_and(exists_no_follow) =>
+        {
+            Ok(None)
+        }
+        Err(LeaseError::Busy { lock_path, holder }) => Err(match holder {
+            Some(h) => format!(
+                "a groove process (pid {}, {}) still holds the writer lock at {} after {}s",
+                h.pid,
+                h.role.as_str(),
+                lock_path.display(),
+                wait.as_secs()
+            ),
+            None => format!(
+                "a groove process still holds the writer lock at {} after {}s",
+                lock_path.display(),
+                wait.as_secs()
+            ),
+        }),
+        Err(e) => Err(format!(
+            "{e}, so groove cannot tell whether a process still writes the index"
+        )),
+    }
+}
+
+/// Remove the symlink `link` if it is still a symlink that resolves to
+/// `resolved`, the file whose removal it was the way to; otherwise leave it
+/// and say so. A link repointed during the purge names another database,
+/// which this purge did not remove and so must not orphan or misreport.
+///
+/// The check narrows the window, it does not close it: `link` can still be
+/// swapped between the check and `remove_file`. Closing it would take
+/// removing by a handle opened on the link (`unlinkat` under an `O_NOFOLLOW`
+/// directory handle on unix, `FILE_FLAG_OPEN_REPARSE_POINT` with a delete
+/// disposition on Windows), which `std` does not offer.
+fn remove_link_if_unchanged(link: &Path, resolved: &Path) {
+    if !is_symlink(link) || WriterLease::resolved_db_path(link) != resolved {
+        eprintln!(
+            "Warning: left in place: {} (it no longer links to {}; it changed during the purge)",
+            link.display(),
+            resolved.display()
+        );
+        return;
+    }
+    match std::fs::remove_file(link) {
+        Ok(()) => eprintln!(
+            "Removed symlink to the index database: {} -> {}",
+            link.display(),
+            resolved.display()
+        ),
+        Err(e) => eprintln!(
+            "Warning: left in place: {} ({})",
+            link.display(),
+            crate::embedder::ascii_io_error(&e)
+        ),
+    }
+}
+
+/// Remove the config home, if it is there, and say so.
+fn remove_config_home(home: &Path) -> Result<()> {
+    if home.exists() {
+        std::fs::remove_dir_all(home)?;
+        eprintln!(
+            "Removed config home: {} (groove.toml + service files)",
+            home.display()
+        );
+    }
+    Ok(())
 }
 
 /// The lock and holder files `--purge` leaves beside the database, as they
@@ -677,5 +845,163 @@ mod tests {
             "the backend must not be consulted when the confirmation is missing"
         );
         assert!(toml.exists());
+    }
+
+    /// kuriya #645 review (I1). A process that still holds the writer lock
+    /// (a server the backend told to stop but that has not exited) could put
+    /// a `-wal` back after purge looked. Purge now deletes nothing -- not the
+    /// database, not the config home that names it -- and says to run it
+    /// again; run again once the holder is gone, it finishes.
+    #[test]
+    fn a_database_whose_writer_lock_is_held_is_kept_with_the_config_home() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        let wal = with_suffix(&db, "-wal");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"uncheckpointed pages").unwrap();
+        let toml = home.path().join("groove.toml");
+        let lease = crate::writer_lease::WriterLease::try_acquire(
+            &db,
+            crate::writer_lease::Role::Serve,
+            &kb_root.path().join("kb"),
+        )
+        .expect("nobody else holds the lease");
+
+        let be = FakeBackend::ok();
+        let err = run_with_backend_waiting(
+            &be,
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect_err("a held writer lock must stop the purge");
+
+        let msg = err.to_string();
+        assert!(msg.contains("writer lock"), "{msg}");
+        assert!(msg.contains("--purge --yes"), "it must say to run again: {msg}");
+        assert_eq!(be.uninstalled.take().as_deref(), Some("au28"));
+        assert_eq!(std::fs::read(&db).unwrap(), b"main", "the database is kept");
+        assert!(wal.exists(), "the WAL is kept: {}", wal.display());
+        assert!(toml.exists(), "the config home naming the database is kept");
+
+        drop(lease);
+        run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect("run again with the lock free, the purge finishes");
+        assert!(!db.exists(), "the database must be deleted");
+        assert!(!wal.exists(), "the WAL must be deleted");
+        assert!(!home.path().exists(), "the config home must be deleted");
+    }
+
+    /// kuriya #645 review (I1). The backend stops a server without waiting
+    /// for it to exit, so purge waits for the writer lock before it gives up.
+    /// [`hold_writer_lock`] is called directly: through `run_with_backend`,
+    /// the Windows tray cleanup before it can take longer than the hold below,
+    /// and the test would pass without waiting.
+    #[test]
+    fn purge_waits_for_a_stopping_writer_to_let_go() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let lease = crate::writer_lease::WriterLease::try_acquire(
+            &db,
+            crate::writer_lease::Role::Serve,
+            &kb_root.path().join("kb"),
+        )
+        .expect("nobody else holds the lease");
+        let target = PurgeTarget::new(&db);
+        assert!(
+            BareWriterLock::try_hold(&target.resolved).is_err(),
+            "the lease must keep purge's lock out while it is held"
+        );
+        let hold = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            drop(lease);
+        });
+
+        let lock = hold_writer_lock(&target, Duration::from_secs(10))
+            .expect("the lock comes free within the wait");
+        let waited = started.elapsed();
+        releaser.join().unwrap();
+
+        assert!(lock.is_some(), "the lock is held for the purge");
+        assert!(waited >= hold, "it must have waited for the release: {waited:?}");
+    }
+
+    /// kuriya #645 review (I2). The database's directory is reached through a
+    /// directory link that is repointed after purge resolved it. The files
+    /// removed are the ones resolved, not the other database the link now
+    /// leads to.
+    #[test]
+    fn a_directory_link_repointed_after_resolution_does_not_move_the_removal() {
+        use crate::writer_lease::DirLink;
+        for kind in DirLink::all() {
+            let root = TempHome::new();
+            let first = root.path().join("first");
+            let second = root.path().join("second");
+            for dir in [&first, &second] {
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(dir.join(".groove.db"), b"main").unwrap();
+                std::fs::write(dir.join(".groove.db-wal"), b"pages").unwrap();
+            }
+            let alias = root.path().join("alias");
+            if !kind.point(&alias, &first) {
+                continue;
+            }
+            let db = alias.join(".groove.db");
+
+            let target = PurgeTarget::new(&db);
+            assert!(kind.point(&alias, &second), "{kind:?}: repoint");
+            purge_database(&target);
+
+            assert!(
+                !first.join(".groove.db").exists() && !first.join(".groove.db-wal").exists(),
+                "{kind:?}: the resolved database must go"
+            );
+            assert_eq!(
+                std::fs::read(second.join(".groove.db")).unwrap(),
+                b"main",
+                "{kind:?}: the database the link now leads to is not this purge's"
+            );
+            assert!(second.join(".groove.db-wal").exists(), "{kind:?}");
+            #[cfg(windows)]
+            std::fs::remove_dir(&alias).unwrap();
+        }
+    }
+
+    /// kuriya #645 review (I2). A `.groove.db` symlink repointed after purge
+    /// resolved it now names another database. Purge removes the one it
+    /// resolved and leaves the link, rather than removing a link it did not
+    /// follow and reporting it as the way to the removed file.
+    #[test]
+    fn a_database_link_repointed_after_resolution_is_left_in_place() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let elsewhere = TempHome::new();
+        let resolved_one = elsewhere.path().join("one.db");
+        let other_one = elsewhere.path().join("other.db");
+        std::fs::write(&resolved_one, b"main").unwrap();
+        std::fs::write(&other_one, b"other").unwrap();
+        if !crate::writer_lease::file_symlink_or_skip(&resolved_one, &db) {
+            return;
+        }
+
+        let target = PurgeTarget::new(&db);
+        std::fs::remove_file(&db).unwrap();
+        assert!(crate::writer_lease::file_symlink_or_skip(&other_one, &db));
+        purge_database(&target);
+
+        assert!(!resolved_one.exists(), "the resolved database must go");
+        assert_eq!(std::fs::read(&other_one).unwrap(), b"other");
+        assert!(
+            std::fs::symlink_metadata(&db).is_ok_and(|m| m.file_type().is_symlink()),
+            "the repointed link must stay"
+        );
     }
 }
