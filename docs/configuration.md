@@ -114,7 +114,7 @@ max_chunk_chars = 3500
 # and `max_text_file_size` (md / txt / source code) are the largest file, in raw bytes, that
 # `groove index`, `rebuild_index` and the watcher read; a larger one is skipped
 # with a warning. `max_decompressed_size` is how far an .xlsx / .docx / .pptx
-# may inflate in total and how much text a PDF or an .xlsx may yield. Each defaults to
+# may inflate in total and how much text a PDF or an .xlsx (v1.23.0+) may yield. Each defaults to
 # 50 MiB and takes a byte count, a size with a unit ("300 MiB", "2 GB"; KB, MB,
 # GB and TB count in 1000s, KiB, MiB, GiB and TiB in 1024s; no fractions), or
 # "unlimited". `0` is refused and the message points at "unlimited", because
@@ -124,7 +124,7 @@ max_chunk_chars = 3500
 # and raising the file cap alone keeps the zip-bomb check in place. A value
 # above the default is announced once with a warning: a file is held in memory
 # whole while it is indexed, an allocation failure aborts the process instead
-# of skipping the file, and PDF and .xlsx extraction still stop after 120 s
+# of skipping the file, and PDF and .xlsx (v1.23.0+) extraction still stop after 120 s
 # (for .xlsx, checked while its entries are inflated, while its sheets are matched
 # to their parts, and at each cell and sheet; opening the archive, calamine
 # opening the workbook or reading one cell is not interrupted, and only the

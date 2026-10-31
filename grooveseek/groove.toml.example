@@ -214,6 +214,12 @@ enabled = ["md"]
 # cap is skipped with a warning. A value above the default is announced once
 # with a warning: a file being indexed is held in memory whole, and an
 # allocation failure aborts the process rather than skipping the file.
+# max_decompressed_size also caps the text an .xlsx yields when it is indexed
+# (v1.23.0+), as it does a PDF's; a workbook past it is skipped. .xlsx
+# extraction stops after 120 s like PDF's (v1.23.0+), checked as entries are
+# inflated, sheets matched to parts, and at each cell and sheet: opening the
+# archive or the workbook and reading one cell are not interrupted, and with
+# "unlimited" nothing bounds those steps (docs/configuration.md).
 # Lowering a cap does not remove documents already indexed: they stay until
 # `groove index --force` runs or the file shrinks under the cap, and an edit
 # that leaves the file over the cap keeps the old text searchable.
@@ -227,7 +233,7 @@ enabled = ["md"]
 #fail_on_frontmatter_error = false
 #max_binary_file_size  = "50 MiB"   # pdf / docx / xlsx / pptx, raw bytes       (default: 50 MiB)
 #max_text_file_size    = "50 MiB"   # md / txt / source code, raw bytes         (default: 50 MiB)
-#max_decompressed_size = "50 MiB"   # xlsx/docx/pptx inflated total, PDF text   (default: 50 MiB)
+#max_decompressed_size = "50 MiB"   # xlsx/docx/pptx inflated, PDF+xlsx text    (default: 50 MiB)
 # A 300 MB workbook needs both of these; the second is what it expands to:
 # max_binary_file_size  = "unlimited"
 # max_decompressed_size = "16 GiB"

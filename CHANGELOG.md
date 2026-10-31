@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-10-31
+
 ### Changed
 
 - **The release build for Apple Silicon (`aarch64-apple-darwin`) runs on `macos-26`.** It ran on
@@ -43,13 +45,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 - **`.xlsx` text extraction is bounded per document.** The text a workbook yields is not
   proportional to its size: shared strings can be referenced from any number of cells and
-  sheets. A workbook now yields at most `[index].max_decompressed_size` of text (50 MiB by
-  default), counted as the stored headings (`Sheet: ...`), the chunk bodies and the blank
-  lines between bodies in the document's raw content, and stops after 120 s, the same bounds
-  as PDF; past either it is skipped with a `decompression-bomb guard` error, on the index path
-  and on `get_document` alike. The clock is read while the decompression preflight inflates
-  each entry, while the sheets are resolved to their parts, between the steps that open the
-  workbook, at every cell and at every sheet boundary. Opening the zip archive, calamine
+  sheets. A workbook now yields at most `[index].max_decompressed_size` of text when it is
+  indexed (50 MiB by default), counted as the stored headings (`Sheet: ...`), the chunk bodies
+  and the blank lines between bodies in the document's raw content, and stops after 120 s, the
+  same bounds as PDF; past either it is skipped with a `decompression-bomb guard` error.
+  `get_document` and `resources/read` apply the same bounds with the built-in 50 MiB, whatever
+  the key says, as they already do for PDF. The clock is read while the decompression
+  preflight inflates each entry, while the sheets are resolved to their parts, between the
+  steps that open the workbook, at every cell and at every sheet boundary. Opening the zip archive, calamine
   opening the workbook, reading the title from `docProps/core.xml` and reading a single cell
   cannot be interrupted; that work is bounded by the decompression budget instead. With
   `max_decompressed_size = "unlimited"`, which lifts that budget, nothing bounds those steps:
@@ -6663,7 +6666,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.23.0...HEAD
+[1.23.0]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/alphabet-h/grooveseek/compare/v1.21.5...v1.22.0
 [1.21.5]: https://github.com/alphabet-h/grooveseek/compare/v1.21.4...v1.21.5
 [1.21.4]: https://github.com/alphabet-h/grooveseek/compare/v1.21.3...v1.21.4
