@@ -23,7 +23,7 @@ pub fn run(params: UninstallParams) -> Result<()> {
     run_with_backend(backend().as_ref(), config_home.as_deref(), params)
 }
 
-/// `run` with its two ambient dependencies passed in (AU-28).
+/// [`run`] with its two ambient dependencies passed in (AU-28).
 ///
 /// Both are needed, not just the backend. `--purge --yes` deletes the config
 /// home and the index database it names, so a test that supplied only a fake
@@ -95,21 +95,30 @@ fn run_with_backend_waiting(
         // NOT inside config_home. Read the configured `kb_path` from the
         // install-generated toml before deleting config_home so that the
         // advertised `--purge` cleanup actually removes the index database.
-        // When it cannot be read, say so: the config home about to be removed
-        // is the last place that names the database.
         match database_named_by(&home) {
-            Ok(db) => {
+            Ok(Some(db)) => {
                 // Resolved once, whole; everything removed below is named
                 // from this resolution (kuriya #645 review).
                 let target = PurgeTarget::new(&db);
                 purge_under_writer_lock(&target, &home, &name, writer_wait, remove_config_home)?;
             }
-            Err(why) => {
+            Ok(None) => {
+                // No groove.toml at all: nothing names a database, now or on
+                // a re-run, so keeping the config home would only make the
+                // purge impossible to finish.
                 eprintln!(
-                    "Warning: {why}; the index database (.groove.db with its -wal / -shm) \
-                     was not removed"
+                    "Warning: {} is not there, so no index database is named; only the \
+                     config home is removed",
+                    home.join("groove.toml").display()
                 );
                 remove_config_home(&home)?;
+            }
+            Err(why) => {
+                // The config home's groove.toml is the only record of where
+                // the database is. Removing it here would orphan the database
+                // and leave a re-run nothing to find it or its lock by
+                // (kuriya #645, local Codex r3), so nothing is removed.
+                return Err(undecidable_database(&why, &home, &name));
             }
         }
     } else if let Some(home) = config_home
@@ -262,7 +271,7 @@ struct PurgeTarget {
     /// Whether `link` was a symlink when it was resolved.
     is_link: bool,
     /// What the symlink at `link` held when it was resolved, as
-    /// `std::fs::read_link` spells it; `None` when `link` was not a symlink,
+    /// [`std::fs::read_link`] spells it; `None` when `link` was not a symlink,
     /// or was one that could not be read (then the link is left in place and
     /// named, [`link_step`]). [`remove_link_if_unchanged`] removes the link
     /// only while it still holds this.
@@ -552,6 +561,24 @@ fn ascii_error_chain(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
+/// The error `--purge` stops with when the config home's `groove.toml` is
+/// there but does not tell where the index database is (`why`, from
+/// [`database_named_by`]). Nothing has been removed but the service unit,
+/// and the backends' `uninstall` succeeds on a unit that is already gone, so
+/// the re-run it suggests can finish the purge.
+fn undecidable_database(why: &str, home: &Path, name: &str) -> anyhow::Error {
+    anyhow!(
+        "{why}. groove cannot tell where the index database is, so nothing was removed: \
+         the config home ({}) is kept, because its groove.toml ({}) is the only record of \
+         where the database is. The service unit is already gone. Either fix groove.toml and \
+         run `groove service uninstall --service-name {name} --purge --yes` again to finish \
+         the purge, or delete the index database by hand (.groove.db in the parent directory \
+         of the KB, with its .groove.db-wal / .groove.db-shm) and then the config home.",
+        home.display(),
+        home.join("groove.toml").display()
+    )
+}
+
 /// Remove the config home, if it is there, and say so.
 fn remove_config_home(home: &Path) -> Result<()> {
     if home.exists() {
@@ -606,6 +633,12 @@ fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
 
 /// The database a service's `groove.toml` names, or why it cannot be told.
 ///
+/// `Ok(None)` only when `groove.toml` is not there at all (the open fails
+/// with "not found"): then nothing names a database. A file that is there
+/// but cannot be read (permissions, a directory or a named pipe in its
+/// place, over the cap, not UTF-8, not TOML, no usable `kb_path`) is an
+/// error, because the database it may name cannot be told apart from none.
+///
 /// `kb_path` is resolved the way the server resolves it when it loads that
 /// file: a relative one against the directory holding `groove.toml` (the
 /// config home), not against wherever `groove service uninstall` was run. A `kb_path` with
@@ -620,12 +653,13 @@ fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
 /// what they lead to unless it is a regular file. A named pipe or a device in
 /// its place would otherwise block the purge, and a huge file would be read
 /// whole, after the service unit is already gone (kuriya #645, local Codex
-/// r2). Only the read is shared: `load_from` itself is not called, because it
-/// also checks every other key against this build's schema, and a config this
-/// build would refuse for an unrelated key still names the database to purge.
-fn database_named_by(home: &Path) -> std::result::Result<PathBuf, String> {
+/// r2). Only the read is shared: [`crate::config::Config::load_from`] itself
+/// is not called, because it also checks every other key against this
+/// build's schema, and a config this build would refuse for an unrelated key
+/// still names the database to purge.
+fn database_named_by(home: &Path) -> std::result::Result<Option<PathBuf>, String> {
     let toml_path = home.join("groove.toml");
-    let bytes = crate::links::read_required_following(
+    let Some(bytes) = crate::links::read_required_following(
         &toml_path,
         crate::config::MAX_CONFIG_FILE_BYTES,
         "config",
@@ -633,7 +667,9 @@ fn database_named_by(home: &Path) -> std::result::Result<PathBuf, String> {
     // The chain names the file already ("refusing to read the config: <path>:
     // <reason>", "failed to read the config: <path>: <io error>").
     .map_err(|e| ascii_error_chain(&e))?
-    .ok_or_else(|| format!("could not read {}: it is not there", toml_path.display()))?;
+    else {
+        return Ok(None);
+    };
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("could not read {}: it is not UTF-8", toml_path.display()))?;
     let value = toml::from_str::<toml::Value>(&text)
@@ -651,7 +687,7 @@ fn database_named_by(home: &Path) -> std::result::Result<PathBuf, String> {
             toml_path.display()
         ));
     }
-    Ok(crate::resolve_db_path(&kb))
+    Ok(Some(crate::resolve_db_path(&kb)))
 }
 
 fn exists_no_follow(p: &Path) -> bool {
@@ -983,7 +1019,7 @@ mod tests {
 
         let db = database_named_by(home.path()).expect("a relative kb_path names a database");
 
-        assert_eq!(db, crate::resolve_db_path(&home.path().join("kb")));
+        assert_eq!(db, Some(crate::resolve_db_path(&home.path().join("kb"))));
     }
 
     /// A `kb_path` that is a filesystem root has no parent to hold
@@ -1002,30 +1038,135 @@ mod tests {
         let why = database_named_by(home.path()).expect_err("a root has no parent");
 
         assert!(why.contains("no parent directory"), "{why}");
+
+        // Nor does the purge go on without it (local Codex r3): the config
+        // home that holds the kb_path to fix is kept.
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect_err("a root kb_path stops the purge");
+        assert!(
+            home.path().join("groove.toml").exists(),
+            "groove.toml stays"
+        );
     }
 
     /// A `groove.toml` that cannot be read used to skip the database without
-    /// a word and then delete the only file that named it. It is now a
-    /// reason (printed as a warning), and the rest of the purge goes on.
+    /// a word and then delete the only file that named it. Then a warning
+    /// said so and the config home still went, which orphaned the database:
+    /// a re-run had nothing left to find it or its lock by (kuriya #645,
+    /// local Codex r3). Now nothing is removed, and the error names the
+    /// reason, the config home, its `groove.toml` and the two ways to finish.
     #[test]
-    fn an_unparsable_config_names_no_database_and_the_home_still_goes() {
+    fn an_unparsable_config_keeps_the_config_home_and_says_how_to_finish() {
         let home = TempHome::new();
-        std::fs::write(home.path().join("groove.toml"), "kb_path = [unclosed\n").unwrap();
+        let toml = home.path().join("groove.toml");
+        std::fs::write(&toml, "kb_path = [unclosed\n").unwrap();
 
         let why = database_named_by(home.path()).expect_err("broken toml");
         assert!(why.contains("could not parse"), "{why}");
 
+        let be = FakeBackend::ok();
+        let err = run_with_backend(&be, Some(home.path()), params(true, true))
+            .expect_err("a database that cannot be located stops the purge");
+        let msg = format!("{err:#}");
+
+        assert_eq!(
+            be.uninstalled.take().as_deref(),
+            Some("au28"),
+            "the service unit is removed first"
+        );
+        assert!(toml.exists(), "groove.toml is kept: {}", toml.display());
+        assert!(msg.contains("could not parse"), "{msg}");
+        assert!(msg.contains(&home.path().display().to_string()), "{msg}");
+        assert!(msg.contains(&toml.display().to_string()), "{msg}");
+        assert!(msg.contains("service unit is already gone"), "{msg}");
+        assert!(
+            msg.contains("groove service uninstall --service-name au28 --purge --yes"),
+            "{msg}"
+        );
+        assert!(msg.contains(".groove.db-wal / .groove.db-shm"), "{msg}");
+        // The paths are the machine's; everything else stays ASCII (AGENTS.md).
+        let words = msg.replace(&home.path().display().to_string(), "");
+        assert!(words.is_ascii(), "stderr stays ASCII: {msg}");
+    }
+
+    /// kuriya #645, local Codex r3. The refusal above is not a dead end: the
+    /// re-run it names removes the service unit again (the backends succeed
+    /// on a unit that is already gone) and, with `groove.toml` fixed, purges
+    /// the database and the config home as a first run would have.
+    #[test]
+    fn a_purge_stopped_by_a_broken_config_finishes_once_the_config_is_fixed() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let wal = with_suffix(&db, "-wal");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"pages").unwrap();
+        let toml = home.path().join("groove.toml");
+        let good = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, "kb_path = [unclosed\n").unwrap();
+
         run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
-            .expect("purge is best-effort past the service unit");
-        assert!(!home.path().exists(), "the config home is still removed");
+            .expect_err("a broken groove.toml stops the purge");
+        assert_eq!(std::fs::read(&db).unwrap(), b"main", "the database stays");
+        assert!(wal.exists(), "the WAL stays: {}", wal.display());
+        assert!(home.path().exists(), "the config home stays");
+
+        std::fs::write(&toml, good).unwrap();
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("the re-run finishes the purge");
+        assert!(!db.exists(), "the database is deleted on the re-run");
+        assert!(!wal.exists(), "the WAL is deleted on the re-run");
+        assert!(
+            !home.path().exists(),
+            "the config home is deleted on the re-run"
+        );
+    }
+
+    /// kuriya #645, local Codex r3. Only a `groove.toml` that is not there
+    /// counts as absent. A directory in its place is something there that
+    /// cannot be read, so the purge stops and keeps the config home.
+    #[test]
+    fn a_groove_toml_that_is_a_directory_is_not_taken_for_an_absent_one() {
+        let home = TempHome::new();
+        std::fs::create_dir_all(home.path().join("groove.toml")).unwrap();
+
+        let why = database_named_by(home.path()).expect_err("a directory is not a config");
+        assert!(why.contains("groove.toml"), "{why}");
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect_err("a directory in place of groove.toml stops the purge");
+        assert!(
+            home.path().join("groove.toml").is_dir(),
+            "the config home stays"
+        );
+    }
+
+    /// kuriya #645, local Codex r3. With no `groove.toml` at all, nothing
+    /// names a database now or on any re-run, so keeping the config home
+    /// would make the purge impossible to finish: it warns and removes the
+    /// config home, as it did before.
+    #[test]
+    fn a_config_home_without_groove_toml_is_still_removed() {
+        let home = TempHome::new();
+        std::fs::write(home.path().join("service.xml"), b"<task/>").unwrap();
+
+        assert_eq!(
+            database_named_by(home.path()),
+            Ok(None),
+            "no groove.toml names no database"
+        );
+
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect("a config home without groove.toml is purged");
+        assert!(!home.path().exists(), "the config home is removed");
     }
 
     /// kuriya #645, local Codex r2. `groove.toml` is read the way the server
     /// reads its `--config`, bounded by [`crate::config::MAX_CONFIG_FILE_BYTES`].
     /// One byte over it (a valid file that names the database, padded with a
     /// comment, so an unbounded read would parse it and purge the database),
-    /// it names no database: the database stays, with a warning, and the
-    /// config home still goes, as for any config that cannot be read.
+    /// it names no database: the purge stops with an error and removes
+    /// nothing, the database and the config home that names it both stay, as
+    /// for any config that cannot be read (local Codex r3).
     #[test]
     fn a_groove_toml_over_the_config_cap_names_no_database_and_the_database_stays() {
         let home = TempHome::new();
@@ -1052,16 +1193,20 @@ mod tests {
             "{why}"
         );
 
-        run_with_backend_waiting(
+        let err = run_with_backend_waiting(
             &FakeBackend::ok(),
             Some(home.path()),
             params(true, true),
             Duration::ZERO,
         )
-        .expect("purge is best-effort past the service unit");
+        .expect_err("a database that cannot be located stops the purge");
+        assert!(
+            format!("{err:#}").contains("over the"),
+            "the error gives the reason: {err:#}"
+        );
         assert_eq!(std::fs::read(&db).unwrap(), b"main", "the database stays");
         assert!(wal.exists(), "the WAL stays: {}", wal.display());
-        assert!(!home.path().exists(), "the config home is still removed");
+        assert!(toml.exists(), "the config home and its groove.toml stay");
     }
 
     /// kuriya #645, local Codex r2. A named pipe in place of `groove.toml`
@@ -1080,6 +1225,12 @@ mod tests {
         let why = database_named_by(home.path()).expect_err("a fifo is not a config");
 
         assert!(why.contains("not a regular file"), "{why}");
+
+        // Something is there, so it is not taken for an absent groove.toml:
+        // the purge stops and the config home stays (local Codex r3).
+        run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
+            .expect_err("a fifo in place of groove.toml stops the purge");
+        assert!(home.path().exists(), "the config home stays");
     }
 
     /// kuriya #645, local Codex r2. The pid in the refusal comes from

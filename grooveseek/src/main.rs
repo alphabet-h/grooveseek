@@ -442,7 +442,11 @@ enum ServiceSubcommand {
         /// index's writer lock, neither is deleted: the command waits up to
         /// 10 seconds for it to exit, then stops with an error naming the pid
         /// recorded for it, which can be stale: confirm that pid is groove,
-        /// stop it only if it is, and run the command again
+        /// stop it only if it is, and run the command again. When groove.toml
+        /// is there but does not tell where the database is, neither is
+        /// deleted and the command stops with an error: fix groove.toml and
+        /// run it again. With no groove.toml at all, only the config home is
+        /// deleted
         #[arg(long)]
         purge: bool,
         /// Confirm --purge. Has no effect without it

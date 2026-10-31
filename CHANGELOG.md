@@ -29,8 +29,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   purge now removes the file it points to with the `-wal` / `-shm` beside it, then the link; it
   used to remove the link alone and say the database was removed. A relative `kb_path` is read
   against the config home, as the server reads it, not against the directory `uninstall` runs
-  in; a `kb_path` that is a filesystem root, or a `groove.toml` that cannot be read, leaves the
-  database alone with a warning instead of skipping it without a word. `groove.toml` is read the
+  in. When the database cannot be located (a `kb_path` that is a filesystem root, or a
+  `groove.toml` that is there but cannot be read), the purge used to skip the database without a
+  word and then delete the config home, the only record of where the database was; it now
+  deletes nothing more and fails, naming the reason, the config home and its `groove.toml`, and
+  saying to fix `groove.toml` and run it again or delete the database and the config home by hand.
+  A config home with no `groove.toml` at all names no database, so it is removed alone with a
+  warning. `groove.toml` is read the
   way the server reads its `--config`: over the 1 MiB config limit, or not a regular file (a named
   pipe or a device in its place), it is not read and counts as a config that cannot be read.
   The purge now holds the index's writer lock from before it lists the files until the config
