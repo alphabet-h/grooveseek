@@ -148,7 +148,7 @@ phase が **release を構成する最終 PR** だった場合のみ:
 5. tag 作成: `git tag -a vX.Y.Z -m "..."` → `git push origin vX.Y.Z`
 6. `release.yml` (cargo-dist) が auto で binary build + GH Release を作成 (手動の `gh release create` は禁止)
 7. release run を待つ間に **disk を測って user に見せる** — `powershell -NoProfile -File .dev/tools/disk-sweep.ps1` (引数なし = 報告のみ、何も消さない) の空きと `target` の TOTAL を伝え、「消すなら `/disk-sweep apply` と打ってください」と添える。**controller は `-Apply` を付けて実行しない** — `/disk-sweep` は `disable-model-invocation` で、削除は user が打った時にしか始まらない (この step がそれを迂回したら gate の意味が無い)。**`.dev/tools/disk-sweep.ps1` が無い checkout (前提の節) では測れない** — release は止めず、user に「disk: 未計測 (script なし)」と伝えて次へ進む。PowerShell を手で組んで代用しない、「クリーンアップした」とも言わない。release を切った直後は、直前まで大量に build していて次の build 予定が最も薄い。**`target` は次の release までに数十 GB 単位で戻る**ので、日数ではなく release を契機にする。何を消し何を残すかの判定は script が持ち、ここには写さない
-8. (任意) minor / major を出した後は `/full-audit` を回して次の minor の候補を洗い出す。回す時機は `.dev/release-checklist.md` の「release 後の full-audit」節。結果は kuriya の audit 親と子 task に置く
+8. (任意) `/full-audit` の起動の条件に当たっていれば回す。release とは切り離してあり、minor / major を出したことは条件に入らない (前回の audit からの経過と前回の子の片付き具合で決まる。条件は `.claude/commands/full-audit.md` の「起動の条件」節)。結果は kuriya の audit 親と子 task に置く
 
 step 4 で kuriya に `release-blocker` の tag が付いた未了の子 task が残っていたら、tag を打たずに Phase 5-6 にループバックして fix し、merge したらその子を `done` にしてから step 4 をやり直す。それ以外の audit 指摘は release を止めない。
 

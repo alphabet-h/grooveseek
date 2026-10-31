@@ -4,11 +4,34 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 # /full-audit
 
-プロジェクト全体を多角的に厳しめにレビューし、結果を `.dev/knowledge/` 配下の audit ノートと kuriya の audit 親 (親 issue + 指摘ごとの子 task) に整理し、着手プランを提示する。**release の前の gate ではない** — minor を出した後に回し、次の minor の候補を洗い出す。
+プロジェクト全体を多角的に厳しめにレビューし、結果を `.dev/knowledge/` 配下の audit ノートと kuriya の audit 親 (親 issue + 指摘ごとの子 task) に整理し、着手プランを提示する。**release の前の gate ではなく、release とも切り離してある** — 前回の audit からの経過と、
+前回の指摘の片付き具合で回す (下の「起動の条件」節)。release の直前に代わりに見る確認は
+`.dev/release-checklist.md` の「release 直前の確認」節にある (ここには写さない)。
 
-## 想定起動タイミング
+## 起動の条件
 
-起動の時機と、release の直前に代わりに見る確認は `.dev/release-checklist.md` の「release 後の full-audit」節と「release 直前の確認」節にある (ここには写さない)。
+規則の家はこの節だけ (2026-10-31 user 決定、kuriya #641)。Phase 0 がこの節を機械的に当てる。
+「前回の audit」= kuriya の audit 親 (tag `full-audit`) のうち、`audit-<YYYY-MM-DD>` tag の日付が最も新しいもの。
+日付 tag の付いた audit 親が 1 つも無い時 (初回、または親に日付 tag が無い時) の扱いは Phase 0 の 1 にある (経過の gate を当てずに回すことがある)。
+
+- **通常の引き金**: 前回の audit から **1 か月以上** 経ち、**かつ** 前回までの audit 親の子がすべて片付いている
+  (`done` / `dropped`。残してよいのは、理由つきで見送った子だけ)
+- **棚卸しの段**: 前回から 1 か月経った時点で子が残っていたら、1 件ずつ「やる / `dropped` / 理由つきで見送り」に振り分け、
+  そのうえで回す。「やる」にした子は片付けてから回す。見送りは子に tag `audit-deferred` を足し
+  (`mcp__kuriya__update` の `tags` は全置換なので、元の tag も渡す)、body に `append` で理由を書く
+- **上限**: 前回から **3 か月** 経ったら、棚卸しが済んでいなくても回す
+  (推定の値: minor が 2 週間に 2 回のペースなら、10 回前後の release が無監査で出る)
+- **前倒ししてよい**: 大規模 refactor (DB schema / transport / chunking 算法等) の後、
+  重大な security 修正 (権限境界 / 入力検証 / 認証層) の後。1 か月を待たずに回してよい (棚卸しの段は同じく先に行う)
+- **minor / major の release は引き金に入らない**。2026-10-31 までは「minor / major を出した後」だった (kuriya #600) が、
+  audit の指摘を直して minor を出すとそれがまた audit を呼び、片付かない medium / low が release ごとに積み上がった
+  (minor は 2 週間に 4 回。via: `git tag -l "v1.2*" --sort=creatordate`)
+
+採らなかった案 (kuriya #641):
+
+- 「minor の後のまま、audit の修正だけの minor を除く」— 新機能が 1 つ混ざるとまた回るので、頻度が下がらない
+- 「前回の子が全部片付いた時だけ」— low を 1 件放置すると永久に回らず、新しいコードの検査 (audit の本来の役目) まで止まる。
+  棚卸しの段と 3 か月の上限はこれを塞ぐために足した
 
 ## 前提
 
@@ -26,17 +49,32 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 ## 実行フロー
 
-### Phase 0 — 前の audit 親の確認と Scope 確認
+### Phase 0 — 起動の条件の確認と Scope 確認
 
-**最初に前の audit 親を確かめる** (subagent を出す前、audit ノートを書く前)。audit 親は**親自身**に tag `full-audit` が付いている
+**最初に前の audit 親を確かめ、「起動の条件」節を当てる** (subagent を出す前、audit ノートを書く前)。audit 親は**親自身**に tag `full-audit` が付いている
 (3-2 の step 1。2026-10-22 分は task #536)。子の tag からは引かない — 指摘の無い audit は子を持たず、付け替えた子は元の日付の tag を持ったままになる。
 
-1. `mcp__kuriya__find` に `tags_all: ["full-audit"]` を渡し、`done` / `dropped` 以外の親をすべて挙げる (直近の 1 つに絞らない)
+1. `mcp__kuriya__find` に `tags_all: ["full-audit"]` を渡して親をすべて挙げる (状態で絞らない。`truncated` が true なら `limit` を上げる)。
+   `audit-<YYYY-MM-DD>` tag の日付が最も新しいものが前回の audit で、その日付から今日までの経過を出す。
+   以下の 2・3 は、このうち `done` / `dropped` 以外の親をすべて見る (直近の 1 つに絞らない)。
+   **日付 tag で経過が出せない時**は 3 を当てる前に分ける:
+   - **`full-audit` の親が 1 つも無い** (初回): 経過の gate を当てずに回す (2 は当てる対象が無いので飛ばす)
+   - **日付 tag の無い `full-audit` 親がある**: その親の番号を user に示し、tag `audit-<YYYY-MM-DD>` を足して直すか
+     (日付は親の `created_at` か body の出典のノート名から取り、user に確かめる。`mcp__kuriya__update` の `tags` は全置換なので元の tag も渡す)、
+     直せないなら経過の gate を当てずに回すかを user に確かめる。直したら 1 から引き直す。
+     日付 tag の付いた親が別にあっても、tag の無い親のほうが新しいかもしれないので、同じく先に user に確かめる
 2. **途中で止まった audit が無いか** — 挙がった親の body に「起票完了」の行 (3-2 の step 4) が無ければ、その audit は 3-2 の途中で
-   止まっている。新しい audit は回さず、3-2 の「途中で止まった時」に従ってその親の起票を終わらせる
-3. それぞれの親を `find` の `under: <親の番号>` で読み、`release-blocker` か high の未了 (`open` / `doing` / `pending`) の子が
-   残っていたら、**ここで止まり、新しい audit は回さない** (`.dev/release-checklist.md` の「release 後の full-audit」節)。
-   残っている子の番号を user に示して終わる
+   止まっている (以下「未完の親」)。未完の親があれば新しい audit は回さず、3 も当てない:
+   - **1 つ**: その親の**番号**を再開の対象として、3-2 の「途中で止まった時」に従って起票を終わらせる
+   - **2 つ以上**: **ここで止まる**。番号を user に示し、再開する親を 1 つ選んでもらう (自動で選ばない)。選ばれた 1 つを
+     「途中で止まった時」で終わらせ、残りは次の `/full-audit` の Phase 0 でまた 1 つずつ扱う
+3. **経過で分ける** (前倒しの事由 — 大規模 refactor / 重大な security 修正の後 — があれば、user に確かめて 1 か月を経たものとして扱う):
+   - **3 か月以上**: 上限。子が残っていても回す (残った子は 3-2 の step 2 で新しい親へ付け替える)
+   - **1 か月以上 3 か月未満**: それぞれの親を `find` の `under: <親の番号>` で読み、未了 (`open` / `doing` / `pending`) の子のうち
+     tag `audit-deferred` の無いものを挙げる。無ければ回す。あれば棚卸しの段に入る — 1 件ずつ「やる / `dropped` / 理由つきで見送り」を
+     user に振り分けてもらい、`dropped` は `report` で、見送りは「起動の条件」節の形で記録する。「やる」が 1 件でも残ったら
+     **ここで止まり、新しい audit は回さない**。「やる」の子の番号を user に示して終わる
+   - **1 か月未満**: **ここで止まる**。前回の日付と、回せるようになる日 (前回 + 1 か月) を user に示して終わる
 
 通ったら 1 行で確認する:
 
@@ -268,9 +306,19 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
 1. **親を 1 つ作る** — `mcp__kuriya__capture` に `kind: issue`、title `full-audit YYYY-MM-DD`、
    body に出典 (Phase 3-1 の `.dev/knowledge/review-YYYY-MM-DD-full-audit.md`、対象 commit) と ID の接頭辞、
    tags に `full-audit` と `audit-<YYYY-MM-DD>` (Phase 0 は親をこの tag で引く)。返った親の番号を 3-1 のノートにすぐ書いておく
-2. **前の親の残りを付け替えるか決める** — 前の audit 親に残った low / medium の未了を、新しい親へ移すか前の親に残すかを決める
-   (`release-blocker` / high の未了が残っていれば Phase 0 で止まっているので、ここには来ない)。移すものは
-   `mcp__kuriya__update` に `item_id` と `parent_id: <新しい親の番号>` を渡して付け替える (木は 4 段まで。audit の子は 2 段目なので収まる)
+2. **前の親すべての残りを新しい親へ付け替える** — 付け替え元は Phase 0 の 1 で挙げた `done` / `dropped` 以外の audit 親のうち、
+   次の 3 つを除いたものすべて (直近の 1 つに絞らない): 新しい親 (step 1 で作った、または再開している親) 自身 /
+   未完の親 (body に「起票完了」の行が無い親。自分の起票が終わるまで子を動かさず、`done` にもしない。未起票の指摘を黙って捨てないため) /
+   `audit-<YYYY-MM-DD>` の日付が新しい親と同じか後の親 (古い audit を再開した時に、後の audit の子を逆向きに吸い上げないため)。
+   日付 tag の無い親 (Phase 0 の 1 で直さなかった親) は、付け替え元に入れるかを user に確かめる。
+   新しく回した audit なら、付け替え元に残る未了は見送りの子 (tag `audit-deferred`) と、3 か月の上限で回した時の振り分け前の子だけ
+   (「やる」が残っていれば Phase 0 で止まっている)。再開の時は Phase 0 の 3 を通っていないので、振り分け前の子も来る。
+   どれも同じく付け替え、次の棚卸しの段に回す。それぞれの親を `find` の
+   `under: <親の番号>` で読み、未了 (`open` / `doing` / `pending`) の子をすべて
+   `mcp__kuriya__update` に `item_id` と `parent_id: <新しい親の番号>` を渡して付け替え (木は 4 段まで。audit の子は 2 段目なので収まる)、
+   次の棚卸しの段で新しい親の子と一緒に振り分ける。付け替えたら元の親をもう一度 `under` で読み、未了が残っていないことを確かめてから
+   `report` で `done` にする (残っていれば付け替えを続ける)。この step は冪等 — 付け替え済みの子は新しい親の下にいるので、
+   もう一度当てても同じ結果になる
 3. **指摘ごとに子 task を作る** — `capture` に `kind: task`・`parent_id: <親の番号>`。
    - title: `<接頭辞>-NN: 要旨` (接頭辞は audit ごとに決める。`AU` / `BU` … の続き)
    - priority: 重大度 (Critical → `highest`、High → `high`、Medium → `medium`、Low → `low`、Info → `lowest`)
@@ -283,12 +331,16 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
 5. **状態は kuriya の `report` で動かす** — 着手は `doing`、直したら `done` (summary に PR 番号)、
    直さないと決めた low は `dropped` (summary に理由)。子が全部 `done` / `dropped` になったら親を `done` にする
 
-**途中で止まった時** (step 1〜4 のどこかで落ちた、または Phase 0 の 2 が「起票完了」の無い親を見つけた): 親を作り直さない。
-3-1 のノートに書いた親の番号 (無ければ `find` の `tags_all: ["full-audit", "audit-<YYYY-MM-DD>"]`) を使い、`find` の
-`under: <親の番号>` で作られた子の title (`<接頭辞>-NN`) とノートの TODO 化マッピングを突き合わせ、足りない子だけを作ってから step 4 に進む。
+**途中で止まった時** (step 1〜4 のどこかで落ちた、または Phase 0 の 2 が未完の親を見つけた): 親を作り直さない。
+再開の対象は**番号で受け取る** — 同じ session で落ちたなら step 1 の `capture` が返した番号、新しい session なら Phase 0 の 2 が
+示した未完の親の番号 (2 つ以上なら user が選んだ 1 つ)。`audit-<YYYY-MM-DD>` の tag で引き直さない (同じ日付の親が複数あり得て、
+どれを再開するか決められない)。3-1 のノートに親の番号が無ければ、先にその番号をノートに書いてから続ける。
+その番号の親を新しい親として、**まず step 2 からやり直す** (冪等なので、付け替えの途中で止まっていても、済んでいても同じ結果になる。古い親に子を取り残さない)。
+そのうえで `find` の `under: <親の番号>` で作られた子の title (`<接頭辞>-NN`) とノートの TODO 化マッピングを突き合わせ、
+足りない子だけを作ってから step 4 に進む (step 2 で付け替えた前の audit の子は、元の日付の tag と接頭辞を持つので突き合わせから外す)。
 この再開の間は Phase 0 の 3 の止まる条件を当てない (今まさに作っている親の子なので)。
 
-`release-blocker` 以外の指摘は release を止めない (次の minor の候補)。tag の前に見る形は
+`release-blocker` 以外の指摘は release を止めない (後の release で直す候補)。tag の前に見る形は
 `.dev/release-checklist.md` の「release 直前の確認」節。
 
 ---
@@ -313,7 +365,8 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
 - **C. 中期のみ** に集中 (~2-3 時間) — 中期の子を `doing` に
 - **D. 今セッションは TODO 化だけ** で終了 (実装は次セッション) — 子は `open` のまま
 
-どれを選んでも、残った子は親の下で `open` のまま次の minor の候補になる。直さないと決めた low は `dropped` にする。
+どれを選んでも、残った子は親の下で `open` のまま、次の audit の前の棚卸しの段 (「起動の条件」節) で振り分ける。
+直さないと決めた low は `dropped` にする。
 木は `mcp__kuriya__find` の `under: <親の番号>` で読める。
 
 ---
@@ -332,11 +385,21 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
 
 実例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md`
 
-直前の audit ノートの探し方は `.dev/release-checklist.md` の「release 後の full-audit」節にある — 新規は `.dev/knowledge/` 直下、済んだサイクルのものは `.dev/knowledge/archive/audits/` と置き場が分かれているので、**両方見る**。見つかったら Phase 0 で「前回 audit (`<date>`) からの差分にフォーカスすべき箇所はあるか」をユーザに確認してもよい。
+直前の audit の日付は kuriya の audit 親の `audit-<YYYY-MM-DD>` tag で引く (Phase 0 の 1)。ノートの置き場は分かれている —
+新規は `.dev/knowledge/review-YYYY-MM-DD-full-audit.md`、済んだサイクルのものは `.dev/knowledge/archive/audits/` — ので、**両方見る**:
+
+```bash
+find .dev -name 'review-*full-audit*' | sort | tail -1
+```
+
+この行が正しいのは live 側 (`.dev/knowledge/` 直下) に古いノートを残していない時だけ。`sort` は path 全体を比べるので
+`knowledge/review-...` が `knowledge/archive/...` より後に来て、live に何かあればそれが勝つ (2026-08-27 の PR #244 まで、
+live に残っていた 2026-04-29 のノートが毎回返っていた)。**live を空に保つのが前提** — 残す必要ができたら basename で sort する形に変える
+(codex P2 on PR #244)。見つかったら Phase 0 で「前回 audit (`<date>`) からの差分にフォーカスすべき箇所はあるか」をユーザに確認してもよい。
 
 ## 関連
 
 - `CLAUDE.local.md` が import する `../grooveseek-shared/rules/knowledge-notes.md` (`.dev/knowledge/` への書き込み) と
   `../grooveseek-shared/rules/workflow.md` (audit と cycle の置き場)。どちらも owner 側の private repo で、公開 repo の checkout には無い
-- `.dev/release-checklist.md` の「release 直前の確認」節と「release 後の full-audit」節
+- `.dev/release-checklist.md` の「release 直前の確認」節 (release を止めるのは `release-blocker` の未了だけで、audit を回したかどうかではない)
 - `.dev/feature-ideas.md` の「優先度ピック」 (= 既知の長期計画)、本コマンドが登録する todo は実装可能性の高い具体 issue
