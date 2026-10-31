@@ -162,6 +162,7 @@ groove serve --kb-path /path/to/knowledge-base --model bge-m3   # must match the
 groove serve --kb-path ... --model bge-m3 --reranker bge-v2-m3  # + cross-encoder reranking
 groove serve --kb-path ... --transport http --port 3100         # HTTP, multi-client
 groove serve --kb-path ... --no-watch                           # disable live-sync
+groove serve --kb-path ... --debounce-ms 2000                   # watcher debounce (default 500 ms)
 ```
 
 Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](clients.md#http-transport-for-multiple-simultaneous-clients) section. A `--bind` outside loopback additionally requires `--i-know`, because groove ships no authentication. On Linux, where a service manager passes `LISTEN_FDS` — systemd, or anything else speaking the same protocol — `--systemd-socket` takes the listening socket it already bound instead of binding one; it cannot be combined with `--bind` or `--port`, and `serve` refuses to start rather than falling back to TCP when no socket was passed. An abstract socket — a `ListenStream=` whose name starts with `@` — is refused as well, because it has no file for `SocketMode=` to apply to. A build for any other operating system refuses the flag outright. The same applies to `[transport.http].systemd_socket` in a trusted config: if the transport resolves to stdio, which accepts no socket, `serve` refuses to start instead of ignoring the key — unless you asked for stdio yourself with `--transport stdio`, which still runs that config on stdio for the one session.
@@ -225,6 +226,10 @@ OS-specific backends:
 The installer writes a config home at `<dirs::config_dir()>/groove/<service-name>/` containing `groove.toml` (with `kb_path` and `bind`). Override the base directory via `GROOVE_CONFIG_HOME` env var. The registered launch line names that file with `--config` (v0.20.0+), so the daemon reads the config the installer wrote rather than whatever it discovers from its working directory — see [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
 
 Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since groove has no authentication.
+
+`--no-auto-start` registers the service without starting it, now or at login: on Linux the unit is written but not enabled, on macOS the plist sets `RunAtLoad` and `KeepAlive` to false and is not loaded, and on Windows the task's logon trigger is registered disabled. Start it by hand from the OS service manager when you want it.
+
+`service install` refuses to overwrite an instance that is already installed — an existing `groove.toml` in its config home, or an existing unit / plist / task. `--force` overwrites both instead. The existing `groove.toml` is edited rather than replaced: only `kb_path` and `[transport.http].bind` are rewritten, and every other setting and comment is kept; `--kb-path` may then be left out to keep the `kb_path` already there. Re-running `service install --force` is how an existing service picks up a new launch line after an upgrade. With `--with-tray`, `--force` also skips the check for an existing tray autostart entry.
 
 > **Migration from v0.7.x personal-http recipe**: The `grooveseek/examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `groove service install`:
 > - Linux: `systemctl --user disable groove.service && rm ~/.config/systemd/user/groove.service`

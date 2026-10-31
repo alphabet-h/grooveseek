@@ -11,7 +11,7 @@ Markdown のナレッジベース — opt-in でプレーンテキスト / PDF /
 
 [![CI](https://img.shields.io/github/actions/workflow/status/alphabet-h/grooveseek/ci.yml?branch=main&label=CI)](https://github.com/alphabet-h/grooveseek/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/alphabet-h/grooveseek?label=release)](https://github.com/alphabet-h/grooveseek/releases/latest)
-[![docs](https://img.shields.io/badge/docs-grooveseek.github.io-blue)](https://alphabet-h.github.io/grooveseek/)
+[![docs](https://img.shields.io/static/v1?label=docs&message=alphabet-h.github.io%2Fgrooveseek&color=blue)](https://alphabet-h.github.io/grooveseek/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#ライセンス)
 
 YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`、v1.2.0 以降は Rust のソース、grammar を自分で置けば v1.3.0 以降は Python、v1.5.0 以降は PHP も) をパースし、見出し単位で — ソースコードなら定義 1 つを 1 chunk として — チャンク化、既定では FastEmbed (BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。信頼された設定を書けば、代わりに [OpenAI 互換 embedding endpoint](docs/usage.ja.md#外部の-openai-互換-embedding) を opt-in できる。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。

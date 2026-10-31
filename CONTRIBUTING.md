@@ -30,7 +30,7 @@ cargo test -p grooveseek --lib <name>  # One test by name (the workspace has sev
                                   # and `--lib` skips the integration-test binaries)
 ```
 
-**`--lib` also skips `main.rs`.** The binary carries three `#[cfg(test)]`
+**`--lib` also skips `main.rs`.** The binary carries four `#[cfg(test)]`
 modules of its own — the CLI surface tests among them — and none of them run
 under `--lib`. Reach those with `--bin groove`, and when you are not sure which
 target a test lives in, drop the filter and let `cargo test <name>` search all
@@ -78,10 +78,18 @@ The order of the two `cargo test` lines matters on a cold model cache, which is 
 - `grooveseek/src/mmr.rs` — MMR diversity re-rank (`mmr_select`, v0.7.0+)
 - `grooveseek/src/parent.rs` — Parent retriever content expansion (`apply_parent_retriever`, v0.7.0+)
 - `grooveseek/src/server.rs` — `rmcp::ServerHandler` with six MCP tools
+- `grooveseek/src/server/` — the halves split out of `server.rs` (v1.0.0+): `search.rs` (the `search` tool body and pipeline), `documents.rs` (`get_document` / `get_best_practice` and the read-path checks), `kb_uri.rs` (the corpus side of `kb://` resources), and `writer_slot.rs` / `writer_role.rs` (who in one `groove serve` holds the writer lease, v1.22.0+)
+- `grooveseek/src/prompts.rs` — the MCP `prompts` surface (v0.22.0+)
+- `grooveseek/src/resources.rs` — the MCP `resources` surface: the `kb://` URI codec and the `resources/list` grouping (v0.22.0+)
+- `grooveseek/src/schema_compat.rs` — normalises the JSON Schema advertised for the MCP tools (v0.14.0+)
+- `grooveseek/src/writer_lease.rs` — one writer per index: the OS lock on `.groove.db.writer-lock` (v1.22.0+, ADR-0031)
 - `grooveseek/src/transport/` — stdio and Streamable HTTP transports
 - `grooveseek/src/watcher.rs` — `notify-debouncer-full`-based incremental reindex
 - `grooveseek/src/schema.rs` — frontmatter schema validation
 - `grooveseek/src/quality.rs` / `grooveseek/src/graph.rs` — quality filter + BFS connection graph
+- `grooveseek/src/graph_render.rs` — draws a connection graph as Graphviz DOT or a standalone SVG
+- `grooveseek/src/doctor.rs` — the checks behind `groove doctor` (v0.23.0+)
+- `grooveseek/src/exclusion.rs` — the one place that decides whether a knowledge-base path is out of scope, shared by the index walk, the `validate` walk and the watcher (v0.21.0+)
 - `grooveseek/src/eval.rs` — optional retrieval-quality evaluation for `groove eval`
 - `grooveseek/src/config.rs` — `groove.toml` 4-tier discovery / merge with CLI overrides
 - `grooveseek/src/markdown.rs` — backward-compatible shim re-exporting `parser::markdown`
@@ -103,7 +111,7 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.
 ## Test layering
 
 - **Light tests**: default `cargo test`. No network, no model download, runs in seconds. This is the only *test* layer that gates pull requests — `ci.yml` runs no other tests, only the checks listed above (fmt, clippy, check, and `cargo doc`).
-- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Not PR-gating, but not manual-only either: `nightly.yml` runs `cargo test --features test-helpers -- --include-ignored` daily on both ubuntu-latest and windows-latest, so these do get exercised — a day later, and the Windows leg skips the three tests that need the ~2.3 GB models. Two different kinds of cost hide behind that one flag:
+- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Not PR-gating, but not manual-only either: `nightly.yml` runs `cargo test --features test-helpers -- --include-ignored` daily on ubuntu-latest, windows-latest and macos-latest, so these do get exercised — a day later, and the Windows and macOS legs skip the five tests that need the ~2.3 GB models. Two different kinds of cost hide behind that one flag:
   - **Model downloads** — ONNX models on first run (BGE-small ~130 MB, BGE-M3 ~2.3 GB, BGE-reranker-v2-m3 ~2.3 GB), cached per OS convention afterwards. See "Working around HuggingFace TLS failures" in [docs/clients.md](docs/clients.md) if your network blocks the download.
   - **Real changes to your machine** — a few tests register and unregister actual OS services. `grooveseek/tests/service_install_integration.rs` calls `Register-ScheduledTask` on Windows, and `crates/groove-tray/tests/install_integration.rs` writes a shortcut into `%APPDATA%\…\Start Menu\Programs\Startup\`. They use a per-PID service name and clean up after themselves, but a killed run can leave a scheduled task or a startup shortcut behind. Check with `Get-ScheduledTask -TaskName 'groove*'` if a run dies partway.
 

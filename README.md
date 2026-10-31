@@ -15,7 +15,7 @@ with YAML frontmatter. Japanese or other multilingual content needs
 
 [![CI](https://img.shields.io/github/actions/workflow/status/alphabet-h/grooveseek/ci.yml?branch=main&label=CI)](https://github.com/alphabet-h/grooveseek/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/alphabet-h/grooveseek?label=release)](https://github.com/alphabet-h/grooveseek/releases/latest)
-[![docs](https://img.shields.io/badge/docs-grooveseek.github.io-blue)](https://alphabet-h.github.io/grooveseek/)
+[![docs](https://img.shields.io/static/v1?label=docs&message=alphabet-h.github.io%2Fgrooveseek&color=blue)](https://alphabet-h.github.io/grooveseek/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`, plus Rust source since v1.2.0, and Python since v1.3.0 and PHP since v1.5.0, whose grammars you download and place) files with YAML frontmatter, splits them into heading-based chunks — or, for source code, one chunk per definition, generates embeddings with FastEmbed by default (BGE-small-en-v1.5, or BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. A trusted configuration can instead opt into an [OpenAI-compatible embedding endpoint](docs/usage.md#external-openai-compatible-embeddings). Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.

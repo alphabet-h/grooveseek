@@ -573,16 +573,6 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
     }
 }
 
-/// (feature-49) `.grooveignore` が書き換わったら判定器を組み直す。
-///
-/// `&mut` で済むのは `WatcherState` を所有しているのが [`run_watch_loop`] 1 本
-/// だけだから。ロックを足さずに済むこの形が一番強い排他で、BU-32 の
-/// 「並行の不変条件は論証でなく排他で閉じる」をコストゼロで満たす。
-///
-/// **効くのはこれ以降のイベントだけ**。すでに index に入っている文書は次の
-/// full index (`groove index` / MCP `rebuild_index`) まで残る — walk から消えた
-/// path を DB から落とすのは削除 pass の仕事で、watcher は個々のイベントしか
-/// 見ないため。ログでそう言う。
 /// Escape a diagnostic so it survives a non-UTF-8 console.
 ///
 /// AGENTS.md asks stderr to stay ASCII: it is read on a console, and on a
@@ -640,6 +630,16 @@ fn is_ignore_file(kb_path: &Path, p: &Path) -> bool {
     to_rel(kb_path, p).as_deref() == Some(crate::exclusion::IGNORE_FILE_NAME)
 }
 
+/// (feature-49) `.grooveignore` が書き換わったら判定器を組み直す。
+///
+/// `&mut` で済むのは `WatcherState` を所有しているのが [`run_watch_loop`] 1 本
+/// だけだから。ロックを足さずに済むこの形が一番強い排他で、BU-32 の
+/// 「並行の不変条件は論証でなく排他で閉じる」をコストゼロで満たす。
+///
+/// **効くのはこれ以降のイベントだけ**。すでに index に入っている文書は次の
+/// full index (`groove index` / MCP `rebuild_index`) まで残る — walk から消えた
+/// path を DB から落とすのは削除 pass の仕事で、watcher は個々のイベントしか
+/// 見ないため。ログでそう言う。
 fn reload_rules(state: &mut WatcherState) {
     let exclude_dirs = state.rules.exclude_dirs().to_vec();
     state.rules = crate::exclusion::ExclusionRules::load(&state.kb_path, exclude_dirs);
