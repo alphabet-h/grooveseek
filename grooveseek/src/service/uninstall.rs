@@ -226,7 +226,7 @@ fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
 ///
 /// `kb_path` is resolved the way the server resolves it when it loads that
 /// file: a relative one against the directory holding `groove.toml` (the
-/// config home), not against wherever `uninstall` was run. A `kb_path` with
+/// config home), not against wherever `groove service uninstall` was run. A `kb_path` with
 /// no parent (a filesystem root) is refused: [`crate::resolve_db_path`] would
 /// fall back to `./.groove.db`, a path relative to the current directory that
 /// need not be this service's database at all.
@@ -585,7 +585,7 @@ mod tests {
     }
 
     /// A `kb_path` that is a filesystem root has no parent to hold
-    /// `.groove.db`; `resolve_db_path` would fall back to `./.groove.db` in
+    /// `.groove.db`; [`crate::resolve_db_path`] would fall back to `./.groove.db` in
     /// the current directory, which `--purge` must not delete.
     #[test]
     fn a_root_kb_path_names_no_database() {
