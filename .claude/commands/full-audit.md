@@ -28,10 +28,15 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 ### Phase 0 — 前の audit 親の確認と Scope 確認
 
-**最初に前の audit 親を確かめる** (subagent を出す前、audit ノートを書く前)。kuriya の直前の audit 親
-(`mcp__kuriya__find` で `audit-<YYYY-MM-DD>` tag の子を引き、その `parent_id`。2026-10-22 分は task #536) の下に
-`release-blocker` か high の未了 (`open` / `doing` / `pending`) の子が残っていたら、**ここで止まり、新しい audit は回さない**
-(`.dev/release-checklist.md` の「release 後の full-audit」節)。残っている子の番号を user に示して終わる。
+**最初に前の audit 親を確かめる** (subagent を出す前、audit ノートを書く前)。audit 親は**親自身**に tag `full-audit` が付いている
+(3-2 の step 1。2026-10-22 分は task #536)。子の tag からは引かない — 指摘の無い audit は子を持たず、付け替えた子は元の日付の tag を持ったままになる。
+
+1. `mcp__kuriya__find` に `tags_all: ["full-audit"]` を渡し、`done` / `dropped` 以外の親をすべて挙げる (直近の 1 つに絞らない)
+2. **途中で止まった audit が無いか** — 挙がった親の body に「起票完了」の行 (3-2 の step 4) が無ければ、その audit は 3-2 の途中で
+   止まっている。新しい audit は回さず、3-2 の「途中で止まった時」に従ってその親の起票を終わらせる
+3. それぞれの親を `find` の `under: <親の番号>` で読み、`release-blocker` か high の未了 (`open` / `doing` / `pending`) の子が
+   残っていたら、**ここで止まり、新しい audit は回さない** (`.dev/release-checklist.md` の「release 後の full-audit」節)。
+   残っている子の番号を user に示して終わる
 
 通ったら 1 行で確認する:
 
@@ -261,7 +266,8 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
 `.dev/archive/2026-10-22-cycle/` で凍結し、その未了は kuriya の task #536 の子へ移した。
 
 1. **親を 1 つ作る** — `mcp__kuriya__capture` に `kind: issue`、title `full-audit YYYY-MM-DD`、
-   body に出典 (Phase 3-1 の `.dev/knowledge/review-YYYY-MM-DD-full-audit.md`、対象 commit) と ID の接頭辞
+   body に出典 (Phase 3-1 の `.dev/knowledge/review-YYYY-MM-DD-full-audit.md`、対象 commit) と ID の接頭辞、
+   tags に `full-audit` と `audit-<YYYY-MM-DD>` (Phase 0 は親をこの tag で引く)。返った親の番号を 3-1 のノートにすぐ書いておく
 2. **前の親の残りを付け替えるか決める** — 前の audit 親に残った low / medium の未了を、新しい親へ移すか前の親に残すかを決める
    (`release-blocker` / high の未了が残っていれば Phase 0 で止まっているので、ここには来ない)。移すものは
    `mcp__kuriya__update` に `item_id` と `parent_id: <新しい親の番号>` を渡して付け替える (木は 4 段まで。audit の子は 2 段目なので収まる)
@@ -272,9 +278,15 @@ Markdown の台帳 (`audit-todos.md`) は作らない。audit の台帳 (2026-10
      該当時は `release-blocker` (定義 = security の High 以上 / 使う人に見える回帰 / 秘密の漏洩)
    - body: 対象 `file:line`、何が / なぜ壊れるか / どう直すか、完了条件 (実装後に何を見れば直ったと言えるか)
 4. **ノートに番号を書き足して閉じる** — 3-1 のノートの TODO 化マッピングに、親と各子の kuriya の item 番号を書き足す。
+   あわせて親の body の末尾に `起票完了: <子の数> 件` の行を `mcp__kuriya__update` の `append` で足す (Phase 0 はこの行の有無で途中停止を見分ける)。
    ノートはこの書き足しで完成とし、以後は凍結する (状態は kuriya だけが持つ)
 5. **状態は kuriya の `report` で動かす** — 着手は `doing`、直したら `done` (summary に PR 番号)、
    直さないと決めた low は `dropped` (summary に理由)。子が全部 `done` / `dropped` になったら親を `done` にする
+
+**途中で止まった時** (step 1〜4 のどこかで落ちた、または Phase 0 の 2 が「起票完了」の無い親を見つけた): 親を作り直さない。
+3-1 のノートに書いた親の番号 (無ければ `find` の `tags_all: ["full-audit", "audit-<YYYY-MM-DD>"]`) を使い、`find` の
+`under: <親の番号>` で作られた子の title (`<接頭辞>-NN`) とノートの TODO 化マッピングを突き合わせ、足りない子だけを作ってから step 4 に進む。
+この再開の間は Phase 0 の 3 の止まる条件を当てない (今まさに作っている親の子なので)。
 
 `release-blocker` 以外の指摘は release を止めない (次の minor の候補)。tag の前に見る形は
 `.dev/release-checklist.md` の「release 直前の確認」節。
