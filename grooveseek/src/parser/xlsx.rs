@@ -504,12 +504,12 @@ impl DocumentGuard<'_> {
     /// 読み途中のシートが `pending` bytes になった時点で、文書がどちらかの上限を超えていれば
     /// `Err`。時間は処理の **後** に見る (罠: 前だけで見ると最後の超過を拾えない。PDF と同じ)。
     /// 時間の上限を過ぎたか。
-    fn expired(&self) -> bool {
+    fn past_deadline(&self) -> bool {
         self.started.elapsed() > self.timeout
     }
 
     fn check(&self, pending: usize) -> Result<()> {
-        if self.expired() {
+        if self.past_deadline() {
             return Err(anyhow!(
                 "{}: xlsx text extraction exceeded {} s after {} sheet(s) (decompression-bomb guard)",
                 self.path_hint,
@@ -608,7 +608,7 @@ fn resolve_sheet_parts(
 ) -> Result<Option<Vec<Option<usize>>>> {
     let timed_out = std::cell::Cell::new(false);
     let expired = || {
-        let expired = guard.expired();
+        let expired = guard.past_deadline();
         if expired {
             timed_out.set(true);
         }
