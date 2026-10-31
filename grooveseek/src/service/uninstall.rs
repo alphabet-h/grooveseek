@@ -271,7 +271,7 @@ struct PurgeTarget {
     /// Whether `link` was a symlink when it was resolved.
     is_link: bool,
     /// What the symlink at `link` held when it was resolved, as
-    /// [`std::fs::read_link`] spells it; `None` when `link` was not a symlink,
+    /// `std::fs::read_link` spells it; `None` when `link` was not a symlink,
     /// or was one that could not be read (then the link is left in place and
     /// named, [`link_step`]). [`remove_link_if_unchanged`] removes the link
     /// only while it still holds this.
@@ -547,7 +547,7 @@ fn link_unchanged(target: &PurgeTarget) -> bool {
 }
 
 /// `error` and its causes joined as `{:#}` joins them, with every
-/// [`std::io::Error`] among them shown by kind and code only
+/// `std::io::Error` among them shown by kind and code only
 /// ([`crate::embedder::ascii_io_error`]): the OS words its message in the
 /// local language, and stderr stays ASCII (AGENTS.md).
 fn ascii_error_chain(error: &anyhow::Error) -> String {
@@ -564,7 +564,7 @@ fn ascii_error_chain(error: &anyhow::Error) -> String {
 /// The error `--purge` stops with when the config home's `groove.toml` is
 /// there but does not tell where the index database is (`why`, from
 /// [`database_named_by`]). Nothing has been removed but the service unit,
-/// and the backends' `uninstall` succeeds on a unit that is already gone, so
+/// and every [`super::ServiceBackend::uninstall`] succeeds on a unit that is already gone, so
 /// the re-run it suggests can finish the purge.
 fn undecidable_database(why: &str, home: &Path, name: &str) -> anyhow::Error {
     anyhow!(
