@@ -30,13 +30,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   used to remove the link alone and say the database was removed. A relative `kb_path` is read
   against the config home, as the server reads it, not against the directory `uninstall` runs
   in; a `kb_path` that is a filesystem root, or a `groove.toml` that cannot be read, leaves the
-  database alone with a warning instead of skipping it without a word.
+  database alone with a warning instead of skipping it without a word. `groove.toml` is read the
+  way the server reads its `--config`: over the 1 MiB config limit, or not a regular file (a named
+  pipe or a device in its place), it is not read and counts as a config that cannot be read.
   The purge now holds the index's writer lock from before it lists the files until the config
   home is gone, waiting up to 10 seconds for a server the backend has told to stop (Windows'
   `schtasks /End` does not wait for it to exit); a process still holding the lock after that
   leaves the database and the config home in place, and the command fails naming that process's
-  pid and role (when `.groove.db.writer.json` can be read) and saying to stop it (`taskkill /PID <pid>` on Windows, `kill <pid>` on Linux /
-  macOS) and run it again. A lock file that cannot be created or opened at all (permissions, a
+  pid and role as `.groove.db.writer.json` records them (when it can be read; the record can be
+  stale, so the pid may be an earlier holder's, reused since) and saying to confirm the pid is
+  groove first (`tasklist /FI "PID eq <pid>"` on Windows, `ps -p <pid>` on Linux / macOS),
+  stop it only if it is (`taskkill /PID <pid>`, `kill <pid>`), and run it again. A lock file that cannot be created or opened at all (permissions, a
   read-only or network filesystem) has no holder to wait for: the purge warns and deletes without
   the lock, as before. It used to delete while such a server could still put a `-wal`
   back, then delete the config home that named it. The files removed are named from the database

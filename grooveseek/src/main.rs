@@ -440,9 +440,9 @@ enum ServiceSubcommand {
         /// `.groove.db-wal` / `-shm` sidecars. Irreversible; refused unless
         /// --yes is also given. While a groove process still holds the
         /// index's writer lock, neither is deleted: the command waits up to
-        /// 10 seconds for it to exit, then stops with an error naming its pid
-        /// when it can be read;
-        /// stop that process and run the command again
+        /// 10 seconds for it to exit, then stops with an error naming the pid
+        /// recorded for it, which can be stale: confirm that pid is groove,
+        /// stop it only if it is, and run the command again
         #[arg(long)]
         purge: bool,
         /// Confirm --purge. Has no effect without it

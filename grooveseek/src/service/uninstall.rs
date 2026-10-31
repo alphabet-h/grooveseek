@@ -157,7 +157,7 @@ fn purge_under_writer_lock(
         Err(busy) => {
             return Err(anyhow!(
                 "{}. Neither the index database ({}) nor the config home ({}) was removed. \
-                 The service unit is already gone; stop {} and then run \
+                 The service unit is already gone; stop {}. Then run \
                  `groove service uninstall --service-name {name} --purge --yes` again \
                  to finish the purge.",
                 busy.describe(),
@@ -386,6 +386,8 @@ enum WriterCheck {
 #[derive(Debug)]
 struct WriterBusy {
     lock_path: PathBuf,
+    /// Where `holder` was read from: `<db>.writer.json` beside the lock.
+    info_path: PathBuf,
     /// What `<db>.writer.json` says, when it could be read.
     holder: Option<HolderInfo>,
     waited: Duration,
@@ -393,12 +395,21 @@ struct WriterBusy {
 
 impl WriterBusy {
     /// Who holds the lock, where, and for how long purge waited.
+    ///
+    /// The pid is the one `<db>.writer.json` records, which is display only
+    /// ([`HolderInfo`]): after a holder that died without cleaning up, or in
+    /// the moment between a new holder taking the OS lock and writing its own
+    /// record, it is a previous holder's, and the OS may have given it to an
+    /// unrelated process since. The message says so, as `groove index`'s
+    /// refusal does ([`crate::writer_lease::index_busy_message`]).
     fn describe(&self) -> String {
         match &self.holder {
             Some(h) => format!(
-                "a groove process (pid {}, {}) still holds the writer lock at {} after {}s",
+                "a groove process (pid {}, {}, as recorded in {}, which can be stale) \
+                 still holds the writer lock at {} after {}s",
                 h.pid,
                 h.role.as_str(),
+                self.info_path.display(),
                 self.lock_path.display(),
                 self.waited.as_secs()
             ),
@@ -410,12 +421,20 @@ impl WriterBusy {
         }
     }
 
-    /// The process to stop before purge is run again, with the command that
-    /// stops it when its pid is known.
+    /// The process to stop before purge is run again. When a pid is recorded,
+    /// the way to confirm it is groove comes before the command that stops
+    /// it: the record can be stale ([`Self::describe`]), and a reused pid
+    /// names an unrelated process.
     fn how_to_stop(&self) -> String {
         match &self.holder {
             Some(h) => format!(
-                "that process (Windows: `taskkill /PID {pid}`; Linux / macOS: `kill {pid}`)",
+                "that process: first confirm pid {pid} is groove, since the recorded pid \
+                 can belong to an earlier holder and be reused by now \
+                 (Windows: `tasklist /FI \"PID eq {pid}\"`; Linux / macOS: `ps -p {pid}`), \
+                 and only if it is, stop it \
+                 (Windows: `taskkill /PID {pid}`; Linux / macOS: `kill {pid}`); \
+                 if it is not groove, do not stop it: the record is stale, and the lock \
+                 is held by another groove process, to be found by its name",
                 pid = h.pid
             ),
             None => "the groove process that holds it".to_string(),
@@ -459,6 +478,8 @@ fn hold_writer_lock(
         }
         Err(LeaseError::Busy { lock_path, holder }) => Err(WriterBusy {
             lock_path,
+            // The file [`BareWriterLock::try_hold`] read `holder` from.
+            info_path: with_suffix(resolved, ".writer.json"),
             holder,
             waited: wait,
         }),
@@ -591,10 +612,30 @@ fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
 /// no parent (a filesystem root) is refused: [`crate::resolve_db_path`] would
 /// fall back to `./.groove.db`, a path relative to the current directory that
 /// need not be this service's database at all.
+///
+/// The file is read the way the server reads it, since the service's launch
+/// line names it with `--config` ([`crate::config::Config::load_from`]): by
+/// [`crate::links::read_required_following`], bounded by
+/// [`crate::config::MAX_CONFIG_FILE_BYTES`], following links, and refusing
+/// what they lead to unless it is a regular file. A named pipe or a device in
+/// its place would otherwise block the purge, and a huge file would be read
+/// whole, after the service unit is already gone (kuriya #645, local Codex
+/// r2). Only the read is shared: `load_from` itself is not called, because it
+/// also checks every other key against this build's schema, and a config this
+/// build would refuse for an unrelated key still names the database to purge.
 fn database_named_by(home: &Path) -> std::result::Result<PathBuf, String> {
     let toml_path = home.join("groove.toml");
-    let text = std::fs::read_to_string(&toml_path)
-        .map_err(|e| format!("could not read {}: {e}", toml_path.display()))?;
+    let bytes = crate::links::read_required_following(
+        &toml_path,
+        crate::config::MAX_CONFIG_FILE_BYTES,
+        "config",
+    )
+    // The chain names the file already ("refusing to read the config: <path>:
+    // <reason>", "failed to read the config: <path>: <io error>").
+    .map_err(|e| ascii_error_chain(&e))?
+    .ok_or_else(|| format!("could not read {}: it is not there", toml_path.display()))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("could not read {}: it is not UTF-8", toml_path.display()))?;
     let value = toml::from_str::<toml::Value>(&text)
         .map_err(|e| format!("could not parse {}: {e}", toml_path.display()))?;
     let kb = value
@@ -977,6 +1018,156 @@ mod tests {
         run_with_backend(&FakeBackend::ok(), Some(home.path()), params(true, true))
             .expect("purge is best-effort past the service unit");
         assert!(!home.path().exists(), "the config home is still removed");
+    }
+
+    /// kuriya #645, local Codex r2. `groove.toml` is read the way the server
+    /// reads its `--config`, bounded by [`crate::config::MAX_CONFIG_FILE_BYTES`].
+    /// One byte over it (a valid file that names the database, padded with a
+    /// comment, so an unbounded read would parse it and purge the database),
+    /// it names no database: the database stays, with a warning, and the
+    /// config home still goes, as for any config that cannot be read.
+    #[test]
+    fn a_groove_toml_over_the_config_cap_names_no_database_and_the_database_stays() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        let wal = with_suffix(&db, "-wal");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"pages").unwrap();
+        let toml = home.path().join("groove.toml");
+        let mut body = std::fs::read_to_string(&toml).unwrap();
+        body.push('#');
+        let cap = usize::try_from(crate::config::MAX_CONFIG_FILE_BYTES).unwrap();
+        let pad = cap + 1 - body.len() - 1;
+        body.push_str(&"x".repeat(pad));
+        body.push('\n');
+        assert_eq!(body.len(), cap + 1, "one byte over the cap");
+        std::fs::write(&toml, body).unwrap();
+
+        let why = database_named_by(home.path()).expect_err("over the cap is refused");
+        assert!(
+            why.contains(&format!(
+                "over the {} byte limit",
+                crate::config::MAX_CONFIG_FILE_BYTES
+            )),
+            "{why}"
+        );
+
+        run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect("purge is best-effort past the service unit");
+        assert_eq!(std::fs::read(&db).unwrap(), b"main", "the database stays");
+        assert!(wal.exists(), "the WAL stays: {}", wal.display());
+        assert!(!home.path().exists(), "the config home is still removed");
+    }
+
+    /// kuriya #645, local Codex r2. A named pipe in place of `groove.toml`
+    /// is refused before it is read, rather than blocking the purge on a
+    /// writer that never comes.
+    #[cfg(unix)]
+    #[test]
+    fn a_groove_toml_that_is_a_fifo_is_refused_promptly() {
+        let home = TempHome::new();
+        let toml = home.path().join("groove.toml");
+        let c_path = std::ffi::CString::new(toml.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo to test against");
+
+        let why = database_named_by(home.path()).expect_err("a fifo is not a config");
+
+        assert!(why.contains("not a regular file"), "{why}");
+    }
+
+    /// kuriya #645, local Codex r2. The pid in the refusal comes from
+    /// `<db>.writer.json`, which is display only and can be stale, so the
+    /// refusal says so, and puts the way to confirm the pid is groove before
+    /// the commands that stop it.
+    #[test]
+    fn a_held_writer_lock_says_to_confirm_the_recorded_pid_before_stopping_it() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let _lease = crate::writer_lease::WriterLease::try_acquire(
+            &db,
+            crate::writer_lease::Role::Serve,
+            &kb_root.path().join("kb"),
+        )
+        .expect("nobody else holds the lease");
+        let pid = std::process::id();
+
+        let msg = run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect_err("a held writer lock must stop the purge")
+        .to_string();
+
+        assert_confirm_before_stop(&msg, pid);
+    }
+
+    /// kuriya #645, local Codex r2. A holder record left by a process that is
+    /// gone (here a pid no process has: not a multiple of 4, so never one on
+    /// Windows, and above every Linux / macOS `pid_max`) while another
+    /// process holds the lock: the refusal names the recorded pid as possibly
+    /// stale and says to confirm it, and not to stop it when it is not groove.
+    #[test]
+    fn a_stale_holder_record_is_named_as_such_and_confirmed_before_stopping() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let target = PurgeTarget::new(&db);
+        let _held = BareWriterLock::try_hold(&target.resolved).expect("nobody holds the lock");
+        let gone = u32::MAX - 2;
+        let record = HolderInfo {
+            pid: gone,
+            role: crate::writer_lease::Role::Index,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            version: "0.0.0".into(),
+            kb_path: kb_root.path().join("kb").display().to_string(),
+            heartbeat_at: None,
+            watching: None,
+        };
+        let info = with_suffix(&target.resolved, ".writer.json");
+        std::fs::write(&info, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let msg = run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect_err("a held writer lock must stop the purge")
+        .to_string();
+
+        assert_confirm_before_stop(&msg, gone);
+        assert!(
+            msg.contains(&format!("as recorded in {}", info.display())),
+            "{msg}"
+        );
+        assert!(msg.contains("if it is not groove, do not stop it"), "{msg}");
+        assert!(db.exists(), "the database is kept");
+    }
+
+    /// The refusal names `pid` as recorded and possibly stale, and gives the
+    /// commands that confirm it is groove before the ones that stop it.
+    fn assert_confirm_before_stop(msg: &str, pid: u32) {
+        assert!(msg.contains("which can be stale"), "{msg}");
+        let confirm_win = format!("`tasklist /FI \"PID eq {pid}\"`");
+        let confirm_unix = format!("`ps -p {pid}`");
+        let stop_win = format!("`taskkill /PID {pid}`");
+        let stop_unix = format!("`kill {pid}`");
+        let at = |needle: &str| {
+            msg.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {msg}"))
+        };
+        assert!(at(&confirm_win) < at(&stop_win), "confirm first: {msg}");
+        assert!(at(&confirm_unix) < at(&stop_unix), "confirm first: {msg}");
     }
 
     /// A backend that refuses must abort before anything is deleted. Deleting
