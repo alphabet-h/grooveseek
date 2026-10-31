@@ -107,7 +107,7 @@ max_chunk_chars = 3500
 # 任意 (v1.15.0+): サイズ上限。`max_binary_file_size` (pdf / docx / xlsx / pptx) と
 # `max_text_file_size` (md / txt / ソースコード) は `groove index` / `rebuild_index` / watcher が読む
 # ファイル 1 本の生バイト上限で、超えたファイルは warning 付きで skip される。
-# `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF から取り出す
+# `max_decompressed_size` は .xlsx / .docx / .pptx の展開後合計と、PDF / .xlsx から取り出す
 # テキスト量の上限。どれも既定は 50 MiB で、バイト数、単位付きの大きさ ("300 MiB"、
 # "2 GB"。KB / MB / GB / TB は 1000 進、KiB / MiB / GiB / TiB は 1024 進、小数は不可)、
 # または "unlimited" を書ける。`0` はエラーで、メッセージが "unlimited" を案内する —
@@ -115,8 +115,8 @@ max_chunk_chars = 3500
 # 300 MB の workbook には `max_binary_file_size` と `max_decompressed_size` の両方が
 # 要る: 中の XML はファイルの数倍に展開されるので、ファイル側の上限だけを上げても
 # zip-bomb の検査は残る。既定を超える値は 1 回だけ警告される: 索引中はファイルを
-# まるごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF の
-# 抽出は上限に関係なく 120 秒で打ち切られる。上限を下げても、索引済みの文書は
+# まるごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF と
+# .xlsx の抽出は上限に関係なく 120 秒で打ち切られる。上限を下げても、索引済みの文書は
 # `groove index --force` を打つか、ファイルが上限の下まで縮むまで残る。上限を超えたままの
 # 編集では古いテキストが検索に出続ける。読み出しは連動しない:
 # `get_document` / `resources/read` はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、

@@ -22,6 +22,33 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   scheduled brownouts already cancelled the v1.22.0 release run. Set in
   `[dist.github-custom-runners]` of `dist-workspace.toml`; the other targets keep their runners.
 
+### Fixed
+
+- **An `.xlsx` whose sheets share one worksheet part is read once.** calamine re-inflates the
+  part for every `<sheet>` that names it, through the same `r:id`, another `r:id` with the same
+  `Target`, or another spelling of the path, so a 4 KB workbook listing one sheet 200 times was
+  extracted 200 times over (200 chunks of the same text). A sheet that points at a part an
+  earlier sheet already read, or repeats an earlier sheet's name, is now skipped with a warning.
+- **The 1 MiB per-sheet cap of `.xlsx` is checked per cell, not per row.** One row whose cells
+  all reference the same long shared string grew past the cap without bound, because the cap
+  was only checked between rows. The cell that crosses the cap is kept whole, then the sheet
+  stops.
+
+### Security
+
+- **`.xlsx` text extraction is bounded per document.** The text a workbook yields is not
+  proportional to its size: shared strings can be referenced from any number of cells and
+  sheets. A workbook now yields at most `[index].max_decompressed_size` of text (50 MiB by
+  default) and stops after 120 s, the same bounds as PDF; past either it is skipped with a
+  `decompression-bomb guard` error, on the index path and on `get_document` alike.
+- **An `.xlsx` that declares more shared strings than it can hold no longer aborts the
+  process.** calamine reserves the `uniqueCount` of `xl/sharedStrings.xml` before reading a
+  string ([tafia/calamine#684](https://github.com/tafia/calamine/issues/684)), so a workbook of
+  under 2 KB declaring 100,000,000,000 failed a multi-terabyte allocation. The decompression
+  preflight now refuses any `uniqueCount` above a fifth of `[index].max_decompressed_size` (a
+  shared string takes at least 5 bytes), or of the default 50 MiB when the key is
+  `"unlimited"`, before calamine opens the workbook.
+
 ## [1.22.0] - 2026-10-31
 
 ### Added

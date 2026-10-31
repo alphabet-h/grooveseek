@@ -119,12 +119,37 @@ enum WorkbookFormat {
 }
 
 /// シートあたりの抽出テキスト上限 (byte)。数百万行 xlsx で chunk が数百 MB に
-/// なる事故を防ぐ (§4.5)。**truncate の粒度は行単位**: ある行を push した結果
-/// 合計が cap を超えたら、その行までを保持して break する。したがって
-/// - 最終 content の長さは `cap + (超過を招いた 1 行の bytes)` 以内 (行途中では切らない)、
-/// - **1 行だけで cap を超える場合もその行は丸ごと emit** してから break する
-///   (巨大セル 1 個で切断すると内容が中途半端になるより、1 行は完全に残す方針)。
+/// なる事故を防ぐ (§4.5)。**truncate の粒度はセル単位** (AX-03、kuriya 604): セルを
+/// 1 つ読むたびに「今の行をここで確定したら合計が cap を超えるか」を見て、超えるなら
+/// その行をそのセルまでで確定して break する。したがって
+/// - 最終 content の長さは `cap + (超過を招いた 1 セルの bytes) + 1` 以内、
+/// - **1 セルだけで cap を超える場合もそのセルは丸ごと emit** してから break する
+///   (セルの途中では切らない)。
+///
+/// 旧版は行の境目でしか見ていなかったので、1 行に同じ共有文字列 (最大で展開 budget
+/// 1 本分) を参照するセルを並べると、1 行 = 1 シートが展開 budget の何倍にも膨らんだ
+/// (1 MiB の共有文字列を 200 セルで参照 → 200 MiB、`ax03-findings.md` の
+/// `row_ssref200`)。セル 1 つは共有文字列 1 本 (展開 budget 以内) に縛られる。
 const SHEET_MAX_BYTES: usize = 1024 * 1024;
+
+/// `<si/>` (5 bytes) が共有文字列 1 本の最短の書き方。正直な sharedStrings part は
+/// `uniqueCount` 件の `<si>` を持つので、展開後 `n` bytes の part に入る件数は `n / 5` 以下。
+/// [`unique_count_limit`] がこれで `uniqueCount` の上限を出す。
+const MIN_SHARED_STRING_BYTES: u64 = 5;
+
+/// xlsx 1 本の抽出に掛ける上限の組 (cap 注入版の [`parse_xlsx_bytes_limited`] が受け取る)。
+#[derive(Clone, Copy, Debug)]
+struct XlsxLimits {
+    /// シート 1 枚のテキスト上限 ([`SHEET_MAX_BYTES`])。超えたら truncate。
+    sheet_max_bytes: usize,
+    /// 展開 budget (`[index].max_decompressed_size`)。preflight と frontmatter が使う。
+    decompressed_budget: u64,
+    /// 文書全体のテキスト上限。超えたら `Err` (file ごと skip)。本番は展開 budget と同じ値。
+    doc_text_cap: usize,
+    /// 文書 1 本の実時間上限。超えたら `Err`。本番は
+    /// [`super::pdf::PDF_DOC_EXTRACT_TIMEOUT`] (PDF と同じ 120 秒)。
+    timeout: std::time::Duration,
+}
 
 /// xls 用の抽出入口。[`SHEET_MAX_BYTES`] と既定の展開 budget を渡す薄い wrapper。
 ///
@@ -176,17 +201,72 @@ fn parse_workbook_bytes_budgeted(
 
 /// xlsx (zip container) の抽出本体。streaming cell reader を使う (下記
 /// `extract_xlsx_sheet_text_streaming` 参照)。
+///
+/// 文書単位の上限 2 つ (AX-03、kuriya 604) をここで決める: 文書全体のテキストは展開 budget
+/// まで (超えたら `Err`。PDF の [`super::pdf`] と同じ形と文言)、実時間は
+/// [`super::pdf::PDF_DOC_EXTRACT_TIMEOUT`] まで。index と read 経路 (MCP の `get_document`)
+/// はどちらもここを通るので、両方に同じ上限が掛かる。
 fn parse_xlsx_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
     sheet_max_bytes: usize,
     decompressed_budget: u64,
 ) -> Result<ParsedDocument> {
+    parse_xlsx_bytes_limited(
+        bytes,
+        path_hint,
+        XlsxLimits {
+            sheet_max_bytes,
+            decompressed_budget,
+            // `"unlimited"` の `u64::MAX` は usize に収まらない環境でも飽和させる (PDF と同じ)。
+            doc_text_cap: usize::try_from(decompressed_budget).unwrap_or(usize::MAX),
+            // 文書 1 本の抽出時間の上限は PDF と同じ値を共有する (1 つの問いに 1 つの答え)。
+            timeout: super::pdf::PDF_DOC_EXTRACT_TIMEOUT,
+        },
+    )
+}
+
+/// [`parse_xlsx_bytes_capped`] の本体 (上限を全部注入できる版。unit test が小さい上限で
+/// 文書 budget と時間の分岐を踏むため分離)。
+///
+/// シートの読み方 (AX-03):
+///
+/// 1. **同名のシートの 2 枚目以降は開かない**。calamine の `worksheet_cells_reader(name)` は
+///    同名なら最初の 1 枚を返すので、2 枚目以降は 1 枚目と同じ part を読み直すだけ。
+/// 2. **既に読んだ zip entry を指すシートは開かない**。calamine は `<sheet>` ごとに part を
+///    展開し直し、同じ part を指す `<sheet>` を何枚でも許す (同じ `r:id` でも、別の `r:id` で
+///    同じ `Target` でも)。sheet から entry への解決は [`resolve_sheet_parts`] が calamine
+///    0.37.0 の規則を写して行う。**写しは重複除去にしか使わない**: 解決できなければ全シートを
+///    読み、写しが calamine とずれても下の 2 つの上限が文書を縛る (上限の正しさは写しに依らない)。
+///
+/// 上限 (どれも calamine が読むパートを name から言い当てない):
+///
+/// - シート 1 枚: [`SHEET_MAX_BYTES`] をセル単位で (truncate)
+/// - 文書全体のテキスト: `limits.doc_text_cap` をセル単位で (`Err`)。共有文字列はセルから何度でも
+///   参照できるので、出力テキストは入力の大きさに比例しない。重複の無い 200 枚の part がそれぞれ
+///   同じ 1 MiB の共有文字列を参照するだけで 200 MiB になった (`distinct200`)
+/// - 実時間: `limits.timeout` をセルごととシートごとに (`Err`)。テキストを出さない part を
+///   重複させずに並べる形 (出力ゼロのまま CPU だけ食う) の backstop。粒度はセルなので、
+///   セルを 1 つも含まない 1 part の展開そのものは止まらない (その part の展開量は preflight の
+///   展開 budget に縛られる)
+fn parse_xlsx_bytes_limited(
+    bytes: &[u8],
+    path_hint: &str,
+    limits: XlsxLimits,
+) -> Result<ParsedDocument> {
+    let mut guard = DocumentGuard {
+        path_hint,
+        used: 0,
+        cap: limits.doc_text_cap,
+        started: std::time::Instant::now(),
+        timeout: limits.timeout,
+        sheets: 0,
+    };
     // codex P2 (PR #70 round 2, zip-bomb hardening): calamine は zip 展開を
     // 内部で行うため `ooxml::read_zip_part` の累積 budget 機構が効かない。
     // calamine を呼ぶ前に、実際に読まれる XML part の申告 uncompressed
     // size 合計を検査する。(feature-61) budget は parser が構築時に受け取った値。
-    preflight_xlsx_decompression_budget_capped(bytes, path_hint, decompressed_budget)?;
+    preflight_xlsx_decompression_budget_capped(bytes, path_hint, limits.decompressed_budget)?;
 
     let cursor = Cursor::new(bytes);
     // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
@@ -195,23 +275,50 @@ fn parse_xlsx_bytes_capped(
     let mut xlsx = calamine::Xlsx::new(cursor)
         .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
-    let frontmatter = xlsx_frontmatter(bytes, path_hint, decompressed_budget);
+    let frontmatter = xlsx_frontmatter(bytes, path_hint, limits.decompressed_budget);
     let title = frontmatter.title.as_deref().unwrap_or("");
     let mut chunks = Vec::new();
     // `sheet_names()` は Vec<String> を owned で返すため、ループ中に
     // `&mut xlsx` を再度借用しても (streaming reader との) 競合はない。
-    for name in xlsx.sheet_names() {
-        let Some(text) =
-            extract_xlsx_sheet_text_streaming(&mut xlsx, &name, path_hint, sheet_max_bytes)
-        else {
+    let names = xlsx.sheet_names();
+    let parts = resolve_sheet_parts(bytes, &names);
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_parts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, name) in names.iter().enumerate() {
+        if !seen_names.insert(name.as_str()) {
+            eprintln!(
+                "{path_hint}: sheet {name:?} repeats an earlier sheet name, which reads the same part; skipping it"
+            );
+            continue;
+        }
+        if let Some(index) = parts.as_ref().and_then(|parts| parts[i])
+            && !seen_parts.insert(index)
+        {
+            eprintln!(
+                "{path_hint}: sheet {name:?} points at a part an earlier sheet already read; skipping it"
+            );
+            continue;
+        }
+        guard.sheets += 1;
+        let extracted = extract_xlsx_sheet_text_streaming(
+            &mut xlsx,
+            name,
+            path_hint,
+            limits.sheet_max_bytes,
+            &guard,
+        )?;
+        // セルを 1 つも読まなかったシートの分も時間を見る (セルごとの判定に掛からない)。
+        guard.check(0)?;
+        let Some(text) = extracted else {
             // open 失敗 / 途中の XML エラーはシート丸ごと skip
             // (旧実装の `worksheet_range()` エラー時と同じ挙動)。
             continue;
         };
+        guard.used = guard.used.saturating_add(text.len());
         if text.trim().is_empty() {
             continue; // 空シートは chunk を作らない
         }
-        chunks.push(super::sheet_chunk(chunks.len(), title, &name, &text));
+        chunks.push(super::sheet_chunk(chunks.len(), title, name, &text));
     }
 
     let raw_content = super::join_chunk_bodies(&chunks);
@@ -242,19 +349,30 @@ fn parse_xlsx_bytes_capped(
 /// するセルだけを到着順に読む。**存在するセルだけを `\t` で連結する
 /// (位置忠実な padding はしない)**: 検索用途のテキスト抽出であり、セル間の
 /// gap を空文字で埋める必要はないため。行が変わったら直前の行を確定して
-/// `\n` を付けて `text` に push し、その時点で `sheet_max_bytes` を超えて
-/// いれば warn + 読み込み打ち切り (既存の「行単位」truncate 意味論 —
-/// 超過を招いた行は保持、次の行には進まない、巨大 1 行も丸ごと残す — を
-/// 維持する)。
+/// `\n` を付けて `text` に push する。
+///
+/// 上限はセルを 1 つ読むたびに見る (AX-03)。「今の行をこのセルまでで確定した時の長さ」
+/// (`text.len() + row_bytes + 1`) について:
+///
+/// - 文書全体の上限 (`guard`) を超えるなら `Err` (file ごと skip)。時間の上限も同じ所で見る
+/// - `sheet_max_bytes` を超えるなら、行をこのセルまでで確定して warn + 読み込み打ち切り
+///   (超過を招いたセルは保持し、次のセルには進まない。巨大な 1 セルも丸ごと残す)
+///
+/// 行の境目の判定は要らない: 確定した長さはセルごとの判定を既に通っている。
 fn extract_xlsx_sheet_text_streaming(
     xlsx: &mut calamine::Xlsx<Cursor<&[u8]>>,
     name: &str,
     path_hint: &str,
     sheet_max_bytes: usize,
-) -> Option<String> {
-    let mut reader = xlsx.worksheet_cells_reader(name).ok()?;
+    guard: &DocumentGuard<'_>,
+) -> Result<Option<String>> {
+    let Ok(mut reader) = xlsx.worksheet_cells_reader(name) else {
+        return Ok(None);
+    };
     let mut text = String::new();
     let mut row_cells: Vec<String> = Vec::new();
+    // `row_cells` を `\t` で繋いだ長さ (改行を除く)。
+    let mut row_bytes: usize = 0;
     let mut current_row: Option<u32> = None;
 
     loop {
@@ -266,29 +384,274 @@ fn extract_xlsx_sheet_text_streaming(
                 }
                 break;
             }
-            Err(_) => return None,
+            Err(_) => return Ok(None),
         };
         let (row, _col) = cell.get_position();
         if current_row != Some(row) {
             if current_row.is_some() {
                 flush_xlsx_row(&mut text, &row_cells);
                 row_cells.clear();
-                if text.len() > sheet_max_bytes {
-                    eprintln!(
-                        "{path_hint}: sheet {name:?} exceeds {sheet_max_bytes} bytes; truncating"
-                    );
-                    return Some(text);
-                }
+                row_bytes = 0;
             }
             current_row = Some(row);
         }
         let data: Data = cell.get_value().clone().into();
-        row_cells.push(match data {
+        let value = match data {
             Data::Empty => String::new(),
             other => other.to_string(),
-        });
+        };
+        let separator = usize::from(!row_cells.is_empty());
+        row_bytes = row_bytes
+            .saturating_add(separator)
+            .saturating_add(value.len());
+        row_cells.push(value);
+        // この行をここで確定した時のシートの長さ (改行込み)。
+        let settled = text.len().saturating_add(row_bytes).saturating_add(1);
+        guard.check(settled)?;
+        if settled > sheet_max_bytes {
+            flush_xlsx_row(&mut text, &row_cells);
+            eprintln!("{path_hint}: sheet {name:?} exceeds {sheet_max_bytes} bytes; truncating");
+            return Ok(Some(text));
+        }
     }
-    Some(text)
+    Ok(Some(text))
+}
+
+/// 文書 1 本の抽出に掛ける上限 (テキスト量と実時間) の帳簿。[`parse_xlsx_bytes_limited`] が
+/// 持ち、シートを読み終えるごとに `used` を足す。
+struct DocumentGuard<'a> {
+    path_hint: &'a str,
+    /// 読み終えたシートのテキストの合計 (bytes)。
+    used: usize,
+    /// 文書全体のテキスト上限。
+    cap: usize,
+    started: std::time::Instant,
+    timeout: std::time::Duration,
+    /// 開いたシートの数 (error 文に使う)。
+    sheets: usize,
+}
+
+impl DocumentGuard<'_> {
+    /// 読み途中のシートが `pending` bytes になった時点で、文書がどちらかの上限を超えていれば
+    /// `Err`。時間は処理の **後** に見る (罠: 前だけで見ると最後の超過を拾えない。PDF と同じ)。
+    fn check(&self, pending: usize) -> Result<()> {
+        if self.started.elapsed() > self.timeout {
+            return Err(anyhow!(
+                "{}: xlsx text extraction exceeded {} s after {} sheet(s) (decompression-bomb guard)",
+                self.path_hint,
+                self.timeout.as_secs_f64(),
+                self.sheets
+            ));
+        }
+        if self.used.saturating_add(pending) > self.cap {
+            return Err(anyhow!(
+                "{}: extracted text exceeds {} bytes across {} sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)",
+                self.path_hint,
+                self.cap,
+                self.sheets
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// workbook の `<sheet>` を 1 枚ずつ、calamine 0.37.0 がそのシートで開く zip entry の index に
+/// 解決する。戻り値は `calamine_names` (= `Xlsx::sheet_names()`) と同じ並びで、entry が無い
+/// シートは `None`。**重複除去にしか使わない** ([`parse_xlsx_bytes_limited`]): calamine は
+/// sheet から part への path を公開しない (`Xlsx::sheets` は private、公開の `Sheet` は
+/// name / typ / visible だけ) ので、規則を写すしかない。
+///
+/// 写した規則 (calamine 0.37.0 の `src/xlsx/mod.rs` と `src/utils.rs`):
+///
+/// - zip の entry 名は `\` を `/` にして ASCII 小文字にした名前で引く (無ければ path そのまま)。
+///   同じ小文字名の entry が複数あれば `ZipArchive::file_names` の順で後勝ち
+/// - `_rels/.rels` の `<Relationships>` 以降の `<Relationship>` のうち、`Type` が
+///   `/relationships/officeDocument` で終わるものの `Target` (entity を展開) の最後の `/`
+///   までが xl_path (先頭の `/` は剥ぐ)。複数あれば後勝ち
+/// - `{xl_path}_rels/workbook.xml.rels` の `<Relationship>` を `Id` で引く表 (後勝ち)。
+///   属性は raw で、`Id` / `Type` / `Target` が 3 つ揃った所で読むのをやめる
+/// - `{xl_path}workbook.xml` の `<sheet>` (`</workbook>` まで) ごとに、`name` (entity を展開) と、
+///   local name が `id` の属性 (後勝ち) で表を引く。`Target` が `/` で始まれば先頭を剥いだ
+///   絶対 path、そうでなければ `xl_path + Target`
+///
+/// 解決できない時 (part が読めない、XML / 属性が壊れている、表に無い `r:id`、解決した名前の並びが
+/// `calamine_names` と一致しない) は `None` を返し、呼び出し側は全シートを読む。calamine が
+/// 規則を変えて写しがずれても、失うのは重複除去だけで、文書の上限は別に掛かっている。
+fn resolve_sheet_parts(bytes: &[u8], calamine_names: &[String]) -> Option<Vec<Option<usize>>> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
+    let mut cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for name in zip.file_names() {
+        let name = name.ok()?;
+        cache.insert(
+            name.replace('\\', "/").to_ascii_lowercase(),
+            name.to_string(),
+        );
+    }
+    let entry_name = |path: &str| -> String {
+        cache
+            .get(&path.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| path.to_string())
+    };
+
+    // 1. `_rels/.rels` から xl_path。
+    let mut document_target: Option<String> = None;
+    let mut seen_root = false;
+    for_each_xml_element(
+        &mut zip,
+        &entry_name("_rels/.rels"),
+        b"Relationships",
+        |local, e| {
+            if local == b"Relationships" {
+                seen_root = true;
+                return Some(());
+            }
+            if !seen_root || local != b"Relationship" {
+                return Some(());
+            }
+            let [rel_type, target] = get_attrs_like_calamine(raw_attrs(e)?, ["Type", "Target"]);
+            if rel_type.is_some_and(|t| t.ends_with("/relationships/officeDocument"))
+                && let Some(target) = target
+            {
+                document_target = Some(quick_xml::escape::unescape(&target).ok()?.into_owned());
+            }
+            Some(())
+        },
+    )?;
+    let target = document_target?;
+    let xl_path = target
+        .rfind('/')
+        .map(|i| &target[..=i])
+        .map(|p| p.strip_prefix('/').unwrap_or(p))
+        .unwrap_or("")
+        .to_string();
+
+    // 2. `{xl_path}_rels/workbook.xml.rels` の Id -> Target。
+    let mut relationships: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for_each_xml_element(
+        &mut zip,
+        &entry_name(&format!("{xl_path}_rels/workbook.xml.rels")),
+        b"Relationships",
+        |local, e| {
+            if local != b"Relationship" {
+                return Some(());
+            }
+            let [id, _rel_type, target] =
+                get_attrs_like_calamine(raw_attrs(e)?, ["Id", "Type", "Target"]);
+            if let Some(id) = id {
+                relationships.insert(id, target.unwrap_or_default());
+            }
+            Some(())
+        },
+    )?;
+
+    // 3. `{xl_path}workbook.xml` の `<sheet>` ごとに entry を引く。
+    let mut sheets: Vec<(String, Option<usize>)> = Vec::new();
+    let workbook = entry_name(&format!("{xl_path}workbook.xml"));
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for_each_xml_element(&mut zip, &workbook, b"workbook", |local, e| {
+        if local != b"sheet" {
+            return Some(());
+        }
+        let mut name = String::new();
+        let mut rel_id = String::new();
+        for (key, value) in raw_attrs(e)? {
+            if key == "name" {
+                name = quick_xml::escape::unescape(&value).ok()?.into_owned();
+            } else if key == "id" || key.strip_suffix("id").is_some_and(|p| p.ends_with(':')) {
+                rel_id = value;
+            }
+        }
+        pending.push((name, rel_id));
+        Some(())
+    })?;
+    for (name, rel_id) in pending {
+        let target = relationships.get(&rel_id)?;
+        let path = match target.strip_prefix('/') {
+            Some(absolute) => absolute.to_string(),
+            None => format!("{xl_path}{target}"),
+        };
+        sheets.push((name, zip.index_for_name(&entry_name(&path))));
+    }
+
+    let names_agree = sheets.len() == calamine_names.len()
+        && sheets
+            .iter()
+            .zip(calamine_names)
+            .all(|((resolved, _), calamine)| resolved == calamine);
+    names_agree.then(|| sheets.into_iter().map(|(_, index)| index).collect())
+}
+
+/// zip entry `name` を calamine の `xml_reader` と同じ設定 (空要素を start + end に展開、
+/// 閉じ tag の名前を照合しない) で読み、start 要素ごとに `on_start(local name, 要素)` を呼ぶ。
+/// local name が `stop_at` の end 要素で読むのをやめる。entry が無ければ何もせず `Some(())`、
+/// 読めない / XML が壊れている / `on_start` が `None` を返したら `None`。
+fn for_each_xml_element(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    name: &str,
+    stop_at: &[u8],
+    mut on_start: impl FnMut(&[u8], &quick_xml::events::BytesStart<'_>) -> Option<()>,
+) -> Option<()> {
+    use quick_xml::events::Event;
+
+    let entry = match zip.by_name(name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Some(()),
+        Err(_) => return None,
+    };
+    let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(entry));
+    let config = reader.config_mut();
+    config.check_end_names = false;
+    config.trim_text(false);
+    config.check_comments = false;
+    config.expand_empty_elements = true;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf).ok()? {
+            Event::Start(e) => on_start(e.local_name().as_ref(), &e)?,
+            Event::End(e) if e.local_name().as_ref() == stop_at => return Some(()),
+            Event::Eof => return Some(()),
+            _ => {}
+        }
+    }
+}
+
+/// 要素の属性を `(key, raw value)` で並べる (entity は展開しない。calamine の
+/// `iter_raw_attrs` と同じ)。壊れていれば `None`。
+fn raw_attrs(e: &quick_xml::events::BytesStart<'_>) -> Option<Vec<(String, String)>> {
+    e.attributes()
+        .with_checks(false)
+        .map(|attr| {
+            let attr = attr.ok()?;
+            let key = std::str::from_utf8(attr.key.as_ref()).ok()?.to_string();
+            let value = std::str::from_utf8(&attr.value).ok()?.to_string();
+            Some((key, value))
+        })
+        .collect()
+}
+
+/// calamine の `get_attrs!` macro の写し: 属性を前から見て、`keys` のどれかに完全一致する
+/// key の値を入れ (同じ key は後勝ち)、一致した回数 (重複も数える) が `keys` の数に届いたら
+/// 読むのをやめる。
+fn get_attrs_like_calamine<const N: usize>(
+    attrs: Vec<(String, String)>,
+    keys: [&str; N],
+) -> [Option<String>; N] {
+    let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
+    let mut found = 0;
+    for (key, value) in attrs {
+        let Some(slot) = keys.iter().position(|k| *k == key) else {
+            continue;
+        };
+        values[slot] = Some(value);
+        found += 1;
+        if found == N {
+            break;
+        }
+    }
+    values
 }
 
 /// `row_cells` (存在したセルだけ) を `\t` join して 1 行として `text` に
@@ -412,7 +775,7 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 ///    zip 8.6 までの話。zip 9.0.1 (zip-rs/zip2#1022) 以降は zip 自身が、申告
 ///    uncompressed size を超えた read を `InvalidData` ("File is larger than its
 ///    declared uncompressed size") で失敗させる。calamine も同じ `zip` の `by_name` で
-///    part を読むので、そこで同じく止まる。そこで層 2 の [`count_decompressed_bytes`]
+///    part を読むので、そこで同じく止まる。そこで層 2 の [`count_decompressed_bytes_scanning`]
 ///    は申告 size ちょうどまで読んでから 1 バイトだけ probe して、zip の拒否を見分ける:
 ///    probe が EOF なら申告どおり、`Err` なら zip が申告超えを拒んだ (か、申告 size の
 ///    境目で decoder が失敗した = 壊れている) ので、**申告どおりに読めない entry として
@@ -470,6 +833,10 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// 残すより、この誤検知を受け入れる方を選ぶ (skip は理由付きの warn として
 /// 出るので silent failure ではない)。
 ///
+/// 層 2 で読んだバイトは [`UniqueCountScan`] にも渡し、どこかに [`unique_count_limit`] を超える
+/// `uniqueCount` が書かれていれば `Err` にする (AX-41。calamine が申告件数を先に reserve して
+/// abort するのを、calamine を呼ぶ前に止める)。
+///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
 /// parser は zip 展開を経由しない)。
@@ -487,6 +854,9 @@ fn preflight_xlsx_decompression_budget_capped(
     };
     // 全 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
     let mut total: u64 = 0;
+    // 層 2 で読んだバイトに書かれた `uniqueCount` (AX-41、[`UniqueCountScan`])。
+    let (unique_basis, unique_limit) = unique_count_limit(cap);
+    let mut unique_counts = UniqueCountScan::default();
     for i in 0..zip.len() {
         // 申告 size は metadata だけで取れる (`by_index_raw` は圧縮データを
         // そのまま返す reader = 展開しない)。
@@ -514,7 +884,7 @@ fn preflight_xlsx_decompression_budget_capped(
 
         // 層 2: 申告値は信用できないので実際に展開して数える。申告 size ちょうどまで
         // 読んでから 1 バイト probe し、zip が申告どおりに読ませない entry はその場で
-        // 拒否する ([`count_decompressed_bytes`])。zip が申告で止めなかった時も、残り
+        // 拒否する ([`count_decompressed_bytes_scanning`])。zip が申告で止めなかった時も、残り
         // budget を 1 バイトでも超えたら打ち切れるよう `remaining + 1` で bound する。
         //
         // CRC は見ない (`ignore_crc32`)。probe は EOF を読むので、照合つきの reader だと
@@ -530,16 +900,29 @@ fn preflight_xlsx_decompression_budget_capped(
             // 読めないため、budget には数えず次へ進む。
             continue;
         };
-        let actual = match count_decompressed_bytes(
+        let actual = match count_decompressed_bytes_scanning(
             &mut entry,
             declared,
             remaining.saturating_add(1),
+            &mut unique_counts,
         ) {
             Inflation::Counted(actual) => actual,
             Inflation::UnreadableAsDeclared => anyhow::bail!(
                 "{path_hint}: entry {name:?} cannot be read as declared (zip-bomb guard; it declares {declared} bytes but holds more, or is corrupt; the archive is rejected whatever [index].max_decompressed_size is)"
             ),
         };
+        unique_counts.finish();
+        if unique_counts.largest > unique_limit {
+            let largest = unique_counts.largest;
+            let raise = if unique_basis == cap {
+                "; raise [index].max_decompressed_size to admit this file"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "{path_hint}: entry {name:?} declares uniqueCount {largest}, more shared strings than {unique_basis} bytes can hold (at most {unique_limit}) (zip-bomb guard; the workbook reader reserves memory for the declared count up front{raise})"
+            );
+        }
         total = total.saturating_add(actual);
         if total > cap {
             anyhow::bail!(
@@ -550,7 +933,7 @@ fn preflight_xlsx_decompression_budget_capped(
     Ok(())
 }
 
-/// [`count_decompressed_bytes`] が entry を読んで分かったこと。
+/// [`count_decompressed_bytes_scanning`] が entry を読んで分かったこと。
 #[derive(Debug, PartialEq, Eq)]
 enum Inflation {
     /// 展開後のバイト数 (`limit` 以下)。
@@ -587,10 +970,14 @@ enum Inflation {
 /// 呼び出し側は層 1 の後に `limit = remaining + 1` で呼ぶので `declared < limit`
 /// (`remaining` が `u64::MAX` で `limit` が飽和した時だけ等しくなり得る)。それが
 /// 崩れても `limit` を超えては読まない (1 段目も `limit` で止める)。
-fn count_decompressed_bytes(
+///
+/// 読んだバイトは全部 `scan` にも渡す。preflight はこれで `uniqueCount` を探す
+/// ([`UniqueCountScan`])。
+fn count_decompressed_bytes_scanning(
     reader: &mut impl std::io::Read,
     declared: u64,
     limit: u64,
+    scan: &mut UniqueCountScan,
 ) -> Inflation {
     let mut buf = [0u8; 8 * 1024];
     let mut total: u64 = 0;
@@ -600,7 +987,10 @@ fn count_decompressed_bytes(
         let want = std::cmp::min(buf.len() as u64, up_to_declared - total) as usize;
         match reader.read(&mut buf[..want]) {
             Ok(0) | Err(_) => return Inflation::Counted(total),
-            Ok(n) => total += n as u64,
+            Ok(n) => {
+                scan.feed(&buf[..n]);
+                total += n as u64;
+            }
         }
     }
     if total >= limit {
@@ -609,7 +999,10 @@ fn count_decompressed_bytes(
     // 2. 申告 size の 1 バイト先を probe する。
     match reader.read(&mut buf[..1]) {
         Ok(0) => return Inflation::Counted(total),
-        Ok(n) => total += n as u64,
+        Ok(n) => {
+            scan.feed(&buf[..n]);
+            total += n as u64;
+        }
         Err(_) => return Inflation::UnreadableAsDeclared,
     }
     // 3. zip が申告 size で止めなかった: zip 8.6 の時と同じく `limit` まで数える。
@@ -617,10 +1010,158 @@ fn count_decompressed_bytes(
         let want = std::cmp::min(buf.len() as u64, limit - total) as usize;
         match reader.read(&mut buf[..want]) {
             Ok(0) | Err(_) => break,
-            Ok(n) => total += n as u64,
+            Ok(n) => {
+                scan.feed(&buf[..n]);
+                total += n as u64;
+            }
         }
     }
     Inflation::Counted(total)
+}
+
+/// 展開したバイト列から `uniqueCount` 属性の値 (の最大) を探す (AX-41 / calamine の
+/// tafia/calamine#684)。
+///
+/// calamine 0.37.0 は sharedStrings の `<sst uniqueCount="N">` の N をそのまま
+/// `Vec::reserve(N)` する (`src/xlsx/mod.rs` の `read_shared_strings`)。1 件 24 bytes なので、
+/// 1.7 KB の xlsx が `uniqueCount="100000000000"` と書くだけで 2.4 TB の確保に失敗して
+/// **プロセスが abort する** (catch できない)。preflight は全 entry の全 byte を既に読んでいる
+/// ので、そこで値を見る。
+///
+/// **part を name で選ばない** (`preflight_xlsx_decompression_budget_capped` の「なぜ全 entry
+/// なのか」と同じ理由): calamine は sharedStrings の path を rels の xl_path から作るので、
+/// どの entry が sharedStrings かを言い当てる代わりに、全 entry のどこに書かれた `uniqueCount`
+/// も数える。その代わりの偽陽性は、セルの本文に `uniqueCount="<上限を超える数>"` という文字列
+/// そのものを書いた workbook だけ (推定、実害は無視できる)。
+///
+/// 読み方は calamine (`raw_attr` は key の完全一致、値は raw、`atoi_simd` で先頭の `0` を
+/// 飛ばし `+` を受けない) の上位集合: `uniqueCount` の後に XML の空白、`=`、空白、引用符
+/// (`"` か `'`) と続けば、先頭の `0` を飛ばして数字を飽和しながら読む。数字の後に何が来ても
+/// (calamine なら数字でないので reserve しない値でも) 数える。状態は呼び出しをまたいで持つので、
+/// 読み出しバッファの境目で切れた属性も拾う。entry の境目では [`UniqueCountScan::finish`] する。
+#[derive(Default)]
+struct UniqueCountScan {
+    state: UniqueCountState,
+    /// これまでに読み終えた値の最大。
+    largest: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+enum UniqueCountState {
+    /// `uniqueCount` の先頭を探している。
+    #[default]
+    Idle,
+    /// `uniqueCount` の先頭から n 文字が一致した。
+    Name(usize),
+    /// 名前の後、`=` を待っている。
+    BeforeEq,
+    /// `=` の後、引用符を待っている。
+    AfterEq,
+    /// 引用符の後、先頭の `0` を飛ばしている。
+    Zeros,
+    /// 数字を読んでいる (ここまでの値)。
+    Digits(u64),
+}
+
+impl UniqueCountScan {
+    const NEEDLE: &'static [u8] = b"uniqueCount";
+
+    fn feed(&mut self, bytes: &[u8]) {
+        use UniqueCountState::*;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match self.state {
+                Idle => match bytes[i..].iter().position(|&c| c == Self::NEEDLE[0]) {
+                    Some(at) => {
+                        i += at + 1;
+                        self.state = Name(1);
+                    }
+                    None => return,
+                },
+                Name(matched) => {
+                    if b == Self::NEEDLE[matched] {
+                        i += 1;
+                        self.state = if matched + 1 == Self::NEEDLE.len() {
+                            BeforeEq
+                        } else {
+                            Name(matched + 1)
+                        };
+                    } else {
+                        // KMP: 一致した部分の最長の border から照合し直す (`b` は読み直す)。
+                        let border = Self::border(matched);
+                        self.state = if border == 0 { Idle } else { Name(border) };
+                    }
+                }
+                BeforeEq | AfterEq if matches!(b, b' ' | b'\t' | b'\r' | b'\n') => i += 1,
+                BeforeEq if b == b'=' => {
+                    i += 1;
+                    self.state = AfterEq;
+                }
+                AfterEq if matches!(b, b'"' | b'\'') => {
+                    i += 1;
+                    self.state = Zeros;
+                }
+                BeforeEq | AfterEq => self.state = Idle,
+                Zeros if b == b'0' => i += 1,
+                Zeros | Digits(_) if b.is_ascii_digit() => {
+                    let so_far = match self.state {
+                        Digits(v) => v,
+                        _ => 0,
+                    };
+                    self.state = Digits(
+                        so_far
+                            .saturating_mul(10)
+                            .saturating_add(u64::from(b - b'0')),
+                    );
+                    i += 1;
+                }
+                Zeros | Digits(_) => self.settle(),
+            }
+        }
+    }
+
+    /// entry の終わり。読みかけの値があれば数える。
+    fn finish(&mut self) {
+        self.settle();
+    }
+
+    fn settle(&mut self) {
+        if let UniqueCountState::Digits(v) = self.state {
+            self.largest = self.largest.max(v);
+        }
+        self.state = UniqueCountState::Idle;
+    }
+
+    /// `NEEDLE[..matched]` の最長の真の border (接頭辞でも接尾辞でもある部分) の長さ。
+    fn border(matched: usize) -> usize {
+        (1..matched)
+            .rev()
+            .find(|&len| Self::NEEDLE[..len] == Self::NEEDLE[matched - len..matched])
+            .unwrap_or(0)
+    }
+}
+
+/// `uniqueCount` の上限を `(上限の基になった bytes, 上限の件数)` で返す。
+///
+/// 上限は `基 / 5` ([`MIN_SHARED_STRING_BYTES`]): 正直な sharedStrings part は展開後 `cap` bytes
+/// 以内 (preflight が archive 全体をそう縛る) なので、`<si>` は高々 `cap / 5` 件。基は通常
+/// `cap` そのもの。既定 50 MiB で 10,485,760 件 = reserve 240 MiB (計算値。AX-41 の正直な最悪、
+/// 空の `<si/>` 1000 万件で 229 MiB と同じ桁)。
+///
+/// `cap` が `"unlimited"` の時だけ、基を既定の展開 budget
+/// ([`super::DEFAULT_MAX_DECOMPRESSED_BYTES`]) に固定する: `cap / 5` のままでは上限が無いのと同じで、
+/// 1.7 KB の file で abort する穴が開いたままになる。代償として、`"unlimited"` の下でも 1000 万件を
+/// 超える共有文字列を持つ workbook は拒まれる (`"unlimited"` を選んだ運用者でも、その件数の
+/// workbook は reserve だけで数百 MiB を確保する)。`"unlimited"` かどうかは
+/// [`super::FileSizeLimit::cap_bytes`] の値と比べて決める (sentinel の値をここに書かない)。
+fn unique_count_limit(cap: u64) -> (u64, u64) {
+    let basis = if cap == super::FileSizeLimit::Unlimited.cap_bytes() {
+        super::DEFAULT_MAX_DECOMPRESSED_BYTES
+    } else {
+        cap
+    };
+    (basis, basis / MIN_SHARED_STRING_BYTES)
 }
 
 /// `docProps/core.xml` から frontmatter を取る。読めなければ (zip でない xls、core.xml が
@@ -1780,5 +2321,647 @@ mod tests {
             panic!("an unlimited cap refused the read");
         };
         assert_eq!(read_back, bytes);
+    }
+
+    // -----------------------------------------------------------------------
+    // AX-03 (kuriya 604) / AX-41 (kuriya 626): sheets that share a part, shared
+    // strings referenced many times, and the declared `uniqueCount`.
+    // -----------------------------------------------------------------------
+
+    /// [`count_decompressed_bytes_scanning`] without the `uniqueCount` scan: the counting the
+    /// tests above pin, under the name they call it by.
+    fn count_decompressed_bytes(
+        reader: &mut impl std::io::Read,
+        declared: u64,
+        limit: u64,
+    ) -> Inflation {
+        count_decompressed_bytes_scanning(reader, declared, limit, &mut UniqueCountScan::default())
+    }
+
+    const SPREADSHEET_NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    /// A workbook wired by hand: `sheets` are `(name, r:id)` in workbook order, `rels` are the
+    /// workbook relationships `(Id, Target)` (all worksheets), `parts` are written as named, and
+    /// `shared` (when given) becomes `{xl_dir}sharedStrings.xml`. The package relationship points
+    /// at `{xl_dir}workbook.xml`, so `xl_dir` is the prefix calamine derives (`"xl/"` normally).
+    fn make_wired_xlsx(
+        xl_dir: &str,
+        sheets: &[(String, String)],
+        rels: &[(String, String)],
+        parts: &[(String, Vec<u8>)],
+        shared: Option<&[u8]>,
+        stored: bool,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = if stored {
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)
+            } else {
+                SimpleFileOptions::default()
+            };
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#).unwrap();
+            zip.start_file("_rels/.rels", opt).unwrap();
+            zip.write_all(format!(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="{xl_dir}workbook.xml"/></Relationships>"#).as_bytes()).unwrap();
+            zip.start_file(format!("{xl_dir}workbook.xml"), opt)
+                .unwrap();
+            let mut wb = format!(r#"<?xml version="1.0"?><workbook {SPREADSHEET_NS}><sheets>"#);
+            for (i, (name, rid)) in sheets.iter().enumerate() {
+                wb.push_str(&format!(
+                    r#"<sheet name="{name}" sheetId="{}" r:id="{rid}"/>"#,
+                    i + 1
+                ));
+            }
+            wb.push_str("</sheets></workbook>");
+            zip.write_all(wb.as_bytes()).unwrap();
+            zip.start_file(format!("{xl_dir}_rels/workbook.xml.rels"), opt)
+                .unwrap();
+            let mut rl = String::from(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            );
+            for (id, target) in rels {
+                rl.push_str(&format!(r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{target}"/>"#));
+            }
+            rl.push_str("</Relationships>");
+            zip.write_all(rl.as_bytes()).unwrap();
+            for (name, body) in parts {
+                zip.start_file(name.as_str(), opt).unwrap();
+                zip.write_all(body).unwrap();
+            }
+            if let Some(shared) = shared {
+                zip.start_file(format!("{xl_dir}sharedStrings.xml"), opt)
+                    .unwrap();
+                zip.write_all(shared).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    fn worksheet_xml(rows: &str) -> Vec<u8> {
+        format!(r#"<?xml version="1.0"?><worksheet {SPREADSHEET_NS}><sheetData>{rows}</sheetData></worksheet>"#).into_bytes()
+    }
+
+    /// One row holding one inline-string cell.
+    fn one_cell_worksheet(text: &str) -> Vec<u8> {
+        worksheet_xml(&format!(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row>"#
+        ))
+    }
+
+    /// `<sst>` with `count_attr` written verbatim (e.g. `uniqueCount="3"`) and `items` as `<si>`.
+    fn shared_strings_xml(count_attr: &str, items: &[&str]) -> Vec<u8> {
+        let mut sst = format!(r#"<?xml version="1.0"?><sst {SPREADSHEET_NS} {count_attr}>"#);
+        for item in items {
+            sst.push_str(&format!("<si><t>{item}</t></si>"));
+        }
+        sst.push_str("</sst>");
+        sst.into_bytes()
+    }
+
+    fn owned_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+        pairs.into_iter().collect()
+    }
+
+    /// `n` sheets named `S0..` whose relationships all reach `xl/worksheets/sheet1.xml`.
+    /// `distinct_rids` gives each sheet its own `r:id` (all with the same `Target`).
+    fn sheets_sharing_one_part(n: usize, distinct_rids: bool) -> Vec<u8> {
+        let rid = |i: usize| {
+            if distinct_rids {
+                format!("rId{i}")
+            } else {
+                "rId1".to_string()
+            }
+        };
+        let sheets = owned_pairs((0..n).map(|i| (format!("S{i}"), rid(i))));
+        let rels = if distinct_rids {
+            owned_pairs((0..n).map(|i| (rid(i), "worksheets/sheet1.xml".to_string())))
+        } else {
+            owned_pairs([("rId1".to_string(), "worksheets/sheet1.xml".to_string())])
+        };
+        make_wired_xlsx(
+            "xl/",
+            &sheets,
+            &rels,
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                one_cell_worksheet("shared-part"),
+            )],
+            None,
+            false,
+        )
+    }
+
+    /// AX-03: 200 sheets with the same `r:id` used to open the same part 200 times and
+    /// emit 200 copies of its text; the part is read once.
+    #[test]
+    fn test_xlsx_sheets_sharing_one_part_are_read_once() {
+        let bytes = sheets_sharing_one_part(200, false);
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "dup.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 1, "one part, one chunk");
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Sheet: S0"));
+        assert!(doc.chunks[0].content.contains("shared-part"));
+    }
+
+    /// AX-03: de-duplicating by `r:id` is not enough -- 200 distinct `r:id`s with one `Target`.
+    #[test]
+    fn test_xlsx_sheets_sharing_one_part_through_distinct_rids_are_read_once() {
+        let bytes = sheets_sharing_one_part(200, true);
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "dup.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 1, "one part, one chunk");
+    }
+
+    /// AX-03: a relative `Target`, an absolute one and one spelled in another case all reach
+    /// the same zip entry in calamine, so they are one part.
+    #[test]
+    fn test_xlsx_sheets_sharing_one_part_through_absolute_and_relative_targets_are_read_once() {
+        let sheets = owned_pairs([
+            ("Rel".to_string(), "rId1".to_string()),
+            ("Abs".to_string(), "rId2".to_string()),
+            ("Case".to_string(), "rId3".to_string()),
+        ]);
+        let rels = owned_pairs([
+            ("rId1".to_string(), "worksheets/sheet1.xml".to_string()),
+            ("rId2".to_string(), "/xl/worksheets/sheet1.xml".to_string()),
+            ("rId3".to_string(), "WORKSHEETS/Sheet1.XML".to_string()),
+        ]);
+        let bytes = make_wired_xlsx(
+            "xl/",
+            &sheets,
+            &rels,
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                one_cell_worksheet("one-part"),
+            )],
+            None,
+            false,
+        );
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "spelling.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 1, "three spellings of one part");
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Sheet: Rel"));
+    }
+
+    /// calamine opens a sheet by name and takes the first sheet of that name, so a second
+    /// sheet with the same name would read the first one's part again: it is skipped.
+    #[test]
+    fn test_xlsx_duplicate_sheet_names_produce_one_chunk() {
+        let sheets = owned_pairs([
+            ("Same".to_string(), "rId1".to_string()),
+            ("Same".to_string(), "rId2".to_string()),
+        ]);
+        let rels = owned_pairs([
+            ("rId1".to_string(), "worksheets/sheet1.xml".to_string()),
+            ("rId2".to_string(), "worksheets/sheet2.xml".to_string()),
+        ]);
+        let bytes = make_wired_xlsx(
+            "xl/",
+            &sheets,
+            &rels,
+            &[
+                (
+                    "xl/worksheets/sheet1.xml".to_string(),
+                    one_cell_worksheet("first-part"),
+                ),
+                (
+                    "xl/worksheets/sheet2.xml".to_string(),
+                    one_cell_worksheet("second-part"),
+                ),
+            ],
+            None,
+            false,
+        );
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "names.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 1);
+        assert!(doc.chunks[0].content.contains("first-part"));
+    }
+
+    /// Equivalence (binary-parser-resource-guard-pitfalls 罠 5): distinct parts are all read,
+    /// in workbook order, with the text they always had.
+    #[test]
+    fn test_xlsx_distinct_sheets_are_all_read() {
+        let sheets = owned_pairs((1..=3).map(|i| (format!("S{i}"), format!("rId{i}"))));
+        let rels =
+            owned_pairs((1..=3).map(|i| (format!("rId{i}"), format!("worksheets/sheet{i}.xml"))));
+        let parts: Vec<(String, Vec<u8>)> = (1..=3)
+            .map(|i| {
+                (
+                    format!("xl/worksheets/sheet{i}.xml"),
+                    one_cell_worksheet(&format!("text-{i}")),
+                )
+            })
+            .collect();
+        let bytes = make_wired_xlsx("xl/", &sheets, &rels, &parts, None, false);
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "three.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 3);
+        for (i, chunk) in doc.chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.heading.as_deref(),
+                Some(format!("Sheet: S{}", i + 1).as_str())
+            );
+            assert!(
+                chunk.content.contains(&format!("text-{}", i + 1)),
+                "{:?}",
+                chunk.content
+            );
+        }
+        // The same workbook through the minimal builder reads the same as before this change.
+        let minimal = make_minimal_xlsx(&[("A", &[&["x", "y"], &["z"]]), ("B", &[&["w"]])]);
+        let doc = XlsxParser::default()
+            .parse_bytes(&minimal, "m.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 2);
+        assert!(
+            doc.chunks[0].content.contains("x\ty\nz"),
+            "{:?}",
+            doc.chunks[0].content
+        );
+    }
+
+    /// Pins the copy of calamine 0.37.0's sheet-to-entry rules in [`resolve_sheet_parts`]:
+    /// a non-standard xl_path, relative / absolute / differently cased targets, and the
+    /// fallback when the resolved names disagree with calamine's.
+    #[test]
+    fn resolve_sheet_parts_follows_calamine_rules() {
+        let sheets = owned_pairs([
+            ("Rel".to_string(), "rId1".to_string()),
+            ("Abs".to_string(), "rId2".to_string()),
+            ("Case".to_string(), "rId3".to_string()),
+            ("Other".to_string(), "rId4".to_string()),
+        ]);
+        let rels = owned_pairs([
+            ("rId1".to_string(), "sheets/a.xml".to_string()),
+            ("rId2".to_string(), "/custom/sheets/a.xml".to_string()),
+            ("rId3".to_string(), "Sheets/A.XML".to_string()),
+            ("rId4".to_string(), "sheets/b.xml".to_string()),
+        ]);
+        let bytes = make_wired_xlsx(
+            "custom/",
+            &sheets,
+            &rels,
+            &[
+                ("custom/sheets/a.xml".to_string(), one_cell_worksheet("a")),
+                ("custom/sheets/b.xml".to_string(), one_cell_worksheet("b")),
+            ],
+            None,
+            false,
+        );
+        let archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+        let a = archive.index_for_name("custom/sheets/a.xml");
+        let b = archive.index_for_name("custom/sheets/b.xml");
+        assert!(a.is_some() && b.is_some() && a != b);
+
+        let names: Vec<String> = sheets.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(resolve_sheet_parts(&bytes, &names), Some(vec![a, a, a, b]));
+        // calamine agrees on the names (the copy is checked against them at run time).
+        let xlsx = calamine::Xlsx::new(Cursor::new(bytes.as_slice())).unwrap();
+        assert_eq!(xlsx.sheet_names(), names);
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "custom.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 2, "a once, b once");
+
+        let disagreeing = vec!["Rel".to_string()];
+        assert_eq!(
+            resolve_sheet_parts(&bytes, &disagreeing),
+            None,
+            "names that disagree with calamine's fall back to reading every sheet"
+        );
+    }
+
+    /// AX-03 P1: one row whose cells all reference the same shared string grew past the
+    /// sheet cap because the cap was only checked between rows. It is checked per cell, so
+    /// the overshoot is at most one cell.
+    #[test]
+    fn test_xlsx_repeated_shared_string_refs_in_one_row_stop_at_the_sheet_cap() {
+        const CELL: usize = 200;
+        const CAP: usize = 1000;
+        let long = "s".repeat(CELL);
+        let row: String = (0..200).map(|_| r#"<c t="s"><v>0</v></c>"#).collect();
+        let bytes = make_wired_xlsx(
+            "xl/",
+            &owned_pairs([("S".to_string(), "rId1".to_string())]),
+            &owned_pairs([("rId1".to_string(), "worksheets/sheet1.xml".to_string())]),
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                worksheet_xml(&format!(r#"<row r="1">{row}</row>"#)),
+            )],
+            Some(&shared_strings_xml(
+                r#"count="200" uniqueCount="1""#,
+                &[&long],
+            )),
+            false,
+        );
+        let doc = parse_workbook_bytes_capped(&bytes, "row.xlsx", WorkbookFormat::Xlsx, CAP)
+            .expect("parse");
+        let content = &doc.chunks[0].content;
+        assert!(content.contains(&long));
+        assert!(
+            content.len() <= CAP + CELL + 1,
+            "the overshoot is bounded by one cell, got len={}",
+            content.len()
+        );
+    }
+
+    /// AX-03 P2: the same row against a document budget below what it expands to is refused
+    /// whole, through the public parser (preflight passes: the archive itself is small).
+    #[test]
+    fn test_xlsx_repeated_shared_string_refs_in_one_row_refuse_past_the_document_budget() {
+        let long = "s".repeat(2000);
+        let row: String = (0..200).map(|_| r#"<c t="s"><v>0</v></c>"#).collect();
+        let bytes = make_wired_xlsx(
+            "xl/",
+            &owned_pairs([("S".to_string(), "rId1".to_string())]),
+            &owned_pairs([("rId1".to_string(), "worksheets/sheet1.xml".to_string())]),
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                worksheet_xml(&format!(r#"<row r="1">{row}</row>"#)),
+            )],
+            Some(&shared_strings_xml(
+                r#"count="200" uniqueCount="1""#,
+                &[&long],
+            )),
+            false,
+        );
+        let budget = 16 * 1024;
+        preflight_xlsx_decompression_budget_capped(&bytes, "row.xlsx", budget)
+            .expect("premise: the archive fits the budget");
+        let err = XlsxParser::with_budget(budget)
+            .parse_bytes(&bytes, "row.xlsx", &[])
+            .expect_err("400 KB of text from a 16 KiB budget is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("decompression-bomb guard") && msg.contains("max_decompressed_size"),
+            "{msg}"
+        );
+        assert!(msg.is_ascii(), "{msg}");
+    }
+
+    fn three_small_sheets() -> Vec<u8> {
+        let sheets = owned_pairs((1..=3).map(|i| (format!("S{i}"), format!("rId{i}"))));
+        let rels =
+            owned_pairs((1..=3).map(|i| (format!("rId{i}"), format!("worksheets/sheet{i}.xml"))));
+        let parts: Vec<(String, Vec<u8>)> = (1..=3)
+            .map(|i| {
+                (
+                    format!("xl/worksheets/sheet{i}.xml"),
+                    one_cell_worksheet("aaaa"),
+                )
+            })
+            .collect();
+        make_wired_xlsx("xl/", &sheets, &rels, &parts, None, false)
+    }
+
+    fn limits(doc_text_cap: usize, timeout: std::time::Duration) -> XlsxLimits {
+        XlsxLimits {
+            sheet_max_bytes: SHEET_MAX_BYTES,
+            decompressed_budget: crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES,
+            doc_text_cap,
+            timeout,
+        }
+    }
+
+    /// AX-03 P2: three sheets of `"aaaa\n"` (5 bytes each) fit a 15-byte document budget
+    /// exactly (PDF's `pdf.rs` boundary test has the same shape).
+    #[test]
+    fn test_xlsx_document_text_budget_admits_exactly_the_budget() {
+        let doc = parse_xlsx_bytes_limited(
+            &three_small_sheets(),
+            "three.xlsx",
+            limits(15, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect("15 bytes of text fit a 15-byte budget");
+        assert_eq!(doc.chunks.len(), 3);
+    }
+
+    /// ...and one byte less is refused, naming the budget and how to raise it.
+    #[test]
+    fn test_xlsx_document_text_budget_refuses_past_the_budget() {
+        let err = parse_xlsx_bytes_limited(
+            &three_small_sheets(),
+            "three.xlsx",
+            limits(14, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect_err("15 bytes of text do not fit 14");
+        assert_eq!(
+            err.to_string(),
+            "three.xlsx: extracted text exceeds 14 bytes across 3 sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)"
+        );
+    }
+
+    /// The wall-clock backstop: a zero timeout stops the extraction with the guard's error.
+    #[test]
+    fn test_xlsx_time_budget_stops_extraction() {
+        let err = parse_xlsx_bytes_limited(
+            &three_small_sheets(),
+            "slow.xlsx",
+            limits(usize::MAX, std::time::Duration::ZERO),
+        )
+        .expect_err("a zero timeout has always passed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeded") && msg.contains("decompression-bomb guard"),
+            "{msg}"
+        );
+        assert!(msg.is_ascii(), "{msg}");
+    }
+
+    /// The scanner reads `uniqueCount` whatever the read boundaries: every split of the input
+    /// into two feeds, and one byte at a time, gives the same value.
+    #[test]
+    fn unique_count_scan_reads_across_feed_boundaries() {
+        let cases: &[(&[u8], u64)] = &[
+            (br#"<sst uniqueCount="12345">"#, 12345),
+            (
+                br#"<sst uniqueCount="000000100000000000">"#,
+                100_000_000_000,
+            ),
+            (br#"<sst uniqueCount='42'>"#, 42),
+            (b"<sst uniqueCount \n=\t \"9\">", 9),
+            (br#"<sst uniquuniqueCount="7">"#, 7),
+            (br#"<sst uniqueCount="12a">"#, 12),
+            (
+                br#"<sst uniqueCount="99999999999999999999999999">"#,
+                u64::MAX,
+            ),
+            (br#"<sst uniqueCount=12>"#, 0),
+            (br#"<sst uniqueCountX="12">"#, 0),
+            (br#"<sst count="5">"#, 0),
+        ];
+        for &(input, expected) in cases {
+            for split in 0..=input.len() {
+                let mut scan = UniqueCountScan::default();
+                scan.feed(&input[..split]);
+                scan.feed(&input[split..]);
+                scan.finish();
+                assert_eq!(scan.largest, expected, "{input:?} split at {split}");
+            }
+            let mut scan = UniqueCountScan::default();
+            for byte in input {
+                scan.feed(std::slice::from_ref(byte));
+            }
+            scan.finish();
+            assert_eq!(scan.largest, expected, "{input:?} byte by byte");
+        }
+    }
+
+    fn workbook_with_unique_count(count_attr: &str, padding: usize) -> Vec<u8> {
+        let shared = format!(
+            r#"<?xml version="1.0"?><!--{}--><sst {SPREADSHEET_NS} {count_attr}><si><t>x</t></si></sst>"#,
+            "p".repeat(padding)
+        );
+        make_wired_xlsx(
+            "xl/",
+            &owned_pairs([("S".to_string(), "rId1".to_string())]),
+            &owned_pairs([("rId1".to_string(), "worksheets/sheet1.xml".to_string())]),
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                worksheet_xml(r#"<row r="1"><c r="A1" t="s"><v>0</v></c></row>"#),
+            )],
+            Some(shared.as_bytes()),
+            true,
+        )
+    }
+
+    /// AX-41: calamine reserves `uniqueCount` entries before it reads one, so a 1.7 KB file
+    /// declaring 100,000,000,000 aborted the process. The preflight refuses it in every
+    /// spelling calamine accepts, and where the attribute straddles the 8 KiB read buffer.
+    #[test]
+    fn test_xlsx_preflight_rejects_a_unique_count_beyond_the_budget() {
+        let cap = crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES;
+        for attr in [
+            r#"uniqueCount="100000000000""#,
+            r#"uniqueCount="000000100000000000""#,
+            r#"uniqueCount='100000000000'"#,
+            r#"uniqueCount = "100000000000""#,
+        ] {
+            let bytes = workbook_with_unique_count(attr, 0);
+            let err = preflight_xlsx_decompression_budget_capped(&bytes, "sst.xlsx", cap)
+                .expect_err(attr);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("uniqueCount 100000000000") && msg.contains("zip-bomb guard"),
+                "{msg}"
+            );
+            assert!(msg.contains("raise [index].max_decompressed_size"), "{msg}");
+            assert!(msg.is_ascii(), "{msg}");
+        }
+        // Stored entries are read in 8 KiB pieces: put the attribute across that boundary.
+        let prefix = r#"<?xml version="1.0"?><!--"#.len();
+        let to_attr = format!(r#"--><sst {SPREADSHEET_NS} "#).len();
+        for offset in 8 * 1024 - 14..=8 * 1024 + 1 {
+            let padding = offset - prefix - to_attr;
+            let bytes = workbook_with_unique_count(r#"uniqueCount="100000000000""#, padding);
+            preflight_xlsx_decompression_budget_capped(&bytes, "sst.xlsx", cap)
+                .expect_err("an attribute across the read boundary is still read");
+        }
+    }
+
+    /// The whole parser returns that refusal instead of aborting: this fixture is the one that
+    /// took the process down (a regression would abort this test binary).
+    #[test]
+    fn test_xlsx_refuses_a_unique_count_that_would_abort_the_process() {
+        let bytes = workbook_with_unique_count(r#"uniqueCount="100000000000""#, 0);
+        let err = XlsxParser::default()
+            .parse_bytes(&bytes, "abort.xlsx", &[])
+            .expect_err("refused before calamine reserves");
+        assert!(err.to_string().contains("uniqueCount"), "{err}");
+    }
+
+    /// The limit is `budget / 5` on the index path: exactly the limit is admitted, one more is
+    /// refused (a 64 KiB budget allows 13,107).
+    #[test]
+    fn test_xlsx_unique_count_limit_follows_the_parser_budget() {
+        let budget = 64 * 1024;
+        assert_eq!(unique_count_limit(budget), (budget, 13_107));
+        let at = workbook_with_unique_count(r#"uniqueCount="13107""#, 0);
+        let doc = XlsxParser::with_budget(budget)
+            .parse_bytes(&at, "at.xlsx", &[])
+            .expect("exactly the limit is admitted");
+        assert!(doc.chunks[0].content.contains('x'));
+        let over = workbook_with_unique_count(r#"uniqueCount="13108""#, 0);
+        let err = XlsxParser::with_budget(budget)
+            .parse_bytes(&over, "over.xlsx", &[])
+            .expect_err("one over the limit is refused");
+        assert!(err.to_string().contains("at most 13107"), "{err}");
+    }
+
+    /// A truthful `uniqueCount` is admitted and the shared strings read as before.
+    #[test]
+    fn test_xlsx_preflight_admits_a_truthful_unique_count() {
+        let bytes = make_wired_xlsx(
+            "xl/",
+            &owned_pairs([("S".to_string(), "rId1".to_string())]),
+            &owned_pairs([("rId1".to_string(), "worksheets/sheet1.xml".to_string())]),
+            &[(
+                "xl/worksheets/sheet1.xml".to_string(),
+                worksheet_xml(
+                    r#"<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>2</v></c></row>"#,
+                ),
+            )],
+            Some(&shared_strings_xml(
+                r#"count="3" uniqueCount="3""#,
+                &["alpha", "beta", "gamma"],
+            )),
+            false,
+        );
+        preflight_xlsx_decompression_budget(&bytes, "ok.xlsx").expect("truthful count");
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "ok.xlsx", &[])
+            .expect("parse");
+        assert!(
+            doc.chunks[0].content.contains("alpha\tgamma"),
+            "{:?}",
+            doc.chunks[0].content
+        );
+    }
+
+    /// `"unlimited"` keeps a fixed limit (the default budget / 5) instead of none, on the index
+    /// path, and the read path (MCP `get_document`) keeps the default budget's limit too.
+    #[test]
+    fn test_xlsx_unique_count_limit_holds_under_unlimited_and_on_the_read_path() {
+        let unlimited = crate::parser::FileSizeLimit::Unlimited.cap_bytes();
+        let default = crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES;
+        assert_eq!(unique_count_limit(unlimited), (default, default / 5));
+        assert_eq!(unique_count_limit(default), (default, 10_485_760));
+
+        let over = workbook_with_unique_count(r#"uniqueCount="10485761""#, 0);
+        let err = XlsxParser::with_budget(unlimited)
+            .parse_bytes(&over, "over.xlsx", &[])
+            .expect_err("unlimited still has a uniqueCount limit");
+        let msg = err.to_string();
+        assert!(msg.contains("uniqueCount 10485761"), "{msg}");
+        assert!(
+            !msg.contains("raise [index]"),
+            "raising does not help under unlimited: {msg}"
+        );
+        XlsxParser::default()
+            .parse_bytes_for_read(&over, "over.xlsx", &[])
+            .expect_err("the read path refuses it too");
+
+        let at = workbook_with_unique_count(r#"uniqueCount="10485760""#, 0);
+        preflight_xlsx_decompression_budget_capped(&at, "at.xlsx", unlimited)
+            .expect("exactly the fixed limit is admitted");
+    }
+
+    /// The read path goes through the same per-document guards: a workbook whose sheets all
+    /// share one part reads as one chunk there too.
+    #[test]
+    fn xlsx_read_path_reads_a_shared_part_once() {
+        let bytes = sheets_sharing_one_part(50, true);
+        let doc = XlsxParser::default()
+            .parse_bytes_for_read(&bytes, "dup.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 1);
     }
 }
