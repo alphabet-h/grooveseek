@@ -50,9 +50,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   and the blank lines between bodies in the document's raw content, and stops after 120 s, the
   same bounds as PDF; past either it is skipped with a `decompression-bomb guard` error.
   `get_document` and `resources/read` apply the same bounds with the built-in 50 MiB, whatever
-  the key says, as they already do for PDF. The clock is read while the decompression preflight inflates
-  each entry, while the sheets are resolved to their parts, between the steps that open the
-  workbook, at every cell and at every sheet boundary. Opening the zip archive, calamine
+  the key says, as they already do for PDF. The clock is read while the decompression
+  preflight inflates each entry, while the sheets are resolved to their parts, between the
+  steps that open the workbook, at every cell and at every sheet boundary. Opening the zip archive, calamine
   opening the workbook, reading the title from `docProps/core.xml` and reading a single cell
   cannot be interrupted; that work is bounded by the decompression budget instead. With
   `max_decompressed_size = "unlimited"`, which lifts that budget, nothing bounds those steps:
