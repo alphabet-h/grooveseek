@@ -209,6 +209,8 @@ groove service uninstall --service-name personal --purge --yes # config + .groov
 
 `uninstall --purge --yes` が消すのは、その instance の config home (`groove.toml` とサービスのファイル) と、`kb_path` が指す `.groove.db` とその隣の `.groove.db-wal` / `.groove.db-shm`。`.groove.db` が symlink なら、その先の file とその隣の `-wal` / `-shm` を消してから link を消す。相対の `kb_path` は、サーバと同じく config home を基準に読む。`groove.toml` が読めない、または使える `kb_path` が無いときは、DB には触らず警告を出す。隣の lock と持ち主のファイル (`.groove.db.writer-lock` と、プロセスが残していれば `.groove.db.writer.json`、`.groove.db.writer.json.tmp-<pid>` / `.groove.db.replace-lock`) は消さずに stderr に名前を出す。これらは索引の中身を持たない。消せなかったファイルは stderr に残したものとして出し、purge の残りは続ける。
 
+purge は、DB を見る前から config home を消し終えるまで索引の writer lock (`.groove.db.writer-lock`) を握る。その間に、lock の下で書く `groove index` やサーバが `-wal` を作り直すことはない。サービスの停止はサーバの終了を待たない (Windows の `schtasks /End` はすぐ戻る) ので、purge は lock を最大 10 秒待つ。それでも groove のプロセスが握っていれば、それ以上は消さない。DB も、それを名指す config home も残し、持ち主を名指したエラーで終わる。この時点でサービスの unit は消えている。そのプロセスが終わってから、同じ `uninstall --purge --yes` をもう一度打てば purge が終わる。writer lock を取らずに索引を読むプロセス (`groove search` のような読むだけのコマンドや、reader として動くサーバ) は締め出さない。Windows では、それが開いているファイルは残したものとして出る。
+
 OS 別バックエンド:
 - **Linux**: systemd-user (`~/.config/systemd/user/groove-<name>.service`)。ログアウト後も daemon を生かしたい場合は `sudo loginctl enable-linger $USER` を実行。
 - **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.groove.<name>.plist`)。daemon の出力は launchd が config home の `groove.out` / `groove.err` に書く。plist は `Umask` に `0077` を指定するので、agent が作るもの (ログ、インデックス DB) はすべて自分のアカウントからしか読めない。

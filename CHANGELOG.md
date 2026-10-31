@@ -31,6 +31,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   against the config home, as the server reads it, not against the directory `uninstall` runs
   in; a `kb_path` that is a filesystem root, or a `groove.toml` that cannot be read, leaves the
   database alone with a warning instead of skipping it without a word.
+  The purge now holds the index's writer lock from before it lists the files until the config
+  home is gone, waiting up to 10 seconds for a server the backend has told to stop (Windows'
+  `schtasks /End` does not wait for it to exit); a process still holding the lock after that
+  leaves the database and the config home in place, and the command fails saying to run it again
+  once that process has exited. It used to delete while such a server could still put a `-wal`
+  back, then delete the config home that named it. The files removed are named from the database
+  path resolved once, the directory symlinks and junctions above it included, so a directory link
+  repointed during the purge no longer moves the removal to another database, and a `.groove.db`
+  symlink repointed meanwhile is left in place with a warning.
 
 ### Documentation
 
