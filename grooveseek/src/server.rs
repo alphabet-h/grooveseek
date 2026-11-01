@@ -1144,7 +1144,14 @@ impl KbServer {
                        another groove process (a groove index run, or another \
                        server's watcher) is writing the same index, or when \
                        this server started while one was and is reading only. \
-                       When a reply carries writer_notice, this server is \
+                       The reply lists the files counted in skipped as \
+                       skipped_files (the first 50, in path order, each with \
+                       path, reason and the detail keys its reason has) and \
+                       how many more there were as skipped_files_omitted. New \
+                       reason values may be added, and a file reported as \
+                       corrupt_or_unsupported or no_text may move to a more \
+                       specific value; treat an unknown value as a generic \
+                       failure. When a reply carries writer_notice, this server is \
                        not keeping the index current and the text says why; \
                        pass it on to the user."
     )]

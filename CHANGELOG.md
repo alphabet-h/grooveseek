@@ -24,6 +24,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   needs a wildcard arm. `reindex_single_file_explained` returns `Reindexed { result, reason }`,
   the single-file reindex with the same reason. `IndexResult` now derives `Clone`. See
   [ADR-0032](docs/decisions/0032-report-why-each-file-was-not-indexed.md) (kuriya #660).
+- MCP: the `rebuild_index` reply carries `skipped_files`, the first 50 entries of that list in
+  path order, each with `path`, `reason` (the `kind()` name) and the flat detail keys its reason
+  has (`size` / `limit` / `limit_key` / `seconds` / `http_status` / `cause` / `directory`), and
+  `skipped_files_omitted`, how many more there were. Both keys are present even when nothing was
+  skipped, in a plain reply and in one that carries an `error`, but not in a `Rebuild failed`
+  reply. New `reason` values may be added, and a file reported with a generic value
+  (`corrupt_or_unsupported` / `no_text`) may move to a more specific one; treat an unknown value
+  as a generic failure. See [docs/mcp-tools.md](docs/mcp-tools.md) and
+  [ADR-0032](docs/decisions/0032-report-why-each-file-was-not-indexed.md) (kuriya #660).
+  <!-- via: grooveseek/src/server.rs `const SKIPPED_FILES_IN_REPLY: usize = 50` -->
 
 ### Changed
 
