@@ -177,8 +177,9 @@ Until now the library could not answer that:
 - **The vocabulary of `reason` grows by addition**, and a file reported with a
   generic value (`corrupt_or_unsupported`, `no_text`) may later move to a more
   specific one; a consumer treats an unknown value as a generic failure.
-  Moving between specific values, or removing or renaming one, is a major
-  change. [mcp-tools.md](../mcp-tools.md) states this with the MCP change.
+  Moving between specific values, moving from a specific value to a generic
+  one, or removing or renaming one, is a major change.
+  [mcp-tools.md](../mcp-tools.md) states this with the MCP change.
 - **Revisit when** the desktop wants the files as they are skipped (add
   `ProgressEvent::Skipped`, which `SkipReason` being `Copy` allows), or the
   watcher or the admin status must show what it could not read (and with it

@@ -136,7 +136,8 @@ groove の desktop の画面は、索引が読めなかったファイルが**�
   2 回目の読みの失敗は `Unreadable` の skip になる。`rename_single_file` は今も理由を捨てる。
 - **`reason` の語彙は追加で育ち**、汎用の値 (`corrupt_or_unsupported`、`no_text`) で報告して
   いたファイルが、後でより具体的な値へ移ることがある。消費者は知らない値を汎用の失敗として
-  扱う。具体的な値どうしの移動、値の削除や改名は major の変更。
+  扱う。具体的な値どうしの移動、具体的な値から汎用の値への移動、
+  値の削除や改名は major の変更。
   [mcp-tools.ja.md](../mcp-tools.ja.md) が MCP の変更と一緒にこれを書く。
 - **見直す時**: desktop が skip を起きた順に見せたくなった時 (`SkipReason` が `Copy` なので
   `ProgressEvent::Skipped` を足せる)、または watcher や admin status が読めなかったものを
