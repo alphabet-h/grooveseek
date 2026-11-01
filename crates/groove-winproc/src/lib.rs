@@ -120,8 +120,79 @@ pub enum StopOutcome {
 mod process;
 #[cfg(windows)]
 pub use process::{
-    EXIT_WAIT, creation_time_of, stop_process_if_image_matches, stop_process_if_matches,
+    EXIT_WAIT, creation_time_of, is_recorded_process_running, stop_process_if_image_matches,
+    stop_process_if_matches,
 };
+
+/// File name of the [`RecordLock`] in the service's config home.
+pub const SERVE_RECORD_LOCK_FILE: &str = "serve-pid.lock";
+
+/// How long [`RecordLock::acquire`] callers wait for the lock by default.
+/// Every holder keeps it for a moment (a check and a spawn, or a check and a
+/// terminate of up to the 10 s exit wait), so this outlasts a holder that is
+/// stopping a server.
+pub const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The per-config-home section in which the [`ServeRecord`] is read and acted
+/// on: `groove-svc` checks whether the recorded server is alive, removes the
+/// record, spawns and writes the new record inside it, and `groove service
+/// uninstall`, `install --force` and the tray read the record and stop the
+/// server inside it (kuriya #650). Without it, a second launch could replace
+/// the record of a server that is still running, and a stop could read the
+/// record while a launch is between spawning and writing it.
+///
+/// An OS file lock on `serve-pid.lock` in the config home, held for as long
+/// as this value lives: the lock is keyed by the file itself, so no path
+/// spelling has to be normalized into a name (a named mutex built from the
+/// path would have to agree on case, 8.3 names and the `\\?\` prefix across
+/// three programs), and the OS releases it when the holder exits, even
+/// abnormally. The lock file is left in place, like the index's writer lock.
+#[derive(Debug)]
+pub struct RecordLock {
+    file: std::fs::File,
+}
+
+impl RecordLock {
+    /// Take the lock of the service whose config home is `config_home`,
+    /// retrying until `wait` has passed; then a `TimedOut` error. An error
+    /// opening the lock file is returned as it is (`NotFound` when the config
+    /// home does not exist).
+    pub fn acquire(config_home: &Path, wait: std::time::Duration) -> io::Result<Self> {
+        let path = config_home.join(SERVE_RECORD_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "another groove process held {} for {}s",
+                        path.display(),
+                        wait.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+impl Drop for RecordLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -188,6 +259,40 @@ mod tests {
             Some(ServeRecord { pid: 2, created: 2 })
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The section is exclusive per config home, and free again once its
+    /// holder is dropped.
+    #[test]
+    fn the_record_lock_is_exclusive_until_dropped() {
+        let dir = temp_dir("lock");
+        let held = RecordLock::acquire(&dir, std::time::Duration::ZERO).unwrap();
+        let busy = RecordLock::acquire(&dir, std::time::Duration::from_millis(120)).unwrap_err();
+        assert_eq!(busy.kind(), io::ErrorKind::TimedOut);
+        drop(held);
+        let again = RecordLock::acquire(&dir, std::time::Duration::ZERO);
+        assert!(again.is_ok(), "{again:?}");
+        drop(again);
+        let other = temp_dir("lock-other");
+        let a = RecordLock::acquire(&dir, std::time::Duration::ZERO).unwrap();
+        assert!(
+            RecordLock::acquire(&other, std::time::Duration::ZERO).is_ok(),
+            "another config home has its own lock"
+        );
+        drop(a);
+        let _ = std::fs::remove_dir_all(other);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_config_home_has_no_lock_to_take() {
+        let missing = std::env::temp_dir().join(format!(
+            "groove-winproc-missing-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let err = RecordLock::acquire(&missing, std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

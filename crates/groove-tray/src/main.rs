@@ -76,7 +76,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     // PR-2: fail-fast config resolve (= spec section 6 末尾、PR-1 fallback drop).
-    let cfg = config::resolve(&args.service_name, args.kb_path.as_ref())?;
+    // (kuriya #650) `--config-home` names the service's config home, which
+    // holds `groove.toml` as `--kb-path` does; it wins over `--kb-path`.
+    let mut cfg = config::resolve(
+        &args.service_name,
+        args.config_home.as_ref().or(args.kb_path.as_ref()),
+    )?;
+    cfg.config_home = args.config_home.clone();
     tracing::info!(
         "config resolved: service={} bind={}",
         cfg.service_name,
@@ -166,8 +172,10 @@ fn handle_menu(
             // confirmation binds this address, and a daemon holding `0.0.0.0`
             // does not stop us binding `127.0.0.1` (measured).
             let bind = cfg.bind.clone();
+            let home = cfg.config_home.clone();
             runtime.spawn(async move {
-                if let Err(e) = daemon::stop(&service, &status_url, &bind).await {
+                if let Err(e) = daemon::stop_in(&service, home.as_deref(), &status_url, &bind).await
+                {
                     tracing::warn!("daemon stop failed: {e}");
                 }
             });
@@ -175,8 +183,10 @@ fn handle_menu(
         "restart" => {
             let status_url = cfg.status_url.clone();
             let bind = cfg.bind.clone();
+            let home = cfg.config_home.clone();
             runtime.spawn(async move {
-                if let Err(e) = daemon::restart(&service, &status_url, &bind).await {
+                if let Err(e) = daemon::restart(&service, home.as_deref(), &status_url, &bind).await
+                {
                     tracing::warn!("daemon restart failed: {e}");
                 }
             });

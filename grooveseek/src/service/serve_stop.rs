@@ -53,6 +53,21 @@ pub(crate) enum ServeStop {
 /// behind the recorded pid is still that server. Waits up to
 /// [`groove_winproc::EXIT_WAIT`] for it to exit, and no longer.
 pub(crate) fn stop_recorded_serve(config_home: &Path) -> ServeStop {
+    // The record is read and acted on inside the section groove-svc writes it
+    // in ([`groove_winproc::RecordLock`]), so a launch cannot replace it
+    // between the read and the stop. No config home: no record either. A
+    // section that cannot be taken in time (a launch that hangs) does not
+    // block the uninstall; the record is read without it, as before.
+    let _section =
+        match groove_winproc::RecordLock::acquire(config_home, groove_winproc::RECORD_LOCK_WAIT) {
+            Ok(section) => Some(section),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return ServeStop::NoRecord {
+                    path: ServeRecord::path_in(config_home),
+                };
+            }
+            Err(_) => None,
+        };
     let path = ServeRecord::path_in(config_home);
     let record = match ServeRecord::read(&path) {
         Ok(Some(r)) => r,

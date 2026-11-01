@@ -23,7 +23,7 @@ use windows_sys::Win32::Foundation::{
     WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
@@ -108,6 +108,81 @@ pub fn stop_process_if_image_matches(
     stop_process_if_matches(pid, expected_file_name, None)
 }
 
+/// Open `pid` with `access` and check that it is the process meant: its
+/// executable is named `expected_file_name`, it has not exited, and, given
+/// `created` (a [`crate::ServeRecord`]'s creation time), it was created at
+/// exactly that time. `Ok(Err(outcome))` says why it is not (never
+/// [`StopOutcome::Terminated`]). The one identity check, shared by
+/// [`stop_process_if_matches`] and [`is_recorded_process_running`].
+fn open_checked(
+    pid: u32,
+    expected_file_name: &str,
+    created: Option<u64>,
+    access: PROCESS_ACCESS_RIGHTS,
+) -> io::Result<Result<Owned, StopOutcome>> {
+    // SAFETY: plain call; the result is checked for null.
+    let raw = unsafe { OpenProcess(access, 0, pid) };
+    if raw.is_null() {
+        // SAFETY: plain call, right after the failing one.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_INVALID_PARAMETER {
+            // The documented answer for a pid that names no process.
+            return Ok(Err(StopOutcome::NotRunning));
+        }
+        return Err(os_error("OpenProcess", pid, code));
+    }
+    let handle = Owned(raw);
+
+    let Some(image) = image_path(&handle) else {
+        // The process can exit between the open and the query; the handle
+        // still answers whether it did.
+        if has_exited(&handle) {
+            return Ok(Err(StopOutcome::NotRunning));
+        }
+        return Err(io::Error::other(format!(
+            "QueryFullProcessImageNameW failed for pid {pid}"
+        )));
+    };
+    if !image_file_name_matches(&image, expected_file_name) {
+        return Ok(Err(StopOutcome::NotOurProcess));
+    }
+    if let Some(expected) = created {
+        match creation_time(handle.0) {
+            Some(actual) if actual == expected => {}
+            Some(_) => return Ok(Err(StopOutcome::Reused)),
+            None if has_exited(&handle) => return Ok(Err(StopOutcome::NotRunning)),
+            None => {
+                return Err(io::Error::other(format!(
+                    "GetProcessTimes failed for pid {pid}"
+                )));
+            }
+        }
+    }
+    if has_exited(&handle) {
+        return Ok(Err(StopOutcome::NotRunning));
+    }
+    Ok(Ok(handle))
+}
+
+/// Whether the process `groove-svc` recorded (`pid`, created at `created`) is
+/// still running as `expected_file_name`: the check
+/// [`stop_process_if_matches`] makes before it terminates, without the
+/// terminate. An `Err` means it could not be found out (a process with that
+/// pid exists but cannot be examined).
+pub fn is_recorded_process_running(
+    pid: u32,
+    expected_file_name: &str,
+    created: u64,
+) -> io::Result<bool> {
+    let checked = open_checked(
+        pid,
+        expected_file_name,
+        Some(created),
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    )?;
+    Ok(checked.is_ok())
+}
+
 /// Terminate `pid` when its executable is named `expected_file_name` and,
 /// given `created` (a [`crate::ServeRecord`]'s creation time), the process
 /// was created at exactly that time; then wait up to [`EXIT_WAIT`] for it to
@@ -123,50 +198,15 @@ pub fn stop_process_if_matches(
     expected_file_name: &str,
     created: Option<u64>,
 ) -> io::Result<StopOutcome> {
-    // SAFETY: plain call; the result is checked for null.
-    let raw = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        )
+    let handle = match open_checked(
+        pid,
+        expected_file_name,
+        created,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+    )? {
+        Ok(handle) => handle,
+        Err(outcome) => return Ok(outcome),
     };
-    if raw.is_null() {
-        // SAFETY: plain call, right after the failing one.
-        let code = unsafe { GetLastError() };
-        if code == ERROR_INVALID_PARAMETER {
-            // The documented answer for a pid that names no process.
-            return Ok(StopOutcome::NotRunning);
-        }
-        return Err(os_error("OpenProcess", pid, code));
-    }
-    let handle = Owned(raw);
-
-    let Some(image) = image_path(&handle) else {
-        // The process can exit between the open and the query; the handle
-        // still answers whether it did.
-        if has_exited(&handle) {
-            return Ok(StopOutcome::NotRunning);
-        }
-        return Err(io::Error::other(format!(
-            "QueryFullProcessImageNameW failed for pid {pid}"
-        )));
-    };
-    if !image_file_name_matches(&image, expected_file_name) {
-        return Ok(StopOutcome::NotOurProcess);
-    }
-    if let Some(expected) = created {
-        match creation_time(handle.0) {
-            Some(actual) if actual == expected => {}
-            Some(_) => return Ok(StopOutcome::Reused),
-            None if has_exited(&handle) => return Ok(StopOutcome::NotRunning),
-            None => {
-                return Err(io::Error::other(format!(
-                    "GetProcessTimes failed for pid {pid}"
-                )));
-            }
-        }
-    }
 
     // SAFETY: the handle carries PROCESS_TERMINATE.
     if unsafe { TerminateProcess(handle.0, 1) } == 0 {
@@ -324,5 +364,23 @@ mod tests {
             stop_process_if_matches(u32::MAX - 2, "groove.exe", Some(1)).unwrap(),
             StopOutcome::NotRunning
         );
+    }
+
+    /// The check without the terminate: true only for the recorded process,
+    /// and it leaves it running.
+    #[test]
+    fn the_running_check_matches_only_the_recorded_process_and_stops_nothing() {
+        let d = Disguised::new();
+        let mut child = spawn(&d.exe());
+        let created = creation_time_of(&child).unwrap();
+        assert!(is_recorded_process_running(child.id(), "groove.exe", created).unwrap());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the check stops nothing"
+        );
+        assert!(!is_recorded_process_running(child.id(), "groove.exe", created - 1).unwrap());
+        assert!(!is_recorded_process_running(child.id(), "ping.exe", created).unwrap());
+        reap(child);
+        assert!(!is_recorded_process_running(u32::MAX - 2, "groove.exe", created).unwrap());
     }
 }

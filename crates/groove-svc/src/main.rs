@@ -93,47 +93,104 @@ fn main() -> std::io::Result<()> {
     // installer.
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 
-    // (kuriya #650) The previous record goes before the new server starts, so
-    // a record that then cannot be written leaves none rather than an old one:
-    // uninstall warns about a missing record, but would read an old one as
-    // "that server has exited, nothing to stop".
-    let record_path = clear_old_record(&extra_args);
-
-    let child = Command::new(&grooveseek_exe)
-        .args(child_args(&extra_args))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
-
-    // (kuriya #650) Record which process is the service's server, so
-    // `groove service uninstall` can stop it: this process exits right away,
-    // so Task Scheduler sees a finished task and `schtasks /End` stops nothing.
-    // Best-effort: the server is already running, and failing here would only
-    // put an error in the task history while it runs anyway.
-    if let Some(path) = record_path
-        && let Ok(created) = groove_winproc::creation_time_of(&child)
-    {
-        let record = groove_winproc::ServeRecord {
-            pid: child.id(),
-            created,
-        };
-        let _ = record.write(&path);
-    }
-    // Dropping `child` closes its handle and leaves the server running.
+    let spawn = || {
+        Command::new(&grooveseek_exe)
+            .args(child_args(&extra_args))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
+    // `AlreadyRunning` is a success: the service's server is up, which is
+    // what starting the task asks for.
+    launch(record_dir(&extra_args).as_deref(), spawn)?;
     Ok(())
 }
 
-/// Remove the record of the server an earlier run started, and return where
-/// this run's record goes; `None` when the Action names no config home.
-/// Best-effort like the write: a record that cannot be removed is left, and
-/// one that is not there is what is wanted.
+/// What [`launch`] did.
 #[cfg(target_os = "windows")]
-fn clear_old_record(extra: &[String]) -> Option<std::path::PathBuf> {
-    let path = groove_winproc::ServeRecord::path_in(&record_dir(extra)?);
+#[derive(Debug, PartialEq, Eq)]
+enum Launch {
+    /// The server recorded in the config home is running (this pid): nothing
+    /// was spawned and the record was left as it was.
+    AlreadyRunning(u32),
+    /// A server was spawned (this pid), and recorded when there is a config
+    /// home to record it in.
+    Started(u32),
+}
+
+/// File name of the server's executable, as the record's check expects it.
+#[cfg(target_os = "windows")]
+const SERVE_IMAGE: &str = "groove.exe";
+
+/// Start the service's server unless the one recorded in `config_home` is
+/// still running (kuriya #650).
+///
+/// The task can be started again while its server runs (Task Scheduler sees
+/// a finished task once this launcher exits: a manual `/Run`, the next logon,
+/// the tray's Start). A second server would fail to bind the port and exit,
+/// and recording it would drop the running one from the record, out of
+/// uninstall's reach. So the check of the recorded server, the removal of the
+/// record, the spawn and the new record happen in one section, serialized per
+/// config home by [`groove_winproc::RecordLock`]; a running recorded server
+/// (its image and exact creation time, the check the stop makes) means no
+/// spawn at all.
+///
+/// The old record is removed before the spawn, so a record that then cannot
+/// be written leaves none (uninstall warns) rather than an old one read as
+/// "that server has exited". Writing it is best-effort: the server is already
+/// running by then. An error before the spawn (the lock not taken in time, a
+/// recorded process that exists but cannot be examined) spawns nothing, and
+/// lands in the task history. Without a config home (an Action from before
+/// BU-07) there is nothing to record or check, and the server is started as
+/// before.
+#[cfg(target_os = "windows")]
+fn launch(
+    config_home: Option<&std::path::Path>,
+    spawn: impl FnOnce() -> std::io::Result<std::process::Child>,
+) -> std::io::Result<Launch> {
+    launch_waiting(config_home, groove_winproc::RECORD_LOCK_WAIT, spawn)
+}
+
+/// [`launch`] with the wait for the section passed in, so a test of the
+/// refusal need not sit out [`groove_winproc::RECORD_LOCK_WAIT`].
+#[cfg(target_os = "windows")]
+fn launch_waiting(
+    config_home: Option<&std::path::Path>,
+    wait: std::time::Duration,
+    spawn: impl FnOnce() -> std::io::Result<std::process::Child>,
+) -> std::io::Result<Launch> {
+    use groove_winproc::{RecordLock, ServeRecord};
+    let Some(home) = config_home else {
+        return Ok(Launch::Started(spawn()?.id()));
+    };
+    let _section = match RecordLock::acquire(home, wait) {
+        Ok(section) => section,
+        // No config home: no groove.toml either, so the server will report
+        // that itself; there is no record to keep consistent.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Launch::Started(spawn()?.id()));
+        }
+        Err(e) => return Err(e),
+    };
+    let path = ServeRecord::path_in(home);
+    if let Ok(Some(record)) = ServeRecord::read(&path)
+        && groove_winproc::is_recorded_process_running(record.pid, SERVE_IMAGE, record.created)?
+    {
+        return Ok(Launch::AlreadyRunning(record.pid));
+    }
     let _ = std::fs::remove_file(&path);
-    Some(path)
+    let child = spawn()?;
+    if let Ok(created) = groove_winproc::creation_time_of(&child) {
+        let _ = ServeRecord {
+            pid: child.id(),
+            created,
+        }
+        .write(&path);
+    }
+    // Dropping `child` closes its handle and leaves the server running.
+    Ok(Launch::Started(child.id()))
 }
 
 /// The directory the [`groove_winproc::ServeRecord`] goes in: the one holding
@@ -179,39 +236,6 @@ mod record_dir_tests {
         );
     }
 
-    /// The old record is gone before the new server is started, so a failed
-    /// write leaves no record rather than a stale one.
-    #[cfg(windows)]
-    #[test]
-    fn the_old_record_is_cleared_before_the_server_starts() {
-        let dir = std::env::temp_dir().join(format!(
-            "groove-svc-clear-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = groove_winproc::ServeRecord::path_in(&dir);
-        groove_winproc::ServeRecord { pid: 8, created: 1 }
-            .write(&old)
-            .unwrap();
-        let extra = vec![
-            "--config".to_string(),
-            dir.join("groove.toml").display().to_string(),
-        ];
-        assert_eq!(super::clear_old_record(&extra), Some(old.clone()));
-        assert!(!old.exists(), "the old record is removed");
-        assert_eq!(
-            super::clear_old_record(&extra),
-            Some(old.clone()),
-            "and none is fine"
-        );
-        assert_eq!(super::clear_old_record(&[]), None);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn without_a_config_argument_nothing_is_recorded() {
         assert_eq!(record_dir(&[]), None);
@@ -228,6 +252,147 @@ mod record_dir_tests {
             record_dir(&["--config".to_string(), "home/groove.toml".to_string()]),
             Some(std::path::PathBuf::from("home"))
         );
+    }
+}
+
+/// (kuriya #650) The launcher's check and record: a second start of the task
+/// while the recorded server runs spawns nothing and keeps the record.
+#[cfg(all(test, target_os = "windows"))]
+mod launch_tests {
+    use super::{Launch, launch};
+    use groove_winproc::ServeRecord;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "groove-svc-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// `ping.exe` copied as `groove.exe`: a harmless stand-in server.
+    fn stand_in_exe(dir: &Path) -> PathBuf {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let exe = dir.join("groove.exe");
+        std::fs::copy(Path::new(&root).join("System32").join("ping.exe"), &exe).unwrap();
+        exe
+    }
+
+    fn spawn_stand_in(exe: &Path) -> std::io::Result<Child> {
+        Command::new(exe)
+            .args(["-t", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+
+    #[test]
+    fn a_second_start_while_the_recorded_server_runs_spawns_nothing() {
+        let home = temp_dir("home");
+        let bin = temp_dir("bin");
+        let exe = stand_in_exe(&bin);
+
+        let first = launch(Some(&home), || spawn_stand_in(&exe)).unwrap();
+        let Launch::Started(pid) = first else {
+            panic!("the first start spawns: {first:?}")
+        };
+        let record = ServeRecord::read(&ServeRecord::path_in(&home))
+            .unwrap()
+            .expect("the first start is recorded");
+        assert_eq!(record.pid, pid);
+
+        let mut spawned_again = false;
+        let second = launch(Some(&home), || {
+            spawned_again = true;
+            spawn_stand_in(&exe)
+        })
+        .unwrap();
+        assert_eq!(second, Launch::AlreadyRunning(pid));
+        assert!(
+            !spawned_again,
+            "nothing is spawned while the recorded server runs"
+        );
+        assert_eq!(
+            ServeRecord::read(&ServeRecord::path_in(&home)).unwrap(),
+            Some(record),
+            "the record still names the running server"
+        );
+
+        // Once it has exited, the next start spawns and records a new one.
+        assert_eq!(
+            groove_winproc::stop_process_if_matches(pid, "groove.exe", Some(record.created))
+                .unwrap(),
+            groove_winproc::StopOutcome::Terminated
+        );
+        let third = launch(Some(&home), || spawn_stand_in(&exe)).unwrap();
+        let Launch::Started(new_pid) = third else {
+            panic!("a start after the server exited spawns: {third:?}")
+        };
+        let new_record = ServeRecord::read(&ServeRecord::path_in(&home))
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(new_record.pid, new_pid);
+        let _ = groove_winproc::stop_process_if_matches(
+            new_pid,
+            "groove.exe",
+            Some(new_record.created),
+        );
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// A start that cannot take the section in time (another launch, or a
+    /// stop, holds it) spawns nothing and fails, to the task history.
+    #[test]
+    fn a_start_that_cannot_take_the_section_spawns_nothing() {
+        let home = temp_dir("busy");
+        let held = groove_winproc::RecordLock::acquire(&home, std::time::Duration::ZERO).unwrap();
+        let mut spawned = false;
+        let err = super::launch_waiting(Some(&home), std::time::Duration::from_millis(100), || {
+            spawned = true;
+            Err(std::io::Error::other("must not be called"))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!spawned, "nothing is spawned without the section");
+        drop(held);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// An old record whose server has exited does not stop a start, and is
+    /// replaced by the new one.
+    #[test]
+    fn a_stale_record_is_replaced() {
+        let home = temp_dir("stale");
+        let bin = temp_dir("stale-bin");
+        let exe = stand_in_exe(&bin);
+        ServeRecord {
+            pid: u32::MAX - 2,
+            created: 1,
+        }
+        .write(&ServeRecord::path_in(&home))
+        .unwrap();
+        let Launch::Started(pid) = launch(Some(&home), || spawn_stand_in(&exe)).unwrap() else {
+            panic!("a stale record does not block the start")
+        };
+        let rec = ServeRecord::read(&ServeRecord::path_in(&home))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.pid, pid);
+        let _ = groove_winproc::stop_process_if_matches(pid, "groove.exe", Some(rec.created));
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(bin);
     }
 }
 

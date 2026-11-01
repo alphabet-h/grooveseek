@@ -108,7 +108,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is running but cannot be stopped makes the uninstall fail, with or without `--purge` (which
   then deletes nothing), naming its pid and how to stop it. `groove-svc` removes the previous
   record before it starts the server, so a record it then cannot write leaves none (a warning
-  at uninstall) rather than an old one read as "that server has exited". `service install
+  at uninstall) rather than an old one read as "that server has exited". A start of the task
+  while the recorded server runs (a manual `/Run`, the next logon, the tray's Start) spawns
+  nothing and keeps the record, instead of starting a second server that fails to bind and
+  taking the running one out of the record; the check, the spawn and the record, and every
+  read-then-stop of the record, are serialized per config home by a lock file,
+  `serve-pid.lock`, beside it. `service install
   --force` stops the server the previous install started before it re-registers and starts
   the task, so the new server does not meet the old one on the port; one that is running and
   cannot be stopped fails the install before anything is re-registered. The refusals also give
@@ -119,7 +124,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the task stays registered is now an error instead of "Removed service unit", and one whose
   task cannot be checked afterwards is a warning. The tray's Stop
   uses the same record first, with the same check, and falls back to the status endpoint's pid
-  as before; its process handling moved to a new internal crate, `groove-winproc`, which
+  as before; the tray's startup shortcut now passes the service's config home
+  (`--config-home`), so the tray finds `groove.toml` and the record for a service installed
+  under `GROOVE_CONFIG_HOME` too (an existing shortcut keeps the default place until
+  `tray-install` or `install --with-tray` is run again); its process handling moved to a new internal crate, `groove-winproc`, which
   `groove` and `groove-svc` share. Linux and macOS are unchanged (kuriya #650).
 
 ### Documentation

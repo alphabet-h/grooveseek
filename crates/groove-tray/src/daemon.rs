@@ -1,6 +1,7 @@
 use crate::process::{StopOutcome, stop_process_if_image_matches, stop_recorded_process};
 use anyhow::{Context, Result, bail};
 use groove_tray::powershell::{CREATE_NO_WINDOW, decode_diagnostic, with_utf8_output};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// File name of the daemon executable. Every stop is gated on the target
@@ -68,7 +69,22 @@ enum DaemonProbe {
 /// Whatever path runs, the outcome is confirmed against the daemon itself
 /// before returning — see [`confirm_stopped`]. The pid is read first, because
 /// the status endpoint dies with the daemon.
+// The menu calls [`stop_in`] with the config home it was told; this form,
+// for the default place, is what the end-to-end tests below call.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()> {
+    stop_in(service_name, None, status_url, bind).await
+}
+
+/// [`stop`] for a service whose config home the tray was told
+/// (`--config-home`); `None` looks in the default place
+/// ([`service_config_home`]).
+pub async fn stop_in(
+    service_name: &str,
+    config_home: Option<&Path>,
+    status_url: &str,
+    bind: &str,
+) -> Result<()> {
     // Nothing here decides success. Each mechanism is attempted, and
     // `confirm_stopped` is the only authority on whether the daemon is gone —
     // including when a mechanism errors. Letting the fallback's error
@@ -80,8 +96,10 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
     // creation time, comes first: it is the service's own server even when
     // another groove answers on the port. Anything short of a stop falls
     // through to the status endpoint's pid, as before.
-    if let Some(record) = recorded_server(service_name) {
-        match stop_recorded_process(record.pid, DAEMON_IMAGE, record.created) {
+    if let Some(home) = service_config_home(service_name, config_home)
+        && let Some((pid, outcome)) = stop_recorded_server(&home)
+    {
+        match outcome {
             Ok(StopOutcome::Terminated) => {
                 if let Err(e) = stop_scheduled_task(service_name).await {
                     tracing::debug!(
@@ -91,12 +109,10 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
                 return confirm_stopped(bind).await;
             }
             Ok(other) => tracing::debug!(
-                "recorded server pid {} not stopped ({other:?}); using the status endpoint",
-                record.pid
+                "recorded server pid {pid} not stopped ({other:?}); using the status endpoint"
             ),
             Err(e) => tracing::warn!(
-                "could not stop the recorded server pid {}: {e}; using the status endpoint",
-                record.pid
+                "could not stop the recorded server pid {pid}: {e}; using the status endpoint"
             ),
         }
     }
@@ -140,21 +156,39 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
         })
 }
 
-/// The record `groove-svc` wrote of the server it started, looked for in
-/// `<dirs::config_dir()>/groove/<service>`: the config home `groove service
-/// install` uses when `GROOVE_CONFIG_HOME` is not set, and the default
-/// [`crate::config::resolve`] reads `groove.toml` from. It does not follow
-/// the tray's `--kb-path` override (that names where `groove.toml` is read,
-/// not the service's config home) nor `GROOVE_CONFIG_HOME`; a service
-/// installed elsewhere has its record there, which this does not find, and
-/// the stop falls back to the status endpoint. `None` also when there is no
-/// record or it cannot be read: a server started by an older `groove-svc`, or
-/// not by the task at all.
-fn recorded_server(service_name: &str) -> Option<groove_winproc::ServeRecord> {
-    let home = dirs::config_dir()?.join("groove").join(service_name);
-    groove_winproc::ServeRecord::read(&groove_winproc::ServeRecord::path_in(&home))
-        .ok()
-        .flatten()
+/// The service's config home, where `groove-svc` records the server it
+/// starts: the one the tray was told (`--config-home`, which `groove service
+/// install --with-tray` and `tray-install` put in the startup shortcut, so a
+/// service installed under `GROOVE_CONFIG_HOME` is found too), or else
+/// `<dirs::config_dir()>/groove/<service>`, the default `groove service
+/// install` uses and [`crate::config::resolve`] reads `groove.toml` from. A
+/// tray started by an older shortcut, for a service installed elsewhere,
+/// finds no record there and falls back to the status endpoint.
+fn service_config_home(service_name: &str, told: Option<&Path>) -> Option<PathBuf> {
+    match told {
+        Some(home) => Some(home.to_path_buf()),
+        None => Some(dirs::config_dir()?.join("groove").join(service_name)),
+    }
+}
+
+/// Stop the server `groove-svc` recorded in `config_home`, reading the record
+/// and stopping it inside the section groove-svc writes it in
+/// ([`groove_winproc::RecordLock`]), so a launch cannot replace the record in
+/// between; a section that cannot be taken in time does not block the stop.
+/// `None` when there is no record or it cannot be read; otherwise the
+/// recorded pid and what the stop did (only a process with the recorded
+/// image and creation time is stopped).
+fn stop_recorded_server(config_home: &Path) -> Option<(u32, Result<StopOutcome>)> {
+    let _section =
+        groove_winproc::RecordLock::acquire(config_home, groove_winproc::RECORD_LOCK_WAIT).ok();
+    let record =
+        groove_winproc::ServeRecord::read(&groove_winproc::ServeRecord::path_in(config_home))
+            .ok()
+            .flatten()?;
+    Some((
+        record.pid,
+        stop_recorded_process(record.pid, DAEMON_IMAGE, record.created),
+    ))
 }
 
 /// Stop then start, with a short grace period so the listening socket is
@@ -164,8 +198,16 @@ fn recorded_server(service_name: &str) -> Option<groove_winproc::ServeRecord> {
 /// A failed stop propagates, which is the point: starting a second instance
 /// while the first still holds the port produces a daemon that dies on bind and
 /// a tray that reports it as started.
-pub async fn restart(service_name: &str, status_url: &str, bind: &str) -> Result<()> {
-    stop(service_name, status_url, bind).await?;
+///
+/// `config_home` is the service's config home when the tray was told it
+/// ([`stop_in`]).
+pub async fn restart(
+    service_name: &str,
+    config_home: Option<&Path>,
+    status_url: &str,
+    bind: &str,
+) -> Result<()> {
+    stop_in(service_name, config_home, status_url, bind).await?;
     tokio::time::sleep(Duration::from_millis(800)).await;
     start(service_name).await
 }
@@ -691,5 +733,72 @@ mod tests {
             let candidate = dir.join("groove.exe");
             candidate.is_file().then_some(candidate)
         })
+    }
+}
+
+/// (kuriya #650) The record is found in the config home the tray was told,
+/// not only in the default place.
+#[cfg(test)]
+mod recorded_stop_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn a_told_config_home_is_used_and_the_default_otherwise() {
+        let told = crate::test_support::unique_temp_path("groove-tray-home");
+        assert_eq!(service_config_home("work", Some(&told)), Some(told.clone()));
+        if let Some(base) = dirs::config_dir() {
+            assert_eq!(
+                service_config_home("work", None),
+                Some(base.join("groove").join("work"))
+            );
+        }
+    }
+
+    /// A service installed under a config home that is not the default
+    /// (as with `GROOVE_CONFIG_HOME`): the record there is found, passes the
+    /// creation-time check and its server is stopped.
+    #[test]
+    fn the_record_in_a_non_default_config_home_is_found_and_stopped() {
+        let home = crate::test_support::unique_temp_path("groove-tray-650-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let bin = crate::test_support::unique_temp_path("groove-tray-650-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let exe = bin.join(DAEMON_IMAGE);
+        std::fs::copy(Path::new(&root).join("System32").join("ping.exe"), &exe).unwrap();
+        let mut child = Command::new(&exe)
+            .args(["-t", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        groove_winproc::ServeRecord {
+            pid: child.id(),
+            created: groove_winproc::creation_time_of(&child).unwrap(),
+        }
+        .write(&groove_winproc::ServeRecord::path_in(&home))
+        .unwrap();
+
+        let (pid, outcome) = stop_recorded_server(&home).expect("the record is found");
+        assert_eq!(pid, child.id());
+        assert_eq!(outcome.unwrap(), StopOutcome::Terminated);
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the recorded server exited"
+        );
+
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    #[test]
+    fn no_record_means_nothing_to_stop_here() {
+        let home = crate::test_support::unique_temp_path("groove-tray-650-empty");
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(stop_recorded_server(&home).is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 }
