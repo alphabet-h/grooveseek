@@ -645,10 +645,6 @@ pub(crate) fn ooxml_local(qname: &[u8]) -> &[u8] {
 /// unchanged, so every stderr line and every existing assertion on the text stays as it was.
 #[derive(Debug)]
 pub(crate) struct Unindexable {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the indexer in PR-2 (#660)")
-    )]
     pub(crate) cause: ParseCause,
     message: String,
 }

@@ -995,6 +995,30 @@ fn read_crossed_rename_again(
     context_mode: ContextMode,
     declared: DeclaredSet<'_>,
 ) -> Result<SingleResult> {
+    read_crossed_rename_again_explained(
+        db,
+        embedder,
+        entry,
+        exclude_headings,
+        registry,
+        context_mode,
+        declared,
+    )
+    .map(|r| r.result)
+}
+
+/// [`read_crossed_rename_again`] with the reason the file was not indexed (#660): the body. A
+/// refused or failed re-read gives its own reason (spec R2 / R3); the rest come from
+/// [`index_single_disk_entry_explained`].
+fn read_crossed_rename_again_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+) -> Result<Reindexed> {
     let ext = entry
         .full
         .extension()
@@ -1006,7 +1030,8 @@ fn read_crossed_rename_again(
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
     );
-    let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, size_cap_key(is_binary)) {
+    let key = size_cap_key(is_binary);
+    let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, key) {
         Ok((Some(bytes), _)) => bytes,
         Ok((None, refused)) => {
             // (#544, GitHub codex P2 on PR #396) The file can have grown past the cap since
@@ -1017,13 +1042,21 @@ fn read_crossed_rename_again(
             {
                 tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
             }
-            return Ok(SingleResult::Refused);
+            return Ok(Reindexed {
+                result: SingleResult::Refused,
+                reason: Some(reason_of_unread(refused, key)),
+            });
         }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_READ_FAILED,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_READ_FAILED,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                }),
             });
         }
     };
@@ -1032,7 +1065,7 @@ fn read_crossed_rename_again(
         size: bytes.len() as u64,
         ..entry.clone()
     };
-    index_single_disk_entry(
+    index_single_disk_entry_explained(
         db,
         embedder,
         &again,
@@ -1445,6 +1478,22 @@ pub enum SingleResult {
         deindexed: bool,
         frontmatter_unparsed: bool,
     },
+}
+
+/// [`SingleResult`] and, when the file was not indexed, why (#660). `reason` is `Some` exactly when
+/// [`rebuild_index`] would count this result in [`IndexResult::skipped`], except for a path
+/// reached through a link (the file itself a symlink included): that is `Refused` or
+/// `OutsideKnowledgeBaseDeindexed` with `reason: None`, because the full index leaves such a
+/// file out on purpose and lists it nowhere.
+/// At the watcher's entry a failure to stat or resolve the file, or the first read of it, is
+/// still an `Err`, as before. The second read (the one the indexing body does after the hash
+/// check) failing is a `Skipped` with `Some(SkipReason::Unreadable { .. })` here as in the full
+/// index, with any cause; it is also where a refusal of that read (hard link, not a plain file,
+/// too large) comes from.
+#[derive(Debug, PartialEq)]
+pub struct Reindexed {
+    pub result: SingleResult,
+    pub reason: Option<SkipReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,6 +2781,20 @@ fn write_reparsed_table_rows(
     Ok(SingleResult::Unchanged)
 }
 
+/// (#660, spec R4) The reason for what [`write_reparsed_table_rows`] returned, and only for that:
+/// its one skip, [`SKIPPED_CHANGED_DURING_READ`], is [`SkipReason::ChangedDuringRead`]; its other
+/// result, [`SingleResult::Unchanged`], has none. Not a general map from [`SingleResult`] to a
+/// reason -- a `Refused` there could be either of two reasons, or none (spec §5.7).
+fn explain_reparsed_table_rows(result: SingleResult) -> Reindexed {
+    let reason = match &result {
+        SingleResult::Skipped { reason, .. } if *reason == SKIPPED_CHANGED_DURING_READ => {
+            Some(SkipReason::ChangedDuringRead)
+        }
+        _ => None,
+    };
+    Reindexed { result, reason }
+}
+
 /// The write for a changed file whose new chunks match the row's ([`stored_chunks_match`]):
 /// the document's metadata and hash, its `document_fields` rows, its code positions, without
 /// re-embedding. `None` when the metadata update touched no row (it went away in between): the
@@ -3090,6 +3153,34 @@ fn index_single_disk_entry(
     declared: DeclaredSet<'_>,
     row_dropped_unless_updated: bool,
 ) -> Result<SingleResult> {
+    index_single_disk_entry_explained(
+        db,
+        embedder,
+        entry,
+        exclude_headings,
+        registry,
+        mode,
+        context_mode,
+        declared,
+        row_dropped_unless_updated,
+    )
+    .map(|r| r.result)
+}
+
+/// [`index_single_disk_entry`] with the reason the file was not indexed (#660): the body. Each
+/// return point that does not index the file names its reason (spec §6.1, R1-R7, R11).
+#[allow(clippy::too_many_arguments)]
+fn index_single_disk_entry_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    mode: Reindex,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+    row_dropped_unless_updated: bool,
+) -> Result<Reindexed> {
     let force = mode == Reindex::Force;
     // (feature-62) A re-read the one-time docx pass asked for: past the fast path below, but
     // not a forced one.
@@ -3128,9 +3219,12 @@ fn index_single_disk_entry(
     // spelling: the scan and [`Registry::by_extension`] both take `.MD` as Markdown, and a
     // comparison against the literal did not (codex P1, round 2).
     let Some(parser) = registry.by_extension(ext) else {
-        return Ok(SingleResult::Skipped {
-            reason: "no parser for extension",
-            frontmatter_unparsed: false,
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: "no parser for extension",
+                frontmatter_unparsed: false,
+            },
+            reason: Some(SkipReason::CorruptOrUnsupported),
         });
     };
     let unchanged = !force
@@ -3141,7 +3235,10 @@ fn index_single_disk_entry(
     let refresh_only =
         unchanged && (refresh_frontmatter || refresh_fields) && parser.extension() == "md";
     if unchanged && !refresh_only {
-        return Ok(SingleResult::Unchanged);
+        return Ok(Reindexed {
+            result: SingleResult::Unchanged,
+            reason: None,
+        });
     }
 
     // Read + parse only for files we actually need to embed.
@@ -3165,13 +3262,21 @@ fn index_single_disk_entry(
             {
                 tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
             }
-            return Ok(SingleResult::Refused);
+            return Ok(Reindexed {
+                result: SingleResult::Refused,
+                reason: Some(reason_of_unread(refused, key)),
+            });
         }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_READ_FAILED,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_READ_FAILED,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                }),
             });
         }
     };
@@ -3195,9 +3300,12 @@ fn index_single_disk_entry(
     // parse: what they fail or yield says nothing about the file the rename was decided on.
     // Before the parse, so nothing was parsed and no frontmatter warning was written.
     if row_dropped_unless_updated && read_hash != entry.hash {
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_CHANGED_DURING_READ,
-            frontmatter_unparsed: false,
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false,
+            },
+            reason: Some(SkipReason::ChangedDuringRead),
         });
     }
     let excludes: Vec<&str> = match exclude_headings {
@@ -3208,9 +3316,12 @@ fn index_single_disk_entry(
         Ok(p) => p,
         Err(e) => {
             eprintln!("Skipping {}: parse failed: {e}", entry.rel);
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_PARSE_FAILED,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_PARSE_FAILED,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(skip::reason_of_parse_error(&e)),
             });
         }
     };
@@ -3235,9 +3346,12 @@ fn index_single_disk_entry(
     // (an editor that truncates before it writes) would otherwise drop the row below. The row is
     // left for the event that write raises.
     if (reparse || mode == Reindex::Event) && read_hash != entry.hash {
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_CHANGED_DURING_READ,
-            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            },
+            reason: Some(SkipReason::ChangedDuringRead),
         });
     }
 
@@ -3254,9 +3368,12 @@ fn index_single_disk_entry(
         // The warning above already named the file if what was read failed to parse,
         // and a named failure is a counted one (codex P2, round 6).
         if read_hash != entry.hash {
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_CHANGED_DURING_READ,
-                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_CHANGED_DURING_READ,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                },
+                reason: Some(SkipReason::ChangedDuringRead),
             });
         }
         // (#251 / feature-58) Two reasons open an unchanged file, and each decides
@@ -3267,7 +3384,10 @@ fn index_single_disk_entry(
         let broken = parsed.frontmatter_error.is_some();
         let tag_it = broken && refresh_frontmatter;
         if !tag_it && !refresh_fields {
-            return Ok(SingleResult::Unchanged);
+            return Ok(Reindexed {
+                result: SingleResult::Unchanged,
+                reason: None,
+            });
         }
         let tx = db.begin_transaction()?;
         if tag_it {
@@ -3290,8 +3410,11 @@ fn index_single_disk_entry(
             write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
         }
         tx.commit()?;
-        return Ok(SingleResult::MetadataRefreshed {
-            frontmatter_unparsed: tag_it,
+        return Ok(Reindexed {
+            result: SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: tag_it,
+            },
+            reason: None,
         });
     }
 
@@ -3306,14 +3429,20 @@ fn index_single_disk_entry(
         // (#543) A watcher event leaves what `--force` would leave too: no row. The row the
         // earlier text wrote goes, and the result says whether there was one.
         if mode == Reindex::Event {
-            return Ok(SingleResult::NothingToIndex {
-                deindexed: deindex_single_file(db, &entry.rel)?,
-                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            return Ok(Reindexed {
+                result: SingleResult::NothingToIndex {
+                    deindexed: deindex_single_file(db, &entry.rel)?,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                },
+                reason: Some(SkipReason::NoText),
             });
         }
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_NO_CHUNKS,
-            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_NO_CHUNKS,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            },
+            reason: Some(SkipReason::NoText),
         });
     }
 
@@ -3353,20 +3482,28 @@ fn index_single_disk_entry(
     if reparse && chunks_unchanged {
         return match &table_rows {
             Some(decision) if !decision.matches && decision.stored_hash != entry.hash => {
-                Ok(SingleResult::Skipped {
-                    reason: SKIPPED_CHANGED_DURING_READ,
-                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                Ok(Reindexed {
+                    result: SingleResult::Skipped {
+                        reason: SKIPPED_CHANGED_DURING_READ,
+                        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                    },
+                    reason: Some(SkipReason::ChangedDuringRead),
                 })
             }
-            Some(decision) if !decision.matches => write_reparsed_table_rows(
-                db,
-                &entry.rel,
-                decision,
-                &parsed.chunks,
-                context_mode,
-                parsed.frontmatter_error.is_some(),
-            ),
-            _ => Ok(SingleResult::Unchanged),
+            Some(decision) if !decision.matches => {
+                Ok(explain_reparsed_table_rows(write_reparsed_table_rows(
+                    db,
+                    &entry.rel,
+                    decision,
+                    &parsed.chunks,
+                    context_mode,
+                    parsed.frontmatter_error.is_some(),
+                )?))
+            }
+            _ => Ok(Reindexed {
+                result: SingleResult::Unchanged,
+                reason: None,
+            }),
         };
     }
 
@@ -3384,7 +3521,10 @@ fn index_single_disk_entry(
             category.as_deref(),
         )?
     {
-        return Ok(done);
+        return Ok(Reindexed {
+            result: done,
+            reason: None,
+        });
     }
 
     // Embed first, *outside* the DB tx — fastembed inference can take
@@ -3457,9 +3597,14 @@ fn index_single_disk_entry(
                      {outcome}",
                     entry.rel, rejected.status
                 );
-                return Ok(SingleResult::Skipped {
-                    reason: SKIPPED_EMBED_REJECTED,
-                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                return Ok(Reindexed {
+                    result: SingleResult::Skipped {
+                        reason: SKIPPED_EMBED_REJECTED,
+                        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                    },
+                    reason: Some(SkipReason::EmbedRejected {
+                        http_status: rejected.status,
+                    }),
                 });
             }
             return Err(e).with_context(|| format!("failed to embed chunks for {}", entry.rel));
@@ -3508,9 +3653,12 @@ fn index_single_disk_entry(
     write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
     tx.commit()?;
 
-    Ok(SingleResult::Updated {
-        chunks: parsed.chunks.len() as u32,
-        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+    Ok(Reindexed {
+        result: SingleResult::Updated {
+            chunks: parsed.chunks.len() as u32,
+            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        },
+        reason: None,
     })
 }
 
@@ -3671,7 +3819,29 @@ pub fn reindex_single_file(
     exclude_headings: Option<&[String]>,
     registry: &Registry,
 ) -> Result<SingleResult> {
-    reindex_single_file_checked(
+    reindex_single_file_checked_explained(
+        db,
+        embedder,
+        kb_path,
+        rel,
+        exclude_headings,
+        registry,
+        false,
+    )
+    .map(|r| r.result)
+}
+
+/// [`reindex_single_file`] with the reason the file was not indexed (#660): see [`Reindexed`]
+/// for when `reason` is `Some`.
+pub fn reindex_single_file_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    kb_path: &Path,
+    rel: &str,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+) -> Result<Reindexed> {
+    reindex_single_file_checked_explained(
         db,
         embedder,
         kb_path,
@@ -3697,6 +3867,31 @@ pub(crate) fn reindex_single_file_checked(
     registry: &Registry,
     row_dropped_unless_updated: bool,
 ) -> Result<SingleResult> {
+    reindex_single_file_checked_explained(
+        db,
+        embedder,
+        kb_path,
+        rel,
+        exclude_headings,
+        registry,
+        row_dropped_unless_updated,
+    )
+    .map(|r| r.result)
+}
+
+/// [`reindex_single_file_checked`] with the reason the file was not indexed (#660): the body.
+/// The watcher's entry gives R8 (gone), R9 (over the cap by the stat) and R2 (its first read
+/// refused) itself, and `None` for a path through a link (R10, spec §6.1); the rest come from
+/// [`index_single_disk_entry_explained`].
+fn reindex_single_file_checked_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    kb_path: &Path,
+    rel: &str,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    row_dropped_unless_updated: bool,
+) -> Result<Reindexed> {
     let full = kb_path.join(rel);
     match look_at_single_path(kb_path, rel, &full)
         .with_context(|| format!("failed to stat {}", full.display()))?
@@ -3710,16 +3905,24 @@ pub(crate) fn reindex_single_file_checked(
         // same way when a link is on the way ([`look_at_single_path`]).
         SinglePathLook::ThroughALink => {
             eprintln!("{}", outside_kb_line(rel));
-            return Ok(if deindex_outside_kb(db, kb_path, rel)? {
-                SingleResult::OutsideKnowledgeBaseDeindexed
-            } else {
-                SingleResult::Refused
+            return Ok(Reindexed {
+                result: if deindex_outside_kb(db, kb_path, rel)? {
+                    SingleResult::OutsideKnowledgeBaseDeindexed
+                } else {
+                    SingleResult::Refused
+                },
+                reason: None,
             });
         }
         SinglePathLook::Missing => {
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_FILE_GONE,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_FILE_GONE,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(SkipReason::Unreadable {
+                    cause: ReadFailure::Gone,
+                }),
             });
         }
     }
@@ -3733,10 +3936,13 @@ pub(crate) fn reindex_single_file_checked(
         .with_context(|| format!("failed to resolve {}", full.display()))?
     {
         eprintln!("{}", outside_kb_line(rel));
-        return Ok(if deindex_outside_kb(db, kb_path, rel)? {
-            SingleResult::OutsideKnowledgeBaseDeindexed
-        } else {
-            SingleResult::Refused
+        return Ok(Reindexed {
+            result: if deindex_outside_kb(db, kb_path, rel)? {
+                SingleResult::OutsideKnowledgeBaseDeindexed
+            } else {
+                SingleResult::Refused
+            },
+            reason: None,
         });
     }
 
@@ -3767,9 +3973,16 @@ pub(crate) fn reindex_single_file_checked(
         if let Err(e) = db.record_document_sizes(&[(rel, len)]) {
             tracing::warn!("failed to record the grown size of {rel}: {e}");
         }
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_TOO_LARGE,
-            frontmatter_unparsed: false,
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_TOO_LARGE,
+                frontmatter_unparsed: false,
+            },
+            reason: Some(SkipReason::TooLarge {
+                size: len,
+                limit: cap,
+                key,
+            }),
         });
     }
 
@@ -3778,7 +3991,8 @@ pub(crate) fn reindex_single_file_checked(
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
     );
-    let (maybe_bytes, refused) = read_for_index_under(&full, rel, cap, size_cap_key(is_binary_ext))
+    let key = size_cap_key(is_binary_ext);
+    let (maybe_bytes, refused) = read_for_index_under(&full, rel, cap, key)
         .with_context(|| format!("failed to read {}", full.display()))?;
     let Some(bytes) = maybe_bytes else {
         // (codex P2 round 5) The watcher has the same stat-then-read window.
@@ -3787,7 +4001,10 @@ pub(crate) fn reindex_single_file_checked(
         {
             tracing::warn!("failed to record the grown size of {rel}: {e}");
         }
-        return Ok(SingleResult::Refused);
+        return Ok(Reindexed {
+            result: SingleResult::Refused,
+            reason: Some(reason_of_unread(refused, key)),
+        });
     };
     let hash = sha256_hex_bytes(&bytes);
     let size = bytes.len() as u64;
@@ -3815,7 +4032,7 @@ pub(crate) fn reindex_single_file_checked(
     // list read before it would be written over rows the new pass never sees again.
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     // (#543) `Event`, not `Incremental`: a file that now yields no chunks loses its row here.
-    index_single_disk_entry(
+    index_single_disk_entry_explained(
         db,
         embedder,
         &entry,
@@ -12053,5 +12270,202 @@ mod tests {
             )
         );
         assert!(note.is_ascii());
+    }
+
+    /// #660: `md`, `txt` and `pdf` enabled, with the text cap lowered to 16 bytes so a small
+    /// `.txt` is over it. Every other text fixture of these tests stays at 16 bytes or under.
+    fn i660_explain_registry() -> Registry {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(16),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string(), "pdf".to_string()];
+        Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+            .expect("md + txt + pdf")
+    }
+
+    /// #660 T-L11: the watcher's single-file entry says why each kind of file was not indexed.
+    #[test]
+    fn explained_gives_the_reason_for_each_kind() {
+        let dir = mk_tmp("i660-explained-kinds");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/binary/encrypted.pdf"),
+            dir.0.join("encrypted.pdf"),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.0.join("sjis.txt"), b"\x82\xa0\x82\xa2").unwrap();
+
+        let explain = |rel: &str| {
+            reindex_single_file_explained(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &dir.0,
+                rel,
+                None,
+                &registry,
+            )
+            .unwrap()
+        };
+        let big = explain("big.txt");
+        assert_eq!(
+            big.reason,
+            Some(SkipReason::TooLarge {
+                size: 64,
+                limit: 16,
+                key: LimitKey::MaxTextFileSize,
+            }),
+            "{big:?}"
+        );
+        let encrypted = explain("encrypted.pdf");
+        assert_eq!(
+            encrypted.reason,
+            Some(SkipReason::Encrypted),
+            "{encrypted:?}"
+        );
+        let empty = explain("empty.md");
+        assert_eq!(empty.reason, Some(SkipReason::NoText), "{empty:?}");
+        let sjis = explain("sjis.txt");
+        assert_eq!(sjis.reason, Some(SkipReason::NotUtf8), "{sjis:?}");
+    }
+
+    /// #660 T-L11 (R10): a symlink in the KB is left out on purpose, as the walk leaves it out,
+    /// so the watcher gives it no reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_has_no_reason_at_the_watcher() {
+        let dir = mk_tmp("i660-explained-symlink");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("target.md"), b"# A\n\nhi\n").unwrap();
+        std::os::unix::fs::symlink(dir.0.join("target.md"), dir.0.join("link.md")).unwrap();
+        let got = reindex_single_file_explained(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            "link.md",
+            None,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(got.reason, None, "{got:?}");
+        assert!(
+            matches!(
+                got.result,
+                SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// #660 T-L12 (I4): `reason` is `Some` exactly for the results the rebuild loop counts as
+    /// skipped, except a path through a link (R10).
+    #[test]
+    fn reason_is_some_exactly_when_the_loop_counts_it() {
+        let dir = mk_tmp("i660-reason-iff-counted");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("plain.md"), b"# A\n\nhi\n").unwrap();
+        std::fs::write(dir.0.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+        std::fs::write(dir.0.join("sjis.txt"), b"\x82\xa0\x82\xa2").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.0.join("plain.md"), dir.0.join("link.md")).unwrap();
+
+        type Case = (&'static str, fn(&SingleResult) -> bool, Option<SkipReason>);
+        let base: Vec<Case> = vec![
+            (
+                "plain.md",
+                |r| matches!(r, SingleResult::Updated { .. }),
+                None,
+            ),
+            (
+                "empty.md",
+                |r| matches!(r, SingleResult::NothingToIndex { .. }),
+                Some(SkipReason::NoText),
+            ),
+            (
+                "big.txt",
+                |r| matches!(r, SingleResult::Skipped { .. }),
+                Some(SkipReason::TooLarge {
+                    size: 64,
+                    limit: 16,
+                    key: LimitKey::MaxTextFileSize,
+                }),
+            ),
+            (
+                "sjis.txt",
+                |r| matches!(r, SingleResult::Skipped { .. }),
+                Some(SkipReason::NotUtf8),
+            ),
+        ];
+        // (R10) Only where a symlink could be made above.
+        let link: Case = ("link.md", |r| matches!(r, SingleResult::Refused), None);
+        let cases = base.into_iter().chain(cfg!(unix).then_some(link));
+        for (rel, variant, reason) in cases {
+            let got = reindex_single_file_explained(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &dir.0,
+                rel,
+                None,
+                &registry,
+            )
+            .unwrap();
+            assert!(variant(&got.result), "{rel}: {got:?}");
+            assert_eq!(got.reason, reason, "{rel}: {got:?}");
+            assert_eq!(
+                got.reason.is_some(),
+                !matches!(
+                    got.result,
+                    SingleResult::Updated { .. }
+                        | SingleResult::Unchanged
+                        | SingleResult::MetadataRefreshed { .. }
+                ) && rel != "link.md",
+                "{rel}: {got:?}"
+            );
+        }
+    }
+
+    /// #660 T-L12b (R4): the reparse's table-rows write that found the row changed under it is a
+    /// changed-during-read skip with that reason; an undisturbed write has none.
+    #[test]
+    fn a_reparsed_table_rows_change_is_changed_during_read() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("i660-reparse-table-rows");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let chunks = parse_doc(&registry, "docx", "tariff.docx", &table_docx()).chunks;
+        let cases: [(&str, Option<&str>, Option<SkipReason>); 2] = [
+            ("steady.docx", None, None),
+            (
+                "rewritten.docx",
+                Some(
+                    "UPDATE chunks SET content = 'another writer was here' WHERE document_id = (SELECT id FROM documents WHERE path = ?1)",
+                ),
+                Some(SkipReason::ChangedDuringRead),
+            ),
+        ];
+        for (rel, interruption, expected) in cases {
+            write_row(&db, rel, "hash-of-these-bytes", &chunks);
+            let decision = decide_table_rows(&db, rel, &chunks)
+                .unwrap()
+                .expect("a docx row");
+            if let Some(sql) = interruption {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(sql, [rel])
+                    .unwrap();
+            }
+            let result =
+                write_reparsed_table_rows(&db, rel, &decision, &chunks, ContextMode::Off, false)
+                    .unwrap();
+            let explained = explain_reparsed_table_rows(result);
+            assert_eq!(explained.reason, expected, "{rel}: {explained:?}");
+        }
     }
 }
