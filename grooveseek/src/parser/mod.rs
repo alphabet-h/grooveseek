@@ -637,6 +637,61 @@ pub(crate) fn ooxml_local(qname: &[u8]) -> &[u8] {
 }
 
 // ---------------------------------------------------------------------------
+// Typed parse-failure cause (#660)
+// ---------------------------------------------------------------------------
+
+/// (#660) Why a parser refused a document, carried inside the `anyhow::Error` it returns so the
+/// indexer can classify the failure without reading the message. `Display` is the message,
+/// unchanged, so every stderr line and every existing assertion on the text stays as it was.
+#[derive(Debug)]
+pub(crate) struct Unindexable {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the indexer in PR-2 (#660)")
+    )]
+    pub(crate) cause: ParseCause,
+    message: String,
+}
+
+impl std::fmt::Display for Unindexable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Unindexable {}
+
+/// (#660) The kind of failure an [`Unindexable`] error stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseCause {
+    /// The document is password-protected or encrypted.
+    Encrypted,
+    /// Extracting the document would go past a decompression / extraction cap.
+    OverExtractionLimit { limit: u64 },
+    /// The input is larger than a parser's own size cap.
+    OverParserLimit { size: u64, limit: u64 },
+    /// Extraction ran past its time budget.
+    ExtractionTimedOut { seconds: u64 },
+    /// The container or format is damaged, or a variant the parser does not read.
+    CorruptOrUnsupported,
+    /// The text the document yields decodes to mojibake.
+    TextUndecodable,
+    /// The document held too little text to index.
+    TooLittleText,
+}
+
+/// An `anyhow::Error` wrapping an [`Unindexable`] built from the given cause and message.
+pub(crate) fn unindexable(cause: ParseCause, message: String) -> anyhow::Error {
+    anyhow::Error::new(Unindexable { cause, message })
+}
+
+/// Test helper: the cause an error carries, through any `.context(..)` layers.
+#[cfg(test)]
+pub(crate) fn cause_of(e: &anyhow::Error) -> Option<ParseCause> {
+    e.downcast_ref::<Unindexable>().map(|u| u.cause)
+}
+
+// ---------------------------------------------------------------------------
 // Parser trait
 // ---------------------------------------------------------------------------
 
@@ -1442,5 +1497,28 @@ mod tests {
         ));
         let content = "p\nfirst\nline\tb\nq";
         assert!(table_rows_fit(content, &[row_span(0, 2, 14)]));
+    }
+
+    /// #660 (spec T-P11): the non-UTF-8 error a text parser returns through the public
+    /// [`ParserExt::parse_bytes`] entrance still downcasts to `Utf8Error`, so the indexer can tell
+    /// it apart from a typed [`Unindexable`] cause without reading the message.
+    #[test]
+    fn a_non_utf8_markdown_error_still_downcasts_to_utf8_error() {
+        let err = MarkdownParser
+            .parse_bytes(b"\xff\xfe# x", "a.md", &[])
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<std::str::Utf8Error>().is_some(),
+            "{err:#}"
+        );
+    }
+
+    /// #660 (spec T-P11): a cause put on an error survives `.context(..)`, and the message the
+    /// error carries is the one it was built with.
+    #[test]
+    fn an_unindexable_cause_survives_context_and_keeps_its_message() {
+        let err = unindexable(ParseCause::Encrypted, "a.pdf: locked".to_string()).context("outer");
+        assert_eq!(cause_of(&err), Some(ParseCause::Encrypted));
+        assert_eq!(err.root_cause().to_string(), "a.pdf: locked");
     }
 }

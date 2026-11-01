@@ -223,11 +223,17 @@ impl Parser for CodeParser {
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
         if bytes.len() as u64 > MAX_RAW_CODE_BYTES {
-            anyhow::bail!(
-                "{path_hint}: source file is {} bytes, over the {} byte limit for code",
-                bytes.len(),
-                MAX_RAW_CODE_BYTES
-            );
+            return Err(super::unindexable(
+                super::ParseCause::OverParserLimit {
+                    size: bytes.len() as u64,
+                    limit: MAX_RAW_CODE_BYTES,
+                },
+                format!(
+                    "{path_hint}: source file is {} bytes, over the {} byte limit for code",
+                    bytes.len(),
+                    MAX_RAW_CODE_BYTES
+                ),
+            ));
         }
         // Validated up front so the rest can slice on byte offsets from the tree without
         // re-checking. Non-UTF-8 is a per-file skip, matching the default implementation.
@@ -1169,6 +1175,26 @@ impl Counter {
             .parse_bytes(&oversized, "big.rs", &[])
             .expect_err("over the cap");
         assert!(err.to_string().contains("over the"), "{err}");
+    }
+
+    #[test]
+    fn source_over_the_code_limit_is_over_parser_limit() {
+        // #660: the indexer tells this skip apart from a corrupt file by the cause the error
+        // carries, read through the public `parse_bytes` entrance (spec T-P10).
+        let grammar = static_rust::grammar().expect("rust grammar builds");
+        let parser = CodeParser::new(grammar, "rs", DEFAULT_MAX_CHUNK_CHARS);
+        let oversized = vec![b'a'; usize::try_from(MAX_RAW_CODE_BYTES).unwrap_or(0) + 1];
+        let err = parser
+            .parse_bytes(&oversized, "big.rs", &[])
+            .expect_err("over the cap");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::OverParserLimit {
+                size: MAX_RAW_CODE_BYTES + 1,
+                limit: MAX_RAW_CODE_BYTES,
+            })
+        );
+        assert!(err.to_string().contains("byte limit for code"), "{err}");
     }
 
     #[test]

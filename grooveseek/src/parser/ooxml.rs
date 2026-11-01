@@ -7,11 +7,51 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use quick_xml::events::{BytesRef, Event};
 use quick_xml::reader::Reader;
 
-use super::Frontmatter;
+use super::{Frontmatter, ParseCause, unindexable};
+
+/// The first 8 bytes of an OLE compound file (CFB), which is what an encrypted OOXML package is.
+const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// (#660) What bytes that are not a zip are, for an OOXML extension: [`ParseCause::Encrypted`]
+/// when they are a compound file (magic D0 CF 11 E0 A1 B1 1A E1) holding the UTF-16LE name
+/// "EncryptedPackage", [`ParseCause::CorruptOrUnsupported`] otherwise (a legacy .doc / .xls
+/// renamed, a truncated file).
+///
+/// The compound file is not parsed: a search for the name's bytes is enough, and the one way it
+/// can be wrong (an unencrypted compound file that happens to hold those bytes) still tells the
+/// user to open the file in Office again. Called only once a zip has failed to open, so a
+/// document that opens pays nothing.
+pub(crate) fn cause_of_unopenable_ooxml(bytes: &[u8]) -> ParseCause {
+    if !bytes.starts_with(&CFB_MAGIC) {
+        return ParseCause::CorruptOrUnsupported;
+    }
+    let name: Vec<u8> = "EncryptedPackage"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    if bytes.windows(name.len()).any(|w| w == name.as_slice()) {
+        ParseCause::Encrypted
+    } else {
+        ParseCause::CorruptOrUnsupported
+    }
+}
+
+/// (#660) A compound file that [`cause_of_unopenable_ooxml`] reads as encrypted: the CFB magic,
+/// zero padding, then the UTF-16LE name "EncryptedPackage". Not a valid compound file; the
+/// tests of [`crate::parser::docx`], [`crate::parser::pptx`] and [`crate::parser::xlsx`]
+/// share it.
+#[cfg(test)]
+pub(crate) fn synthetic_encrypted_cfb() -> Vec<u8> {
+    let mut bytes = CFB_MAGIC.to_vec();
+    bytes.resize(512, 0);
+    bytes.extend("EncryptedPackage".encode_utf16().flat_map(u16::to_le_bytes));
+    bytes.resize(1024, 0);
+    bytes
+}
 
 /// zip 内 `name` エントリを、cap に [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`] を固定して
 /// 読む (test 専用)。
@@ -85,7 +125,53 @@ pub(crate) fn read_zip_part(
     budget: &mut u64,
     cap: u64,
 ) -> Result<Option<Vec<u8>>> {
+    read_zip_part_or_why(zip, path_hint, name, budget, cap).map(|read| read.ok())
+}
+
+/// (#660) [`read_zip_part`] that says why a part was left out ([`PartLeftOut`]) instead of
+/// `None`, for a caller whose error names the cause. The stderr lines and the `Err` are
+/// [`read_zip_part`]'s, which is this with the reason dropped.
+pub(crate) fn read_zip_part_or_why(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+) -> Result<std::result::Result<Vec<u8>, PartLeftOut>> {
     read_zip_part_within(zip, path_hint, name, budget, cap, OverDocumentBudget::Fail)
+}
+
+/// (#660) Why [`read_zip_part_within`] left a part out. Each value is decided where the read
+/// decides it, so a caller naming the cause asks this rather than looking at the part again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartLeftOut {
+    /// The archive has no entry by this name.
+    Missing,
+    /// The archive has an entry by this name that the zip layer cannot open (an unsupported
+    /// compression method, say).
+    Unopenable,
+    /// The part declares more than the cap ([`entry_over_budget_message`]).
+    DeclaredOverCap,
+    /// The part declares no more than the cap but inflates past it
+    /// ([`entry_over_budget_message`]). Only a part the document cannot do without is told
+    /// apart this way; one it can do without is [`Self::PastDocumentBudget`].
+    InflatedOverCap,
+    /// The read failed before it completed ([`part_unreadable_as_declared_message`]).
+    UnreadableAsDeclared,
+    /// The part would take the document past its budget and the document can do without it
+    /// ([`part_past_document_budget_message`]).
+    PastDocumentBudget,
+}
+
+impl PartLeftOut {
+    /// Whether raising `[index].max_decompressed_size` would let the part be read: the part
+    /// was left out for its size, not because it is absent or broken.
+    pub(crate) fn is_over_the_limit(self) -> bool {
+        match self {
+            Self::DeclaredOverCap | Self::InflatedOverCap | Self::PastDocumentBudget => true,
+            Self::Missing | Self::Unopenable | Self::UnreadableAsDeclared => false,
+        }
+    }
 }
 
 /// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
@@ -118,7 +204,7 @@ pub(crate) fn read_optional_zip_part(
         OverDocumentBudget::Skip { skipped_means },
     )
     .ok()
-    .flatten()
+    .and_then(|read| read.ok())
 }
 
 /// What [`read_zip_part_within`] does with a part that would take the document past its
@@ -144,14 +230,15 @@ fn read_zip_part_within(
     budget: &mut u64,
     cap: u64,
     over: OverDocumentBudget<'_>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<std::result::Result<Vec<u8>, PartLeftOut>> {
     let mut file = match zip.by_name(name) {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        Err(zip::result::ZipError::FileNotFound) => return Ok(Err(PartLeftOut::Missing)),
+        Err(_) => return Ok(Err(PartLeftOut::Unopenable)),
     };
     if file.size() > cap {
         eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
-        return Ok(None);
+        return Ok(Err(PartLeftOut::DeclaredOverCap));
     }
     // How far this part may inflate: `cap` for a part the document cannot do without (the
     // total is checked after the read), what is left of the budget for one it can (so it
@@ -165,7 +252,7 @@ fn read_zip_part_within(
                     "{}",
                     part_past_document_budget_message(path_hint, name, cap, skipped_means)
                 );
-                return Ok(None);
+                return Ok(Err(PartLeftOut::PastDocumentBudget));
             }
             remaining
         }
@@ -184,27 +271,34 @@ fn read_zip_part_within(
             "{}",
             part_unreadable_as_declared_message(path_hint, name, file.size())
         );
-        return Ok(None);
+        return Ok(Err(PartLeftOut::UnreadableAsDeclared));
     }
     if buf.len() as u64 > bound {
-        match over {
+        let why = match over {
             OverDocumentBudget::Fail => {
                 eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
+                PartLeftOut::InflatedOverCap
             }
-            OverDocumentBudget::Skip { skipped_means } => eprintln!(
-                "{}",
-                part_past_document_budget_message(path_hint, name, cap, skipped_means)
-            ),
-        }
-        return Ok(None);
+            OverDocumentBudget::Skip { skipped_means } => {
+                eprintln!(
+                    "{}",
+                    part_past_document_budget_message(path_hint, name, cap, skipped_means)
+                );
+                PartLeftOut::PastDocumentBudget
+            }
+        };
+        return Ok(Err(why));
     }
     *budget = budget.saturating_add(buf.len() as u64);
     if *budget > cap {
-        bail!(
-            "cumulative decompressed size across zip entries exceeds {cap} bytes (zip-bomb guard; raise [index].max_decompressed_size to admit this file)"
-        );
+        return Err(unindexable(
+            ParseCause::OverExtractionLimit { limit: cap },
+            format!(
+                "cumulative decompressed size across zip entries exceeds {cap} bytes (zip-bomb guard; raise [index].max_decompressed_size to admit this file)"
+            ),
+        ));
     }
-    Ok(Some(buf))
+    Ok(Ok(buf))
 }
 
 /// (feature-61) 1 パートが展開 budget を超えて読み飛ばされる時の警告文。stderr に出るので
@@ -755,6 +849,75 @@ mod tests {
     }
 
     #[test]
+    fn cfb_with_encrypted_package_is_encrypted() {
+        assert_eq!(
+            cause_of_unopenable_ooxml(&synthetic_encrypted_cfb()),
+            ParseCause::Encrypted
+        );
+    }
+
+    #[test]
+    fn cfb_without_the_stream_name_is_corrupt() {
+        let mut bytes = CFB_MAGIC.to_vec();
+        bytes.resize(CFB_MAGIC.len() + 512, 0);
+        assert_eq!(
+            cause_of_unopenable_ooxml(&bytes),
+            ParseCause::CorruptOrUnsupported
+        );
+    }
+
+    #[test]
+    fn empty_and_random_bytes_are_corrupt() {
+        assert_eq!(
+            cause_of_unopenable_ooxml(b""),
+            ParseCause::CorruptOrUnsupported
+        );
+        // A fixed linear congruential sequence, so the input is the same on every run.
+        let mut state: u32 = 0x1234_5678;
+        let random: Vec<u8> = (0..64)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        assert_eq!(
+            cause_of_unopenable_ooxml(&random),
+            ParseCause::CorruptOrUnsupported
+        );
+    }
+
+    #[test]
+    fn cumulative_budget_overrun_is_over_extraction_limit() {
+        // Built like `test_read_zip_entry_capped_rejects_cumulative_budget_over_cap`.
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("a.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap();
+            zip.start_file("b.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap();
+            zip.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        let mut budget: u64 = 0;
+        let cap: u64 = 15;
+        read_zip_entry_capped(&mut archive, "a.bin", &mut budget, cap).unwrap();
+        let err = read_zip_entry_capped(&mut archive, "b.bin", &mut budget, cap)
+            .expect_err("20 bytes in all is over a cap of 15");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: cap })
+        );
+        assert!(
+            err.to_string()
+                .contains("cumulative decompressed size across zip entries exceeds 15 bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_parse_core_xml_maps_dublin_core() {
         // 非 ASCII を含むため raw byte string (`br#"..."#`) は使えない
         // (raw byte string literal は ASCII 限定)。`r#"..."#.as_bytes()` で代用する。
@@ -945,6 +1108,47 @@ mod tests {
             read_optional_zip_part(&mut archive, "<test>", "fits.xml", &mut budget, cap, "-");
         assert_eq!(fits, Some(b"<fits/>".to_vec()));
         assert_eq!(budget, 17);
+    }
+
+    /// (#660) [`read_zip_part_or_why`] says why it left a part out, and only a part left out
+    /// for its size counts as over the limit ([`PartLeftOut::is_over_the_limit`]): a missing
+    /// part, one declaring more than the cap, and one holding more than it declares (refused by
+    /// zip 9 at the declared size, before the cap) each get their own reason, and none of them
+    /// charges the budget.
+    #[test]
+    fn read_zip_part_or_why_names_why_a_part_was_left_out() {
+        const REAL: u32 = 2048;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("big.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&[0u8; 100]).unwrap();
+            zip.start_file("forged.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_size(&buf, REAL, 1);
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+        let cap: u64 = 50;
+        let mut budget: u64 = 0;
+        let mut why = |name: &str| {
+            read_zip_part_or_why(&mut archive, "<test>", name, &mut budget, cap)
+                .unwrap()
+                .expect_err("the part is left out")
+        };
+        assert_eq!(why("absent.bin"), PartLeftOut::Missing);
+        assert_eq!(why("big.bin"), PartLeftOut::DeclaredOverCap);
+        assert_eq!(why("forged.bin"), PartLeftOut::UnreadableAsDeclared);
+        assert_eq!(budget, 0, "a part left out charges nothing");
+
+        assert!(PartLeftOut::DeclaredOverCap.is_over_the_limit());
+        assert!(PartLeftOut::InflatedOverCap.is_over_the_limit());
+        assert!(PartLeftOut::PastDocumentBudget.is_over_the_limit());
+        assert!(!PartLeftOut::Missing.is_over_the_limit());
+        assert!(!PartLeftOut::Unopenable.is_over_the_limit());
+        assert!(!PartLeftOut::UnreadableAsDeclared.is_over_the_limit());
     }
 
     /// feature-66 (R1.2): tables are renumbered per chunk by first appearance, in the order of
