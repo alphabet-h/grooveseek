@@ -3801,7 +3801,8 @@ mod tests {
         );
     }
 
-    /// (#660, spec §9 T-P6) The preflight's own time limit is `ExtractionTimedOut`.
+    /// (#660, spec §9 T-P6) The preflight's own time limit is
+    /// [`ParseCause::ExtractionTimedOut`].
     #[test]
     fn preflight_time_limit_is_extraction_timed_out() {
         let err = parse_xlsx_bytes_limited(

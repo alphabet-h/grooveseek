@@ -552,7 +552,8 @@ fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
 }
 
 /// (#660) The cause an oxidize-pdf error stands for: the three encryption
-/// variants are `Encrypted`, anything else is `CorruptOrUnsupported`.
+/// variants are [`ParseCause::Encrypted`], anything else is
+/// [`ParseCause::CorruptOrUnsupported`].
 fn cause_of_pdf_error(e: &ParseError) -> ParseCause {
     match e {
         ParseError::EncryptionNotSupported | ParseError::WrongPassword | ParseError::PdfLocked => {

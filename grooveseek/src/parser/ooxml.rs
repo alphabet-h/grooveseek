@@ -16,9 +16,10 @@ use super::{Frontmatter, ParseCause, unindexable};
 /// The first 8 bytes of an OLE compound file (CFB), which is what an encrypted OOXML package is.
 const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
-/// (#660) What bytes that are not a zip are, for an OOXML extension: `Encrypted` when they are a
-/// compound file (magic D0 CF 11 E0 A1 B1 1A E1) holding the UTF-16LE name "EncryptedPackage",
-/// `CorruptOrUnsupported` otherwise (a legacy .doc / .xls renamed, a truncated file).
+/// (#660) What bytes that are not a zip are, for an OOXML extension: [`ParseCause::Encrypted`]
+/// when they are a compound file (magic D0 CF 11 E0 A1 B1 1A E1) holding the UTF-16LE name
+/// "EncryptedPackage", [`ParseCause::CorruptOrUnsupported`] otherwise (a legacy .doc / .xls
+/// renamed, a truncated file).
 ///
 /// The compound file is not parsed: a search for the name's bytes is enough, and the one way it
 /// can be wrong (an unencrypted compound file that happens to hold those bytes) still tells the

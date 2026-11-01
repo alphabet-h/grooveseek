@@ -1861,7 +1861,8 @@ mod tests {
     /// at the declared size, before the cap is reached, so the part is
     /// [`crate::parser::ooxml::PartLeftOut::UnreadableAsDeclared`] and the document is
     /// corrupt: raising the key would not make it readable. If zip stops failing that read,
-    /// the part reaches the cap instead and this becomes `OverExtractionLimit`.
+    /// the part reaches the cap instead and this becomes
+    /// [`crate::parser::ParseCause::OverExtractionLimit`].
     #[test]
     fn a_document_xml_holding_more_than_it_declares_is_corrupt() {
         const REAL: u32 = 4096;
