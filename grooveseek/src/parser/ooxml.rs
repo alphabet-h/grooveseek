@@ -123,7 +123,53 @@ pub(crate) fn read_zip_part(
     budget: &mut u64,
     cap: u64,
 ) -> Result<Option<Vec<u8>>> {
+    read_zip_part_or_why(zip, path_hint, name, budget, cap).map(|read| read.ok())
+}
+
+/// (#660) [`read_zip_part`] that says why a part was left out ([`PartLeftOut`]) instead of
+/// `None`, for a caller whose error names the cause. The stderr lines and the `Err` are
+/// [`read_zip_part`]'s, which is this with the reason dropped.
+pub(crate) fn read_zip_part_or_why(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path_hint: &str,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+) -> Result<std::result::Result<Vec<u8>, PartLeftOut>> {
     read_zip_part_within(zip, path_hint, name, budget, cap, OverDocumentBudget::Fail)
+}
+
+/// (#660) Why [`read_zip_part_within`] left a part out. Each value is decided where the read
+/// decides it, so a caller naming the cause asks this rather than looking at the part again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartLeftOut {
+    /// The archive has no entry by this name.
+    Missing,
+    /// The archive has an entry by this name that the zip layer cannot open (an unsupported
+    /// compression method, say).
+    Unopenable,
+    /// The part declares more than the cap ([`entry_over_budget_message`]).
+    DeclaredOverCap,
+    /// The part declares no more than the cap but inflates past it
+    /// ([`entry_over_budget_message`]). Only a part the document cannot do without is told
+    /// apart this way; one it can do without is [`Self::PastDocumentBudget`].
+    InflatedOverCap,
+    /// The read failed before it completed ([`part_unreadable_as_declared_message`]).
+    UnreadableAsDeclared,
+    /// The part would take the document past its budget and the document can do without it
+    /// ([`part_past_document_budget_message`]).
+    PastDocumentBudget,
+}
+
+impl PartLeftOut {
+    /// Whether raising `[index].max_decompressed_size` would let the part be read: the part
+    /// was left out for its size, not because it is absent or broken.
+    pub(crate) fn is_over_the_limit(self) -> bool {
+        match self {
+            Self::DeclaredOverCap | Self::InflatedOverCap | Self::PastDocumentBudget => true,
+            Self::Missing | Self::Unopenable | Self::UnreadableAsDeclared => false,
+        }
+    }
 }
 
 /// (feature-62) [`read_zip_part`] for a part the document can do without (`word/styles.xml`):
@@ -156,7 +202,7 @@ pub(crate) fn read_optional_zip_part(
         OverDocumentBudget::Skip { skipped_means },
     )
     .ok()
-    .flatten()
+    .and_then(|read| read.ok())
 }
 
 /// What [`read_zip_part_within`] does with a part that would take the document past its
@@ -182,14 +228,15 @@ fn read_zip_part_within(
     budget: &mut u64,
     cap: u64,
     over: OverDocumentBudget<'_>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<std::result::Result<Vec<u8>, PartLeftOut>> {
     let mut file = match zip.by_name(name) {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        Err(zip::result::ZipError::FileNotFound) => return Ok(Err(PartLeftOut::Missing)),
+        Err(_) => return Ok(Err(PartLeftOut::Unopenable)),
     };
     if file.size() > cap {
         eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
-        return Ok(None);
+        return Ok(Err(PartLeftOut::DeclaredOverCap));
     }
     // How far this part may inflate: `cap` for a part the document cannot do without (the
     // total is checked after the read), what is left of the budget for one it can (so it
@@ -203,7 +250,7 @@ fn read_zip_part_within(
                     "{}",
                     part_past_document_budget_message(path_hint, name, cap, skipped_means)
                 );
-                return Ok(None);
+                return Ok(Err(PartLeftOut::PastDocumentBudget));
             }
             remaining
         }
@@ -222,19 +269,23 @@ fn read_zip_part_within(
             "{}",
             part_unreadable_as_declared_message(path_hint, name, file.size())
         );
-        return Ok(None);
+        return Ok(Err(PartLeftOut::UnreadableAsDeclared));
     }
     if buf.len() as u64 > bound {
-        match over {
+        let why = match over {
             OverDocumentBudget::Fail => {
                 eprintln!("{}", entry_over_budget_message(path_hint, name, cap));
+                PartLeftOut::InflatedOverCap
             }
-            OverDocumentBudget::Skip { skipped_means } => eprintln!(
-                "{}",
-                part_past_document_budget_message(path_hint, name, cap, skipped_means)
-            ),
-        }
-        return Ok(None);
+            OverDocumentBudget::Skip { skipped_means } => {
+                eprintln!(
+                    "{}",
+                    part_past_document_budget_message(path_hint, name, cap, skipped_means)
+                );
+                PartLeftOut::PastDocumentBudget
+            }
+        };
+        return Ok(Err(why));
     }
     *budget = budget.saturating_add(buf.len() as u64);
     if *budget > cap {
@@ -245,7 +296,7 @@ fn read_zip_part_within(
             ),
         ));
     }
-    Ok(Some(buf))
+    Ok(Ok(buf))
 }
 
 /// (feature-61) 1 パートが展開 budget を超えて読み飛ばされる時の警告文。stderr に出るので
@@ -1055,6 +1106,47 @@ mod tests {
             read_optional_zip_part(&mut archive, "<test>", "fits.xml", &mut budget, cap, "-");
         assert_eq!(fits, Some(b"<fits/>".to_vec()));
         assert_eq!(budget, 17);
+    }
+
+    /// (#660) [`read_zip_part_or_why`] says why it left a part out, and only a part left out
+    /// for its size counts as over the limit ([`PartLeftOut::is_over_the_limit`]): a missing
+    /// part, one declaring more than the cap, and one holding more than it declares (refused by
+    /// zip 9 at the declared size, before the cap) each get their own reason, and none of them
+    /// charges the budget.
+    #[test]
+    fn read_zip_part_or_why_names_why_a_part_was_left_out() {
+        const REAL: u32 = 2048;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("big.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&[0u8; 100]).unwrap();
+            zip.start_file("forged.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_size(&buf, REAL, 1);
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+        let cap: u64 = 50;
+        let mut budget: u64 = 0;
+        let mut why = |name: &str| {
+            read_zip_part_or_why(&mut archive, "<test>", name, &mut budget, cap)
+                .unwrap()
+                .expect_err("the part is left out")
+        };
+        assert_eq!(why("absent.bin"), PartLeftOut::Missing);
+        assert_eq!(why("big.bin"), PartLeftOut::DeclaredOverCap);
+        assert_eq!(why("forged.bin"), PartLeftOut::UnreadableAsDeclared);
+        assert_eq!(budget, 0, "a part left out charges nothing");
+
+        assert!(PartLeftOut::DeclaredOverCap.is_over_the_limit());
+        assert!(PartLeftOut::InflatedOverCap.is_over_the_limit());
+        assert!(PartLeftOut::PastDocumentBudget.is_over_the_limit());
+        assert!(!PartLeftOut::Missing.is_over_the_limit());
+        assert!(!PartLeftOut::Unopenable.is_over_the_limit());
+        assert!(!PartLeftOut::UnreadableAsDeclared.is_over_the_limit());
     }
 
     /// feature-66 (R1.2): tables are renumbered per chunk by first appearance, in the order of

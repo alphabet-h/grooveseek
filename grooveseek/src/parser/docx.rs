@@ -91,18 +91,23 @@ fn parse_with_budget(
     // 積算で無制限に膨らむのを防ぐ)。(feature-62) word/styles.xml も同じ budget で
     // 読むが、収まらなければ文書を諦めずに styles.xml だけを読み飛ばす。
     let mut budget: u64 = 0;
-    let doc_xml =
-        super::ooxml::read_zip_part(&mut zip, path_hint, "word/document.xml", &mut budget, cap)?
-            .ok_or_else(|| {
-                // (#660) `read_zip_part` says `None` both when the part is absent or cannot be
-                // read as declared and when it declares more than `cap`; only the last is
-                // readable by raising the key.
-                let cause = match zip.by_name("word/document.xml") {
-                    Ok(f) if f.size() > cap => ParseCause::OverExtractionLimit { limit: cap },
-                    _ => ParseCause::CorruptOrUnsupported,
-                };
-                unindexable(cause, format!("{path_hint}: word/document.xml missing"))
-            })?;
+    let doc_xml = super::ooxml::read_zip_part_or_why(
+        &mut zip,
+        path_hint,
+        "word/document.xml",
+        &mut budget,
+        cap,
+    )?
+    .map_err(|why| {
+        // (#660) The reader says why the part was left out; only a part left out for its
+        // size is readable by raising the key ([`super::ooxml::PartLeftOut::is_over_the_limit`]).
+        let cause = if why.is_over_the_limit() {
+            ParseCause::OverExtractionLimit { limit: cap }
+        } else {
+            ParseCause::CorruptOrUnsupported
+        };
+        unindexable(cause, format!("{path_hint}: word/document.xml missing"))
+    })?;
     // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
     let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap)?;
     // (feature-62) After core.xml, so the parts that were always read take the budget in the
@@ -1848,6 +1853,77 @@ mod tests {
             err.to_string().contains("word/document.xml missing"),
             "{err}"
         );
+    }
+
+    /// (#660) A `word/document.xml` that declares less than the cap but holds more than it is
+    /// named by the reason [`crate::parser::ooxml::read_zip_part_or_why`] gives, not by looking
+    /// at its declared size again. Under zip 9.0.1 and later (zip-rs/zip2#1022) the read fails
+    /// at the declared size, before the cap is reached, so the part is
+    /// [`crate::parser::ooxml::PartLeftOut::UnreadableAsDeclared`] and the document is
+    /// corrupt: raising the key would not make it readable. If zip stops failing that read,
+    /// the part reaches the cap instead and this becomes `OverExtractionLimit`.
+    #[test]
+    fn a_document_xml_holding_more_than_it_declares_is_corrupt() {
+        const REAL: u32 = 4096;
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            zip.start_file("word/document.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![b' '; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_document_xml_size(&bytes, REAL, 1);
+        let cap: u64 = 1024;
+        {
+            let mut zip = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+            assert_eq!(
+                zip.by_name("word/document.xml").unwrap().size(),
+                1,
+                "premise: the part declares 1 byte"
+            );
+        }
+        assert!(
+            u64::from(REAL) > cap,
+            "premise: the part holds more than the cap"
+        );
+        let err = DocxParser::with_budget(cap)
+            .parse_bytes(&forged, "forged.docx", &[])
+            .expect_err("document.xml cannot be read");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::CorruptOrUnsupported)
+        );
+        assert!(
+            err.to_string().contains("word/document.xml missing"),
+            "{err}"
+        );
+    }
+
+    /// Rewrites the uncompressed size `forged`'s entries declare from `real` to `fake`, in the
+    /// local file header (+22) and the central directory header (+24), as the ooxml tests'
+    /// `forge_declared_size` does.
+    fn forge_document_xml_size(zip_bytes: &[u8], real: u32, fake: u32) -> Vec<u8> {
+        let mut data = zip_bytes.to_vec();
+        let mut patched = 0;
+        for (magic, offset) in [(b"PK\x03\x04", 22usize), (b"PK\x01\x02", 24usize)] {
+            let mut i = 0;
+            while i + offset + 4 <= data.len() {
+                if &data[i..i + 4] == magic
+                    && u32::from_le_bytes(data[i + offset..i + offset + 4].try_into().unwrap())
+                        == real
+                {
+                    data[i + offset..i + offset + 4].copy_from_slice(&fake.to_le_bytes());
+                    patched += 1;
+                }
+                i += 1;
+            }
+        }
+        assert_eq!(
+            patched, 2,
+            "expected to patch the local + central header size fields"
+        );
+        data
     }
 
     /// feature-61 (AC5): the budget the parser was built with reaches the
