@@ -1,6 +1,6 @@
 [package]
 name = "groove-winproc"
-version = "1.23.0"
+version = "1.24.0"
 edition = "2024"
 description = "Windows process identity and stop helpers shared by groove, groove-svc and groove-tray"
 authors = ["koshian"]

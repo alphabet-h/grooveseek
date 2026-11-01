@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-11-02
+
 ### Added
 
 - Library: `IndexResult::skipped_files` lists every file counted in `skipped`, one entry per path
@@ -37,6 +39,26 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **Windows service: what changes when you upgrade** (kuriya #650; the full entry is under
+  Fixed below). Linux and macOS are unchanged.
+  - **`groove service uninstall` can now fail (exit 1) without `--purge`.** When the server the
+    service recorded is running and cannot be stopped, the uninstall fails, naming its pid and
+    how to stop it (`taskkill /PID <pid>`, or `taskkill /F /PID <pid>`); the service unit has
+    already been removed by then. It used to exit 0 and leave the server running. A server
+    started by an earlier release has no record: it is not stopped, a warning says so, and the
+    uninstall still exits 0, so stop that server by hand.
+  - **`groove service install --force` stops the server the previous install started** before it
+    re-registers the task. When that server is running and cannot be stopped, the install fails
+    and nothing is re-registered (`groove.toml` has already been rewritten); stop the pid it names
+    and run the same command again. A server started by an earlier release has no record and is
+    not stopped: unless `--no-auto-start` is given, the install warns that a server still
+    running on the bind address leaves the new one unable to bind it.
+  - **The tray's startup shortcut passes the service's config home (`--config-home`, a new
+    `groove-tray` flag)**, so the tray finds `groove.toml` and the server record of a service
+    installed under `GROOVE_CONFIG_HOME`. A shortcut made by an earlier release does not pass it
+    and keeps looking in the default place until the shortcut is made again, with
+    `groove service tray-install --force` or `groove service install --force --with-tray` (an
+    existing shortcut is not overwritten without `--force`).
 - **`skipped` counts hard links and names the index cannot hold** (the `groove index` `Done in`
   line and the MCP `rebuild_index` reply). Both were already "present on disk but not indexed" but
   only produced a warning
@@ -140,6 +162,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   under `GROOVE_CONFIG_HOME` too (an existing shortcut keeps the default place until
   `tray-install` or `install --with-tray` is run again); its process handling moved to a new internal crate, `groove-winproc`, which
   `groove` and `groove-svc` share. Linux and macOS are unchanged (kuriya #650).
+
+### Internal
+
+- New workspace member `crates/groove-winproc` (`publish = false`, no binary and no release asset
+  of its own), shared by `groove`, `groove-svc` and `groove-tray` for the server record and the
+  checked process stop above (kuriya #650).
+- Parsers carry a typed cause (`parser::Unindexable` / `ParseCause`) inside the errors they
+  return, without changing the error text; the indexer reads it for the reasons in
+  `skipped_files` (kuriya #660).
 
 ### Documentation
 
@@ -6805,7 +6836,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.23.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.24.0...HEAD
+[1.24.0]: https://github.com/alphabet-h/grooveseek/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/alphabet-h/grooveseek/compare/v1.21.5...v1.22.0
 [1.21.5]: https://github.com/alphabet-h/grooveseek/compare/v1.21.4...v1.21.5
