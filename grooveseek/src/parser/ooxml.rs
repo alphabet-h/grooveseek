@@ -42,7 +42,8 @@ pub(crate) fn cause_of_unopenable_ooxml(bytes: &[u8]) -> ParseCause {
 
 /// (#660) A compound file that [`cause_of_unopenable_ooxml`] reads as encrypted: the CFB magic,
 /// zero padding, then the UTF-16LE name "EncryptedPackage". Not a valid compound file; the
-/// docx / pptx / xlsx tests share it.
+/// tests of [`crate::parser::docx`], [`crate::parser::pptx`] and [`crate::parser::xlsx`]
+/// share it.
 #[cfg(test)]
 pub(crate) fn synthetic_encrypted_cfb() -> Vec<u8> {
     let mut bytes = CFB_MAGIC.to_vec();

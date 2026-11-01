@@ -680,7 +680,7 @@ pub(crate) enum ParseCause {
     TooLittleText,
 }
 
-/// `anyhow::Error::new(Unindexable { cause, message })`.
+/// An `anyhow::Error` wrapping an [`Unindexable`] built from the given cause and message.
 pub(crate) fn unindexable(cause: ParseCause, message: String) -> anyhow::Error {
     anyhow::Error::new(Unindexable { cause, message })
 }
