@@ -105,10 +105,11 @@ groove の desktop の画面は、索引が読めなかったファイルが**�
   今までどおり row を失う。`unspellable` は `embed_rejected` と同じく `skipped` の内訳になる。
 - **載せないもの** (今と同じ): `.grooveignore` / `exclude_dirs` で外したファイル、未対応の
   拡張子、Office の lock file (`~$*`)、symlink。
-- **MCP の返答。** `rebuild_index` は `skipped_files` (library の一覧の先頭 50 件をその順で。
-  各 entry は `path`、`reason`、flat な詳細の key) と `skipped_files_omitted` (残りの件数) を
-  足す。これは同じ release で出る別の変更で、それが入るまでは MCP の `skipped` は hard link と
-  名前を既に含むが、返答に一覧は無い。
+- **MCP の返答 (ここで決め、出すのは別の変更)。** `rebuild_index` は `skipped_files`
+  (library の一覧の先頭 50 件をその順で。各 entry は `path`、`reason`、flat な詳細の key) と
+  `skipped_files_omitted` (残りの件数) を足すことにする。この 2 つの field は同じ release
+  (v1.24.0) の別の変更で入り、library の変更は serialize しない。それまで MCP の返答は件数
+  だけで、`skipped` は hard link と名前を既に含む。
 - **`groove index` は変えない**: 新しい出力は無く、`Done in` 行の文言もそのまま。
 - **[ADR-0023](0023-index-only-names-the-server-can-open.ja.md) を 2 つの事実の点で改める**。
   決定は変えない: MCP の `rebuild_index` の返答は索引が持てない名前の件数を (`skipped` の中に)
@@ -130,7 +131,7 @@ groove の desktop の画面は、索引が読めなかったファイルが**�
   `unspellable` でも同じで、前は loop がファイルごとに数えていた。`embed_rejected` は
   ファイルごとのままなので、その場合は対応する一覧の entry より多くなり得る。
 - **library の一覧に上限は無い**: skip したファイルごとに小さい entry 1 つで、run が既に持つ
-  ファイルごとの状態の隣にある。上限は一覧が process の外へ出る所 (MCP) で切る。
+  ファイルごとの状態の隣にある。上限は一覧が process の外へ出る所 (MCP の返答。上の別の変更で入る) で切る。
 - **watcher の入口は、ファイルの最初の stat・解決・読みが失敗した時は今も `Err` を返す**。
   2 回目の読みの失敗は `Unreadable` の skip になる。`rename_single_file` は今も理由を捨てる。
 - **`reason` の語彙は追加で育ち**、汎用の値 (`corrupt_or_unsupported`、`no_text`) で報告して

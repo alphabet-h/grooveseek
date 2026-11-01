@@ -134,12 +134,13 @@ Until now the library could not answer that:
 - **Not listed** (unchanged): files left out by `.grooveignore` /
   `exclude_dirs`, unsupported extensions, Office lock files (`~$*`) and
   symlinks.
-- **The MCP reply.** `rebuild_index` adds `skipped_files` (the first 50
-  entries of the library's list, in its order, each as `path`, `reason` and
-  flat detail keys) and `skipped_files_omitted` (how many more). This is a
-  separate change shipped in the same release as the rest; until it lands, the
-  MCP `skipped` count already includes hard links and names, but the reply has
-  no list.
+- **The MCP reply (decided here, shipped separately).** `rebuild_index` is to
+  add `skipped_files` (the first 50 entries of the library's list, in its
+  order, each as `path`, `reason` and flat detail keys) and
+  `skipped_files_omitted` (how many more). Those two fields arrive in a
+  separate change of the same release (v1.24.0); the library change does not
+  serialize them. Until then the MCP reply carries counts only, and its
+  `skipped` already includes hard links and names.
 - **`groove index` is unchanged**: no new output, and the `Done in` line keeps
   its wording.
 - **This amends [ADR-0023](0023-index-only-names-the-server-can-open.md)** on
@@ -168,8 +169,8 @@ Until now the library could not answer that:
   file. `embed_rejected` stays per file, so it can exceed the matching list
   entries in that case.
 - **The library's list has no cap**: one small entry per skipped file, next to
-  the per-file state a run already holds. The cap is applied where the list
-  leaves the process (MCP).
+  the per-file state a run already holds. The cap belongs where the list
+  leaves the process (the MCP reply, in the separate change above).
 - **The watcher's entry still returns `Err`** when the first stat, resolve or
   read of a file fails; a failure of the second read is a skip with
   `Unreadable`. `rename_single_file` still drops the reason.
