@@ -71,7 +71,8 @@ Chosen option: 3.
   `skipped` of the MCP `rebuild_index` reply: a name the walk leaves out is
   counted there, and the `not indexed` count of the `Done in` line is no longer
   added to it. Each one is also an entry of the library's
-  `IndexResult::skipped_files`
+  `IndexResult::skipped_files`, and comes back as an entry (`reason`
+  `unspellable_name`) in the `skipped_files` of the MCP `rebuild_index` reply
   ([ADR-0032](0032-report-why-each-file-was-not-indexed.md)). The decision is
   unchanged.
 - The watcher asks it after the extension filter, of the relative path it

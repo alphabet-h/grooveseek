@@ -569,6 +569,103 @@ fn with_foreign_writes<T: Serialize>(
     }
 }
 
+/// (#660, spec 5.4) How many of the run's skipped files the reply lists; the rest are only
+/// counted (`skipped_files_omitted`). Keeps the tool reply small; the lib's list is not cut.
+const SKIPPED_FILES_IN_REPLY: usize = 50;
+
+/// One skipped file in the reply: [`Self::path`], [`Self::reason`] ([`indexer::SkipReason::kind`])
+/// and the flat detail keys its reason has. A key the reason does not have is absent, not null.
+#[derive(Serialize)]
+struct SkippedFileJson {
+    path: String,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_key: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory: Option<bool>,
+}
+
+/// The reply's copy of `f`. [`SkippedFileJson::limit_key`] comes from
+/// [`indexer::SkipReason::limit_key`] only, the one place the `[index]`
+/// ([`crate::config::IndexConfig`]) key names live.
+fn skipped_file_json(f: &indexer::SkippedFile) -> SkippedFileJson {
+    use indexer::SkipReason;
+    let mut json = SkippedFileJson {
+        path: f.path.clone(),
+        reason: f.reason.kind(),
+        size: None,
+        limit: None,
+        limit_key: f.reason.limit_key(),
+        seconds: None,
+        http_status: None,
+        cause: None,
+        directory: None,
+    };
+    match f.reason {
+        SkipReason::TooLarge { size, limit, .. } | SkipReason::OverParserLimit { size, limit } => {
+            json.size = Some(size);
+            json.limit = Some(limit);
+        }
+        SkipReason::OverExtractionLimit { limit } => json.limit = Some(limit),
+        SkipReason::ExtractionTimedOut { seconds } => json.seconds = Some(seconds),
+        SkipReason::EmbedRejected { http_status } => json.http_status = Some(http_status),
+        SkipReason::Unreadable { cause } => json.cause = Some(cause.kind()),
+        SkipReason::UnspellableName { directory } => json.directory = Some(directory),
+        // Listed rather than `_`, so a new variant that carries a detail fails to compile here.
+        SkipReason::Encrypted
+        | SkipReason::CorruptOrUnsupported
+        | SkipReason::NotUtf8
+        | SkipReason::TextUndecodable
+        | SkipReason::TooLittleText
+        | SkipReason::NoText
+        | SkipReason::ChangedDuringRead
+        | SkipReason::NotPlainFile
+        | SkipReason::HardLink => {}
+    }
+    json
+}
+
+/// The run's skipped files beside the reply (#660, spec 5.4): the first
+/// [`SKIPPED_FILES_IN_REPLY`] of [`indexer::IndexResult::skipped_files`] in the lib's order, and
+/// how many more there were. Flattened, like [`WithChunkCounts`]; both keys are present even
+/// when nothing was skipped.
+#[derive(Serialize)]
+struct WithSkippedFiles<T: Serialize> {
+    #[serde(flatten)]
+    body: T,
+    skipped_files: Vec<SkippedFileJson>,
+    skipped_files_omitted: usize,
+}
+
+/// `body` with the skipped files of `result`. Both keys come from
+/// [`indexer::IndexResult::skipped_files`] alone (spec I5), never from
+/// [`indexer::IndexResult::skipped`].
+fn with_skipped_files<T: Serialize>(body: T, result: &indexer::IndexResult) -> WithSkippedFiles<T> {
+    WithSkippedFiles {
+        body,
+        skipped_files: result
+            .skipped_files
+            .iter()
+            .take(SKIPPED_FILES_IN_REPLY)
+            .map(skipped_file_json)
+            .collect(),
+        skipped_files_omitted: result
+            .skipped_files
+            .len()
+            .saturating_sub(SKIPPED_FILES_IN_REPLY),
+    }
+}
+
 /// The reply of [`KbServer::rebuild_index`] to a run that completed: an error beside the
 /// counts when the run fails one of the checks (all embeds refused, a forced rebuild with a
 /// refusal, unparsed frontmatter under `fail_on_frontmatter_error`, in that order), the
@@ -586,7 +683,10 @@ fn rebuild_reply(result: &indexer::IndexResult, fail_on_frontmatter_error: bool)
     };
     let strict = |error: String, stats: IndexStats| {
         RebuildReply::Strict(with_chunk_counts(
-            with_foreign_writes(StrictIndexFailure { error, stats }, result),
+            with_foreign_writes(
+                with_skipped_files(StrictIndexFailure { error, stats }, result),
+                result,
+            ),
             result,
         ))
     };
@@ -614,7 +714,7 @@ fn rebuild_reply(result: &indexer::IndexResult, fail_on_frontmatter_error: bool)
         );
     }
     RebuildReply::Stats(with_chunk_counts(
-        with_foreign_writes(stats, result),
+        with_foreign_writes(with_skipped_files(stats, result), result),
         result,
     ))
 }
@@ -632,8 +732,8 @@ pub(crate) struct ErrorResponse {
 #[serde(untagged)]
 enum RebuildReply {
     Error(ErrorResponse),
-    Strict(WithChunkCounts<WithForeignWrites<StrictIndexFailure>>),
-    Stats(WithChunkCounts<WithForeignWrites<IndexStats>>),
+    Strict(WithChunkCounts<WithForeignWrites<WithSkippedFiles<StrictIndexFailure>>>),
+    Stats(WithChunkCounts<WithForeignWrites<WithSkippedFiles<IndexStats>>>),
 }
 
 /// A reply with the writer notice beside it (ADR-0031): flattened, so the
@@ -1055,7 +1155,14 @@ impl KbServer {
                        another groove process (a groove index run, or another \
                        server's watcher) is writing the same index, or when \
                        this server started while one was and is reading only. \
-                       When a reply carries writer_notice, this server is \
+                       The reply lists the files counted in skipped as \
+                       skipped_files (the first 50, in path order, each with \
+                       path, reason and the detail keys its reason has) and \
+                       how many more there were as skipped_files_omitted. New \
+                       reason values may be added, and a file reported as \
+                       corrupt_or_unsupported or no_text may move to a more \
+                       specific value; treat an unknown value as a generic \
+                       failure. When a reply carries writer_notice, this server is \
                        not keeping the index current and the text says why; \
                        pass it on to the user."
     )]
@@ -2146,6 +2253,150 @@ mod tests {
         for json in rebuild_reply_arms(indexer::IndexResult::default()) {
             assert_eq!(json["kept_changed"], 0, "{json}");
             assert_eq!(json["renames_skipped"], 0, "{json}");
+        }
+    }
+
+    /// #660: `count` skipped files named `f000.md`, `f001.md`, ... in path order, with
+    /// `skipped` matching the list (I1).
+    fn result_with_skipped_files(count: usize) -> indexer::IndexResult {
+        let skipped_files: Vec<indexer::SkippedFile> = (0..count)
+            .map(|i| indexer::SkippedFile {
+                path: format!("f{i:03}.md"),
+                reason: indexer::SkipReason::NoText,
+            })
+            .collect();
+        indexer::IndexResult {
+            skipped: u32::try_from(count).unwrap(),
+            skipped_files,
+            ..Default::default()
+        }
+    }
+
+    /// (#660 T-M1, spec 5.4) Both replies carry the two keys even when no file was skipped.
+    #[test]
+    fn rebuild_replies_carry_skipped_files_even_when_empty() {
+        for json in rebuild_reply_arms(indexer::IndexResult::default()) {
+            assert_eq!(json["skipped_files"], serde_json::json!([]), "{json}");
+            assert_eq!(json["skipped_files_omitted"], 0, "{json}");
+        }
+    }
+
+    /// (#660 T-M2, spec I5) The reply lists the first N files in the order the lib gave them
+    /// and counts the rest.
+    #[test]
+    fn rebuild_replies_cap_the_list_and_count_the_rest() {
+        let result = result_with_skipped_files(SKIPPED_FILES_IN_REPLY + 3);
+        let first = result.skipped_files[0].path.clone();
+        let last = result.skipped_files[SKIPPED_FILES_IN_REPLY - 1]
+            .path
+            .clone();
+        for json in rebuild_reply_arms(result) {
+            let list = json["skipped_files"].as_array().expect("an array");
+            assert_eq!(list.len(), SKIPPED_FILES_IN_REPLY, "{json}");
+            assert_eq!(list[0]["path"], first.as_str(), "{json}");
+            assert_eq!(
+                list[SKIPPED_FILES_IN_REPLY - 1]["path"],
+                last.as_str(),
+                "{json}"
+            );
+            assert_eq!(json["skipped_files_omitted"], 3, "{json}");
+            assert!(json.get("body").is_none(), "flattened, not nested: {json}");
+        }
+    }
+
+    /// (#660 RF4) Exactly N files fit with nothing omitted; one more is omitted.
+    #[test]
+    fn rebuild_reply_truncates_at_exactly_the_limit() {
+        for json in rebuild_reply_arms(result_with_skipped_files(SKIPPED_FILES_IN_REPLY)) {
+            let list = json["skipped_files"].as_array().expect("an array");
+            assert_eq!(list.len(), SKIPPED_FILES_IN_REPLY, "{json}");
+            assert_eq!(json["skipped_files_omitted"], 0, "{json}");
+        }
+        for json in rebuild_reply_arms(result_with_skipped_files(SKIPPED_FILES_IN_REPLY + 1)) {
+            let list = json["skipped_files"].as_array().expect("an array");
+            assert_eq!(list.len(), SKIPPED_FILES_IN_REPLY, "{json}");
+            assert_eq!(json["skipped_files_omitted"], 1, "{json}");
+        }
+    }
+
+    /// (#660 T-M3, spec 5.4) Each reason serializes to [`SkippedFileJson::path`],
+    /// [`SkippedFileJson::reason`] and only the flat detail keys it has;
+    /// [`SkippedFileJson::limit_key`] is absent where no key raises the limit.
+    #[test]
+    fn each_reason_serializes_to_its_flat_shape() {
+        use indexer::{LimitKey, ReadFailure, SkipReason};
+        use serde_json::json;
+        let cases = [
+            (
+                SkipReason::TooLarge {
+                    size: 9,
+                    limit: 5,
+                    key: LimitKey::MaxBinaryFileSize,
+                },
+                json!({"path": "a.pdf", "reason": "too_large", "size": 9, "limit": 5,
+                       "limit_key": "max_binary_file_size"}),
+            ),
+            (
+                SkipReason::TooLarge {
+                    size: 9,
+                    limit: 5,
+                    key: LimitKey::MaxTextFileSize,
+                },
+                json!({"path": "a.pdf", "reason": "too_large", "size": 9, "limit": 5,
+                       "limit_key": "max_text_file_size"}),
+            ),
+            (
+                SkipReason::OverExtractionLimit { limit: 5 },
+                json!({"path": "a.pdf", "reason": "over_extraction_limit", "limit": 5,
+                       "limit_key": "max_decompressed_size"}),
+            ),
+            (
+                SkipReason::OverParserLimit { size: 9, limit: 5 },
+                json!({"path": "a.pdf", "reason": "over_parser_limit", "size": 9, "limit": 5}),
+            ),
+            (
+                SkipReason::ExtractionTimedOut { seconds: 120 },
+                json!({"path": "a.pdf", "reason": "extraction_timed_out", "seconds": 120}),
+            ),
+            (
+                SkipReason::EmbedRejected { http_status: 413 },
+                json!({"path": "a.pdf", "reason": "embed_rejected", "http_status": 413}),
+            ),
+            (
+                SkipReason::Unreadable {
+                    cause: ReadFailure::InUse,
+                },
+                json!({"path": "a.pdf", "reason": "unreadable", "cause": "in_use"}),
+            ),
+            (
+                SkipReason::UnspellableName { directory: false },
+                json!({"path": "a.pdf", "reason": "unspellable_name", "directory": false}),
+            ),
+            (
+                SkipReason::Encrypted,
+                json!({"path": "a.pdf", "reason": "encrypted"}),
+            ),
+        ];
+        for (reason, expected) in cases {
+            let result = indexer::IndexResult {
+                skipped: 1,
+                skipped_files: vec![indexer::SkippedFile {
+                    path: "a.pdf".to_string(),
+                    reason,
+                }],
+                ..Default::default()
+            };
+            for json in rebuild_reply_arms(result.clone()) {
+                assert_eq!(json["skipped_files"], json!([expected.clone()]), "{json}");
+                assert_eq!(json["skipped_files_omitted"], 0, "{json}");
+            }
+            if matches!(reason, SkipReason::OverParserLimit { .. }) {
+                let [plain, _] = rebuild_reply_arms(result);
+                assert!(
+                    plain["skipped_files"][0].get("limit_key").is_none(),
+                    "no key raises a fixed limit: {plain}"
+                );
+            }
         }
     }
 

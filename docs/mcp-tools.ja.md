@@ -12,7 +12,7 @@ GrooveSeek が接続クライアントに公開する MCP の面。
 | `list_topics` | index 済みの全トピック / カテゴリと文書数を列挙。`search` の `category` / `topic` filter が受ける値はここで分かる。(v1.1.0+) 各 entry に `children` が付く: そのカテゴリ / トピック配下の directory tree で、topic より下の path segment 1 つが 1 node。node は `segment` / `file_count` (その prefix 配下の文書数。親は配下すべてを数える) / 自身の `children` を持つ。root と category のみの entry、および文書が topic 直下にしか無い topic では `[]`。tree は保存された path から作るので、frontmatter の `topic:` で path 由来の topic を上書きした文書も、2 番目の path segment より後の directory をその group に寄与させる。この segment はその文書自身の path から取ったものなので、`<category>/<topic>/` の下に directory として実在するとは限らない — client はこれを繋げて path prefix を組み立ててはいけない。[MCP の面の安定性](stability.ja.md#mcp-の面) を参照 | (なし) |
 | `get_document` | 相対パスから文書の全文 + メタデータを取得。パスはその文書の**ただ 1 つの綴り** — KB 相対・`/` 区切りで、`search` が返したとおり — でなければならない。同じファイルに届く別の書き方 (`./a.md`、`a//b.md`、`a/../a.md`、絶対パス、Windows / macOS での大文字小文字違い、Windows でのバックスラッシュと 8.3 短縮名、symlink のディレクトリ経由) は "not found" になる。要求文字列で絞り込む前段ゲートウェイを迂回させないため。索引が持ちうる名前でないパス (絶対パス・空文字列・`..`・`.`・空の区間を含むもの (`./a.md`、`a//b.md`)、Windows ではドライブ指定・UNC 共有・バックスラッシュ・どこかに含まれる `:` (`note.md:secret` のような代替データストリーム)・`NUL` や `COM1` などの予約デバイス名・末尾がドットか空白の区間・`< > " \| ? *` や制御文字) はディスクを見る前に拒否する: そこに何かがあっても無くても答えは同じで、Windows で共有に接続することもない。索引が持ちうる名前での別の綴り (大文字小文字違い・8.3 短縮名・symlink のディレクトリ経由) は先にディスクを見てから (見るのは KB の中だけ) 同じく "not found" になる | `path` (例: `"deep-dive/mcp/overview.md"`) |
 | `get_best_practice` | opt-in: `groove.toml` の `[best_practice].path_templates` を設定しているときのみ機能する。対象向けの best practice 文書を取得し、任意で特定 h2 セクションを抽出。未設定時は "not configured" エラーを返す | `target` (例: `"claude-code"`)、`category` (任意) |
-| `rebuild_index` | すべてのソースファイル (Markdown + `[parsers].enabled` で有効化された拡張子) を走査してインデックス再構築。**同時に 1 本だけ** (v1.0.0+): 実行中に来た呼び出しは「実行中のものが何秒前に始まったか」を添えたエラーで断る。再構築は embedder と DB を握り続けるので、終わるまで検索が使えないため。この制限は server の中のもの。process の間には書き手のロックが効く (v1.22.0+): 他の groove の process が索引のロックを持っているとき (`groove index` の run、または同じ索引を書いている別の server) は、embedder にも DB にも触れず、embedder・DB・実行中の再構築を**待たずに断り**、その process を名指す。reader として起動した server では、restart されるまで呼び出しをすべて断る。`--no-watch` で起動した server は呼び出しの間だけロックを取るので、再構築の最中にその横で打った `groove index` は exit 3 になる。断りとエラーを含むすべての応答に、在れば `writer_notice` が付く (下の「書き手の注記」を参照)。返り値は CLI の summary と同じ counter で、`frontmatter_unparsed` (v1.7.0+) と `chunks_embedded` / `chunks_reused` (v1.21.0+。embedding model に送った chunk の数と、embed 入力が前と同じで保存済みの vector を使い回した数。`error` 付きの返答にも載る) と `kept_changed` / `renames_skipped` (v1.22.0+。ロックを取らない書き手が run の間に変えたため、prune が残した行の数と、飛ばした rename の数。なければ 0。run が完走して、frontmatter の strict 判定 (`fail_on_frontmatter_error`) や embedding の拒否で `error` が付いた返答には載るが、run 自体が失敗した `Rebuild failed` の返答には載らない) を含む。`[index].fail_on_frontmatter_error = true` のときは、その値が 0 でなければ counter の隣に `error` key が付く。embedding provider が OpenAI 互換のとき、endpoint が入力を断った (HTTP 400 / 413 / 422) ファイルは skip されて `skipped` に数えられ、そうした拒否 (そのファイルのどのバッチも受け付けられないままのもの) があって endpoint がどのバッチも受け付けなかった run では counter の隣に `error` key が付く。`force: true` の run でそうした拒否が 1 つでもあった場合も同じで、再構築が先に索引を空にしたためそのファイルは索引に無い ([ADR-0025](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md))。`force: true` で embedding provider が OpenAI 互換のときは、索引を空にする前に固定の probe 文字列を 1 件 embedding し、endpoint が断れば、索引から何も消していないと述べるエラーを返す ([ADR-0024](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md)) | `force` (任意、既定 false) |
+| `rebuild_index` | すべてのソースファイル (Markdown + `[parsers].enabled` で有効化された拡張子) を走査してインデックス再構築。**同時に 1 本だけ** (v1.0.0+): 実行中に来た呼び出しは「実行中のものが何秒前に始まったか」を添えたエラーで断る。再構築は embedder と DB を握り続けるので、終わるまで検索が使えないため。この制限は server の中のもの。process の間には書き手のロックが効く (v1.22.0+): 他の groove の process が索引のロックを持っているとき (`groove index` の run、または同じ索引を書いている別の server) は、embedder にも DB にも触れず、embedder・DB・実行中の再構築を**待たずに断り**、その process を名指す。reader として起動した server では、restart されるまで呼び出しをすべて断る。`--no-watch` で起動した server は呼び出しの間だけロックを取るので、再構築の最中にその横で打った `groove index` は exit 3 になる。断りとエラーを含むすべての応答に、在れば `writer_notice` が付く (下の「書き手の注記」を参照)。返り値は CLI の summary と同じ counter で、`frontmatter_unparsed` (v1.7.0+) と `chunks_embedded` / `chunks_reused` (v1.21.0+。embedding model に送った chunk の数と、embed 入力が前と同じで保存済みの vector を使い回した数。`error` 付きの返答にも載る) と `kept_changed` / `renames_skipped` (v1.22.0+。ロックを取らない書き手が run の間に変えたため、prune が残した行の数と、飛ばした rename の数。なければ 0。run が完走して、frontmatter の strict 判定 (`fail_on_frontmatter_error`) や embedding の拒否で `error` が付いた返答には載るが、run 自体が失敗した `Rebuild failed` の返答には載らない) と `skipped_files` / `skipped_files_omitted` (v1.24.0+。`skipped` に数えたファイルと、それぞれが索引に入らなかった理由。`kept_changed` と同じ返答に載る。下の「索引に入らなかったファイル」を参照) を含む。`[index].fail_on_frontmatter_error = true` のときは、その値が 0 でなければ counter の隣に `error` key が付く。embedding provider が OpenAI 互換のとき、endpoint が入力を断った (HTTP 400 / 413 / 422) ファイルは skip されて `skipped` に数えられ、そうした拒否 (そのファイルのどのバッチも受け付けられないままのもの) があって endpoint がどのバッチも受け付けなかった run では counter の隣に `error` key が付く。`force: true` の run でそうした拒否が 1 つでもあった場合も同じで、再構築が先に索引を空にしたためそのファイルは索引に無い ([ADR-0025](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md))。`force: true` で embedding provider が OpenAI 互換のときは、索引を空にする前に固定の probe 文字列を 1 件 embedding し、endpoint が断れば、索引から何も消していないと述べるエラーを返す ([ADR-0024](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md)) | `force` (任意、既定 false) |
 | `get_connection_graph` | ドキュメントパスを起点に意味的に関連するチャンクを BFS 展開。`search` の後、query の語が届かなかった文書に答えがありそうな時に使う (探索は query ではなく、起点文書からの embedding 類似度を辿る)。`parent_id` / `depth` / `score` / `snippet` 付きのノード配列を返し、呼び出し側でコンテキスト発見を連鎖させられる。上限で探索が切られた場合は `truncated` / `truncation[]` が付く。`snippet` は抜粋なので、ノードの全文は `get_document` で読む | `start` (必須、探索の起点パス — `groove graph --start`)、`depth` (既定 2、最大 3)、`fan_out` (既定 5、最大 20)、`min_similarity` (既定 0.3)、`seed_strategy` (`all_chunks` / `centroid`。`all-chunks` も受け付ける)、`dedup_by_path`、`category`、`topic`、`exclude_paths`、`max_nodes` (既定 100、最大 2000)、`max_seed_chunks` (既定 32、最大 1000) |
 
 ### 書き手の注記
@@ -26,6 +26,51 @@ GrooveSeek が接続クライアントに公開する MCP の面。
 tool の description が `writer_notice` を名指し、client に利用者へ伝えるよう求める。`search` では成功の応答にだけ付き、`error` の応答には付かない。`groove search --format json` には付かない。advisory であって、凍結した search の field の外にある ([stability.ja.md](stability.ja.md#search-が返すもの))。他の tool には付かない。
 
 reader の文は、起動の時にロックを持っていた process と、今の `.groove.db.writer.json` の中身を名指す。その process がこのナレッジベースを最新に保つと書くのは、それが同じナレッジベースを watch する server で、その file の heartbeat が 15 秒以内で、watcher が watch できていると報告しているときだけ。heartbeat が古い・無いときは、その process は終了した見込み (kill された process は file を残す) で、この server を restart するまで反映されないと書く。watch できていないと報告しているときは、その間は索引されないと書く。
+
+### 索引に入らなかったファイル
+
+(v1.24.0+) `rebuild_index` の応答は、run が `skipped` に数えたファイル — ディスクにはあるが索引に入らなかったもの — を、それぞれの理由とともに並べる ([ADR-0032](decisions/0032-report-why-each-file-was-not-indexed.ja.md))。top level の 2 つの key に載る:
+
+- **`skipped_files`**: library の `IndexResult::skipped_files` の先頭 50 件。path の順のままで (server は並べ替えもまとめ直しもしない)、path ごとに 1 件。<!-- via: grooveseek/src/server.rs `const SKIPPED_FILES_IN_REPLY: usize = 50` --> 各 entry は `path` (ナレッジベースからの相対で、区切りは `/`。索引が名前を持てないファイルは lossy な綴り)、`reason`、下の表のその理由の詳細 key を持つ object。その理由に無い key は `null` ではなく、出さない。
+- **`skipped_files_omitted`**: 並べた分の先にあと何件あったか。`skipped_files` の件数と `skipped_files_omitted` の和が library の一覧の件数で、それは `skipped` に等しい。
+
+どちらの key も、skip したファイルが無くても付く (空の配列と 0)。完走した run の応答に載り、`error` が付いた応答 (frontmatter の strict 判定、embedding の拒否) にも載る。run の無い `Rebuild failed` の応答と断りの応答には載らない。
+
+```json
+{
+  "skipped": 3,
+  "skipped_files": [
+    { "path": "資料/カタログ.pdf", "reason": "too_large", "size": 73400320, "limit": 52428800, "limit_key": "max_binary_file_size" },
+    { "path": "メモ/old.txt", "reason": "not_utf8" }
+  ],
+  "skipped_files_omitted": 1
+}
+```
+
+(上の値は形を示す例。実際の応答には他の counter も載る)
+
+| `reason` | ファイルの状態 | 詳細 key |
+|---|---|---|
+| `too_large` | ファイルサイズの上限を超えた | `size`、`limit` (byte)、`limit_key`: `max_binary_file_size` (pdf / docx / xlsx / pptx) か `max_text_file_size` (md / txt / ソースコード) |
+| `over_extraction_limit` | 展開後の大きさ・抽出したテキストの予算を超えた | `limit` (byte)、`limit_key`: 常に `max_decompressed_size` |
+| `over_parser_limit` | parser 自身の固定の上限を超えた (ソースコードが code parser の byte の上限を超えた) | `size`、`limit` (byte)。設定では上げられないので `limit_key` は無い |
+| `extraction_timed_out` | テキストの抽出が制限時間を過ぎた | `seconds` |
+| `encrypted` | パスワードで保護されている (PDF、または暗号化されたコンテナに入った Office ファイル) | — |
+| `corrupt_or_unsupported` | その形式の文書として読めない (壊れている、途中で切れている、OOXML の拡張子の旧形式、parser の失敗) | — |
+| `not_utf8` | テキスト形式のファイルで、バイト列が UTF-8 でない (Shift_JIS など) | — |
+| `text_undecodable` | text layer が文字化けに復号された PDF | — |
+| `too_little_text` | ページあたりのテキストが少なすぎる PDF (text layer の無いスキャン、文字の少ないスライド) | — |
+| `no_text` | 読んで parse したが embed するものが無い (空、frontmatter だけ) | — |
+| `unreadable` | stat か読み込みができなかった | `cause`: `in_use` (他の process が開いたまま。Windows)、`permission_denied`、`gone` (walk の後で消えた)、`other` のどれか |
+| `embed_rejected` | embedding の endpoint に断られた | `http_status` (400 / 413 / 422) |
+| `changed_during_read` | 走査と読み込みの間に変わった。次の run で読み直す | — |
+| `not_plain_file` | 読む時に通常のファイルでなかった (walk の後で symlink・デバイス・pipe に差し替わった) | — |
+| `hard_link` | 名前が 2 つ以上ある (hard link) | — |
+| `unspellable_name` | `get_document` と `kb://` URI が扱えない名前を持つ ([ADR-0023](decisions/0023-index-only-names-the-server-can-open.ja.md)) | `directory`: ディレクトリごと外したときは `true`、ファイルなら `false` (中に索引の対象のファイルがあったかどうかに関わらず 1 件と数える) |
+
+`limit_key` は、上げればそのファイルが入る `groove.toml` の `[index]` の key の名前。ディスクにはあるが最初から対象にしないファイル (`.grooveignore`、`exclude_dirs`、未対応の拡張子、Office のロックファイル `~$*`、walk が見た symlink) は entry にならない。
+
+**`reason` の語彙について。** 新しい値が足されることがある。そのとき、今まで汎用の値 (`corrupt_or_unsupported` / `no_text`) で報告していたファイルが、より具体的な値 (新しく足す値か、既にある具体的な値) に移ることがある。知らない値は汎用の失敗として扱うこと。具体的な値どうしの移動、具体的な値から汎用の値への移動、値の削除・改名は互換性を壊す変更になる。
 
 ## MCP プロンプト
 
