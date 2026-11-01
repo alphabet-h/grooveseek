@@ -1,7 +1,7 @@
 //! Stopping a service's `groove serve` on Windows (kuriya #650).
 //!
 //! The scheduled task's Action is `groove-svc.exe`, which detach-spawns
-//! `groove.exe serve` and exits at once (the `groove-svc` crate's `main`).
+//! `groove.exe serve` and exits at once (in the `groove-svc` crate).
 //! Task Scheduler therefore sees a task that has finished, in state `Ready`,
 //! and `schtasks /End` has nothing to end: the server kept running after
 //! `groove service uninstall`, and `--purge` waited out its whole wait for a
