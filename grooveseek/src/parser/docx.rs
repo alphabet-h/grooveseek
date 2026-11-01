@@ -1786,10 +1786,6 @@ mod tests {
         );
     }
 
-    /// feature-61 (AC5): the budget the parser was built with reaches the
-    /// `docProps/core.xml` read as well. document.xml fits; document.xml plus
-    /// core.xml is one byte over, so the parse fails at core.xml, which it
-    /// would not if that read still used the 50 MiB constant.
     #[test]
     fn an_encrypted_docx_is_encrypted_and_keeps_its_message() {
         let err = DocxParser::default()
@@ -1854,6 +1850,10 @@ mod tests {
         );
     }
 
+    /// feature-61 (AC5): the budget the parser was built with reaches the
+    /// `docProps/core.xml` read as well. document.xml fits; document.xml plus
+    /// core.xml is one byte over, so the parse fails at core.xml, which it
+    /// would not if that read still used the 50 MiB constant.
     #[test]
     fn ooxml_budget_follows_the_docx_parser_it_was_built_with() {
         let doc_xml: &[u8] = br#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>"#;
