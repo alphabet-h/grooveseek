@@ -132,6 +132,9 @@ struct DiskEntry {
 struct DiskScan {
     entries: Vec<DiskEntry>,
     skipped: Vec<String>,
+    /// (#660) Why each file in `skipped` was declined, at the same index. Written only through
+    /// [`DiskScan::skip`], which pushes both, so the two never come apart.
+    skipped_why: Vec<SkipReason>,
     /// size cap で撥ねたファイルの **実測サイズ** (rel path, bytes)。
     ///
     /// 行は §4.2 で保持されるが、記録済みの `size_bytes` は「最後に索引できた
@@ -147,6 +150,15 @@ struct DiskScan {
     /// ([`Database::rename_documents_checked`]). Only candidates, because [`DiskEntry`] keeps no
     /// content and the rest of the run reads each file again.
     frontmatter_topics: std::collections::HashMap<String, Option<String>>,
+}
+
+impl DiskScan {
+    /// Decline `rel` for `why`: the one way into `skipped`, so `skipped[i]` and
+    /// `skipped_why[i]` are always the same file (#660).
+    fn skip(&mut self, rel: String, why: SkipReason) {
+        self.skipped.push(rel);
+        self.skipped_why.push(why);
+    }
 }
 
 /// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
@@ -195,11 +207,12 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// Read a file for indexing through a handle whose identity has been checked
 /// (BU-20), turning a refusal into the per-file skip every caller already does.
 ///
-/// `Ok((None, _))` means "skip this file, and say why on stderr"; `Err` keeps
+/// `Ok((None, refused))` means "skip this file, and say why on stderr"; `Err` keeps
 /// `std::fs::read`'s meaning so existing read-error handling is unchanged.
 ///
-/// The second element is the length **when the refusal was about size**
-/// (codex P2 round 5). `size_cap_exceeded` stats the path and this reads the
+/// The second element is the refusal itself (#660), so a caller can both name why
+/// ([`reason_of_unread`]) and take the length **when the refusal was about size**
+/// ([`measured`], codex P2 round 5). `size_cap_exceeded` stats the path and this reads the
 /// handle, so a file can cross the cap *between* the two — and then this check
 /// is the one that catches it. A wrapper that dropped the length existed for
 /// one round; it turned out every caller wanted it, because a row that says a
@@ -213,28 +226,63 @@ fn read_for_index_under(
     full: &Path,
     rel: &str,
     cap: u64,
-    key: &str,
-) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
+    key: LimitKey,
+) -> std::io::Result<(Option<Vec<u8>>, Option<crate::links::Refused>)> {
     match crate::links::read_checked(full, cap)? {
         crate::links::Content::Bytes(bytes) => Ok((Some(bytes), None)),
         crate::links::Content::Refused(refused) => {
-            let measured = match refused {
-                crate::links::Refused::TooLarge { len, .. } => Some(len),
-                // The other refusals say nothing about size, so there is
-                // nothing to record and the row keeps what it had.
-                _ => None,
-            };
-            if measured.is_some() {
+            let line = refused.log_line(full);
+            let refused = Some(refused);
+            if measured(&refused).is_some() {
                 eprintln!(
-                    "Skipping {rel}: {}; raise [index].{key} to admit it",
-                    refused.log_line(full)
+                    "Skipping {rel}: {line}; raise [index].{} to admit it",
+                    key.key()
                 );
             } else {
-                eprintln!("Skipping {rel}: {}", refused.log_line(full));
+                eprintln!("Skipping {rel}: {line}");
             }
-            Ok((None, measured))
+            Ok((None, refused))
         }
     }
+}
+
+/// The length a refusal measured on the handle: `Some(len)` for a size refusal, `None` for
+/// the others, which say nothing about size, so the row keeps what it had (codex P2 round 5).
+fn measured(refused: &Option<crate::links::Refused>) -> Option<u64> {
+    match refused {
+        Some(crate::links::Refused::TooLarge { len, .. }) => Some(*len),
+        Some(crate::links::Refused::MultiplyLinked | crate::links::Refused::NotAPlainFile)
+        | None => None,
+    }
+}
+
+/// (#660, spec R2) The reason a read-time refusal gives: a hard link, something other than a
+/// regular file, or a file over `key`'s cap measured on the handle.
+fn reason_of_refusal(r: crate::links::Refused, key: LimitKey) -> SkipReason {
+    match r {
+        crate::links::Refused::MultiplyLinked => SkipReason::HardLink,
+        crate::links::Refused::NotAPlainFile => SkipReason::NotPlainFile,
+        crate::links::Refused::TooLarge { len, cap } => SkipReason::TooLarge {
+            size: len,
+            limit: cap,
+            key,
+        },
+    }
+}
+
+/// (#660) The reason for a [`read_for_index_under`] that returned no bytes. The one place
+/// every `Ok((None, refused))` arm takes its reason from.
+///
+/// `read_for_index_under` never returns `(None, None)` (its body: it returns `None` bytes only
+/// in the `Content::Refused` arm, and there a refusal is always present). The `None` arm exists
+/// only so the match over the type is exhaustive.
+fn reason_of_unread(refused: Option<crate::links::Refused>, key: LimitKey) -> SkipReason {
+    refused.map_or(
+        SkipReason::Unreadable {
+            cause: ReadFailure::Other,
+        },
+        |r| reason_of_refusal(r, key),
+    )
 }
 
 /// (audit AX-02) Whether the file the watcher was told about at `full` resolves
@@ -423,6 +471,7 @@ fn read_for_index(
     cap: u64,
 ) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
     read_for_index_under(full, rel, cap, size_cap_key(false))
+        .map(|(bytes, refused)| (bytes, measured(&refused)))
 }
 
 /// 超過警告に使う「binary」/「text」の語。cap が拡張子で決まるので、
@@ -434,11 +483,11 @@ fn size_cap_kind(is_binary_ext: bool) -> &'static str {
 /// The `[index]` key that sets the cap a file of this kind is held to, chosen
 /// by the same branch as [`size_cap_kind`], so a size warning can say which key
 /// admits the file.
-fn size_cap_key(is_binary_ext: bool) -> &'static str {
+fn size_cap_key(is_binary_ext: bool) -> LimitKey {
     if is_binary_ext {
-        "max_binary_file_size"
+        LimitKey::MaxBinaryFileSize
     } else {
-        "max_text_file_size"
+        LimitKey::MaxTextFileSize
     }
 }
 
@@ -587,6 +636,7 @@ fn scan_disk_entries_observed(
     let mut scan = DiskScan {
         entries: Vec::with_capacity(source_files.len()),
         skipped: Vec::new(),
+        skipped_why: Vec::new(),
         oversize: Vec::new(),
         frontmatter_topics: std::collections::HashMap::new(),
     };
@@ -632,16 +682,29 @@ fn scan_one_file(
         Ok(Some((len, cap))) => {
             let (kind, key) = (size_cap_kind(is_binary), size_cap_key(is_binary));
             eprintln!(
-                "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+                "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{} to admit it",
+                key.key()
             );
             scan.oversize.push((rel.clone(), len));
-            scan.skipped.push(rel);
+            scan.skip(
+                rel,
+                SkipReason::TooLarge {
+                    size: len,
+                    limit: cap,
+                    key,
+                },
+            );
             return;
         }
         Ok(None) => {}
         Err(e) => {
             eprintln!("Skipping {rel}: failed to stat: {e}");
-            scan.skipped.push(rel);
+            scan.skip(
+                rel,
+                SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                },
+            );
             return;
         }
     }
@@ -654,7 +717,8 @@ fn scan_one_file(
     // run's walk-time check is what evicts it — which is where that
     // decision belongs (§4.2, skip preserves).
     let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
-    match read_for_index_under(p, &rel, cap, size_cap_key(is_binary)) {
+    let key = size_cap_key(is_binary);
+    match read_for_index_under(p, &rel, cap, key) {
         Ok((Some(bytes), _)) => {
             let hash = sha256_hex_bytes(&bytes);
             if rename_candidate(&rel, &hash) {
@@ -668,19 +732,24 @@ fn scan_one_file(
                 size: bytes.len() as u64,
             });
         }
-        Ok((None, measured)) => {
+        Ok((None, refused)) => {
             // (codex P2 round 5) The file can cross the cap between the
             // stat above and this read, and then it is *this* check that
             // catches it — so the length has to come from here too, or the
             // row keeps a size the read has just disproved.
-            if let Some(len) = measured {
+            if let Some(len) = measured(&refused) {
                 scan.oversize.push((rel.clone(), len));
             }
-            scan.skipped.push(rel);
+            scan.skip(rel, reason_of_unread(refused, key));
         }
         Err(e) => {
             eprintln!("Skipping {rel}: failed to read: {e}");
-            scan.skipped.push(rel);
+            scan.skip(
+                rel,
+                SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                },
+            );
         }
     }
 }
@@ -939,11 +1008,11 @@ fn read_crossed_rename_again(
     );
     let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, size_cap_key(is_binary)) {
         Ok((Some(bytes), _)) => bytes,
-        Ok((None, measured)) => {
+        Ok((None, refused)) => {
             // (#544, GitHub codex P2 on PR #396) The file can have grown past the cap since
             // the scan: this read is then the only current measurement, and the kept row
             // would otherwise go on advertising the scan's servable size.
-            if let Some(len) = measured
+            if let Some(len) = measured(&refused)
                 && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
             {
                 tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
@@ -3086,11 +3155,11 @@ fn index_single_disk_entry(
     let key = size_cap_key(parser.is_binary());
     let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, key) {
         Ok((Some(b), _)) => b,
-        Ok((None, measured)) => {
+        Ok((None, refused)) => {
             // (codex P2 round 5) Same window as the scan: if the handle check
             // is what refused it, that length is the only current measurement
             // there is, and the row would otherwise keep a stale, servable one.
-            if let Some(len) = measured
+            if let Some(len) = measured(&refused)
                 && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
             {
                 tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
@@ -3686,7 +3755,8 @@ pub(crate) fn reindex_single_file_checked(
     ) {
         let (kind, key) = (size_cap_kind(is_binary_ext), size_cap_key(is_binary_ext));
         eprintln!(
-            "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+            "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{} to admit it",
+            key.key()
         );
         // (codex P2 round 4) Same as the full scan: the row stays, so without
         // this its recorded size is the last one small enough to index and the
@@ -3707,12 +3777,11 @@ pub(crate) fn reindex_single_file_checked(
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
     );
-    let (maybe_bytes, measured) =
-        read_for_index_under(&full, rel, cap, size_cap_key(is_binary_ext))
-            .with_context(|| format!("failed to read {}", full.display()))?;
+    let (maybe_bytes, refused) = read_for_index_under(&full, rel, cap, size_cap_key(is_binary_ext))
+        .with_context(|| format!("failed to read {}", full.display()))?;
     let Some(bytes) = maybe_bytes else {
         // (codex P2 round 5) The watcher has the same stat-then-read window.
-        if let Some(len) = measured
+        if let Some(len) = measured(&refused)
             && let Err(e) = db.record_document_sizes(&[(rel, len)])
         {
             tracing::warn!("failed to record the grown size of {rel}: {e}");
@@ -4161,7 +4230,8 @@ pub fn rename_single_file(
     ) {
         let (kind, key) = (size_cap_kind(is_binary_ext), size_cap_key(is_binary_ext));
         eprintln!(
-            "Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+            "Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{} to admit it",
+            key.key()
         );
         db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         // (codex P2 round 11 on PR #291) Crossed a parser: the row is the old parser's
@@ -4187,7 +4257,7 @@ pub fn rename_single_file(
         registry.limits().text.cap_bytes(),
     );
     let read = read_for_index_under(&full, new_rel, cap, size_cap_key(is_binary_ext));
-    let (maybe_bytes, measured) = match read {
+    let (maybe_bytes, refused) = match read {
         Ok(read) => read,
         Err(e) => {
             // Before the move waited for the bytes, a failed read found the row already moved.
@@ -4207,7 +4277,7 @@ pub fn rename_single_file(
             settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
             return Ok(RenameOutcome::RenamedButRefusedAndDropped);
         }
-        if let Some(len) = measured
+        if let Some(len) = measured(&refused)
             && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
         {
             tracing::warn!("failed to record the grown size of {new_rel}: {e}");
@@ -6567,6 +6637,170 @@ mod tests {
             scan.oversize,
             vec![("big.md".to_string(), 10)],
             "the refused file's real length must come back, and only that file's"
+        );
+    }
+
+    /// (#660) Every skip carries its reason at the same index: `skipped[i]` and
+    /// `skipped_why[i]` are one file.
+    #[test]
+    fn scan_records_why_beside_each_skip() {
+        let tmp = mk_tmp("scanwhy");
+        write_file(&tmp.0, "big.md", "0123456789"); // 10 bytes, over the cap
+        write_file(&tmp.0, "ok.md", "# h"); // 3 bytes, under it
+        write_file(&tmp.0, "huge.md", "0123456789abcdef"); // 16 bytes, over it
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[
+                tmp.0.join("big.md"),
+                tmp.0.join("ok.md"),
+                tmp.0.join("huge.md"),
+            ],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            5,
+        );
+        assert_eq!(
+            scan.skipped,
+            vec!["big.md".to_string(), "huge.md".to_string()]
+        );
+        assert_eq!(
+            scan.skipped_why,
+            vec![
+                SkipReason::TooLarge {
+                    size: 10,
+                    limit: 5,
+                    key: LimitKey::MaxTextFileSize,
+                },
+                SkipReason::TooLarge {
+                    size: 16,
+                    limit: 5,
+                    key: LimitKey::MaxTextFileSize,
+                },
+            ],
+            "one reason per skip, at the same index"
+        );
+    }
+
+    /// (#660) The harness of
+    /// `test_scan_disk_entries_refuses_a_hard_link_that_appeared_after_the_walk`: the read's
+    /// refusal is named, not only counted.
+    #[test]
+    fn scan_names_a_hard_link_that_appeared_after_the_walk() {
+        let tmp = mk_tmp("scanwhyhardlink");
+        write_file(&tmp.0, "ok.md", "# ok");
+        write_file(&tmp.0, "secret.txt", "ssh-rsa AAAA...");
+        let linked = tmp.0.join("notes.md");
+        std::fs::hard_link(tmp.0.join("secret.txt"), &linked)
+            .expect("hard links need no privilege");
+
+        let reg = Registry::defaults();
+        let source = vec![tmp.0.join("ok.md"), linked];
+        let scan = scan_disk_entries(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        assert_eq!(scan.skipped, vec!["notes.md".to_string()]);
+        assert_eq!(scan.skipped_why, vec![SkipReason::HardLink]);
+    }
+
+    /// (#660) A file replaced by a named pipe after the walk is refused at the read
+    /// (`O_NONBLOCK` keeps the open from waiting) and named `NotPlainFile`.
+    #[cfg(unix)]
+    #[test]
+    fn scan_names_a_fifo_not_plain_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = mk_tmp("scanwhyfifo");
+        write_file(&tmp.0, "pipe.md", "# was a note");
+        let path = tmp.0.join("pipe.md");
+        // The walk collected `pipe.md` as a file; it becomes a FIFO before the scan reads it.
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode; the call touches nothing else.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo to test against");
+
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[path],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        assert_eq!(scan.skipped, vec!["pipe.md".to_string()]);
+        assert_eq!(scan.skipped_why, vec![SkipReason::NotPlainFile]);
+    }
+
+    /// (#660 T-L10) A file another process holds open without sharing it (an editor's lock)
+    /// is `Unreadable { InUse }`, not a generic failure.
+    #[cfg(windows)]
+    #[test]
+    fn scan_names_a_file_held_without_sharing_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = mk_tmp("scanwhyinuse");
+        write_file(&tmp.0, "held.md", "# held");
+        let path = tmp.0.join("held.md");
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("open the file without sharing");
+
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            std::slice::from_ref(&path),
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        assert_eq!(scan.skipped, vec!["held.md".to_string()]);
+        assert_eq!(
+            scan.skipped_why,
+            vec![SkipReason::Unreadable {
+                cause: ReadFailure::InUse,
+            }]
+        );
+    }
+
+    /// (#660) A file the OS refuses to open is `Unreadable { PermissionDenied }`. root reads
+    /// through `chmod 000`, so the test has nothing to show there and returns.
+    #[cfg(unix)]
+    #[test]
+    fn scan_names_an_unreadable_file_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = mk_tmp("scanwhydenied");
+        write_file(&tmp.0, "locked.md", "# locked");
+        let path = tmp.0.join("locked.md");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            std::slice::from_ref(&path),
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        // Restore so the temp dir's cleanup can remove it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(scan.skipped, vec!["locked.md".to_string()]);
+        assert_eq!(
+            scan.skipped_why,
+            vec![SkipReason::Unreadable {
+                cause: ReadFailure::PermissionDenied,
+            }]
         );
     }
 
