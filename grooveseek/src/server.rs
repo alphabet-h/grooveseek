@@ -496,7 +496,9 @@ struct IndexStats {
     #[serde(default)]
     renamed: u32,
     deleted: u32,
-    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
+    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文、
+    /// hard link、index が保持できない名前)。path 単位で数え、
+    /// [`crate::indexer::IndexResult::skipped_files`] の件数と常に等しい (#660)。
     #[serde(default)]
     skipped: u32,
     /// (#251) Markdown files this run warned about for a YAML frontmatter that

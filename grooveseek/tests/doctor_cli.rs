@@ -242,7 +242,7 @@ fn serve_starts_its_watcher_without_an_index_so_the_watcher_can_seed_one() {
 fn the_chunk_policy_is_resolved_where_the_insertion_paths_meet() {
     let src = include_str!("../src/indexer.rs");
     let entry = src
-        .split("fn index_single_disk_entry(")
+        .split("fn index_single_disk_entry_explained(")
         .nth(1)
         .expect("the shared insertion path still exists");
     let body = entry.split("\nfn ").next().unwrap_or(entry);

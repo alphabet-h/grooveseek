@@ -14,6 +14,32 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- Library: `IndexResult::skipped_files` lists every file counted in `skipped`, one entry per path
+  in path order, each a `SkippedFile { path, reason }`; its length always equals `skipped`, for a
+  completed run and a cancelled one. The reason is a `SkipReason` (`kind()` gives a stable
+  snake_case name, `limit_key()` the `[index]` key that would admit the file), with `LimitKey` and
+  `ReadFailure` for its details; the three enums are `#[non_exhaustive]`, so a downstream `match`
+  needs a wildcard arm. `reindex_single_file_explained` returns `Reindexed { result, reason }`,
+  the single-file reindex with the same reason. `IndexResult` now derives `Clone`. See
+  [ADR-0032](docs/decisions/0032-report-why-each-file-was-not-indexed.md) (kuriya #660).
+
+### Changed
+
+- **`skipped` counts hard links and names the index cannot hold** (the `groove index` `Done in`
+  line and the MCP `rebuild_index` reply). Both were already "present on disk but not indexed" but
+  only produced a warning
+  ([ADR-0032](docs/decisions/0032-report-why-each-file-was-not-indexed.md)). In short:
+  - A run in which an indexed document became a hard link counts it under both `deleted` and
+    `skipped`: its row is removed, and the file was not read.
+  - **The `not indexed` count at the end of the `Done in` line is now part of `skipped`
+    (v1.24.0+)**, not added to it; the wording of the line is unchanged.
+  - A directory left out for its name counts as one, whether or not it held a file the index
+    would have read.
+  - Separate files whose non-UTF-8 names have the same lossy spelling count once, as one path, in
+    `skipped` and in the `not indexed` count (`IndexResult::unspellable`).
+
 ### Fixed
 
 - **`groove service uninstall --purge --yes` deletes the `.groove.db-wal` / `.groove.db-shm`

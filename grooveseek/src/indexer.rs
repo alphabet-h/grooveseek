@@ -11,6 +11,9 @@ use crate::parser::{ParserExt, Registry};
 use crate::quality;
 
 pub mod progress;
+pub mod skip;
+
+pub use skip::{LimitKey, ReadFailure, SkipReason, SkippedFile};
 
 // ---------------------------------------------------------------------------
 // Hardcoded denylist (F-62)
@@ -129,6 +132,9 @@ struct DiskEntry {
 struct DiskScan {
     entries: Vec<DiskEntry>,
     skipped: Vec<String>,
+    /// (#660) Why each file in [`DiskScan::skipped`] was declined, at the same index. Written only through
+    /// [`DiskScan::skip`], which pushes both, so the two never come apart.
+    skipped_why: Vec<SkipReason>,
     /// size cap で撥ねたファイルの **実測サイズ** (rel path, bytes)。
     ///
     /// 行は §4.2 で保持されるが、記録済みの `size_bytes` は「最後に索引できた
@@ -144,6 +150,15 @@ struct DiskScan {
     /// ([`Database::rename_documents_checked`]). Only candidates, because [`DiskEntry`] keeps no
     /// content and the rest of the run reads each file again.
     frontmatter_topics: std::collections::HashMap<String, Option<String>>,
+}
+
+impl DiskScan {
+    /// Decline `rel` for `why`: the one way into [`Self::skipped`], so entry `i` of it and entry
+    /// `i` of [`Self::skipped_why`] are always the same file (#660).
+    fn skip(&mut self, rel: String, why: SkipReason) {
+        self.skipped.push(rel);
+        self.skipped_why.push(why);
+    }
 }
 
 /// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
@@ -192,11 +207,12 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// Read a file for indexing through a handle whose identity has been checked
 /// (BU-20), turning a refusal into the per-file skip every caller already does.
 ///
-/// `Ok((None, _))` means "skip this file, and say why on stderr"; `Err` keeps
+/// `Ok((None, refused))` means "skip this file, and say why on stderr"; `Err` keeps
 /// `std::fs::read`'s meaning so existing read-error handling is unchanged.
 ///
-/// The second element is the length **when the refusal was about size**
-/// (codex P2 round 5). `size_cap_exceeded` stats the path and this reads the
+/// The second element is the refusal itself (#660), so a caller can both name why
+/// ([`reason_of_unread`]) and take the length **when the refusal was about size**
+/// ([`measured`], codex P2 round 5). [`size_cap_exceeded`] stats the path and this reads the
 /// handle, so a file can cross the cap *between* the two — and then this check
 /// is the one that catches it. A wrapper that dropped the length existed for
 /// one round; it turned out every caller wanted it, because a row that says a
@@ -210,28 +226,63 @@ fn read_for_index_under(
     full: &Path,
     rel: &str,
     cap: u64,
-    key: &str,
-) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
+    key: LimitKey,
+) -> std::io::Result<(Option<Vec<u8>>, Option<crate::links::Refused>)> {
     match crate::links::read_checked(full, cap)? {
         crate::links::Content::Bytes(bytes) => Ok((Some(bytes), None)),
         crate::links::Content::Refused(refused) => {
-            let measured = match refused {
-                crate::links::Refused::TooLarge { len, .. } => Some(len),
-                // The other refusals say nothing about size, so there is
-                // nothing to record and the row keeps what it had.
-                _ => None,
-            };
-            if measured.is_some() {
+            let line = refused.log_line(full);
+            let refused = Some(refused);
+            if measured(&refused).is_some() {
                 eprintln!(
-                    "Skipping {rel}: {}; raise [index].{key} to admit it",
-                    refused.log_line(full)
+                    "Skipping {rel}: {line}; raise [index].{} to admit it",
+                    key.key()
                 );
             } else {
-                eprintln!("Skipping {rel}: {}", refused.log_line(full));
+                eprintln!("Skipping {rel}: {line}");
             }
-            Ok((None, measured))
+            Ok((None, refused))
         }
     }
+}
+
+/// The length a refusal measured on the handle: `Some(len)` for a size refusal, `None` for
+/// the others, which say nothing about size, so the row keeps what it had (codex P2 round 5).
+fn measured(refused: &Option<crate::links::Refused>) -> Option<u64> {
+    match refused {
+        Some(crate::links::Refused::TooLarge { len, .. }) => Some(*len),
+        Some(crate::links::Refused::MultiplyLinked | crate::links::Refused::NotAPlainFile)
+        | None => None,
+    }
+}
+
+/// (#660, spec R2) The reason a read-time refusal gives: a hard link, something other than a
+/// regular file, or a file over the cap of the given [`LimitKey`], measured on the handle.
+fn reason_of_refusal(r: crate::links::Refused, key: LimitKey) -> SkipReason {
+    match r {
+        crate::links::Refused::MultiplyLinked => SkipReason::HardLink,
+        crate::links::Refused::NotAPlainFile => SkipReason::NotPlainFile,
+        crate::links::Refused::TooLarge { len, cap } => SkipReason::TooLarge {
+            size: len,
+            limit: cap,
+            key,
+        },
+    }
+}
+
+/// (#660) The reason for a [`read_for_index_under`] that returned no bytes. The one place
+/// every `Ok((None, refused))` arm takes its reason from.
+///
+/// [`read_for_index_under`] never returns `(None, None)` (its body: it returns `None` bytes only
+/// in the [`crate::links::Content::Refused`] arm, and there a refusal is always present). The `None` arm exists
+/// only so the match over the type is exhaustive.
+fn reason_of_unread(refused: Option<crate::links::Refused>, key: LimitKey) -> SkipReason {
+    refused.map_or(
+        SkipReason::Unreadable {
+            cause: ReadFailure::Other,
+        },
+        |r| reason_of_refusal(r, key),
+    )
 }
 
 /// (audit AX-02) Whether the file the watcher was told about at `full` resolves
@@ -420,6 +471,7 @@ fn read_for_index(
     cap: u64,
 ) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
     read_for_index_under(full, rel, cap, size_cap_key(false))
+        .map(|(bytes, refused)| (bytes, measured(&refused)))
 }
 
 /// 超過警告に使う「binary」/「text」の語。cap が拡張子で決まるので、
@@ -431,11 +483,11 @@ fn size_cap_kind(is_binary_ext: bool) -> &'static str {
 /// The `[index]` key that sets the cap a file of this kind is held to, chosen
 /// by the same branch as [`size_cap_kind`], so a size warning can say which key
 /// admits the file.
-fn size_cap_key(is_binary_ext: bool) -> &'static str {
+fn size_cap_key(is_binary_ext: bool) -> LimitKey {
     if is_binary_ext {
-        "max_binary_file_size"
+        LimitKey::MaxBinaryFileSize
     } else {
-        "max_text_file_size"
+        LimitKey::MaxTextFileSize
     }
 }
 
@@ -584,6 +636,7 @@ fn scan_disk_entries_observed(
     let mut scan = DiskScan {
         entries: Vec::with_capacity(source_files.len()),
         skipped: Vec::new(),
+        skipped_why: Vec::new(),
         oversize: Vec::new(),
         frontmatter_topics: std::collections::HashMap::new(),
     };
@@ -629,16 +682,29 @@ fn scan_one_file(
         Ok(Some((len, cap))) => {
             let (kind, key) = (size_cap_kind(is_binary), size_cap_key(is_binary));
             eprintln!(
-                "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+                "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{} to admit it",
+                key.key()
             );
             scan.oversize.push((rel.clone(), len));
-            scan.skipped.push(rel);
+            scan.skip(
+                rel,
+                SkipReason::TooLarge {
+                    size: len,
+                    limit: cap,
+                    key,
+                },
+            );
             return;
         }
         Ok(None) => {}
         Err(e) => {
             eprintln!("Skipping {rel}: failed to stat: {e}");
-            scan.skipped.push(rel);
+            scan.skip(
+                rel,
+                SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                },
+            );
             return;
         }
     }
@@ -651,7 +717,8 @@ fn scan_one_file(
     // run's walk-time check is what evicts it — which is where that
     // decision belongs (§4.2, skip preserves).
     let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
-    match read_for_index_under(p, &rel, cap, size_cap_key(is_binary)) {
+    let key = size_cap_key(is_binary);
+    match read_for_index_under(p, &rel, cap, key) {
         Ok((Some(bytes), _)) => {
             let hash = sha256_hex_bytes(&bytes);
             if rename_candidate(&rel, &hash) {
@@ -665,19 +732,24 @@ fn scan_one_file(
                 size: bytes.len() as u64,
             });
         }
-        Ok((None, measured)) => {
+        Ok((None, refused)) => {
             // (codex P2 round 5) The file can cross the cap between the
             // stat above and this read, and then it is *this* check that
             // catches it — so the length has to come from here too, or the
             // row keeps a size the read has just disproved.
-            if let Some(len) = measured {
+            if let Some(len) = measured(&refused) {
                 scan.oversize.push((rel.clone(), len));
             }
-            scan.skipped.push(rel);
+            scan.skip(rel, reason_of_unread(refused, key));
         }
         Err(e) => {
             eprintln!("Skipping {rel}: failed to read: {e}");
-            scan.skipped.push(rel);
+            scan.skip(
+                rel,
+                SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                },
+            );
         }
     }
 }
@@ -810,7 +882,7 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// row stays, under [`HASH_AWAITING_REPARSE`] so that no later fast path keeps the old parser's
 /// chunks.
 ///
-/// A further read of a crossed rename this kept awaiting -- [`read_crossed_rename_again`] in
+/// A further read of a crossed rename this kept awaiting -- [`read_crossed_rename_again_explained`] in
 /// [`rebuild_index`], or the watcher's reread ([`crate::watcher`]) -- does not come here: it is
 /// settled by [`settle_further_crossed_read`] (#544, local Codex r4/r5). `Ok(true)` when the
 /// row was dropped.
@@ -843,7 +915,7 @@ pub(crate) fn settle_cross_parser_rename(
 }
 
 /// (#544, local Codex r4/r5, D5) The settlement of a further read of a crossed rename this
-/// branch adds after the first read kept the row awaiting: [`read_crossed_rename_again`] in
+/// branch adds after the first read kept the row awaiting: [`read_crossed_rename_again_explained`] in
 /// [`rebuild_index`], and the watcher's crossed rereads ([`crate::watcher`]). Both ask the read
 /// to check its bytes against its own hash before parsing (`row_dropped_unless_updated` on
 /// [`index_single_disk_entry`]), and only results of such a read come here.
@@ -914,6 +986,10 @@ pub(crate) fn settle_further_crossed_read(
 /// that changed again and (local Codex r4, D5) for a read that failed, which checked no bytes.
 /// A refusal records the length it measured first; the row it lands on is then deleted, which
 /// leaves nothing behind.
+///
+/// (#660) [`rebuild_index`] calls [`read_crossed_rename_again_explained`]; this wrapper is kept
+/// for the tests that read the result alone.
+#[cfg(test)]
 fn read_crossed_rename_again(
     db: &Database,
     embedder: &mut Embedder,
@@ -923,6 +999,31 @@ fn read_crossed_rename_again(
     context_mode: ContextMode,
     declared: DeclaredSet<'_>,
 ) -> Result<SingleResult> {
+    read_crossed_rename_again_explained(
+        db,
+        embedder,
+        entry,
+        exclude_headings,
+        registry,
+        context_mode,
+        declared,
+    )
+    .map(|r| r.result)
+}
+
+/// The re-read of a file whose rename crossed a parser, with the reason the file was not
+/// indexed (#660): the body, which the test-only wrapper above calls and drops the reason of. A
+/// refused or failed re-read gives its own reason (spec R2 / R3); the rest come from
+/// [`index_single_disk_entry_explained`].
+fn read_crossed_rename_again_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+) -> Result<Reindexed> {
     let ext = entry
         .full
         .extension()
@@ -934,24 +1035,33 @@ fn read_crossed_rename_again(
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
     );
-    let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, size_cap_key(is_binary)) {
+    let key = size_cap_key(is_binary);
+    let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, key) {
         Ok((Some(bytes), _)) => bytes,
-        Ok((None, measured)) => {
+        Ok((None, refused)) => {
             // (#544, GitHub codex P2 on PR #396) The file can have grown past the cap since
             // the scan: this read is then the only current measurement, and the kept row
             // would otherwise go on advertising the scan's servable size.
-            if let Some(len) = measured
+            if let Some(len) = measured(&refused)
                 && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
             {
                 tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
             }
-            return Ok(SingleResult::Refused);
+            return Ok(Reindexed {
+                result: SingleResult::Refused,
+                reason: Some(reason_of_unread(refused, key)),
+            });
         }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_READ_FAILED,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_READ_FAILED,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                }),
             });
         }
     };
@@ -960,7 +1070,7 @@ fn read_crossed_rename_again(
         size: bytes.len() as u64,
         ..entry.clone()
     };
-    index_single_disk_entry(
+    index_single_disk_entry_explained(
         db,
         embedder,
         &again,
@@ -1132,7 +1242,7 @@ pub const REJECTIONS_NAMED_ABOVE: &str = "see the warnings above";
 pub const REJECTIONS_NAMED_ON_SERVER_STDERR: &str = "each named on the server's stderr";
 
 /// Summary returned by [`rebuild_index`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IndexResult {
     pub total_documents: u32,
     pub updated: u32,
@@ -1140,8 +1250,15 @@ pub struct IndexResult {
     /// `documents.path` だけが UPDATE された数。
     pub renamed: u32,
     pub deleted: u32,
-    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
+    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文、
+    /// hard link、index が保持できない名前)。path 単位で数え、[`Self::skipped_files`] の
+    /// 件数と常に等しい (#660)。[`Self::unspellable`] と [`Self::embed_rejected`] はこの内訳。
     pub skipped: u32,
+    /// (#660) Every file counted in [`Self::skipped`], one entry each, sorted by
+    /// [`SkippedFile::path`]. Its length equals [`Self::skipped`] for every value
+    /// [`rebuild_index`] returns, completed or [`Self::cancelled`]. A hard link and a name the index cannot hold
+    /// ([`Self::unspellable`]) are in both.
+    pub skipped_files: Vec<SkippedFile>,
     /// Markdown files this run named with `warning: <path>: failed to parse
     /// YAML frontmatter` (#251): the ones indexed with empty metadata and the
     /// `frontmatter:unparsed` tag, the ones skipped for having no chunks after
@@ -1154,8 +1271,9 @@ pub struct IndexResult {
     /// (ADR-0023) Entries the walk left out because their name is not one the
     /// index can hold ([`crate::resources::doc_is_addressable`]): a file, or a
     /// directory together with everything under it, counted once each and
-    /// each named on stderr. Not part of [`Self::skipped`], which counts files
-    /// that were collected and then could not be read or parsed.
+    /// each named on stderr. (#660) Part of [`Self::skipped`]: the entries of
+    /// [`Self::skipped_files`] whose reason is [`SkipReason::UnspellableName`],
+    /// counted by path like the rest of the list.
     pub unspellable: u32,
     /// (AW-04) Files skipped because the embedding endpoint refused their
     /// input before accepting any of it. Also counted in [`Self::skipped`]. A
@@ -1373,6 +1491,26 @@ pub enum SingleResult {
         deindexed: bool,
         frontmatter_unparsed: bool,
     },
+}
+
+/// [`SingleResult`] and, when the file was not indexed, why (#660). [`Reindexed::reason`] is
+/// `Some` exactly when [`rebuild_index`] would count this result in [`IndexResult::skipped`],
+/// except for a path reached through a link (the file itself a symlink included): that is
+/// [`SingleResult::Refused`] or [`SingleResult::OutsideKnowledgeBaseDeindexed`] with no reason,
+/// because the full index leaves such a file out on purpose and lists it nowhere.
+/// At the watcher's entry a failure to stat or resolve the file, or the first read of it, is
+/// still an `Err`, as before. The second read (the one the indexing body does after the hash
+/// check) failing is a [`SingleResult::Skipped`] with the reason [`SkipReason::Unreadable`] here
+/// as in the full index, with any cause; it is also where a refusal of that read (hard link, not
+/// a plain file, too large) comes from.
+/// [`reindex_single_file_explained`] does not itself refuse a path whose name the index cannot
+/// store or that `.grooveignore` excludes: that check is the caller's (the watcher makes it
+/// before calling), so for such a path the reason here can differ from the one
+/// [`rebuild_index`] lists.
+#[derive(Debug, PartialEq)]
+pub struct Reindexed {
+    pub result: SingleResult,
+    pub reason: Option<SkipReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,10 +1731,29 @@ pub fn rebuild_index(
 
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
-    let CollectedSources {
-        files: source_files,
-        unspellable,
-    } = collect_source_files_counted(&kb_path, &kb_path, registry, &rules)?;
+    let collected = collect_source_files_counted(&kb_path, &kb_path, registry, &rules)?;
+    let source_files = collected.files;
+    // (#660, spec 6) The run's list of the files it did not index, one reason per path. Only
+    // `upsert` and `remove` change it, at the write points W0-W7; `complete_index_result` turns
+    // it into `skipped_files`, `skipped` and `unspellable` once (F), for a completed run and a
+    // stopped one alike.
+    let mut skip_ledger = skip::SkipLedger::default();
+    // (#660, spec 5.5) The walk counts each name it leaves out as it pushes it to `left_out`,
+    // before the ledger folds equal paths, so the two counts agree.
+    debug_assert_eq!(
+        collected.unspellable as usize,
+        collected
+            .left_out
+            .iter()
+            .filter(|f| matches!(f.reason, SkipReason::UnspellableName { .. }))
+            .count(),
+        "the walk's count of names left out disagrees with its list"
+    );
+    // W0: what the walk left out (hard links, names the index cannot hold). Not guarded from
+    // the prune (A8): a hard link's row goes, as before.
+    for left in &collected.left_out {
+        skip_ledger.upsert(&left.path, left.reason);
+    }
     eprintln!(
         "Found {} source files (extensions: {:?})",
         source_files.len(),
@@ -1605,10 +1762,7 @@ pub fn rebuild_index(
     // (feature-60) What this run has done so far, in the shape it returns. Counted here as the
     // run goes and completed by `complete_index_result`, whether the run finishes or stops at
     // a check point, so the two returns cannot count differently.
-    let mut tally = IndexResult {
-        unspellable,
-        ..IndexResult::default()
-    };
+    let mut tally = IndexResult::default();
     // (feature-60) The declared-field pass a stopped run closes, built once and handed to every
     // check point (C1-C4). Only shared borrows: `pass_token`, `stored_declared` and
     // `declared_json` are read, never changed, for the rest of the run.
@@ -1672,8 +1826,17 @@ pub fn rebuild_index(
 
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
+    // W1 (#660): each file the scan declined, with its reason; a path declined twice (a lossy
+    // spelling shared by two files) is one entry.
+    for (rel, why) in scan.skipped.iter().zip(&scan.skipped_why) {
+        skip_ledger.upsert(rel, *why);
+    }
     let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
-    tally.skipped = skipped_paths.len() as u32;
+    // (#660, spec 6 I3) Every path the prune guards is listed.
+    debug_assert!(
+        skipped_paths.iter().all(|rel| skip_ledger.contains(rel)),
+        "a path the scan skipped is not in the skip ledger"
+    );
 
     // (feature-60) Check points C1 and C2. C1: the observer above stopped the scan at a file.
     // C2: the token was set after the last file -- or, on an empty knowledge base, where there
@@ -1681,7 +1844,16 @@ pub fn rebuild_index(
     // nothing, and the renames below are the next write, so this is the last point where the
     // index reads as it did before the scan.
     if scan_flow.is_break() || progress.is_cancelled() {
-        return stop_cancelled_run(db, embedder, progress, pass_to_close, tally, None, start);
+        return stop_cancelled_run(
+            db,
+            embedder,
+            progress,
+            pass_to_close,
+            tally,
+            skip_ledger,
+            None,
+            start,
+        );
     }
 
     // rename 検出 + atomically な rename 適用。
@@ -1888,6 +2060,7 @@ pub fn rebuild_index(
                 progress,
                 pass_to_close,
                 tally,
+                skip_ledger,
                 Some(embedded_since),
                 start,
             );
@@ -1914,7 +2087,10 @@ pub fn rebuild_index(
         // it embedded, and the rest of an updated document's chunks were reused.
         let texts_before = embedder.texts_embedded();
         let crossed = crossed_parser_renames.contains(&entry.rel);
-        let single_result = index_single_disk_entry(
+        let Reindexed {
+            result: single_result,
+            reason: skip_reason,
+        } = index_single_disk_entry_explained(
             db,
             embedder,
             entry,
@@ -1988,7 +2164,8 @@ pub fn rebuild_index(
                 reason,
                 frontmatter_unparsed: fm_unparsed,
             } => {
-                tally.skipped += 1;
+                // W2 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, skip_reason);
                 // A refusal that came after an accepted batch of the same file proves the
                 // endpoint works, so it is not counted toward "every input rejected".
                 if reason == SKIPPED_EMBED_REJECTED
@@ -2027,7 +2204,8 @@ pub fn rebuild_index(
             SingleResult::Refused
             | SingleResult::OutsideKnowledgeBaseDeindexed
             | SingleResult::NothingToIndex { .. } => {
-                tally.skipped += 1;
+                // W3 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, skip_reason);
                 if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
                     refresh_pending_rows.insert(entry.rel.clone());
                 }
@@ -2055,17 +2233,23 @@ pub fn rebuild_index(
 
     // (#544, local Codex r1) A crossed rename the loop kept awaiting a reparse holds the old
     // parser's chunks: it gets one further read of the bytes on disk before the run returns
-    // ([`read_crossed_rename_again`]), whose result alone decides the row and replaces the skip
-    // the loop counted for it. Ahead of C4, so a cancel stops it between two reads: a row not
-    // read again keeps the sentinel, which no fast path trusts. Not reported to `progress`,
-    // which already counted the file.
+    // ([`read_crossed_rename_again_explained`]), whose result alone decides the row and replaces
+    // the skip the loop counted for it. Ahead of C4, so a cancel stops it between two reads: a
+    // row not read again keeps the sentinel, which no fast path trusts. Not reported to
+    // `progress`, which already counted the file.
+    // (#660, spec 7 I-reread) W4 and W5-W8 run one after the other within an iteration, with no
+    // cancel check and no early return but `?` between them, so at every break each crossed
+    // path is listed either with the loop's `ChangedDuringRead` or with this read's outcome.
     for entry in crossed_awaiting {
         if progress.is_cancelled() {
             break;
         }
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
         let texts_before = embedder.texts_embedded();
-        let again = read_crossed_rename_again(
+        let Reindexed {
+            result: again,
+            reason: again_reason,
+        } = read_crossed_rename_again_explained(
             db,
             embedder,
             entry,
@@ -2086,7 +2270,12 @@ pub fn rebuild_index(
             unsettled.remove(&entry.rel);
             refresh_pending_rows.remove(&entry.rel);
         }
-        tally.skipped = tally.skipped.saturating_sub(1);
+        // W4 (#660): this read's outcome replaces the loop's `ChangedDuringRead` -- unless the
+        // scan also skipped this path (a lossy spelling shared with another file), which keeps
+        // it guarded and so listed (I3).
+        if !skipped_paths.contains(&entry.rel) {
+            skip_ledger.remove(&entry.rel);
+        }
         match again {
             SingleResult::Updated {
                 chunks,
@@ -2108,7 +2297,8 @@ pub fn rebuild_index(
                 reason,
                 frontmatter_unparsed: fm_unparsed,
             } => {
-                tally.skipped += 1;
+                // W5 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, again_reason);
                 if reason == SKIPPED_EMBED_REJECTED
                     && embedder.documents_refused_after_accepting()
                         == refused_after_accepting_before
@@ -2123,17 +2313,19 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
                 ..
             } => {
-                // Dropped, by the read and by the settlement above.
-                tally.skipped += 1;
+                // Dropped, by the read and by the settlement above. W6 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, again_reason);
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
                 }
             }
             SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed => {
-                tally.skipped += 1;
+                // W7 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, again_reason);
             }
             // Neither comes back for a row under the sentinel: no hash matches it, and
             // `Reindex::Event` runs no one-time check. Named so a new variant is a compile error.
+            // W8 (#660): nothing to list; W4 took the loop's entry off.
             SingleResult::Unchanged | SingleResult::MetadataRefreshed { .. } => {}
         }
     }
@@ -2149,6 +2341,7 @@ pub fn rebuild_index(
             progress,
             pass_to_close,
             tally,
+            skip_ledger,
             Some(embedded_since),
             start,
         );
@@ -2175,6 +2368,11 @@ pub fn rebuild_index(
     //    still match it; a deleted row is counted after its batch commits.
     let mut snapshot_paths: Vec<String> = snapshot.keys().cloned().collect();
     snapshot_paths.sort_unstable();
+    // (#660, spec 6 I3) Again before the prune reads the guard: W4 changed the ledger since W1.
+    debug_assert!(
+        skipped_paths.iter().all(|rel| skip_ledger.contains(rel)),
+        "a path the prune guards is not in the skip ledger"
+    );
     let candidates = documents_to_delete(&snapshot_paths, &visited_paths, &skipped_paths);
     // (ADR-0031) Under `--force` each batch marks the rows it keeps in the transaction that
     // keeps them: the code chunk policy this forced run recorded before its walk claims every
@@ -2244,7 +2442,15 @@ pub fn rebuild_index(
         kept.is_empty() && (force || !refresh_fields || !refresh_pending),
     )?;
 
-    let result = complete_index_result(db, embedder, tally, Some(embedded_since), start, false)?;
+    let result = complete_index_result(
+        db,
+        embedder,
+        tally,
+        skip_ledger,
+        Some(embedded_since),
+        start,
+        false,
+    )?;
     // (feature-62) Recorded last -- after the deletion sweep, for the reason the frontmatter
     // key is, and after every other step of the run that can fail, so a run that returns an
     // `Err` or stops at a check point never records it (I-4) -- together with the placeholder
@@ -2362,14 +2568,29 @@ impl ChunkVectorCounts {
 /// an [`IndexResult`] is completed, for a run that finished and for one that stopped at a
 /// check point alike (AGENTS.md "One question gets one implementation"). `embedded_since` is
 /// `None` for a run stopped before the per-document loop, which embedded nothing.
+///
+/// (#660, spec 6 F) Also the one place [`IndexResult::skipped_files`], [`IndexResult::skipped`]
+/// and [`IndexResult::unspellable`] are written: all three from `ledger`, the run's list of the
+/// files it did not index, so the count and the list cannot disagree (I1, I7).
 fn complete_index_result(
     db: &Database,
     embedder: &Embedder,
     mut tally: IndexResult,
+    ledger: skip::SkipLedger,
     embedded_since: Option<EmbeddedBaseline>,
     start: Instant,
     cancelled: bool,
 ) -> Result<IndexResult> {
+    let skipped_files = ledger.finish();
+    tally.skipped = u32::try_from(skipped_files.len()).unwrap_or(u32::MAX);
+    tally.unspellable = u32::try_from(
+        skipped_files
+            .iter()
+            .filter(|f| matches!(f.reason, SkipReason::UnspellableName { .. }))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    tally.skipped_files = skipped_files;
     tally.embedded = embedded_since.map_or(0, |baseline| baseline.accepted_since(embedder));
     // Count total documents remaining (includes unchanged ones)
     tally.total_documents = db.document_count()?;
@@ -2402,12 +2623,14 @@ struct PassToClose<'a> {
 /// result is completed by [`complete_index_result`] before
 /// [`progress::ProgressReporter::finish_cancelled`] emits
 /// [`progress::ProgressEvent::Cancelled`].
+#[allow(clippy::too_many_arguments)]
 fn stop_cancelled_run(
     db: &Database,
     embedder: &Embedder,
     progress: progress::ProgressReporter,
     pass: PassToClose<'_>,
     tally: IndexResult,
+    ledger: skip::SkipLedger,
     embedded_since: Option<EmbeddedBaseline>,
     start: Instant,
 ) -> Result<IndexResult> {
@@ -2420,9 +2643,25 @@ fn stop_cancelled_run(
             false,
         )?;
     }
-    let result = complete_index_result(db, embedder, tally, embedded_since, start, true)?;
+    let result = complete_index_result(db, embedder, tally, ledger, embedded_since, start, true)?;
     progress.finish_cancelled();
     Ok(result)
+}
+
+/// (#660, spec 6 W2/W3/W5-W7) List `rel` with the reason the indexing body gave a result the
+/// run counts as skipped. That body names one for every such result (I4); a `None` here is a
+/// return point that forgot to, caught in a debug build and otherwise left off the list (the
+/// count follows the list, so the result stays consistent) with a warning naming the file.
+fn list_skip(ledger: &mut skip::SkipLedger, rel: &str, reason: Option<SkipReason>) {
+    debug_assert!(
+        reason.is_some(),
+        "{rel}: a result counted as skipped came back with no reason (I4)"
+    );
+    if let Some(reason) = reason {
+        ledger.upsert(rel, reason);
+    } else {
+        tracing::warn!("{rel} was skipped with no reason given; it is left off the skipped list");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2657,6 +2896,21 @@ fn write_reparsed_table_rows(
     db.update_chunk_table_rows(rel, &decision.row_refs())?;
     tx.commit()?;
     Ok(SingleResult::Unchanged)
+}
+
+/// (#660, spec R4) The reason for what [`write_reparsed_table_rows`] returned, and only for that:
+/// its one skip, [`SKIPPED_CHANGED_DURING_READ`], is [`SkipReason::ChangedDuringRead`]; its other
+/// result, [`SingleResult::Unchanged`], has none. Not a general map from [`SingleResult`] to a
+/// reason -- a [`SingleResult::Refused`] there could be either of two reasons, or none (spec
+/// §5.7).
+fn explain_reparsed_table_rows(result: SingleResult) -> Reindexed {
+    let reason = match &result {
+        SingleResult::Skipped { reason, .. } if *reason == SKIPPED_CHANGED_DURING_READ => {
+            Some(SkipReason::ChangedDuringRead)
+        }
+        _ => None,
+    };
+    Reindexed { result, reason }
 }
 
 /// The write for a changed file whose new chunks match the row's ([`stored_chunks_match`]):
@@ -3017,6 +3271,34 @@ fn index_single_disk_entry(
     declared: DeclaredSet<'_>,
     row_dropped_unless_updated: bool,
 ) -> Result<SingleResult> {
+    index_single_disk_entry_explained(
+        db,
+        embedder,
+        entry,
+        exclude_headings,
+        registry,
+        mode,
+        context_mode,
+        declared,
+        row_dropped_unless_updated,
+    )
+    .map(|r| r.result)
+}
+
+/// [`index_single_disk_entry`] with the reason the file was not indexed (#660): the body. Each
+/// return point that does not index the file names its reason (spec §6.1, R1-R7, R11).
+#[allow(clippy::too_many_arguments)]
+fn index_single_disk_entry_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    mode: Reindex,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+    row_dropped_unless_updated: bool,
+) -> Result<Reindexed> {
     let force = mode == Reindex::Force;
     // (feature-62) A re-read the one-time docx pass asked for: past the fast path below, but
     // not a forced one.
@@ -3055,9 +3337,12 @@ fn index_single_disk_entry(
     // spelling: the scan and [`Registry::by_extension`] both take `.MD` as Markdown, and a
     // comparison against the literal did not (codex P1, round 2).
     let Some(parser) = registry.by_extension(ext) else {
-        return Ok(SingleResult::Skipped {
-            reason: "no parser for extension",
-            frontmatter_unparsed: false,
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: "no parser for extension",
+                frontmatter_unparsed: false,
+            },
+            reason: Some(SkipReason::CorruptOrUnsupported),
         });
     };
     let unchanged = !force
@@ -3068,7 +3353,10 @@ fn index_single_disk_entry(
     let refresh_only =
         unchanged && (refresh_frontmatter || refresh_fields) && parser.extension() == "md";
     if unchanged && !refresh_only {
-        return Ok(SingleResult::Unchanged);
+        return Ok(Reindexed {
+            result: SingleResult::Unchanged,
+            reason: None,
+        });
     }
 
     // Read + parse only for files we actually need to embed.
@@ -3083,22 +3371,30 @@ fn index_single_disk_entry(
     let key = size_cap_key(parser.is_binary());
     let bytes = match read_for_index_under(&entry.full, &entry.rel, cap, key) {
         Ok((Some(b), _)) => b,
-        Ok((None, measured)) => {
+        Ok((None, refused)) => {
             // (codex P2 round 5) Same window as the scan: if the handle check
             // is what refused it, that length is the only current measurement
             // there is, and the row would otherwise keep a stale, servable one.
-            if let Some(len) = measured
+            if let Some(len) = measured(&refused)
                 && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
             {
                 tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
             }
-            return Ok(SingleResult::Refused);
+            return Ok(Reindexed {
+                result: SingleResult::Refused,
+                reason: Some(reason_of_unread(refused, key)),
+            });
         }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_READ_FAILED,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_READ_FAILED,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(SkipReason::Unreadable {
+                    cause: skip::read_failure_of(&e),
+                }),
             });
         }
     };
@@ -3122,9 +3418,12 @@ fn index_single_disk_entry(
     // parse: what they fail or yield says nothing about the file the rename was decided on.
     // Before the parse, so nothing was parsed and no frontmatter warning was written.
     if row_dropped_unless_updated && read_hash != entry.hash {
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_CHANGED_DURING_READ,
-            frontmatter_unparsed: false,
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false,
+            },
+            reason: Some(SkipReason::ChangedDuringRead),
         });
     }
     let excludes: Vec<&str> = match exclude_headings {
@@ -3135,9 +3434,12 @@ fn index_single_disk_entry(
         Ok(p) => p,
         Err(e) => {
             eprintln!("Skipping {}: parse failed: {e}", entry.rel);
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_PARSE_FAILED,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_PARSE_FAILED,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(skip::reason_of_parse_error(&e)),
             });
         }
     };
@@ -3162,9 +3464,12 @@ fn index_single_disk_entry(
     // (an editor that truncates before it writes) would otherwise drop the row below. The row is
     // left for the event that write raises.
     if (reparse || mode == Reindex::Event) && read_hash != entry.hash {
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_CHANGED_DURING_READ,
-            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            },
+            reason: Some(SkipReason::ChangedDuringRead),
         });
     }
 
@@ -3181,9 +3486,12 @@ fn index_single_disk_entry(
         // The warning above already named the file if what was read failed to parse,
         // and a named failure is a counted one (codex P2, round 6).
         if read_hash != entry.hash {
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_CHANGED_DURING_READ,
-                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_CHANGED_DURING_READ,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                },
+                reason: Some(SkipReason::ChangedDuringRead),
             });
         }
         // (#251 / feature-58) Two reasons open an unchanged file, and each decides
@@ -3194,7 +3502,10 @@ fn index_single_disk_entry(
         let broken = parsed.frontmatter_error.is_some();
         let tag_it = broken && refresh_frontmatter;
         if !tag_it && !refresh_fields {
-            return Ok(SingleResult::Unchanged);
+            return Ok(Reindexed {
+                result: SingleResult::Unchanged,
+                reason: None,
+            });
         }
         let tx = db.begin_transaction()?;
         if tag_it {
@@ -3217,8 +3528,11 @@ fn index_single_disk_entry(
             write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
         }
         tx.commit()?;
-        return Ok(SingleResult::MetadataRefreshed {
-            frontmatter_unparsed: tag_it,
+        return Ok(Reindexed {
+            result: SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: tag_it,
+            },
+            reason: None,
         });
     }
 
@@ -3233,14 +3547,20 @@ fn index_single_disk_entry(
         // (#543) A watcher event leaves what `--force` would leave too: no row. The row the
         // earlier text wrote goes, and the result says whether there was one.
         if mode == Reindex::Event {
-            return Ok(SingleResult::NothingToIndex {
-                deindexed: deindex_single_file(db, &entry.rel)?,
-                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            return Ok(Reindexed {
+                result: SingleResult::NothingToIndex {
+                    deindexed: deindex_single_file(db, &entry.rel)?,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                },
+                reason: Some(SkipReason::NoText),
             });
         }
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_NO_CHUNKS,
-            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_NO_CHUNKS,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            },
+            reason: Some(SkipReason::NoText),
         });
     }
 
@@ -3280,20 +3600,28 @@ fn index_single_disk_entry(
     if reparse && chunks_unchanged {
         return match &table_rows {
             Some(decision) if !decision.matches && decision.stored_hash != entry.hash => {
-                Ok(SingleResult::Skipped {
-                    reason: SKIPPED_CHANGED_DURING_READ,
-                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                Ok(Reindexed {
+                    result: SingleResult::Skipped {
+                        reason: SKIPPED_CHANGED_DURING_READ,
+                        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                    },
+                    reason: Some(SkipReason::ChangedDuringRead),
                 })
             }
-            Some(decision) if !decision.matches => write_reparsed_table_rows(
-                db,
-                &entry.rel,
-                decision,
-                &parsed.chunks,
-                context_mode,
-                parsed.frontmatter_error.is_some(),
-            ),
-            _ => Ok(SingleResult::Unchanged),
+            Some(decision) if !decision.matches => {
+                Ok(explain_reparsed_table_rows(write_reparsed_table_rows(
+                    db,
+                    &entry.rel,
+                    decision,
+                    &parsed.chunks,
+                    context_mode,
+                    parsed.frontmatter_error.is_some(),
+                )?))
+            }
+            _ => Ok(Reindexed {
+                result: SingleResult::Unchanged,
+                reason: None,
+            }),
         };
     }
 
@@ -3311,7 +3639,10 @@ fn index_single_disk_entry(
             category.as_deref(),
         )?
     {
-        return Ok(done);
+        return Ok(Reindexed {
+            result: done,
+            reason: None,
+        });
     }
 
     // Embed first, *outside* the DB tx — fastembed inference can take
@@ -3384,9 +3715,14 @@ fn index_single_disk_entry(
                      {outcome}",
                     entry.rel, rejected.status
                 );
-                return Ok(SingleResult::Skipped {
-                    reason: SKIPPED_EMBED_REJECTED,
-                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                return Ok(Reindexed {
+                    result: SingleResult::Skipped {
+                        reason: SKIPPED_EMBED_REJECTED,
+                        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                    },
+                    reason: Some(SkipReason::EmbedRejected {
+                        http_status: rejected.status,
+                    }),
                 });
             }
             return Err(e).with_context(|| format!("failed to embed chunks for {}", entry.rel));
@@ -3435,9 +3771,12 @@ fn index_single_disk_entry(
     write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
     tx.commit()?;
 
-    Ok(SingleResult::Updated {
-        chunks: parsed.chunks.len() as u32,
-        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+    Ok(Reindexed {
+        result: SingleResult::Updated {
+            chunks: parsed.chunks.len() as u32,
+            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        },
+        reason: None,
     })
 }
 
@@ -3598,7 +3937,29 @@ pub fn reindex_single_file(
     exclude_headings: Option<&[String]>,
     registry: &Registry,
 ) -> Result<SingleResult> {
-    reindex_single_file_checked(
+    reindex_single_file_checked_explained(
+        db,
+        embedder,
+        kb_path,
+        rel,
+        exclude_headings,
+        registry,
+        false,
+    )
+    .map(|r| r.result)
+}
+
+/// [`reindex_single_file`] with the reason the file was not indexed (#660): see [`Reindexed`]
+/// for when [`Reindexed::reason`] is `Some`.
+pub fn reindex_single_file_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    kb_path: &Path,
+    rel: &str,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+) -> Result<Reindexed> {
+    reindex_single_file_checked_explained(
         db,
         embedder,
         kb_path,
@@ -3624,6 +3985,31 @@ pub(crate) fn reindex_single_file_checked(
     registry: &Registry,
     row_dropped_unless_updated: bool,
 ) -> Result<SingleResult> {
+    reindex_single_file_checked_explained(
+        db,
+        embedder,
+        kb_path,
+        rel,
+        exclude_headings,
+        registry,
+        row_dropped_unless_updated,
+    )
+    .map(|r| r.result)
+}
+
+/// [`reindex_single_file_checked`] with the reason the file was not indexed (#660): the body.
+/// The watcher's entry gives R8 (gone), R9 (over the cap by the stat) and R2 (its first read
+/// refused) itself, and `None` for a path through a link (R10, spec §6.1); the rest come from
+/// [`index_single_disk_entry_explained`].
+fn reindex_single_file_checked_explained(
+    db: &Database,
+    embedder: &mut Embedder,
+    kb_path: &Path,
+    rel: &str,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    row_dropped_unless_updated: bool,
+) -> Result<Reindexed> {
     let full = kb_path.join(rel);
     match look_at_single_path(kb_path, rel, &full)
         .with_context(|| format!("failed to stat {}", full.display()))?
@@ -3637,16 +4023,24 @@ pub(crate) fn reindex_single_file_checked(
         // same way when a link is on the way ([`look_at_single_path`]).
         SinglePathLook::ThroughALink => {
             eprintln!("{}", outside_kb_line(rel));
-            return Ok(if deindex_outside_kb(db, kb_path, rel)? {
-                SingleResult::OutsideKnowledgeBaseDeindexed
-            } else {
-                SingleResult::Refused
+            return Ok(Reindexed {
+                result: if deindex_outside_kb(db, kb_path, rel)? {
+                    SingleResult::OutsideKnowledgeBaseDeindexed
+                } else {
+                    SingleResult::Refused
+                },
+                reason: None,
             });
         }
         SinglePathLook::Missing => {
-            return Ok(SingleResult::Skipped {
-                reason: SKIPPED_FILE_GONE,
-                frontmatter_unparsed: false,
+            return Ok(Reindexed {
+                result: SingleResult::Skipped {
+                    reason: SKIPPED_FILE_GONE,
+                    frontmatter_unparsed: false,
+                },
+                reason: Some(SkipReason::Unreadable {
+                    cause: ReadFailure::Gone,
+                }),
             });
         }
     }
@@ -3660,10 +4054,13 @@ pub(crate) fn reindex_single_file_checked(
         .with_context(|| format!("failed to resolve {}", full.display()))?
     {
         eprintln!("{}", outside_kb_line(rel));
-        return Ok(if deindex_outside_kb(db, kb_path, rel)? {
-            SingleResult::OutsideKnowledgeBaseDeindexed
-        } else {
-            SingleResult::Refused
+        return Ok(Reindexed {
+            result: if deindex_outside_kb(db, kb_path, rel)? {
+                SingleResult::OutsideKnowledgeBaseDeindexed
+            } else {
+                SingleResult::Refused
+            },
+            reason: None,
         });
     }
 
@@ -3683,7 +4080,8 @@ pub(crate) fn reindex_single_file_checked(
     ) {
         let (kind, key) = (size_cap_kind(is_binary_ext), size_cap_key(is_binary_ext));
         eprintln!(
-            "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+            "Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{} to admit it",
+            key.key()
         );
         // (codex P2 round 4) Same as the full scan: the row stays, so without
         // this its recorded size is the last one small enough to index and the
@@ -3693,9 +4091,16 @@ pub(crate) fn reindex_single_file_checked(
         if let Err(e) = db.record_document_sizes(&[(rel, len)]) {
             tracing::warn!("failed to record the grown size of {rel}: {e}");
         }
-        return Ok(SingleResult::Skipped {
-            reason: SKIPPED_TOO_LARGE,
-            frontmatter_unparsed: false,
+        return Ok(Reindexed {
+            result: SingleResult::Skipped {
+                reason: SKIPPED_TOO_LARGE,
+                frontmatter_unparsed: false,
+            },
+            reason: Some(SkipReason::TooLarge {
+                size: len,
+                limit: cap,
+                key,
+            }),
         });
     }
 
@@ -3704,17 +4109,20 @@ pub(crate) fn reindex_single_file_checked(
         registry.limits().binary.cap_bytes(),
         registry.limits().text.cap_bytes(),
     );
-    let (maybe_bytes, measured) =
-        read_for_index_under(&full, rel, cap, size_cap_key(is_binary_ext))
-            .with_context(|| format!("failed to read {}", full.display()))?;
+    let key = size_cap_key(is_binary_ext);
+    let (maybe_bytes, refused) = read_for_index_under(&full, rel, cap, key)
+        .with_context(|| format!("failed to read {}", full.display()))?;
     let Some(bytes) = maybe_bytes else {
         // (codex P2 round 5) The watcher has the same stat-then-read window.
-        if let Some(len) = measured
+        if let Some(len) = measured(&refused)
             && let Err(e) = db.record_document_sizes(&[(rel, len)])
         {
             tracing::warn!("failed to record the grown size of {rel}: {e}");
         }
-        return Ok(SingleResult::Refused);
+        return Ok(Reindexed {
+            result: SingleResult::Refused,
+            reason: Some(reason_of_unread(refused, key)),
+        });
     };
     let hash = sha256_hex_bytes(&bytes);
     let size = bytes.len() as u64;
@@ -3742,7 +4150,7 @@ pub(crate) fn reindex_single_file_checked(
     // list read before it would be written over rows the new pass never sees again.
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     // (#543) `Event`, not `Incremental`: a file that now yields no chunks loses its row here.
-    index_single_disk_entry(
+    index_single_disk_entry_explained(
         db,
         embedder,
         &entry,
@@ -4158,7 +4566,8 @@ pub fn rename_single_file(
     ) {
         let (kind, key) = (size_cap_kind(is_binary_ext), size_cap_key(is_binary_ext));
         eprintln!(
-            "Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{key} to admit it"
+            "Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit); raise [index].{} to admit it",
+            key.key()
         );
         db.rename_document(old_rel, new_rel, FrontmatterTopic::Unread)?;
         // (codex P2 round 11 on PR #291) Crossed a parser: the row is the old parser's
@@ -4184,7 +4593,7 @@ pub fn rename_single_file(
         registry.limits().text.cap_bytes(),
     );
     let read = read_for_index_under(&full, new_rel, cap, size_cap_key(is_binary_ext));
-    let (maybe_bytes, measured) = match read {
+    let (maybe_bytes, refused) = match read {
         Ok(read) => read,
         Err(e) => {
             // Before the move waited for the bytes, a failed read found the row already moved.
@@ -4204,7 +4613,7 @@ pub fn rename_single_file(
             settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
             return Ok(RenameOutcome::RenamedButRefusedAndDropped);
         }
-        if let Some(len) = measured
+        if let Some(len) = measured(&refused)
             && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
         {
             tracing::warn!("failed to record the grown size of {new_rel}: {e}");
@@ -4449,13 +4858,18 @@ fn name_is_left_out(kb_path: &Path, path: &Path) -> bool {
     index_rel_path(kb_path, path).is_some_and(|r| !crate::resources::rel_is_indexable_name(&r))
 }
 
-/// What [`collect_source_files_counted`] collected, and how many entries it
-/// left out for their names.
+/// What [`collect_source_files_counted`] collected, how many entries it
+/// left out for their names, and what it left out and why.
 #[derive(Debug)]
 pub(crate) struct CollectedSources {
     pub(crate) files: Vec<std::path::PathBuf>,
     /// See [`IndexResult::unspellable`].
     pub(crate) unspellable: u32,
+    /// (#660) Each entry the walk left out, one per entry in walk order (no order is
+    /// promised): a name the index cannot hold ([`SkipReason::UnspellableName`], a directory
+    /// once) or a hard link ([`SkipReason::HardLink`]). The path is spelled by
+    /// [`index_rel_path_or_whole`].
+    pub(crate) left_out: Vec<SkippedFile>,
 }
 
 /// [`collect_source_files_under`], also counting what it left out because the
@@ -4483,9 +4897,16 @@ pub(crate) fn collect_source_files_counted(
     // A `Cell`, because `filter_entry` holds its closure for as long as the
     // loop body runs and both of them count.
     let unspellable = std::cell::Cell::new(0u32);
+    // (#660) A `RefCell` for the same reason. Each push borrows within its own statement, so
+    // no guard outlives it into the other caller.
+    let left_out = std::cell::RefCell::new(Vec::<SkippedFile>::new());
     let leave_out = |path: &Path, is_dir: bool| {
         tracing::warn!("{}", crate::resources::unspellable_reason(path, is_dir));
         unspellable.set(unspellable.get() + 1);
+        left_out.borrow_mut().push(SkippedFile {
+            path: index_rel_path_or_whole(kb_path, path),
+            reason: SkipReason::UnspellableName { directory: is_dir },
+        });
     };
 
     // (AX-35) `follow_links(false)` leaves the root alone: walkdir follows a root that is a
@@ -4538,6 +4959,10 @@ pub(crate) fn collect_source_files_counted(
                 // what we were never going to index.
                 if crate::links::is_multiply_linked(entry.path()) {
                     tracing::warn!("{}", crate::links::refusal_reason(entry.path()));
+                    left_out.borrow_mut().push(SkippedFile {
+                        path: index_rel_path_or_whole(kb_path, entry.path()),
+                        reason: SkipReason::HardLink,
+                    });
                     continue;
                 }
                 files.push(entry.into_path());
@@ -4549,6 +4974,7 @@ pub(crate) fn collect_source_files_counted(
     Ok(CollectedSources {
         files,
         unspellable: unspellable.get(),
+        left_out: left_out.into_inner(),
     })
 }
 
@@ -6274,6 +6700,90 @@ mod tests {
         assert_eq!(got.unspellable, 0);
     }
 
+    /// (#660, spec 5.5) Both names of a hard-linked file come back in `left_out` as
+    /// [`SkipReason::HardLink`], spelled as [`index_rel_path_or_whole`] spells them, and neither
+    /// is collected.
+    #[test]
+    fn collect_lists_a_hard_link_as_left_out() {
+        let tmp = mk_tmp("leftout-hardlink");
+        write_file(&tmp.0, "normal.md", "# normal");
+        write_file(&tmp.0, "a.md", "# a");
+        std::fs::hard_link(tmp.0.join("a.md"), tmp.0.join("b.md"))
+            .expect("hard links need no privilege");
+
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&tmp.0, &tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        let mut left: Vec<(String, SkipReason)> = got
+            .left_out
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        left.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            left,
+            vec![
+                (
+                    index_rel_path_or_whole(&tmp.0, &tmp.0.join("a.md")),
+                    SkipReason::HardLink
+                ),
+                (
+                    index_rel_path_or_whole(&tmp.0, &tmp.0.join("b.md")),
+                    SkipReason::HardLink
+                ),
+            ]
+        );
+        assert_eq!(left[0].0, "a.md");
+        assert_eq!(left[1].0, "b.md");
+        let names: Vec<String> = got
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["normal.md".to_string()]);
+        assert_eq!(got.unspellable, 0, "a hard link is not a name left out");
+    }
+
+    /// (#660, spec 5.5 / S6a) The names the walk cannot keep come back in `left_out`: `CON.md`
+    /// as a file, `dir.` and `sp ` as whole directories (one entry each, their files never
+    /// listed). `b.md.` / `b.md ` have no registered extension and never reach the check.
+    #[cfg(windows)]
+    #[test]
+    fn collect_lists_an_unspellable_name_and_dir_as_left_out() {
+        let (_tmp, _cleanup, kb) = kb_with_unspellable_names("leftout-unspellable");
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&kb, &kb, &reg, &excl(&kb, &[])).unwrap();
+        let mut left: Vec<(String, SkipReason)> = got
+            .left_out
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        left.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = vec![
+            (
+                index_rel_path_or_whole(&kb, &kb.join("CON.md")),
+                SkipReason::UnspellableName { directory: false },
+            ),
+            (
+                index_rel_path_or_whole(&kb, &kb.join("dir.")),
+                SkipReason::UnspellableName { directory: true },
+            ),
+            (
+                index_rel_path_or_whole(&kb, &kb.join("sp ")),
+                SkipReason::UnspellableName { directory: true },
+            ),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(left, expected);
+        assert_eq!(got.unspellable, 3);
+        for absent in [r"dir.\x.md", r"dir.\z.md", r"sp \y.md", "b.md.", "b.md "] {
+            let rel = index_rel_path_or_whole(&kb, &kb.join(absent));
+            assert!(
+                !left.iter().any(|(p, _)| *p == rel),
+                "{rel:?} must not be listed: {left:?}"
+            );
+        }
+    }
+
     /// A row stored for a name the walk no longer collects is gone after the
     /// next full run: the sweep deletes what was neither visited nor skipped
     /// (spec §2, no new code -- this pins the contract the design leans on).
@@ -6564,6 +7074,171 @@ mod tests {
             scan.oversize,
             vec![("big.md".to_string(), 10)],
             "the refused file's real length must come back, and only that file's"
+        );
+    }
+
+    /// (#660) Every skip carries its reason at the same index: entry `i` of
+    /// [`DiskScan::skipped`] and entry `i` of [`DiskScan::skipped_why`] are one file.
+    #[test]
+    fn scan_records_why_beside_each_skip() {
+        let tmp = mk_tmp("scanwhy");
+        write_file(&tmp.0, "big.md", "0123456789"); // 10 bytes, over the cap
+        write_file(&tmp.0, "ok.md", "# h"); // 3 bytes, under it
+        write_file(&tmp.0, "huge.md", "0123456789abcdef"); // 16 bytes, over it
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[
+                tmp.0.join("big.md"),
+                tmp.0.join("ok.md"),
+                tmp.0.join("huge.md"),
+            ],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            5,
+        );
+        assert_eq!(
+            scan.skipped,
+            vec!["big.md".to_string(), "huge.md".to_string()]
+        );
+        assert_eq!(
+            scan.skipped_why,
+            vec![
+                SkipReason::TooLarge {
+                    size: 10,
+                    limit: 5,
+                    key: LimitKey::MaxTextFileSize,
+                },
+                SkipReason::TooLarge {
+                    size: 16,
+                    limit: 5,
+                    key: LimitKey::MaxTextFileSize,
+                },
+            ],
+            "one reason per skip, at the same index"
+        );
+    }
+
+    /// (#660) The harness of
+    /// [`test_scan_disk_entries_refuses_a_hard_link_that_appeared_after_the_walk`]: the read's
+    /// refusal is named, not only counted.
+    #[test]
+    fn scan_names_a_hard_link_that_appeared_after_the_walk() {
+        let tmp = mk_tmp("scanwhyhardlink");
+        write_file(&tmp.0, "ok.md", "# ok");
+        write_file(&tmp.0, "secret.txt", "ssh-rsa AAAA...");
+        let linked = tmp.0.join("notes.md");
+        std::fs::hard_link(tmp.0.join("secret.txt"), &linked)
+            .expect("hard links need no privilege");
+
+        let reg = Registry::defaults();
+        let source = vec![tmp.0.join("ok.md"), linked];
+        let scan = scan_disk_entries(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        assert_eq!(scan.skipped, vec!["notes.md".to_string()]);
+        assert_eq!(scan.skipped_why, vec![SkipReason::HardLink]);
+    }
+
+    /// (#660) A file replaced by a named pipe after the walk is refused at the read
+    /// (`O_NONBLOCK` keeps the open from waiting) and named [`SkipReason::NotPlainFile`].
+    #[cfg(unix)]
+    #[test]
+    fn scan_names_a_fifo_not_plain_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = mk_tmp("scanwhyfifo");
+        write_file(&tmp.0, "pipe.md", "# was a note");
+        let path = tmp.0.join("pipe.md");
+        // The walk collected `pipe.md` as a file; it becomes a FIFO before the scan reads it.
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode; the call touches nothing else.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo to test against");
+
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[path],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        assert_eq!(scan.skipped, vec!["pipe.md".to_string()]);
+        assert_eq!(scan.skipped_why, vec![SkipReason::NotPlainFile]);
+    }
+
+    /// (#660 T-L10) A file another process holds open without sharing it (an editor's lock)
+    /// is [`SkipReason::Unreadable`] with [`ReadFailure::InUse`], not a generic failure.
+    #[cfg(windows)]
+    #[test]
+    fn scan_names_a_file_held_without_sharing_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = mk_tmp("scanwhyinuse");
+        write_file(&tmp.0, "held.md", "# held");
+        let path = tmp.0.join("held.md");
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("open the file without sharing");
+
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            std::slice::from_ref(&path),
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        assert_eq!(scan.skipped, vec!["held.md".to_string()]);
+        assert_eq!(
+            scan.skipped_why,
+            vec![SkipReason::Unreadable {
+                cause: ReadFailure::InUse,
+            }]
+        );
+    }
+
+    /// (#660) A file the OS refuses to open is [`SkipReason::Unreadable`] with
+    /// [`ReadFailure::PermissionDenied`]. root reads
+    /// through `chmod 000`, so the test has nothing to show there and returns.
+    #[cfg(unix)]
+    #[test]
+    fn scan_names_an_unreadable_file_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = mk_tmp("scanwhydenied");
+        write_file(&tmp.0, "locked.md", "# locked");
+        let path = tmp.0.join("locked.md");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            std::slice::from_ref(&path),
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+        // Restore so the temp dir's cleanup can remove it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(scan.skipped, vec!["locked.md".to_string()]);
+        assert_eq!(
+            scan.skipped_why,
+            vec![SkipReason::Unreadable {
+                cause: ReadFailure::PermissionDenied,
+            }]
         );
     }
 
@@ -7629,7 +8304,7 @@ mod tests {
         let both = IndexResult {
             chunks_embedded: 5,
             chunks_reused: 135,
-            ..clean
+            ..clean.clone()
         };
         assert_eq!(
             both.summary_line(),
@@ -7641,7 +8316,7 @@ mod tests {
         let reused_only = IndexResult {
             chunks_embedded: 0,
             chunks_reused: 3,
-            ..clean
+            ..clean.clone()
         };
         assert_eq!(
             reused_only.summary_line(),
@@ -7652,7 +8327,7 @@ mod tests {
         );
         let with_unspellable = IndexResult {
             unspellable: 2,
-            ..both
+            ..both.clone()
         };
         assert_eq!(
             with_unspellable.summary_line(),
@@ -11714,5 +12389,503 @@ mod tests {
             )
         );
         assert!(note.is_ascii());
+    }
+
+    /// #660: the [`crate::parser::markdown`], [`crate::parser::txt`] and [`crate::parser::pdf`]
+    /// parsers enabled, with the text cap lowered to 16 bytes so a small
+    /// `.txt` is over it. Every other text fixture of these tests stays at 16 bytes or under.
+    fn i660_explain_registry() -> Registry {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(16),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string(), "pdf".to_string()];
+        Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+            .expect("md + txt + pdf")
+    }
+
+    /// #660 T-L11: the watcher's single-file entry says why each kind of file was not indexed.
+    #[test]
+    fn explained_gives_the_reason_for_each_kind() {
+        let dir = mk_tmp("i660-explained-kinds");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/binary/encrypted.pdf"),
+            dir.0.join("encrypted.pdf"),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.0.join("sjis.txt"), b"\x82\xa0\x82\xa2").unwrap();
+
+        let explain = |rel: &str| {
+            reindex_single_file_explained(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &dir.0,
+                rel,
+                None,
+                &registry,
+            )
+            .unwrap()
+        };
+        let big = explain("big.txt");
+        assert_eq!(
+            big.reason,
+            Some(SkipReason::TooLarge {
+                size: 64,
+                limit: 16,
+                key: LimitKey::MaxTextFileSize,
+            }),
+            "{big:?}"
+        );
+        let encrypted = explain("encrypted.pdf");
+        assert_eq!(
+            encrypted.reason,
+            Some(SkipReason::Encrypted),
+            "{encrypted:?}"
+        );
+        let empty = explain("empty.md");
+        assert_eq!(empty.reason, Some(SkipReason::NoText), "{empty:?}");
+        let sjis = explain("sjis.txt");
+        assert_eq!(sjis.reason, Some(SkipReason::NotUtf8), "{sjis:?}");
+    }
+
+    /// #660 T-L11 (R10): a symlink in the KB is left out on purpose, as the walk leaves it out,
+    /// so the watcher gives it no reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_has_no_reason_at_the_watcher() {
+        let dir = mk_tmp("i660-explained-symlink");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("target.md"), b"# A\n\nhi\n").unwrap();
+        std::os::unix::fs::symlink(dir.0.join("target.md"), dir.0.join("link.md")).unwrap();
+        let got = reindex_single_file_explained(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &dir.0,
+            "link.md",
+            None,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(got.reason, None, "{got:?}");
+        assert!(
+            matches!(
+                got.result,
+                SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// #660 T-L12 (I4): [`Reindexed::reason`] is `Some` exactly for the results the rebuild loop counts as
+    /// skipped, except a path through a link (R10).
+    #[test]
+    fn reason_is_some_exactly_when_the_loop_counts_it() {
+        let dir = mk_tmp("i660-reason-iff-counted");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("plain.md"), b"# A\n\nhi\n").unwrap();
+        std::fs::write(dir.0.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+        std::fs::write(dir.0.join("sjis.txt"), b"\x82\xa0\x82\xa2").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.0.join("plain.md"), dir.0.join("link.md")).unwrap();
+
+        type Case = (&'static str, fn(&SingleResult) -> bool, Option<SkipReason>);
+        let base: Vec<Case> = vec![
+            (
+                "plain.md",
+                |r| matches!(r, SingleResult::Updated { .. }),
+                None,
+            ),
+            (
+                "empty.md",
+                |r| matches!(r, SingleResult::NothingToIndex { .. }),
+                Some(SkipReason::NoText),
+            ),
+            (
+                "big.txt",
+                |r| matches!(r, SingleResult::Skipped { .. }),
+                Some(SkipReason::TooLarge {
+                    size: 64,
+                    limit: 16,
+                    key: LimitKey::MaxTextFileSize,
+                }),
+            ),
+            (
+                "sjis.txt",
+                |r| matches!(r, SingleResult::Skipped { .. }),
+                Some(SkipReason::NotUtf8),
+            ),
+        ];
+        // (R10) Only where a symlink could be made above.
+        let link: Case = ("link.md", |r| matches!(r, SingleResult::Refused), None);
+        let cases = base.into_iter().chain(cfg!(unix).then_some(link));
+        for (rel, variant, reason) in cases {
+            let got = reindex_single_file_explained(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &dir.0,
+                rel,
+                None,
+                &registry,
+            )
+            .unwrap();
+            assert!(variant(&got.result), "{rel}: {got:?}");
+            assert_eq!(got.reason, reason, "{rel}: {got:?}");
+            assert_eq!(
+                got.reason.is_some(),
+                !matches!(
+                    got.result,
+                    SingleResult::Updated { .. }
+                        | SingleResult::Unchanged
+                        | SingleResult::MetadataRefreshed { .. }
+                ) && rel != "link.md",
+                "{rel}: {got:?}"
+            );
+        }
+    }
+
+    /// #660 T-L12b (R4): the reparse's table-rows write that found the row changed under it is a
+    /// changed-during-read skip with that reason; an undisturbed write has none.
+    #[test]
+    fn a_reparsed_table_rows_change_is_changed_during_read() {
+        use crate::parser::docx::fixture::table_docx;
+        let dir = mk_tmp("i660-reparse-table-rows");
+        let (db, path) = file_db(&dir.0);
+        let registry = docx_registry();
+        let chunks = parse_doc(&registry, "docx", "tariff.docx", &table_docx()).chunks;
+        let cases: [(&str, Option<&str>, Option<SkipReason>); 2] = [
+            ("steady.docx", None, None),
+            (
+                "rewritten.docx",
+                Some(
+                    "UPDATE chunks SET content = 'another writer was here' WHERE document_id = (SELECT id FROM documents WHERE path = ?1)",
+                ),
+                Some(SkipReason::ChangedDuringRead),
+            ),
+        ];
+        for (rel, interruption, expected) in cases {
+            write_row(&db, rel, "hash-of-these-bytes", &chunks);
+            let decision = decide_table_rows(&db, rel, &chunks)
+                .unwrap()
+                .expect("a docx row");
+            if let Some(sql) = interruption {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(sql, [rel])
+                    .unwrap();
+            }
+            let result =
+                write_reparsed_table_rows(&db, rel, &decision, &chunks, ContextMode::Off, false)
+                    .unwrap();
+            let explained = explain_reparsed_table_rows(result);
+            assert_eq!(explained.reason, expected, "{rel}: {explained:?}");
+        }
+    }
+
+    /// #660 (spec 9, PR-2): the list invariants every [`rebuild_index`] result keeps, completed
+    /// or cancelled -- I1 (one entry per skipped file), I2 / I6 (paths strictly ascending, so no
+    /// path twice) and I7 ([`IndexResult::unspellable`] is part of [`IndexResult::skipped`]).
+    /// [`IndexResult::embed_rejected`] is per file and not checked (spec 6 I7).
+    fn assert_skip_ledger(r: &IndexResult) {
+        assert_eq!(
+            r.skipped_files.len(),
+            r.skipped as usize,
+            "I1: one entry per skipped file: {r:?}"
+        );
+        assert!(
+            r.skipped_files.windows(2).all(|w| w[0].path < w[1].path),
+            "I2 / I6: paths ascending and unique: {r:?}"
+        );
+        assert!(
+            r.unspellable <= r.skipped,
+            "I7: unspellable is part of skipped: {r:?}"
+        );
+    }
+
+    /// #660: the [`SkippedFile::path`] and [`SkippedFile::reason`] of each entry of a result's
+    /// list, in its order.
+    fn listed(r: &IndexResult) -> Vec<(String, SkipReason)> {
+        r.skipped_files
+            .iter()
+            .map(|f| (f.path.clone(), f.reason))
+            .collect()
+    }
+
+    /// #660: a full run of the given knowledge base with the given [`Registry`] and the stub
+    /// embedder, reporting to the given reporter.
+    fn i660_rebuild(
+        db: &Database,
+        kb: &Path,
+        registry: &Registry,
+        progress: progress::ProgressReporter,
+    ) -> IndexResult {
+        rebuild_index(
+            db,
+            &mut Embedder::stub_for_tests(2),
+            kb,
+            None,
+            false,
+            None,
+            &[],
+            registry,
+            progress,
+            ContextMode::Off,
+        )
+        .unwrap()
+    }
+
+    /// #660 T-L11 (the rebuild side): the full index lists the files of
+    /// [`explained_gives_the_reason_for_each_kind`] with the reason the watcher's single-file
+    /// entry gives each of them (A7).
+    #[test]
+    fn rebuild_and_watcher_agree() {
+        let dir = mk_tmp("i660-rebuild-watcher-agree");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/binary/encrypted.pdf"),
+            dir.0.join("encrypted.pdf"),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.0.join("sjis.txt"), b"\x82\xa0\x82\xa2").unwrap();
+
+        let result = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        let paths: Vec<&str> = result
+            .skipped_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["big.txt", "empty.md", "encrypted.pdf", "sjis.txt"],
+            "{result:?}"
+        );
+        for file in &result.skipped_files {
+            let watcher = reindex_single_file_explained(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &dir.0,
+                &file.path,
+                None,
+                &registry,
+            )
+            .unwrap();
+            assert_eq!(
+                watcher.reason,
+                Some(file.reason),
+                "{}: the rebuild and the watcher disagree: {watcher:?}",
+                file.path
+            );
+        }
+        assert_skip_ledger(&result);
+    }
+
+    /// #660 T-L6b (I3, A8): a run whose scan declines a file over the size cap and whose walk
+    /// leaves out both names of a hard link. The scan's skip is listed and guarded from the
+    /// prune (the two `debug_assert!`s of I3 run in this debug build); the walk's entries are
+    /// listed but not guarded, so the row of a document that became a hard link is pruned and
+    /// counted in [`IndexResult::deleted`], while the file is listed as [`SkipReason::HardLink`].
+    #[test]
+    fn scan_skips_and_walk_hard_links_meet_the_prune_guard() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let dir = mk_tmp("i660-scan-and-walk-prune");
+        let db = reparse_db();
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(16),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string()];
+        let registry =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+                .expect("md + txt");
+        std::fs::write(dir.0.join("h.md"), b"# H\n\nhi\n").unwrap();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+
+        let first = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        assert_eq!(
+            first.updated, 1,
+            "h.md was meant to be indexed first: {first:?}"
+        );
+        assert_skip_ledger(&first);
+
+        std::fs::hard_link(dir.0.join("h.md"), dir.0.join("h2.md"))
+            .expect("hard links need no privilege");
+        let result = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+
+        assert!(
+            result.deleted >= 1,
+            "the hard link's row was guarded: {result:?}"
+        );
+        assert_eq!(db.get_document_hash("h.md").unwrap(), None, "{result:?}");
+        assert_eq!(
+            listed(&result),
+            vec![
+                (
+                    "big.txt".to_string(),
+                    SkipReason::TooLarge {
+                        size: 64,
+                        limit: 16,
+                        key: LimitKey::MaxTextFileSize,
+                    }
+                ),
+                ("h.md".to_string(), SkipReason::HardLink),
+                ("h2.md".to_string(), SkipReason::HardLink),
+            ],
+            "{result:?}"
+        );
+        assert_skip_ledger(&result);
+    }
+
+    /// #660: [`crossed_rename_rewritten_during_the_run`] as it is, but with the given [`progress::CancelToken`] (if any)
+    /// on the reporter and set from the loop's event for the crossed file -- the last document
+    /// of a knowledge base that holds only it.
+    fn i660_crossed_rename_run(
+        tag: &str,
+        (old_rel, new_rel): (&str, &str),
+        scanned: &'static [u8],
+        rewritten: &'static [u8],
+        cancel: Option<progress::CancelToken>,
+    ) -> (TmpDir, Database, IndexResult) {
+        let dir = mk_tmp(tag);
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "docx".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&registry, old_rel, new_rel),
+            "the pair was meant to cross a parser"
+        );
+        std::fs::write(dir.0.join(new_rel), scanned).unwrap();
+        let old = parse_doc(&registry, "md", old_rel, SCANNED_BYTES).chunks;
+        write_row(&db, old_rel, &sha256_hex_bytes(scanned), &old);
+        let full = dir.0.join(new_rel);
+        let (old_owned, new_owned) = (old_rel.to_string(), new_rel.to_string());
+        let token_cb = cancel.clone();
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            match event {
+                progress::ProgressEvent::Renamed { old, new }
+                    if old == old_owned && new == new_owned =>
+                {
+                    std::fs::write(&full, rewritten).unwrap();
+                }
+                // The loop's event for the crossed file, its last document.
+                progress::ProgressEvent::Unchanged { rel, .. } if rel == new_owned => {
+                    if let Some(token) = &token_cb {
+                        token.cancel();
+                    }
+                }
+                _ => {}
+            }
+        }));
+        let progress = match cancel {
+            Some(token) => progress.with_cancel(token),
+            None => progress,
+        };
+        let result = i660_rebuild(&db, &dir.0, &registry, progress);
+        (dir, db, result)
+    }
+
+    /// #660 T-L7 (I2): the further read of a crossed rename replaces the loop's
+    /// [`SkipReason::ChangedDuringRead`] entry: a read that indexes the file takes it off the
+    /// list, and one that skips it lists the new reason instead.
+    #[test]
+    fn a_crossed_rename_reread_replaces_its_entry() {
+        let (_dir, _db, updated) = i660_crossed_rename_run(
+            "i660-crossed-reread-updated",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            SECOND_READ_BYTES,
+            None,
+        );
+        assert_eq!(updated.updated, 1, "{updated:?}");
+        assert_eq!(listed(&updated), vec![], "{updated:?}");
+        assert_skip_ledger(&updated);
+
+        let (_dir, _db, skipped) = i660_crossed_rename_run(
+            "i660-crossed-reread-skipped",
+            ("note.md", "note.docx"),
+            b"not a zip archive, as scanned",
+            b"not a zip archive, as rewritten",
+            None,
+        );
+        assert_eq!(
+            listed(&skipped),
+            vec![("note.docx".to_string(), SkipReason::CorruptOrUnsupported)],
+            "{skipped:?}"
+        );
+        assert_skip_ledger(&skipped);
+    }
+
+    /// #660 T-L8b (spec 7): a run cancelled from the loop's event for its last document, a
+    /// crossed rename kept awaiting, stops before the further read (C3 does not hold back a
+    /// renamed path; the further read breaks before its first entry; C4 stops the run). The
+    /// entry stays the loop's [`SkipReason::ChangedDuringRead`], and the result keeps I1.
+    #[test]
+    fn a_run_cancelled_before_the_reread_keeps_changed_during_read() {
+        let (_dir, _db, result) = i660_crossed_rename_run(
+            "i660-crossed-reread-cancelled",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            SECOND_READ_BYTES,
+            Some(progress::CancelToken::new()),
+        );
+        assert!(result.cancelled, "{result:?}");
+        assert_eq!(result.updated, 0, "the further read ran: {result:?}");
+        assert_eq!(
+            listed(&result),
+            vec![("note.md".to_string(), SkipReason::ChangedDuringRead)],
+            "{result:?}"
+        );
+        assert_skip_ledger(&result);
+    }
+
+    /// #660 T-L7b (I2, path by path): two names whose lossy spelling is the same
+    /// (`a\u{FFFD}.md`), both empty, are one entry and one skip. Linux only: macOS refuses to
+    /// create a name that is not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn colliding_lossy_names_count_once() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = mk_tmp("i660-lossy-collision");
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        for name in [&b"a\xff.md"[..], &b"a\xfe.md"[..]] {
+            std::fs::write(dir.0.join(std::ffi::OsStr::from_bytes(name)), b"").unwrap();
+        }
+        let result = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        assert_eq!(result.skipped, 1, "{result:?}");
+        assert_eq!(
+            listed(&result),
+            vec![("a\u{FFFD}.md".to_string(), SkipReason::NoText)],
+            "{result:?}"
+        );
+        assert_skip_ledger(&result);
     }
 }
