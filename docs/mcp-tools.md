@@ -66,11 +66,11 @@ Both keys are present even when nothing was skipped (an empty array and 0). They
 | `changed_during_read` | changed between the scan and the read; the next run reads it again | — |
 | `not_plain_file` | was not a regular file when read (a symlink, device or pipe swapped in after the walk) | — |
 | `hard_link` | has more than one name (a hard link) | — |
-| `unspellable_name` | has a name `get_document` and a `kb://` URI cannot take ([ADR-0023](decisions/0023-index-only-names-the-server-can-open.md)) | `directory`: `true` when a whole directory was left out (counted once, whether or not it held a file the index would have read) |
+| `unspellable_name` | has a name `get_document` and a `kb://` URI cannot take ([ADR-0023](decisions/0023-index-only-names-the-server-can-open.md)) | `directory`: `true` when a whole directory was left out, `false` for a file (counted once, whether or not it held a file the index would have read) |
 
 `limit_key` names a key under `[index]` in `groove.toml` that would admit the file if raised. A file that is on disk but never considered (`.grooveignore`, `exclude_dirs`, unsupported extensions, Office lock files `~$*`, symlinks seen by the walk) has no entry.
 
-**The `reason` vocabulary.** New values may be added. When that happens, a file that was reported with a generic value (`corrupt_or_unsupported` / `no_text`) may move to a more specific value (a newly added one, or one that already exists). Treat a value you do not know as a generic failure. Moving between two specific values, or removing or renaming a value, would be a breaking change.
+**The `reason` vocabulary.** New values may be added. When that happens, a file that was reported with a generic value (`corrupt_or_unsupported` / `no_text`) may move to a more specific value (a newly added one, or one that already exists). Treat a value you do not know as a generic failure. Moving between two specific values, moving from a specific value to a generic one, or removing or renaming a value, would be a breaking change.
 
 ## Prompts
 

@@ -620,7 +620,16 @@ fn skipped_file_json(f: &indexer::SkippedFile) -> SkippedFileJson {
         SkipReason::EmbedRejected { http_status } => json.http_status = Some(http_status),
         SkipReason::Unreadable { cause } => json.cause = Some(cause.kind()),
         SkipReason::UnspellableName { directory } => json.directory = Some(directory),
-        _ => {}
+        // Listed rather than `_`, so a new variant that carries a detail fails to compile here.
+        SkipReason::Encrypted
+        | SkipReason::CorruptOrUnsupported
+        | SkipReason::NotUtf8
+        | SkipReason::TextUndecodable
+        | SkipReason::TooLittleText
+        | SkipReason::NoText
+        | SkipReason::ChangedDuringRead
+        | SkipReason::NotPlainFile
+        | SkipReason::HardLink => {}
     }
     json
 }

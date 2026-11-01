@@ -66,11 +66,11 @@ reader の文は、起動の時にロックを持っていた process と、今�
 | `changed_during_read` | 走査と読み込みの間に変わった。次の run で読み直す | — |
 | `not_plain_file` | 読む時に通常のファイルでなかった (walk の後で symlink・デバイス・pipe に差し替わった) | — |
 | `hard_link` | 名前が 2 つ以上ある (hard link) | — |
-| `unspellable_name` | `get_document` と `kb://` URI が扱えない名前を持つ ([ADR-0023](decisions/0023-index-only-names-the-server-can-open.ja.md)) | `directory`: ディレクトリごと外したときは `true` (中に索引の対象のファイルがあったかどうかに関わらず 1 件と数える) |
+| `unspellable_name` | `get_document` と `kb://` URI が扱えない名前を持つ ([ADR-0023](decisions/0023-index-only-names-the-server-can-open.ja.md)) | `directory`: ディレクトリごと外したときは `true`、ファイルなら `false` (中に索引の対象のファイルがあったかどうかに関わらず 1 件と数える) |
 
 `limit_key` は、上げればそのファイルが入る `groove.toml` の `[index]` の key の名前。ディスクにはあるが最初から対象にしないファイル (`.grooveignore`、`exclude_dirs`、未対応の拡張子、Office のロックファイル `~$*`、walk が見た symlink) は entry にならない。
 
-**`reason` の語彙について。** 新しい値が足されることがある。そのとき、今まで汎用の値 (`corrupt_or_unsupported` / `no_text`) で報告していたファイルが、より具体的な値 (新しく足す値か、既にある具体的な値) に移ることがある。知らない値は汎用の失敗として扱うこと。具体的な値どうしの移動や、値の削除・改名は互換性を壊す変更になる。
+**`reason` の語彙について。** 新しい値が足されることがある。そのとき、今まで汎用の値 (`corrupt_or_unsupported` / `no_text`) で報告していたファイルが、より具体的な値 (新しく足す値か、既にある具体的な値) に移ることがある。知らない値は汎用の失敗として扱うこと。具体的な値どうしの移動、具体的な値から汎用の値への移動、値の削除・改名は互換性を壊す変更になる。
 
 ## MCP プロンプト
 
