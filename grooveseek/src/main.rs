@@ -3137,6 +3137,10 @@ mod documented_flags {
         const FOREIGN: &[(&str, &str)] = &[
             ("user", "systemctl --user, in the service migration note"),
             ("debug", "groove-tray --debug, a separate binary"),
+            (
+                "config-home",
+                "groove-tray --config-home, which the tray shortcut passes; a separate binary",
+            ),
             ("release", "cargo build --release, in the README"),
             (
                 "include",

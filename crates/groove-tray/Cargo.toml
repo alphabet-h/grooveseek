@@ -49,7 +49,9 @@ dirs = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
 # Stopping the daemon goes through OpenProcess / QueryFullProcessImageNameW /
-# TerminateProcess (see src/process.rs). Opening the web UI goes through
+# TerminateProcess, now in groove-winproc (kuriya #650; src/process.rs keeps
+# the tray's names). `Win32_System_Threading` stays for CREATE_NO_WINDOW
+# (src/powershell.rs). Opening the web UI goes through
 # ShellExecuteW (see src/ui.rs) — AU-12 replaced `cmd /c start`, which parsed
 # the URL as a command line. Already in the tree transitively via
 # tao/tray-icon; declared directly because we call it ourselves.
@@ -59,6 +61,9 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# (kuriya #650) The process stop shared with `groove service uninstall`, and
+# the record groove-svc writes of the server it started.
+groove-winproc = { path = "../groove-winproc" }
 
 # NOTE (codex P1 round 1 on PR #61): keep `winresource` as an unconditional
 # build-dep. Restricting it to `[target.'cfg(windows)'.build-dependencies]`

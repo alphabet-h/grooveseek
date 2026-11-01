@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 /// Build the PowerShell script that creates a shell:startup `.lnk` shortcut
-/// pointing to `tray_exe_path` with `--service-name <service>` as Arguments.
+/// pointing to `tray_exe_path` with `--service-name <service> --config-home "<working_directory>"` as Arguments.
 /// `working_directory` is set on the shortcut so the tray's logs / config
 /// resolution start from a deterministic CWD.
 pub fn build_install_script(
@@ -19,7 +19,18 @@ pub fn build_install_script(
 ) -> String {
     let lnk_name = ps_quote(&format!("groove-tray-{}.lnk", service_name));
     let target = ps_quote(&tray_exe_path.display().to_string());
-    let args = ps_quote(&format!("--service-name {}", service_name));
+    // (kuriya #650) The working directory is the service's config home (both
+    // callers of `install_autostart` pass it), so the tray is told it as
+    // `--config-home`: `groove.toml` is read there and the record groove-svc
+    // writes of the server is found there, also for a service installed under
+    // `GROOVE_CONFIG_HOME`. Quoted for the tray's own command line (a config
+    // home can contain spaces); it never ends in a backslash, which would
+    // escape the closing quote.
+    let args = ps_quote(&format!(
+        "--service-name {} --config-home \"{}\"",
+        service_name,
+        working_directory.display()
+    ));
     let wd = ps_quote(&working_directory.display().to_string());
     let icon = ps_quote(&format!("{},0", tray_exe_path.display()));
     let desc = ps_quote(&format!("groove tray monitor for service {}", service_name));
@@ -197,6 +208,25 @@ mod tests {
         assert!(s.contains("--service-name groove"));
         assert!(s.contains("groove-tray-groove.lnk"));
         assert!(s.contains("WindowStyle = 7"));
+    }
+
+    /// (kuriya #650) The shortcut tells the tray the config home, quoted for
+    /// a path with spaces.
+    #[test]
+    fn install_script_passes_the_config_home() {
+        let s = build_install_script(
+            "work",
+            &PathBuf::from(r"C:\Users\x\.cargo\bin\groove-tray.exe"),
+            &PathBuf::from(r"D:\my configs\groove\work"),
+        );
+        let args = s
+            .lines()
+            .find(|l| l.contains("$shortcut.Arguments"))
+            .expect("Arguments line");
+        assert!(
+            args.contains(r#"--service-name work --config-home "D:\my configs\groove\work""#),
+            "{args}"
+        );
     }
 
     #[test]

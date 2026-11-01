@@ -9,7 +9,7 @@ Markdown / プレーンテキスト / PDF / Office 文書**およびソースコ
 **Cargo workspace 構成**: 本体は `grooveseek/` (lib + bin `groove`)。`crates/` に
 `groove-grammar-abi` (tree-sitter grammar を受け渡す契約)、`groove-grammar-python` / `groove-grammar-php`
 (それぞれの grammar の `cdylib`、独立した release asset)、`groove-tray` / `groove-svc`
-(Windows 専用) が並ぶ。**ソースは repo 直下の `src/` ではなく `grooveseek/src/`**。
+(Windows 専用)、`groove-winproc` (Windows のプロセスを確かめて止める内部 lib。groove / svc / tray が共有、配布物なし) が並ぶ。**ソースは repo 直下の `src/` ではなく `grooveseek/src/`**。
 
 詳細:
 - **レビューで見る不変条件**: [AGENTS.md](./AGENTS.md) の `## Code Review Rules` (英語)。

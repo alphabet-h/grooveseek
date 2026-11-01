@@ -23,6 +23,13 @@ targets = ["x86_64-pc-windows-msvc"]
 name = "groove-svc"
 path = "src/main.rs"
 
+# (kuriya #650) The record of the server it starts, beside the service's
+# groove.toml, with the child's creation time read from its handle. On every
+# target, not only Windows: the record type compiles everywhere (serde only),
+# and the crate's docs link it on the Linux / macOS CI legs too.
+[dependencies]
+groove-winproc = { path = "../groove-winproc" }
+
 # rustdoc lint levels come from the workspace root, where the reasoning lives.
 [lints]
 workspace = true

@@ -88,6 +88,58 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   path resolved once, the directory symlinks and junctions above it included, so a directory link
   repointed during the purge no longer moves the removal to another database, and a `.groove.db`
   symlink repointed meanwhile is left in place with a warning.
+- **`groove service uninstall` stops the running server on Windows.** The scheduled task's
+  Action is `groove-svc.exe`, which starts `groove.exe serve` detached and exits, so the task
+  is always `Ready` and `schtasks /End` stopped nothing: the server kept running after
+  `uninstall`, and `uninstall --purge --yes` waited out its 10 seconds for the writer lock every
+  time, then refused and kept the database and the config home. `groove-svc` now records the
+  server it starts, its pid and the creation time the OS gave that process, in
+  `serve-pid.json` in the service's config home (written to a temporary file and renamed), and
+  uninstall, with or without `--purge`, stops that process: only when the pid is still
+  `groove.exe` with exactly the recorded creation time, so a pid reused since, even by another
+  groove, is left alone. It waits up to 10 seconds for the server to exit; with `--purge`, the
+  wait of up to 10 seconds for the writer lock follows, so about 20 seconds at most. The
+  index's writer lock is not used to find the server: when another server on the same knowledge
+  base (such as a client's stdio server) took the lock first, the service's server holds none,
+  and the holder is not the service's. A server that was started before this record existed
+  (by an older `groove-svc`, or by an Action that runs `groove.exe` itself) is not stopped: the
+  uninstall warns, names the lock's holder as a lead when there is one, and without `--purge`
+  still exits 0; `--purge` then waits for the lock and refuses as before. A recorded server that
+  is running but cannot be stopped makes the uninstall fail, with or without `--purge` (which
+  then deletes nothing), naming its pid and how to stop it. `groove-svc` removes the previous
+  record before it starts the server, and a server whose record it then cannot write is
+  stopped again and the start fails (in the task history): no server is left running out of the
+  record, and uninstall finds no record (a warning) rather than an old one read as "that server
+  has exited". To find that record, uninstall, `install --force` and the service's stop use the
+  config home the registered task names (the `--config <config home>\groove.toml` of its
+  Action, read before the task is removed) rather than whatever `GROOVE_CONFIG_HOME` is now,
+  say on stderr when the two differ, and fall back to `GROOVE_CONFIG_HOME` or the default when
+  the task is gone or names none; a wrong value there stops nothing, since the stop checks the
+  process. What `--purge` deletes is never taken from the task: only the config home this shell
+  resolves (`GROOVE_CONFIG_HOME` or the default), and when the task names a different one (or
+  the shell resolves none) the purge is refused before anything is touched — the task, its
+  server and every file stay — with both paths and the `GROOVE_CONFIG_HOME` that makes them
+  agree. A start of the task
+  while the recorded server runs (a manual `/Run`, the next logon, the tray's Start) spawns
+  nothing and keeps the record, instead of starting a second server that fails to bind and
+  taking the running one out of the record; the check, the spawn and the record, and every
+  read-then-stop of the record, are serialized per config home by a lock file,
+  `serve-pid.lock`, beside it. `service install
+  --force` stops the server the previous install started before it re-registers and starts
+  the task, so the new server does not meet the old one on the port; one that is running and
+  cannot be stopped fails the install before anything is re-registered. The refusals also give
+  `taskkill /F /PID <pid>`: a server started without a console is refused by
+  `taskkill /PID <pid>` alone ("can only be terminated forcefully").
+  Removing a task that is already gone no longer prints schtasks'
+  `ERROR: The system cannot find the file specified.` twice; a `/Delete` that fails while
+  the task stays registered is now an error instead of "Removed service unit", and one whose
+  task cannot be checked afterwards is a warning. The tray's Stop
+  uses the same record first, with the same check, and falls back to the status endpoint's pid
+  as before; the tray's startup shortcut now passes the service's config home
+  (`--config-home`), so the tray finds `groove.toml` and the record for a service installed
+  under `GROOVE_CONFIG_HOME` too (an existing shortcut keeps the default place until
+  `tray-install` or `install --with-tray` is run again); its process handling moved to a new internal crate, `groove-winproc`, which
+  `groove` and `groove-svc` share. Linux and macOS are unchanged (kuriya #650).
 
 ### Documentation
 

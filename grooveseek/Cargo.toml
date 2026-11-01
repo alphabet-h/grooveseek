@@ -171,6 +171,9 @@ groove-tray = { path = "../crates/groove-tray" }
 # count at all. Already in the dependency tree at this version (via the tray and
 # several transitive deps), so this adds no new build.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# (kuriya #650) Stopping the server groove-svc recorded, on uninstall
+# (`service/serve_stop.rs`); the same crate the tray stops it with.
+groove-winproc = { path = "../crates/groove-winproc" }
 
 [features]
 # (feature-56) The Rust grammar, compiled in. On by default: it is the language

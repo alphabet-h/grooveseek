@@ -60,6 +60,61 @@ fn run_schtasks(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// [`run_schtasks`] with stdout and stderr captured instead of shown, for the
+/// calls whose result is ignored.
+fn run_schtasks_quiet(args: &[&str]) -> Result<()> {
+    let out = Command::new("schtasks")
+        .args(args)
+        .output()
+        .with_context(|| format!("could not run schtasks {}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "schtasks {} failed (status: {})",
+            args.join(" "),
+            out.status
+        ));
+    }
+    Ok(())
+}
+
+/// What [`ServiceBackend::uninstall`] reports for `schtasks /Delete`, given whether the task is
+/// still registered afterwards (`None`: that could not be found out):
+/// success, a task that is not registered (already gone: nothing to remove,
+/// which is what uninstall asks for), a failure that left the task
+/// registered, which is an error, or a failure that cannot be told apart,
+/// which is a warning (`Ok(Some(..))`) rather than taken for either.
+fn delete_outcome(deleted: Result<()>, still_registered: Option<bool>) -> Result<Option<String>> {
+    match (deleted, still_registered) {
+        (Ok(()), _) | (Err(_), Some(false)) => Ok(None),
+        (Err(e), Some(true)) => Err(e.context("the scheduled task is still registered")),
+        (Err(e), None) => Ok(Some(format!(
+            "Warning: {e}, and whether the scheduled task is still registered could not be \
+             checked; see `schtasks /Query /TN <task>`"
+        ))),
+    }
+}
+
+/// Whether the root-folder task `task` is registered, from the CSV listing
+/// [`ServiceBackend::list`] reads too (only the ASCII name column is matched, so the code-page
+/// encoding of the output does not matter). `None` when the listing itself
+/// fails: then nothing can be said either way.
+fn task_registered(task: &str) -> Option<bool> {
+    let out = Command::new("schtasks")
+        .args(["/Query", "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.split(',').next().is_some_and(|f| {
+            f.trim_matches('"')
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case(task)
+        })
+    }))
+}
+
 /// The subcommand word a console-binary Action has to supply itself.
 ///
 /// **Invariant, enforced jointly with `crates/groove-svc/src/main.rs`:** exactly
@@ -263,6 +318,121 @@ fn build_status_script(task: &str) -> String {
     )
 }
 
+/// (kuriya #650) The script that prints the registered task's Action
+/// arguments: the `-Argument` [`build_register_script`] gave it, as Task
+/// Scheduler stored it. Pinned to the root folder like [`build_status_script`].
+fn build_action_arguments_script(task: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         (Get-ScheduledTask -TaskPath '\\' -TaskName '{task}').Actions[0].Arguments"
+    )
+}
+
+/// Split a command line into words the way the child's `CommandLineToArgvW`
+/// does for what [`build_register_script`] writes: whitespace separates, and
+/// `"` starts and ends a quoted run (a path cannot contain `"`, and
+/// [`quote_child_argument`] adds nothing else to unescape).
+fn split_child_arguments(arguments: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    for c in arguments.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// The config home a registered task's Action arguments name: the directory
+/// of the `groove.toml` after `--config` (BU-07), the inverse of what
+/// [`build_register_script`] writes. `None` when there is no `--config` (an
+/// install from before BU-07) or it names no directory.
+fn config_home_in_arguments(arguments: &str) -> Option<PathBuf> {
+    let words = split_child_arguments(arguments);
+    let at = words.iter().position(|w| w == "--config")?;
+    let toml = Path::new(words.get(at + 1)?);
+    toml.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// The config home of the service as its registered task names it, read
+/// before the task is removed (kuriya #650). `None` when there is no such
+/// task or its arguments name none.
+pub(crate) fn registered_config_home(service_name: &str) -> Option<PathBuf> {
+    let task = task_name(service_name);
+    let out =
+        run_powershell_capture(&build_action_arguments_script(&task), "Get-ScheduledTask").ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let arguments = decode_value(&out.stdout, "Get-ScheduledTask stdout").ok()?;
+    config_home_in_arguments(arguments.trim())
+}
+
+/// Which config home to act on: the registered task's (`from_task`) when
+/// there is one, because the task is what runs the service and groove-svc
+/// records the server beside the `groove.toml` it names; otherwise the one
+/// resolved now (`resolved`: `GROOVE_CONFIG_HOME` or the OS default). Also a
+/// note for stderr when the two differ, saying which was used.
+pub(crate) fn choose_config_home(
+    from_task: Option<PathBuf>,
+    resolved: Option<PathBuf>,
+) -> (Option<PathBuf>, Option<String>) {
+    match (from_task, resolved) {
+        (Some(task), Some(now)) if !same_path(&task, &now) => {
+            let note = format!(
+                "Note: the scheduled task names the config home {}, not {} (from \
+                 GROOVE_CONFIG_HOME or the default); using the task's.",
+                task.display(),
+                now.display()
+            );
+            (Some(task), Some(note))
+        }
+        (Some(task), _) => (Some(task), None),
+        (None, now) => (now, None),
+    }
+}
+
+/// Windows paths compare case-insensitively.
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+}
+
+/// The config home of `service_name` to act on: the registered task's when
+/// it can be read, else `resolved` ([`choose_config_home`]); says on stderr
+/// when they differ. Call it before the task is removed.
+pub(crate) fn service_config_home(
+    service_name: &str,
+    resolved: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let (home, note) = choose_config_home(registered_config_home(service_name), resolved);
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    home
+}
+
 /// Map the `TaskState` word to a [`ServiceState`].
 ///
 /// **This reports the state of the scheduled task, not of the daemon.** With
@@ -376,12 +546,78 @@ fn register_via_powershell(
     Ok(())
 }
 
+impl TaskScheduler {
+    /// Stop the server `groove-svc` recorded in `config_home`, when the
+    /// recorded pid is still that process (kuriya #650, [`super::serve_stop`]),
+    /// and say what happened. `schtasks /End` cannot: the task's process is
+    /// the launcher, which has already exited.
+    fn stop_recorded(&self, config_home: &Path) -> super::serve_stop::ServeStop {
+        super::serve_stop::stop_recorded_serve(config_home)
+    }
+
+    /// `install --force`: stop the server the previous install started, before
+    /// anything is registered or run. One that is running and cannot be
+    /// stopped fails the install here, with the task left as it was: starting
+    /// the new one would put a second server on the port (it would fail to
+    /// bind and exit) and replace the record of the one still running, and
+    /// running the same command again once that pid is stopped finishes the
+    /// install (`groove.toml` has been rewritten already, as on any failure
+    /// of this step).
+    fn stop_previous_server(&self, ctx: &InstallContext) -> Result<()> {
+        use super::serve_stop::ServeStop;
+        // The previous server was recorded beside the groove.toml the task
+        // registered then names, which is not this install's config home when
+        // GROOVE_CONFIG_HOME differs between the two installs.
+        let previous_home = service_config_home(&ctx.service_name, Some(ctx.config_home.clone()))
+            .unwrap_or_else(|| ctx.config_home.clone());
+        match self.stop_recorded(&previous_home) {
+            ServeStop::Stopped { pid } => {
+                eprintln!("Stopped the groove server the previous install started (pid {pid}).");
+            }
+            ServeStop::NotRunning { .. } => {}
+            ServeStop::NoRecord { path } if ctx.auto_start => eprintln!(
+                "Warning: there is no record of a server the previous install started ({}); \
+                 a server started before groove kept that record is not stopped, and if one \
+                 is still running on {}, the new one cannot bind it.",
+                path.display(),
+                ctx.bind
+            ),
+            ServeStop::NoRecord { .. } => {}
+            ServeStop::BadRecord { path, why } => eprintln!(
+                "Warning: {} is not a record of the server the previous install started \
+                 ({why}), so no server was stopped.",
+                path.display()
+            ),
+            ServeStop::NotStopped { pid, why } => {
+                return Err(anyhow!(
+                    "the groove server the previous install started (pid {pid}, as recorded in \
+                     {}) is running and could not be stopped: {why}. Nothing was re-registered. \
+                     Stop it (`taskkill /PID {pid}`, or `taskkill /F /PID {pid}` when that \
+                     answers the process can only be terminated forcefully), then run the \
+                     install again.",
+                    groove_winproc::ServeRecord::path_in(&previous_home).display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ServiceBackend for TaskScheduler {
     fn install(&self, ctx: &InstallContext) -> Result<()> {
         // v0.8.3: skip XML entirely — pass Action/Trigger/Settings directly
         // to Register-ScheduledTask (= the parameter set that auto-populates
         // the Principal from the current logon identity, the only path that
         // works without admin elevation on a non-elevated shell).
+        //
+        // (kuriya #650) `--force` over an install whose server is running:
+        // stop that server first. Otherwise `/Run` below starts a second one,
+        // which cannot bind the port and exits, and groove-svc replaces the
+        // record with the one that exited, leaving the running server with
+        // no record for uninstall to find.
+        if ctx.force {
+            self.stop_previous_server(ctx)?;
+        }
         register_via_powershell(
             &ctx.service_name,
             &ctx.binary_path,
@@ -395,9 +631,27 @@ impl ServiceBackend for TaskScheduler {
         Ok(())
     }
     fn uninstall(&self, service_name: &str) -> Result<()> {
+        // `/End` stops the server only on an install whose Action is
+        // `groove.exe` itself (before v0.9.1); with the `groove-svc.exe`
+        // launcher the task's process has already exited, and the uninstall
+        // command stops the server groove-svc recorded (`serve_stop`, kuriya
+        // #650). Its result is ignored, as before. The output of both calls is
+        // captured rather than shown: a task that is already gone printed
+        // schtasks' "ERROR: The system cannot find the file specified." twice
+        // on a successful uninstall. A `/Delete` that fails is then told apart
+        // by asking whether the task is still registered: gone is what was
+        // asked for; still there is an error, not "Removed service unit";
+        // unknown is a warning.
         let task = task_name(service_name);
-        let _ = run_schtasks(&["/End", "/TN", &task]);
-        let _ = run_schtasks(&["/Delete", "/TN", &task, "/F"]);
+        let _ = run_schtasks_quiet(&["/End", "/TN", &task]);
+        let deleted = run_schtasks_quiet(&["/Delete", "/TN", &task, "/F"]);
+        let still_registered = match deleted {
+            Ok(()) => Some(false),
+            Err(_) => task_registered(&task),
+        };
+        if let Some(warning) = delete_outcome(deleted, still_registered)? {
+            eprintln!("{warning}");
+        }
         Ok(())
     }
     fn status(&self, service_name: &str) -> Result<ServiceState> {
@@ -439,8 +693,28 @@ impl ServiceBackend for TaskScheduler {
         }
         Ok(result)
     }
+    /// `schtasks /End` alone stops nothing on an install whose Action is the
+    /// `groove-svc.exe` launcher (the task is `Ready` while the server runs),
+    /// so the server `groove-svc` recorded is stopped, when the recorded pid
+    /// is still that process (kuriya #650, [`super::serve_stop`]). Without a
+    /// record there is nothing to go by, and nothing more is stopped.
     fn stop(&self, service_name: &str) -> Result<()> {
-        run_schtasks(&["/End", "/TN", &task_name(service_name)])
+        use super::serve_stop::ServeStop;
+        let _ = run_schtasks_quiet(&["/End", "/TN", &task_name(service_name)]);
+        // The registered task's config home first, then the one resolved now
+        // (kuriya #650): the record is beside the groove.toml the task names.
+        let resolved = super::resolve_config_home(service_name).ok();
+        let Some(home) = service_config_home(service_name, resolved) else {
+            return Err(anyhow!(
+                "could not resolve the config home of '{service_name}' to find its server"
+            ));
+        };
+        match self.stop_recorded(&home) {
+            ServeStop::NotStopped { pid, why } => Err(anyhow!(
+                "could not stop the groove server of '{service_name}' (pid {pid}): {why}"
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -473,6 +747,111 @@ mod tests {
         assert!(
             !script.contains("schtasks"),
             "the CSV path is what carried the defect: {script}"
+        );
+    }
+
+    /// The `-Argument` value a register script hands to Task Scheduler, with
+    /// PowerShell's `''` undone: what `Actions[0].Arguments` reads back.
+    fn stored_arguments(script: &str) -> String {
+        let start =
+            script.find(" -Argument '").expect("an -Argument clause") + " -Argument '".len();
+        let end = script[start..]
+            .find("' -WorkingDirectory")
+            .expect("the clause ends before -WorkingDirectory")
+            + start;
+        script[start..end].replace("''", "'")
+    }
+
+    /// kuriya #650. The config home read back from a registered task is the
+    /// one install registered: the parse is the inverse of the register
+    /// script's quoting, for both Action shapes and for a path with spaces and
+    /// an apostrophe.
+    #[test]
+    fn the_config_home_is_read_back_from_what_install_registers() {
+        let home = PathBuf::from(r"C:\Users\Mary O'Brien\AppData\Roaming\groove\work");
+        for serve_argument in ["", "serve"] {
+            let target = ActionTarget {
+                execute_path: PathBuf::from(r"C:\bin\groove-svc.exe"),
+                serve_argument: serve_argument.to_string(),
+                used_svc_launcher: serve_argument.is_empty(),
+            };
+            let script = build_register_script("work", &target, &home, true, false);
+            let arguments = stored_arguments(&script);
+            assert_eq!(
+                config_home_in_arguments(&arguments),
+                Some(home.clone()),
+                "{arguments}"
+            );
+        }
+        assert_eq!(config_home_in_arguments("serve"), None, "before BU-07");
+        assert_eq!(config_home_in_arguments("--config"), None);
+        assert_eq!(config_home_in_arguments(r#"--config "groove.toml""#), None);
+    }
+
+    /// kuriya #650. The registered task's config home wins over the one
+    /// resolved now, with a note when they differ; without a task, the
+    /// resolved one is used.
+    #[test]
+    fn the_registered_config_home_wins_over_the_resolved_one() {
+        let task = PathBuf::from(r"D:\cfg\groove\work");
+        let now = PathBuf::from(r"C:\Users\me\AppData\Roaming\groove\work");
+        let (home, note) = choose_config_home(Some(task.clone()), Some(now.clone()));
+        assert_eq!(home, Some(task.clone()));
+        let note = note.expect("a note when they differ");
+        assert!(
+            note.contains(r"D:\cfg\groove\work") && note.contains("using the task's"),
+            "{note}"
+        );
+
+        let (home, note) = choose_config_home(
+            Some(task.clone()),
+            Some(PathBuf::from(r"d:\CFG\groove\work")),
+        );
+        assert_eq!(home, Some(task.clone()));
+        assert_eq!(
+            note, None,
+            "the same path in another case is not a difference"
+        );
+
+        assert_eq!(
+            choose_config_home(None, Some(now.clone())),
+            (Some(now), None)
+        );
+        assert_eq!(
+            choose_config_home(Some(task.clone()), None),
+            (Some(task), None)
+        );
+        assert_eq!(choose_config_home(None, None), (None, None));
+    }
+
+    /// kuriya #650 (I2). Silencing `schtasks /Delete` must not silence a real
+    /// failure: only a task that is no longer registered counts as removed.
+    #[test]
+    fn a_failed_delete_is_an_error_only_while_the_task_is_still_registered() {
+        assert_eq!(delete_outcome(Ok(()), Some(false)).unwrap(), None);
+        assert_eq!(
+            delete_outcome(Err(anyhow!("schtasks /Delete failed")), Some(false)).unwrap(),
+            None,
+            "already gone is what uninstall asked for"
+        );
+        let err = delete_outcome(Err(anyhow!("schtasks /Delete failed")), Some(true))
+            .expect_err("a task still registered was not removed");
+        assert!(format!("{err:#}").contains("still registered"), "{err:#}");
+        // M-e: a check that itself failed is neither "gone" nor an error.
+        let warning = delete_outcome(Err(anyhow!("schtasks /Delete failed")), None)
+            .unwrap()
+            .expect("a warning");
+        assert!(warning.starts_with("Warning:"), "{warning}");
+        assert!(warning.contains("could not be checked"), "{warning}");
+    }
+
+    /// The listing the registration check reads answers for a task that
+    /// certainly does not exist.
+    #[test]
+    fn a_task_that_does_not_exist_is_not_registered() {
+        assert_eq!(
+            task_registered("groove-650-definitely-not-registered-a9f3"),
+            Some(false)
         );
     }
 

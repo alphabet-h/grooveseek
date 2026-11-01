@@ -12,6 +12,12 @@ pub struct Config {
     pub base_url: String,
     pub status_url: String,
     pub ui_url: String,
+    /// (kuriya #650) The service's config home when the tray was told it
+    /// (`--config-home`, which the startup shortcut passes): where
+    /// `groove.toml` was read and where `groove-svc` records the server it
+    /// starts. `None` for a tray started without it (an older shortcut),
+    /// which then looks in the default place.
+    pub config_home: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -91,6 +97,7 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
         base_url,
         status_url,
         ui_url,
+        config_home: None,
     })
 }
 

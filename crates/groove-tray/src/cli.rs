@@ -16,6 +16,12 @@ pub struct Cli {
     #[arg(long)]
     pub kb_path: Option<PathBuf>,
 
+    /// The service's config home, as `groove service install` resolved it
+    /// (the startup shortcut passes it): `groove.toml` is read there, and
+    /// Stop / Restart find the server groove-svc recorded there
+    #[arg(long)]
+    pub config_home: Option<PathBuf>,
+
     /// Attach a console for debugging (release builds otherwise hide stdio)
     #[arg(long)]
     pub debug: bool,

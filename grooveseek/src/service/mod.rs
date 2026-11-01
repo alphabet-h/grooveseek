@@ -17,6 +17,8 @@ use std::path::PathBuf;
 pub mod install;
 pub mod powershell;
 pub mod render;
+#[cfg(target_os = "windows")]
+pub(crate) mod serve_stop;
 pub mod status;
 pub mod uninstall;
 
@@ -67,7 +69,9 @@ pub(crate) trait ServiceBackend {
     fn status(&self, service_name: &str) -> Result<ServiceState>;
     fn list(&self) -> Result<Vec<(String, ServiceState)>>;
     /// uninstall で daemon 起動中を stop してから unit を消すための内部 helper。
-    /// 現状は per-OS の `uninstall` impl が自前で stop しており unused だが、
+    /// 現状は Linux / macOS の [`ServiceBackend::uninstall`] impl が自前で stop し、Windows は
+    /// uninstall コマンドが groove-svc の記録した server を止める (kuriya #650、
+    /// [`uninstall`] が Windows でだけ呼ぶ処理) ので unused だが、
     /// Phase 4+ の `--system` 切替 / 明示的 stop subcommand 追加時に使う想定。
     #[allow(dead_code)]
     fn stop(&self, service_name: &str) -> Result<()>;
