@@ -105,12 +105,19 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (by an older `groove-svc`, or by an Action that runs `groove.exe` itself) is not stopped: the
   uninstall warns, names the lock's holder as a lead when there is one, and without `--purge`
   still exits 0; `--purge` then waits for the lock and refuses as before. A recorded server that
-  is running but cannot be stopped makes an uninstall without `--purge` fail, naming its pid
-  and how to stop it. The refusals also give `taskkill /F /PID <pid>`: a server started without
-  a console is refused by `taskkill /PID <pid>` alone ("can only be terminated forcefully").
+  is running but cannot be stopped makes the uninstall fail, with or without `--purge` (which
+  then deletes nothing), naming its pid and how to stop it. `groove-svc` removes the previous
+  record before it starts the server, so a record it then cannot write leaves none (a warning
+  at uninstall) rather than an old one read as "that server has exited". `service install
+  --force` stops the server the previous install started before it re-registers and starts
+  the task, so the new server does not meet the old one on the port; one that is running and
+  cannot be stopped fails the install before anything is re-registered. The refusals also give
+  `taskkill /F /PID <pid>`: a server started without a console is refused by
+  `taskkill /PID <pid>` alone ("can only be terminated forcefully").
   Removing a task that is already gone no longer prints schtasks'
-  `ERROR: The system cannot find the file specified.` twice, and a `/Delete` that fails while
-  the task stays registered is now an error instead of "Removed service unit". The tray's Stop
+  `ERROR: The system cannot find the file specified.` twice; a `/Delete` that fails while
+  the task stays registered is now an error instead of "Removed service unit", and one whose
+  task cannot be checked afterwards is a warning. The tray's Stop
   uses the same record first, with the same check, and falls back to the status endpoint's pid
   as before; its process handling moved to a new internal crate, `groove-winproc`, which
   `groove` and `groove-svc` share. Linux and macOS are unchanged (kuriya #650).

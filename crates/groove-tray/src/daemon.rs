@@ -140,11 +140,16 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
         })
 }
 
-/// The record `groove-svc` wrote of the server it started, in the service's
-/// config home as the tray finds it (`<config dir>/groove/<service>`, the
-/// same place [`crate::config::resolve`] reads `groove.toml` from). `None`
-/// when there is none or it cannot be read: a server started by an older
-/// `groove-svc`, or not by the task at all.
+/// The record `groove-svc` wrote of the server it started, looked for in
+/// `<dirs::config_dir()>/groove/<service>`: the config home `groove service
+/// install` uses when `GROOVE_CONFIG_HOME` is not set, and the default
+/// [`crate::config::resolve`] reads `groove.toml` from. It does not follow
+/// the tray's `--kb-path` override (that names where `groove.toml` is read,
+/// not the service's config home) nor `GROOVE_CONFIG_HOME`; a service
+/// installed elsewhere has its record there, which this does not find, and
+/// the stop falls back to the status endpoint. `None` also when there is no
+/// record or it cannot be read: a server started by an older `groove-svc`, or
+/// not by the task at all.
 fn recorded_server(service_name: &str) -> Option<groove_winproc::ServeRecord> {
     let home = dirs::config_dir()?.join("groove").join(service_name);
     groove_winproc::ServeRecord::read(&groove_winproc::ServeRecord::path_in(&home))

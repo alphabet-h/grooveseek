@@ -77,15 +77,42 @@ fn run_schtasks_quiet(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// What `uninstall` reports for `schtasks /Delete`: success, a task that is
-/// not registered (already gone: nothing to remove, which is what uninstall
-/// asks for), or a failure that left the task registered, which is an error.
-fn delete_outcome(deleted: Result<()>, still_registered: bool) -> Result<()> {
-    match deleted {
-        Ok(()) => Ok(()),
-        Err(_) if !still_registered => Ok(()),
-        Err(e) => Err(e.context("the scheduled task is still registered")),
+/// What `uninstall` reports for `schtasks /Delete`, given whether the task is
+/// still registered afterwards (`None`: that could not be found out):
+/// success, a task that is not registered (already gone: nothing to remove,
+/// which is what uninstall asks for), a failure that left the task
+/// registered, which is an error, or a failure that cannot be told apart,
+/// which is a warning (`Ok(Some(..))`) rather than taken for either.
+fn delete_outcome(deleted: Result<()>, still_registered: Option<bool>) -> Result<Option<String>> {
+    match (deleted, still_registered) {
+        (Ok(()), _) | (Err(_), Some(false)) => Ok(None),
+        (Err(e), Some(true)) => Err(e.context("the scheduled task is still registered")),
+        (Err(e), None) => Ok(Some(format!(
+            "Warning: {e}, and whether the scheduled task is still registered could not be \
+             checked; see `schtasks /Query /TN <task>`"
+        ))),
     }
+}
+
+/// Whether the root-folder task `task` is registered, from the CSV listing
+/// `list` reads too (only the ASCII name column is matched, so the code-page
+/// encoding of the output does not matter). `None` when the listing itself
+/// fails: then nothing can be said either way.
+fn task_registered(task: &str) -> Option<bool> {
+    let out = Command::new("schtasks")
+        .args(["/Query", "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.split(',').next().is_some_and(|f| {
+            f.trim_matches('"')
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case(task)
+        })
+    }))
 }
 
 /// The subcommand word a console-binary Action has to supply itself.
@@ -404,12 +431,73 @@ fn register_via_powershell(
     Ok(())
 }
 
+impl TaskScheduler {
+    /// Stop the server `groove-svc` recorded in `config_home`, when the
+    /// recorded pid is still that process (kuriya #650, [`super::serve_stop`]),
+    /// and say what happened. `schtasks /End` cannot: the task's process is
+    /// the launcher, which has already exited.
+    fn stop_recorded(&self, config_home: &Path) -> super::serve_stop::ServeStop {
+        super::serve_stop::stop_recorded_serve(config_home)
+    }
+
+    /// `install --force`: stop the server the previous install started, before
+    /// anything is registered or run. One that is running and cannot be
+    /// stopped fails the install here, with the task left as it was: starting
+    /// the new one would put a second server on the port (it would fail to
+    /// bind and exit) and replace the record of the one still running, and
+    /// running the same command again once that pid is stopped finishes the
+    /// install (`groove.toml` has been rewritten already, as on any failure
+    /// of this step).
+    fn stop_previous_server(&self, ctx: &InstallContext) -> Result<()> {
+        use super::serve_stop::ServeStop;
+        match self.stop_recorded(&ctx.config_home) {
+            ServeStop::Stopped { pid } => {
+                eprintln!("Stopped the groove server the previous install started (pid {pid}).");
+            }
+            ServeStop::NotRunning { .. } => {}
+            ServeStop::NoRecord { path } if ctx.auto_start => eprintln!(
+                "Warning: there is no record of a server the previous install started ({}); \
+                 a server started before groove kept that record is not stopped, and if one \
+                 is still running on {}, the new one cannot bind it.",
+                path.display(),
+                ctx.bind
+            ),
+            ServeStop::NoRecord { .. } => {}
+            ServeStop::BadRecord { path, why } => eprintln!(
+                "Warning: {} is not a record of the server the previous install started \
+                 ({why}), so no server was stopped.",
+                path.display()
+            ),
+            ServeStop::NotStopped { pid, why } => {
+                return Err(anyhow!(
+                    "the groove server the previous install started (pid {pid}, as recorded in \
+                     {}) is running and could not be stopped: {why}. Nothing was re-registered. \
+                     Stop it (`taskkill /PID {pid}`, or `taskkill /F /PID {pid}` when that \
+                     answers the process can only be terminated forcefully), then run the \
+                     install again.",
+                    groove_winproc::ServeRecord::path_in(&ctx.config_home).display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ServiceBackend for TaskScheduler {
     fn install(&self, ctx: &InstallContext) -> Result<()> {
         // v0.8.3: skip XML entirely — pass Action/Trigger/Settings directly
         // to Register-ScheduledTask (= the parameter set that auto-populates
         // the Principal from the current logon identity, the only path that
         // works without admin elevation on a non-elevated shell).
+        //
+        // (kuriya #650) `--force` over an install whose server is running:
+        // stop that server first. Otherwise `/Run` below starts a second one,
+        // which cannot bind the port and exits, and groove-svc replaces the
+        // record with the one that exited, leaving the running server with
+        // no record for uninstall to find.
+        if ctx.force {
+            self.stop_previous_server(ctx)?;
+        }
         register_via_powershell(
             &ctx.service_name,
             &ctx.binary_path,
@@ -432,13 +520,19 @@ impl ServiceBackend for TaskScheduler {
         // schtasks' "ERROR: The system cannot find the file specified." twice
         // on a successful uninstall. A `/Delete` that fails is then told apart
         // by asking whether the task is still registered: gone is what was
-        // asked for; still there is an error, not "Removed service unit".
+        // asked for; still there is an error, not "Removed service unit";
+        // unknown is a warning.
         let task = task_name(service_name);
         let _ = run_schtasks_quiet(&["/End", "/TN", &task]);
         let deleted = run_schtasks_quiet(&["/Delete", "/TN", &task, "/F"]);
-        let still_registered =
-            deleted.is_err() && run_schtasks_quiet(&["/Query", "/TN", &task]).is_ok();
-        delete_outcome(deleted, still_registered)
+        let still_registered = match deleted {
+            Ok(()) => Some(false),
+            Err(_) => task_registered(&task),
+        };
+        if let Some(warning) = delete_outcome(deleted, still_registered)? {
+            eprintln!("{warning}");
+        }
+        Ok(())
     }
     fn status(&self, service_name: &str) -> Result<ServiceState> {
         let task = task_name(service_name);
@@ -485,10 +579,10 @@ impl ServiceBackend for TaskScheduler {
     /// is still that process (kuriya #650, [`super::serve_stop`]). Without a
     /// record there is nothing to go by, and nothing more is stopped.
     fn stop(&self, service_name: &str) -> Result<()> {
-        use super::serve_stop::{ServeStop, stop_recorded_serve};
+        use super::serve_stop::ServeStop;
         let _ = run_schtasks_quiet(&["/End", "/TN", &task_name(service_name)]);
         let home = super::resolve_config_home(service_name)?;
-        match stop_recorded_serve(&home) {
+        match self.stop_recorded(&home) {
             ServeStop::NotStopped { pid, why } => Err(anyhow!(
                 "could not stop the groove server of '{service_name}' (pid {pid}): {why}"
             )),
@@ -529,6 +623,37 @@ mod tests {
         );
     }
 
+    /// kuriya #650 (I2). Silencing `schtasks /Delete` must not silence a real
+    /// failure: only a task that is no longer registered counts as removed.
+    #[test]
+    fn a_failed_delete_is_an_error_only_while_the_task_is_still_registered() {
+        assert_eq!(delete_outcome(Ok(()), Some(false)).unwrap(), None);
+        assert_eq!(
+            delete_outcome(Err(anyhow!("schtasks /Delete failed")), Some(false)).unwrap(),
+            None,
+            "already gone is what uninstall asked for"
+        );
+        let err = delete_outcome(Err(anyhow!("schtasks /Delete failed")), Some(true))
+            .expect_err("a task still registered was not removed");
+        assert!(format!("{err:#}").contains("still registered"), "{err:#}");
+        // M-e: a check that itself failed is neither "gone" nor an error.
+        let warning = delete_outcome(Err(anyhow!("schtasks /Delete failed")), None)
+            .unwrap()
+            .expect("a warning");
+        assert!(warning.starts_with("Warning:"), "{warning}");
+        assert!(warning.contains("could not be checked"), "{warning}");
+    }
+
+    /// The listing the registration check reads answers for a task that
+    /// certainly does not exist.
+    #[test]
+    fn a_task_that_does_not_exist_is_not_registered() {
+        assert_eq!(
+            task_registered("groove-650-definitely-not-registered-a9f3"),
+            Some(false)
+        );
+    }
+
     /// `-TaskName` alone searches the entire Task Scheduler namespace, so a
     /// same-named task in a subfolder would add a second line to `.State` and
     /// [`parse_task_state`] would read the pair as "not Running". The
@@ -539,20 +664,6 @@ mod tests {
     /// as a tray that controls a task nobody registered — so both sides pin
     /// the literal. The counterpart is `task_name_uses_grooveseek_prefix` in
     /// `crates/groove-tray/src/daemon.rs`; the two must agree.
-    /// kuriya #650 (I2). Silencing `schtasks /Delete` must not silence a real
-    /// failure: only a task that is no longer registered counts as removed.
-    #[test]
-    fn a_failed_delete_is_an_error_only_while_the_task_is_still_registered() {
-        assert!(delete_outcome(Ok(()), false).is_ok());
-        assert!(
-            delete_outcome(Err(anyhow!("schtasks /Delete failed")), false).is_ok(),
-            "already gone is what uninstall asked for"
-        );
-        let err = delete_outcome(Err(anyhow!("schtasks /Delete failed")), true)
-            .expect_err("a task still registered was not removed");
-        assert!(format!("{err:#}").contains("still registered"), "{err:#}");
-    }
-
     #[test]
     fn task_name_matches_the_tray_copy() {
         assert_eq!(task_name("personal"), "groove-personal");

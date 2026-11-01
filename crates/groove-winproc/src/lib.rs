@@ -6,7 +6,7 @@
 //! - [`ServeRecord`]: what `groove-svc.exe` writes beside the service's
 //!   `groove.toml` when it starts `groove.exe serve` — the child's pid and the
 //!   time the OS created it. Plain file I/O, compiled on every OS.
-//! - On Windows, [`stop_process_if_matches`] and friends: open a pid once,
+//! - On Windows, `stop_process_if_matches` and friends: open a pid once,
 //!   check its image file name (and, given a record, its creation time), and
 //!   terminate it through that same handle, waiting for it to exit. The handle
 //!   pins the process: a pid reused after `OpenProcess` cannot be reached

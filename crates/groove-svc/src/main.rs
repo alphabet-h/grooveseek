@@ -93,6 +93,12 @@ fn main() -> std::io::Result<()> {
     // installer.
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 
+    // (kuriya #650) The previous record goes before the new server starts, so
+    // a record that then cannot be written leaves none rather than an old one:
+    // uninstall warns about a missing record, but would read an old one as
+    // "that server has exited, nothing to stop".
+    let record_path = clear_old_record(&extra_args);
+
     let child = Command::new(&grooveseek_exe)
         .args(child_args(&extra_args))
         .stdin(Stdio::null())
@@ -106,21 +112,31 @@ fn main() -> std::io::Result<()> {
     // so Task Scheduler sees a finished task and `schtasks /End` stops nothing.
     // Best-effort: the server is already running, and failing here would only
     // put an error in the task history while it runs anyway.
-    if let Some(home) = record_dir(&extra_args) {
-        use std::os::windows::io::AsRawHandle;
-        if let Ok(created) = groove_winproc::creation_time_of(child.as_raw_handle()) {
-            let record = groove_winproc::ServeRecord {
-                pid: child.id(),
-                created,
-            };
-            let _ = record.write(&groove_winproc::ServeRecord::path_in(&home));
-        }
+    if let Some(path) = record_path
+        && let Ok(created) = groove_winproc::creation_time_of(&child)
+    {
+        let record = groove_winproc::ServeRecord {
+            pid: child.id(),
+            created,
+        };
+        let _ = record.write(&path);
     }
     // Dropping `child` closes its handle and leaves the server running.
     Ok(())
 }
 
-/// The directory the [`groove_winproc::ServeRecord`] goes in: the one holding
+/// Remove the record of the server an earlier run started, and return where
+/// this run's record goes; `None` when the Action names no config home.
+/// Best-effort like the write: a record that cannot be removed is left, and
+/// one that is not there is what is wanted.
+#[cfg(target_os = "windows")]
+fn clear_old_record(extra: &[String]) -> Option<std::path::PathBuf> {
+    let path = groove_winproc::ServeRecord::path_in(&record_dir(extra)?);
+    let _ = std::fs::remove_file(&path);
+    Some(path)
+}
+
+/// The directory the `groove_winproc::ServeRecord` goes in: the one holding
 /// the `groove.toml` the Action passes as `--config <config_home>\groove.toml`
 /// (BU-07), which is the service's config home. `None` when the Action passes
 /// no `--config` (an install from before BU-07), so nothing is recorded.
@@ -144,9 +160,6 @@ fn main() {
     std::process::exit(1);
 }
 
-/// This crate's half of the "exactly one `serve`" invariant. The installer's
-/// half is asserted in
-/// `grooveseek/tests/service_install_integration.rs::windows_register_script_*`.
 /// (kuriya #650) Where groove-svc records the server it starts.
 #[cfg(test)]
 mod record_dir_tests {
@@ -164,6 +177,39 @@ mod record_dir_tests {
             record_dir(&extra).unwrap(),
             std::path::Path::new("C:\\Users\\me\\AppData\\Roaming\\groove\\work")
         );
+    }
+
+    /// The old record is gone before the new server is started, so a failed
+    /// write leaves no record rather than a stale one.
+    #[cfg(windows)]
+    #[test]
+    fn the_old_record_is_cleared_before_the_server_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "groove-svc-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = groove_winproc::ServeRecord::path_in(&dir);
+        groove_winproc::ServeRecord { pid: 8, created: 1 }
+            .write(&old)
+            .unwrap();
+        let extra = vec![
+            "--config".to_string(),
+            dir.join("groove.toml").display().to_string(),
+        ];
+        assert_eq!(super::clear_old_record(&extra), Some(old.clone()));
+        assert!(!old.exists(), "the old record is removed");
+        assert_eq!(
+            super::clear_old_record(&extra),
+            Some(old.clone()),
+            "and none is fine"
+        );
+        assert_eq!(super::clear_old_record(&[]), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -185,6 +231,9 @@ mod record_dir_tests {
     }
 }
 
+/// This crate's half of the "exactly one `serve`" invariant. The installer's
+/// half is asserted in
+/// `grooveseek/tests/service_install_integration.rs::windows_register_script_*`.
 #[cfg(test)]
 mod tests {
     use super::child_args;

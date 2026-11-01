@@ -89,20 +89,16 @@ fn run_with_backend_waiting(
     }
 
     // (kuriya #650) On Windows the backend cannot stop the server; stop the
-    // one groove-svc recorded. With --purge, one that could not be stopped is
-    // warned about here and then met by the purge's wait and refusal, which
-    // name the lock's holder and how to stop it; without --purge it fails the
-    // uninstall, since nothing else would say it is still running.
+    // one groove-svc recorded. One that is confirmed to be that server (its
+    // image and creation time) and still could not be stopped fails the
+    // uninstall here, with or without --purge, and nothing is deleted: the
+    // purge's lock wait would not catch it, since a server running as a
+    // reader or with its watcher off holds no writer lock.
     #[cfg(target_os = "windows")]
     if let Some(home) = config_home
         && let Some((pid, why)) = stop_recorded_serve(home, !params.purge)
     {
-        if !params.purge {
-            return Err(serve_left_running(&name, home, pid, &why));
-        }
-        eprintln!(
-            "Warning: could not stop the groove server this service started (pid {pid}): {why}"
-        );
+        return Err(serve_left_running(&name, home, pid, &why, params.purge));
     }
 
     if params.purge {
@@ -185,8 +181,8 @@ fn stop_recorded_serve(home: &Path, hint_holder: bool) -> Option<(u32, String)> 
         ServeStop::NoRecord { path } => {
             eprintln!(
                 "Warning: there is no record of the server this service started ({}), so no \
-                 server was stopped. A server started before groove kept that record (by an \
-                 older groove-svc) may still be running; stop it by hand.{}",
+                 server was stopped. A server started without one (by an older groove-svc, or \
+                 one whose record could not be written) may still be running; stop it by hand.{}",
                 path.display(),
                 if hint_holder {
                     lock_holder_hint(home)
@@ -241,16 +237,27 @@ fn lock_holder_hint(home: &Path) -> String {
     )
 }
 
-/// The uninstall without `--purge` fails when the server this service
-/// started is running and could not be stopped: confirmed by its image and
-/// creation time, it is the service's own, so it is named with how to stop it.
+/// The uninstall fails when the server this service started is running and
+/// could not be stopped: confirmed by its image and creation time, it is the
+/// service's own, so it is named with how to stop it. With `--purge`, nothing
+/// has been deleted, and the message says to run the purge again.
 #[cfg(target_os = "windows")]
-fn serve_left_running(name: &str, home: &Path, pid: u32, why: &str) -> anyhow::Error {
+fn serve_left_running(name: &str, home: &Path, pid: u32, why: &str, purge: bool) -> anyhow::Error {
+    let then = if purge {
+        format!(
+            " Neither the index database nor the config home ({}) was removed. Then run \
+             `groove service uninstall --service-name {name} --purge --yes` again to finish \
+             the purge.",
+            home.display()
+        )
+    } else {
+        String::new()
+    };
     anyhow!(
         "The service unit for '{name}' was removed, but the groove server it started (pid \
          {pid}, as recorded in {}) could not be stopped: {why}. Stop it \
          (`taskkill /PID {pid}`, or `taskkill /F /PID {pid}` when that answers the process \
-         can only be terminated forcefully).",
+         can only be terminated forcefully).{then}",
         groove_winproc::ServeRecord::path_in(home).display()
     )
 }
@@ -1531,6 +1538,28 @@ mod tests {
         assert!(!server.is_running(), "the recorded server has exited");
         assert!(!db.exists(), "the database is deleted");
         assert!(!home.path().exists(), "the config home is deleted");
+    }
+
+    /// kuriya #650 (M-a). A recorded server that is running and could not be
+    /// stopped fails the uninstall before anything is deleted; the --purge
+    /// form of the message says nothing was removed and how to finish.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_server_left_running_is_named_and_the_purge_says_nothing_was_removed() {
+        let home = Path::new("C:\\cfg\\au28");
+        let plain = serve_left_running("au28", home, 4242, "access denied", false).to_string();
+        assert!(plain.contains("pid 4242"), "{plain}");
+        assert!(plain.contains("`taskkill /F /PID 4242`"), "{plain}");
+        assert!(!plain.contains("--purge"), "{plain}");
+        let purge = serve_left_running("au28", home, 4242, "access denied", true).to_string();
+        assert!(
+            purge.contains("Neither the index database nor the config home"),
+            "{purge}"
+        );
+        assert!(
+            purge.contains("`groove service uninstall --service-name au28 --purge --yes`"),
+            "{purge}"
+        );
     }
 
     /// kuriya #650. Without a record, the server holding the index's lock is

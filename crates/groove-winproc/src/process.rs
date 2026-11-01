@@ -16,11 +16,11 @@
 
 use crate::{StopOutcome, image_file_name_matches};
 use std::io;
-use std::os::windows::io::RawHandle;
+use std::os::windows::io::AsRawHandle;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, GetLastError, HANDLE,
-    WAIT_OBJECT_0,
+    WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
@@ -58,12 +58,12 @@ fn os_error(what: &str, pid: u32, code: u32) -> io::Error {
     io::Error::new(kind, format!("{what} failed for pid {pid} ({detail})"))
 }
 
-/// The creation time of the process behind `handle`, in `FILETIME` units
+/// The creation time of `process`, in `FILETIME` units
 /// (100 ns intervals since 1601-01-01 UTC). `groove-svc` reads it from the
 /// handle of the child it just spawned (`std::process::Child`'s handle has
 /// every access right), for the [`crate::ServeRecord`].
-pub fn creation_time_of(handle: RawHandle) -> io::Result<u64> {
-    creation_time(handle as HANDLE)
+pub fn creation_time_of(process: &impl AsRawHandle) -> io::Result<u64> {
+    creation_time(process.as_raw_handle() as HANDLE)
         .ok_or_else(|| io::Error::other("GetProcessTimes failed for the child's handle"))
 }
 
@@ -184,6 +184,15 @@ pub fn stop_process_if_matches(
     // into an observation rather than a request.
     // SAFETY: the handle carries PROCESS_SYNCHRONIZE.
     let waited = unsafe { WaitForSingleObject(handle.0, EXIT_WAIT.as_millis() as u32) };
+    if waited == WAIT_FAILED {
+        // SAFETY: plain call, right after the failing one.
+        let code = unsafe { GetLastError() };
+        return Err(os_error(
+            "WaitForSingleObject after TerminateProcess",
+            pid,
+            code,
+        ));
+    }
     if waited != WAIT_OBJECT_0 {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -199,7 +208,6 @@ pub fn stop_process_if_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
 
@@ -269,7 +277,7 @@ mod tests {
     fn a_different_creation_time_is_a_reused_pid_and_left_running() {
         let d = Disguised::new();
         let mut child = spawn(&d.exe());
-        let created = creation_time_of(child.as_raw_handle()).unwrap();
+        let created = creation_time_of(&child).unwrap();
         let outcome = stop_process_if_matches(child.id(), "groove.exe", Some(created - 1)).unwrap();
         assert_eq!(outcome, StopOutcome::Reused);
         assert!(child.try_wait().unwrap().is_none(), "it must still run");
@@ -283,7 +291,7 @@ mod tests {
         let d = Disguised::new();
         let mut child = spawn(&d.exe());
         let pid = child.id();
-        let created = creation_time_of(child.as_raw_handle()).unwrap();
+        let created = creation_time_of(&child).unwrap();
         assert_eq!(
             stop_process_if_matches(pid, "groove.exe", Some(created)).unwrap(),
             StopOutcome::Terminated

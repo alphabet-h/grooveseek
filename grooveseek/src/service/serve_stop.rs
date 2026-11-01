@@ -96,7 +96,6 @@ pub(crate) mod test_support {
 
     use super::SERVE_IMAGE;
     use groove_winproc::ServeRecord;
-    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
 
@@ -137,7 +136,7 @@ pub(crate) mod test_support {
         pub(crate) fn record(&self) -> ServeRecord {
             ServeRecord {
                 pid: self.child.id(),
-                created: groove_winproc::creation_time_of(self.child.as_raw_handle()).unwrap(),
+                created: groove_winproc::creation_time_of(&self.child).unwrap(),
             }
         }
 
@@ -159,7 +158,6 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{StandIn, spawn, system_ping};
     use super::*;
-    use std::os::windows::io::AsRawHandle;
 
     fn home() -> PathBuf {
         let dir = crate::test_support::unique_temp_path("groove-650-home");
@@ -228,7 +226,7 @@ mod tests {
         let mut other = spawn(&system_ping());
         ServeRecord {
             pid: other.id(),
-            created: groove_winproc::creation_time_of(other.as_raw_handle()).unwrap(),
+            created: groove_winproc::creation_time_of(&other).unwrap(),
         }
         .write(&ServeRecord::path_in(&h))
         .unwrap();
