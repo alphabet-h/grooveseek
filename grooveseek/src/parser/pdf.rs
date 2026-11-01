@@ -7,10 +7,10 @@
 
 use std::io::Cursor;
 
-use anyhow::{Result, anyhow};
-use oxidize_pdf::parser::{PdfDocument, PdfReader};
+use anyhow::Result;
+use oxidize_pdf::parser::{ParseError, PdfDocument, PdfReader};
 
-use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
+use super::{Frontmatter, ParseCause, ParsedDocument, Parser, single_text_chunk, unindexable};
 
 /// これ未満の平均 chars/page なら「索引する価値のあるテキストが取れなかった」
 /// として文書ごと落とす閾値。
@@ -307,30 +307,36 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
     // 交互パターンは C1 を出さない清音かな主体の文書を捕まえる (codex P1)。
     let c1_ratio = c1_control_ratio(pages);
     if c1_ratio >= MISDECODED_C1_RATIO {
-        return Err(anyhow!(
-            "{path_hint}: the text layer decoded to mojibake, not text: \
-             {:.1}% of the extracted characters are C1 control codes \
-             (U+0080-U+009F), which correctly decoded text does not contain. \
-             Skipping rather than indexing text that no query can match. This \
-             build could not decode the font encoding this PDF uses; the text \
-             is present and a viewer will show it correctly. Known trigger: a \
-             CID-keyed font with a predefined CMap and no /ToUnicode",
-            c1_ratio * 100.0
+        return Err(unindexable(
+            ParseCause::TextUndecodable,
+            format!(
+                "{path_hint}: the text layer decoded to mojibake, not text: \
+                 {:.1}% of the extracted characters are C1 control codes \
+                 (U+0080-U+009F), which correctly decoded text does not contain. \
+                 Skipping rather than indexing text that no query can match. This \
+                 build could not decode the font encoding this PDF uses; the text \
+                 is present and a viewer will show it correctly. Known trigger: a \
+                 CID-keyed font with a predefined CMap and no /ToUnicode",
+                c1_ratio * 100.0
+            ),
         ));
     }
     let pair_ratio = bytewise_pair_signature_ratio(pages);
     if pair_ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO {
-        return Err(anyhow!(
-            "{path_hint}: the text layer decoded to mojibake, not text: \
-             {:.0}% of the extracted characters alternate a near-constant \
-             character with varied ones, the signature of UTF-16BE text read \
-             one byte at a time (a kana character at U+3042 comes out as the \
-             ASCII pair \"0B\"). Skipping rather than indexing text that no \
-             query can match. This build could not decode the font encoding \
-             this PDF uses; the text is present and a viewer will show it \
-             correctly. Known trigger: a CID-keyed font with a predefined \
-             CMap and no /ToUnicode",
-            pair_ratio * 100.0
+        return Err(unindexable(
+            ParseCause::TextUndecodable,
+            format!(
+                "{path_hint}: the text layer decoded to mojibake, not text: \
+                 {:.0}% of the extracted characters alternate a near-constant \
+                 character with varied ones, the signature of UTF-16BE text read \
+                 one byte at a time (a kana character at U+3042 comes out as the \
+                 ASCII pair \"0B\"). Skipping rather than indexing text that no \
+                 query can match. This build could not decode the font encoding \
+                 this PDF uses; the text is present and a viewer will show it \
+                 correctly. Known trigger: a CID-keyed font with a predefined \
+                 CMap and no /ToUnicode",
+                pair_ratio * 100.0
+            ),
         ));
     }
 
@@ -342,14 +348,17 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
     // `SCANNED_PDF_MIN_CHARS_PER_PAGE` の doc の通り 3 通りあり得る。
     let (non_empty_pages, avg_chars) = non_empty_page_stats(pages);
     if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
-        return Err(anyhow!(
-            "{path_hint}: too little text extracted to index: average {avg_chars} \
-             chars/page across {non_empty_pages} non-empty page(s) < \
-             {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold; skipping. Common causes \
-             include a scanned image with no text layer (OCR is not supported), a text \
-             layer this build could not decode into anything (a PDF whose text you can \
-             select in a viewer can still land here), and a document that genuinely \
-             carries little text per page, such as slides or a figure-heavy report"
+        return Err(unindexable(
+            ParseCause::TooLittleText,
+            format!(
+                "{path_hint}: too little text extracted to index: average {avg_chars} \
+                 chars/page across {non_empty_pages} non-empty page(s) < \
+                 {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold; skipping. Common causes \
+                 include a scanned image with no text layer (OCR is not supported), a text \
+                 layer this build could not decode into anything (a PDF whose text you can \
+                 select in a viewer can still land here), and a document that genuinely \
+                 carries little text per page, such as slides or a figure-heavy report"
+            ),
         ));
     }
 
@@ -485,16 +494,29 @@ fn extract_pdf_with_budget(
 ) -> Result<(Vec<String>, Frontmatter)> {
     // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
     // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs で確認)。
-    let reader = PdfReader::new(Cursor::new(bytes))
-        .map_err(|e| anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}"))?;
+    let reader = PdfReader::new(Cursor::new(bytes)).map_err(|e| {
+        unindexable(
+            cause_of_pdf_error(&e),
+            format!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}"),
+        )
+    })?;
+    // (#660) Open succeeds for an encryption scheme the crate can handle even
+    // when the empty password does not unlock it; such a document fails later,
+    // at page count / page extraction. Whatever that later error looks like, a
+    // locked document is `Encrypted`.
+    let locked = reader.is_encrypted() && !reader.is_unlocked();
     let document = PdfDocument::new(reader);
-    let pages = extract_pages_within_budget_capped(
+    let pages = match extract_pages_within_budget_capped(
         &document,
         path_hint,
         PDF_PAGE_TEXT_MAX_BYTES,
         doc_budget,
         PDF_DOC_EXTRACT_TIMEOUT,
-    )?;
+    ) {
+        Ok(pages) => pages,
+        Err(e) if locked => return Err(unindexable(ParseCause::Encrypted, e.to_string())),
+        Err(e) => return Err(e),
+    };
     let frontmatter = pdf_metadata_frontmatter(&document, path_hint);
     Ok((pages, frontmatter))
 }
@@ -529,6 +551,17 @@ fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
     )
 }
 
+/// (#660) The cause an oxidize-pdf error stands for: the three encryption
+/// variants are `Encrypted`, anything else is `CorruptOrUnsupported`.
+fn cause_of_pdf_error(e: &ParseError) -> ParseCause {
+    match e {
+        ParseError::EncryptionNotSupported | ParseError::WrongPassword | ParseError::PdfLocked => {
+            ParseCause::Encrypted
+        }
+        _ => ParseCause::CorruptOrUnsupported,
+    }
+}
+
 /// ページ本文を per-page 上限 + 文書累積 budget + 実時間上限付きで取り出す本体
 /// (cap 注入版)。本番は [`extract_pdf_with_budget`] が parser の budget で呼び、unit test は
 /// 小さい cap で budget 分岐を踏む ([`crate::parser::ooxml`] の test 用の cap 注入版と同じ形)。
@@ -542,9 +575,12 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
 ) -> Result<Vec<String>> {
     use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
 
-    let page_count = document
-        .page_count()
-        .map_err(|e| anyhow!("{path_hint}: cannot read PDF page count: {e}"))?;
+    let page_count = document.page_count().map_err(|e| {
+        unindexable(
+            cause_of_pdf_error(&e),
+            format!("{path_hint}: cannot read PDF page count: {e}"),
+        )
+    })?;
     let mut extractor = TextExtractor::with_options(ExtractionOptions {
         max_extracted_bytes: Some(page_cap),
         ..Default::default()
@@ -556,10 +592,13 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     let started = std::time::Instant::now();
     for index in 0..page_count {
         let extracted = extractor.extract_from_page(document, index).map_err(|e| {
-            anyhow!(
-                "{path_hint}: PDF text extraction failed on page {} \
-                 (possibly encrypted or unreadable): {e}",
-                index + 1
+            unindexable(
+                cause_of_pdf_error(&e),
+                format!(
+                    "{path_hint}: PDF text extraction failed on page {} \
+                     (possibly encrypted or unreadable): {e}",
+                    index + 1
+                ),
             )
         })?;
         // 展開バイト数そのものは数えられないので、それに比例する実時間で縛る。
@@ -573,11 +612,16 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
         // codex P1 の想定 (「個別には許容されるストリームを数百個」) は複数
         // ページに跨るため、ここで頭打ちになる。
         if started.elapsed() > timeout {
-            return Err(anyhow!(
-                "{path_hint}: PDF text extraction exceeded {} s after {} page(s) \
-                 (decompression-bomb guard)",
-                timeout.as_secs_f64(),
-                index + 1
+            return Err(unindexable(
+                ParseCause::ExtractionTimedOut {
+                    seconds: timeout.as_secs(),
+                },
+                format!(
+                    "{path_hint}: PDF text extraction exceeded {} s after {} page(s) \
+                     (decompression-bomb guard)",
+                    timeout.as_secs_f64(),
+                    index + 1
+                ),
             ));
         }
         if extracted.truncated {
@@ -590,9 +634,14 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
         }
         budget = budget.saturating_add(extracted.text.len());
         if budget > doc_cap {
-            return Err(anyhow!(
-                "{path_hint}: extracted text exceeds {doc_cap} bytes across {} page(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)",
-                index + 1
+            return Err(unindexable(
+                ParseCause::OverExtractionLimit {
+                    limit: doc_cap as u64,
+                },
+                format!(
+                    "{path_hint}: extracted text exceeds {doc_cap} bytes across {} page(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)",
+                    index + 1
+                ),
             ));
         }
         pages.push(extracted.text);
@@ -1770,5 +1819,127 @@ mod tests {
             .expect("minimal pdf must extract");
         assert!(!doc.chunks.is_empty());
         assert!(doc.chunks.iter().all(|c| c.table_rows.is_none()));
+    }
+
+    // ---- #660: typed parse-failure causes ----
+
+    use crate::parser::{ParseCause, cause_of};
+
+    /// T-P1. This fixture does **not** fail at open: oxidize-pdf builds a
+    /// security handler for AES-256 R=6, tries the empty password and still
+    /// returns `Ok` from `PdfReader::new`. It fails later, at page count /
+    /// page extraction, with `ParseError::PdfLocked` (spec §5.3 table,
+    /// `tests/fixtures/binary/README.md:262-275`). So classifying only the
+    /// open error would leave this file without a cause.
+    #[test]
+    fn encrypted_fixture_is_classified_encrypted_at_page_extraction() {
+        const REAL_ENCRYPTED_PDF: &[u8] =
+            include_bytes!("../../tests/fixtures/binary/encrypted.pdf");
+        let err = PdfParser::default()
+            .parse_bytes(REAL_ENCRYPTED_PDF, "docs/encrypted.pdf", &[])
+            .expect_err("real encrypted PDF without unlock() must be Err");
+        assert_eq!(cause_of(&err), Some(ParseCause::Encrypted), "got: {err}");
+    }
+
+    /// T-P2 (fixtures): a PDF with no text layer, and a mostly blank document.
+    ///
+    /// The fixture `mostly_blank.pdf` is not used here: its one text page
+    /// (221 chars) clears the gate, so it parses `Ok`
+    /// (`test_pdf_mostly_blank_pages_not_misclassified_as_scanned`). The
+    /// mostly blank case that does fail the gate — blank pages around one
+    /// thin page — goes through `reject_unindexable_pages` directly.
+    #[test]
+    fn empty_and_mostly_blank_pdfs_are_too_little_text() {
+        const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/binary/empty_text.pdf");
+        let err = PdfParser::default()
+            .parse_bytes(EMPTY, "scan.pdf", &[])
+            .expect_err("no text layer must be Err");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::TooLittleText),
+            "got: {err}"
+        );
+
+        let mut pages = vec![String::new(); 10];
+        pages[4] = "- 5 -".to_string();
+        let err = reject_unindexable_pages(&pages, "docs/mostly_blank.pdf")
+            .expect_err("blank pages around one thin page must be Err");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::TooLittleText),
+            "got: {err}"
+        );
+    }
+
+    /// T-P2 (gates): each of the three gates names its own cause.
+    #[test]
+    fn each_unindexable_page_gate_names_its_cause() {
+        // C1 control codes (kanji read one byte at a time).
+        let c1_pages = vec![misdecoded_utf16be(
+            &"再ランキングの評価について述べる。".repeat(20),
+        )];
+        assert!(c1_control_ratio(&c1_pages) >= MISDECODED_C1_RATIO);
+        let err = reject_unindexable_pages(&c1_pages, "docs/cid.pdf").unwrap_err();
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::TextUndecodable),
+            "got: {err}"
+        );
+
+        // Alternating pair signature with no C1 (kana-only).
+        let pair_pages = vec![misdecoded_utf16be(
+            &"あいうえおかきくけこさしすせそ".repeat(5),
+        )];
+        assert_eq!(c1_control_ratio(&pair_pages), 0.0);
+        assert!(bytewise_pair_signature_ratio(&pair_pages) >= BYTEWISE_PAIR_SIGNATURE_RATIO);
+        let err = reject_unindexable_pages(&pair_pages, "docs/kana.pdf").unwrap_err();
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::TextUndecodable),
+            "got: {err}"
+        );
+
+        // Too few characters per non-empty page.
+        let thin_pages = vec!["Cover".to_string()];
+        let err = reject_unindexable_pages(&thin_pages, "docs/cover.pdf").unwrap_err();
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::TooLittleText),
+            "got: {err}"
+        );
+    }
+
+    /// T-P3: the text cap and the time limit of the capped extractor.
+    #[test]
+    fn the_capped_extractor_names_the_text_cap_and_the_time_limit() {
+        let doc = open_fixture(MINIMAL_PDF);
+        let err = extract_pages_within_budget_capped(
+            &doc,
+            "m.pdf",
+            PDF_PAGE_TEXT_MAX_BYTES,
+            0,
+            std::time::Duration::from_secs(3600),
+        )
+        .expect_err("a zero text cap must refuse a PDF with text");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: 0 }),
+            "got: {err}"
+        );
+
+        let doc = open_fixture(MINIMAL_PDF);
+        let err = extract_pages_within_budget_capped(
+            &doc,
+            "m.pdf",
+            PDF_PAGE_TEXT_MAX_BYTES,
+            usize::MAX,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a zero time budget must refuse");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::ExtractionTimedOut { seconds: 0 }),
+            "got: {err}"
+        );
     }
 }
