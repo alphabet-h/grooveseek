@@ -20,6 +20,12 @@ pub fn run(params: UninstallParams) -> Result<()> {
     // resolves could still uninstall. Making resolution unconditional here
     // would have turned that into a hard failure.
     let config_home = resolve_config_home(&name).ok();
+    // (kuriya #650) On Windows the registered task names the config home the
+    // service runs with (its `--config`), which is where groove-svc records
+    // the server and what --purge must remove, whatever GROOVE_CONFIG_HOME is
+    // now. Read before `run_with_backend` removes the task.
+    #[cfg(target_os = "windows")]
+    let config_home = crate::service::windows::service_config_home(&name, config_home);
     run_with_backend(backend().as_ref(), config_home.as_deref(), params)
 }
 

@@ -318,6 +318,121 @@ fn build_status_script(task: &str) -> String {
     )
 }
 
+/// (kuriya #650) The script that prints the registered task's Action
+/// arguments: the `-Argument` [`build_register_script`] gave it, as Task
+/// Scheduler stored it. Pinned to the root folder like [`build_status_script`].
+fn build_action_arguments_script(task: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         (Get-ScheduledTask -TaskPath '\\' -TaskName '{task}').Actions[0].Arguments"
+    )
+}
+
+/// Split a command line into words the way the child's `CommandLineToArgvW`
+/// does for what [`build_register_script`] writes: whitespace separates, and
+/// `"` starts and ends a quoted run (a path cannot contain `"`, and
+/// [`quote_child_argument`] adds nothing else to unescape).
+fn split_child_arguments(arguments: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    for c in arguments.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// The config home a registered task's Action arguments name: the directory
+/// of the `groove.toml` after `--config` (BU-07), the inverse of what
+/// [`build_register_script`] writes. `None` when there is no `--config` (an
+/// install from before BU-07) or it names no directory.
+fn config_home_in_arguments(arguments: &str) -> Option<PathBuf> {
+    let words = split_child_arguments(arguments);
+    let at = words.iter().position(|w| w == "--config")?;
+    let toml = Path::new(words.get(at + 1)?);
+    toml.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// The config home of the service as its registered task names it, read
+/// before the task is removed (kuriya #650). `None` when there is no such
+/// task or its arguments name none.
+fn registered_config_home(service_name: &str) -> Option<PathBuf> {
+    let task = task_name(service_name);
+    let out =
+        run_powershell_capture(&build_action_arguments_script(&task), "Get-ScheduledTask").ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let arguments = decode_value(&out.stdout, "Get-ScheduledTask stdout").ok()?;
+    config_home_in_arguments(arguments.trim())
+}
+
+/// Which config home to act on: the registered task's (`from_task`) when
+/// there is one, because the task is what runs the service and groove-svc
+/// records the server beside the `groove.toml` it names; otherwise the one
+/// resolved now (`resolved`: `GROOVE_CONFIG_HOME` or the OS default). Also a
+/// note for stderr when the two differ, saying which was used.
+fn choose_config_home(
+    from_task: Option<PathBuf>,
+    resolved: Option<PathBuf>,
+) -> (Option<PathBuf>, Option<String>) {
+    match (from_task, resolved) {
+        (Some(task), Some(now)) if !same_path(&task, &now) => {
+            let note = format!(
+                "Note: the scheduled task names the config home {}, not {} (from \
+                 GROOVE_CONFIG_HOME or the default); using the task's.",
+                task.display(),
+                now.display()
+            );
+            (Some(task), Some(note))
+        }
+        (Some(task), _) => (Some(task), None),
+        (None, now) => (now, None),
+    }
+}
+
+/// Windows paths compare case-insensitively.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+}
+
+/// The config home of `service_name` to act on: the registered task's when
+/// it can be read, else `resolved` ([`choose_config_home`]); says on stderr
+/// when they differ. Call it before the task is removed.
+pub(crate) fn service_config_home(
+    service_name: &str,
+    resolved: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let (home, note) = choose_config_home(registered_config_home(service_name), resolved);
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    home
+}
+
 /// Map the `TaskState` word to a [`ServiceState`].
 ///
 /// **This reports the state of the scheduled task, not of the daemon.** With
@@ -450,7 +565,12 @@ impl TaskScheduler {
     /// of this step).
     fn stop_previous_server(&self, ctx: &InstallContext) -> Result<()> {
         use super::serve_stop::ServeStop;
-        match self.stop_recorded(&ctx.config_home) {
+        // The previous server was recorded beside the groove.toml the task
+        // registered then names, which is not this install's config home when
+        // GROOVE_CONFIG_HOME differs between the two installs.
+        let previous_home = service_config_home(&ctx.service_name, Some(ctx.config_home.clone()))
+            .unwrap_or_else(|| ctx.config_home.clone());
+        match self.stop_recorded(&previous_home) {
             ServeStop::Stopped { pid } => {
                 eprintln!("Stopped the groove server the previous install started (pid {pid}).");
             }
@@ -475,7 +595,7 @@ impl TaskScheduler {
                      Stop it (`taskkill /PID {pid}`, or `taskkill /F /PID {pid}` when that \
                      answers the process can only be terminated forcefully), then run the \
                      install again.",
-                    groove_winproc::ServeRecord::path_in(&ctx.config_home).display()
+                    groove_winproc::ServeRecord::path_in(&previous_home).display()
                 ));
             }
         }
@@ -581,7 +701,14 @@ impl ServiceBackend for TaskScheduler {
     fn stop(&self, service_name: &str) -> Result<()> {
         use super::serve_stop::ServeStop;
         let _ = run_schtasks_quiet(&["/End", "/TN", &task_name(service_name)]);
-        let home = super::resolve_config_home(service_name)?;
+        // The registered task's config home first, then the one resolved now
+        // (kuriya #650): the record is beside the groove.toml the task names.
+        let resolved = super::resolve_config_home(service_name).ok();
+        let Some(home) = service_config_home(service_name, resolved) else {
+            return Err(anyhow!(
+                "could not resolve the config home of '{service_name}' to find its server"
+            ));
+        };
         match self.stop_recorded(&home) {
             ServeStop::NotStopped { pid, why } => Err(anyhow!(
                 "could not stop the groove server of '{service_name}' (pid {pid}): {why}"
@@ -621,6 +748,80 @@ mod tests {
             !script.contains("schtasks"),
             "the CSV path is what carried the defect: {script}"
         );
+    }
+
+    /// The `-Argument` value a register script hands to Task Scheduler, with
+    /// PowerShell's `''` undone: what `Actions[0].Arguments` reads back.
+    fn stored_arguments(script: &str) -> String {
+        let start =
+            script.find(" -Argument '").expect("an -Argument clause") + " -Argument '".len();
+        let end = script[start..]
+            .find("' -WorkingDirectory")
+            .expect("the clause ends before -WorkingDirectory")
+            + start;
+        script[start..end].replace("''", "'")
+    }
+
+    /// kuriya #650. The config home read back from a registered task is the
+    /// one install registered: the parse is the inverse of the register
+    /// script's quoting, for both Action shapes and for a path with spaces and
+    /// an apostrophe.
+    #[test]
+    fn the_config_home_is_read_back_from_what_install_registers() {
+        let home = PathBuf::from(r"C:\Users\Mary O'Brien\AppData\Roaming\groove\work");
+        for serve_argument in ["", "serve"] {
+            let target = ActionTarget {
+                execute_path: PathBuf::from(r"C:\bin\groove-svc.exe"),
+                serve_argument: serve_argument.to_string(),
+                used_svc_launcher: serve_argument.is_empty(),
+            };
+            let script = build_register_script("work", &target, &home, true, false);
+            let arguments = stored_arguments(&script);
+            assert_eq!(
+                config_home_in_arguments(&arguments),
+                Some(home.clone()),
+                "{arguments}"
+            );
+        }
+        assert_eq!(config_home_in_arguments("serve"), None, "before BU-07");
+        assert_eq!(config_home_in_arguments("--config"), None);
+        assert_eq!(config_home_in_arguments(r#"--config "groove.toml""#), None);
+    }
+
+    /// kuriya #650. The registered task's config home wins over the one
+    /// resolved now, with a note when they differ; without a task, the
+    /// resolved one is used.
+    #[test]
+    fn the_registered_config_home_wins_over_the_resolved_one() {
+        let task = PathBuf::from(r"D:\cfg\groove\work");
+        let now = PathBuf::from(r"C:\Users\me\AppData\Roaming\groove\work");
+        let (home, note) = choose_config_home(Some(task.clone()), Some(now.clone()));
+        assert_eq!(home, Some(task.clone()));
+        let note = note.expect("a note when they differ");
+        assert!(
+            note.contains(r"D:\cfg\groove\work") && note.contains("using the task's"),
+            "{note}"
+        );
+
+        let (home, note) = choose_config_home(
+            Some(task.clone()),
+            Some(PathBuf::from(r"d:\CFG\groove\work")),
+        );
+        assert_eq!(home, Some(task.clone()));
+        assert_eq!(
+            note, None,
+            "the same path in another case is not a difference"
+        );
+
+        assert_eq!(
+            choose_config_home(None, Some(now.clone())),
+            (Some(now), None)
+        );
+        assert_eq!(
+            choose_config_home(Some(task.clone()), None),
+            (Some(task), None)
+        );
+        assert_eq!(choose_config_home(None, None), (None, None));
     }
 
     /// kuriya #650 (I2). Silencing `schtasks /Delete` must not silence a real

@@ -107,8 +107,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   still exits 0; `--purge` then waits for the lock and refuses as before. A recorded server that
   is running but cannot be stopped makes the uninstall fail, with or without `--purge` (which
   then deletes nothing), naming its pid and how to stop it. `groove-svc` removes the previous
-  record before it starts the server, so a record it then cannot write leaves none (a warning
-  at uninstall) rather than an old one read as "that server has exited". A start of the task
+  record before it starts the server, and a server whose record it then cannot write is
+  stopped again and the start fails (in the task history): no server is left running out of the
+  record, and uninstall finds no record (a warning) rather than an old one read as "that server
+  has exited". The service's config home is the one its registered task names (the
+  `--config <config home>\groove.toml` of its Action), read before the task is removed: uninstall
+  (with `--purge`, that is the config home it deletes), `install --force` and the service's stop
+  use it rather than whatever `GROOVE_CONFIG_HOME` is now, say on stderr when the two differ, and
+  fall back to `GROOVE_CONFIG_HOME` or the default when the task is gone or names none. A start of the task
   while the recorded server runs (a manual `/Run`, the next logon, the tray's Start) spawns
   nothing and keeps the record, instead of starting a second server that fails to bind and
   taking the running one out of the record; the check, the spawn and the record, and every

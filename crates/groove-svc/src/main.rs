@@ -139,8 +139,10 @@ const SERVE_IMAGE: &str = "groove.exe";
 ///
 /// The old record is removed before the spawn, so a record that then cannot
 /// be written leaves none (uninstall warns) rather than an old one read as
-/// "that server has exited". Writing it is best-effort: the server is already
-/// running by then. An error before the spawn (the lock not taken in time, a
+/// "that server has exited". A server whose record cannot be written (or
+/// whose creation time cannot be read) is stopped again and the launch fails:
+/// a server out of the record is out of reach of uninstall and of the next
+/// launch's check, so it is not left running. An error before the spawn (the lock not taken in time, a
 /// recorded process that exists but cannot be examined) spawns nothing, and
 /// lands in the task history. Without a config home (an Action from before
 /// BU-07) there is nothing to record or check, and the server is started as
@@ -150,16 +152,23 @@ fn launch(
     config_home: Option<&std::path::Path>,
     spawn: impl FnOnce() -> std::io::Result<std::process::Child>,
 ) -> std::io::Result<Launch> {
-    launch_waiting(config_home, groove_winproc::RECORD_LOCK_WAIT, spawn)
+    launch_waiting(
+        config_home,
+        groove_winproc::RECORD_LOCK_WAIT,
+        spawn,
+        |record, path| record.write(path),
+    )
 }
 
-/// [`launch`] with the wait for the section passed in, so a test of the
-/// refusal need not sit out [`groove_winproc::RECORD_LOCK_WAIT`].
+/// [`launch`] with the wait for the section and the record's write passed
+/// in, so a test can refuse the section without sitting out
+/// [`groove_winproc::RECORD_LOCK_WAIT`], and make the write fail.
 #[cfg(target_os = "windows")]
 fn launch_waiting(
     config_home: Option<&std::path::Path>,
     wait: std::time::Duration,
     spawn: impl FnOnce() -> std::io::Result<std::process::Child>,
+    write: impl FnOnce(&groove_winproc::ServeRecord, &std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<Launch> {
     use groove_winproc::{RecordLock, ServeRecord};
     let Some(home) = config_home else {
@@ -181,13 +190,30 @@ fn launch_waiting(
         return Ok(Launch::AlreadyRunning(record.pid));
     }
     let _ = std::fs::remove_file(&path);
-    let child = spawn()?;
-    if let Ok(created) = groove_winproc::creation_time_of(&child) {
-        let _ = ServeRecord {
-            pid: child.id(),
-            created,
-        }
-        .write(&path);
+    let mut child = spawn()?;
+    let recorded = groove_winproc::creation_time_of(&child).and_then(|created| {
+        write(
+            &ServeRecord {
+                pid: child.id(),
+                created,
+            },
+            &path,
+        )
+    });
+    if let Err(e) = recorded {
+        // A server that is not recorded is out of reach of uninstall and of
+        // the next launch's check: stop it, through the handle it was spawned
+        // with, and wait for it, rather than leave it running unmanaged. The
+        // error reaches the task history.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "could not record the server in {} ({e}); it was stopped",
+                path.display()
+            ),
+        ));
     }
     // Dropping `child` closes its handle and leaves the server running.
     Ok(Launch::Started(child.id()))
@@ -359,15 +385,61 @@ mod launch_tests {
         let home = temp_dir("busy");
         let held = groove_winproc::RecordLock::acquire(&home, std::time::Duration::ZERO).unwrap();
         let mut spawned = false;
-        let err = super::launch_waiting(Some(&home), std::time::Duration::from_millis(100), || {
-            spawned = true;
-            Err(std::io::Error::other("must not be called"))
-        })
+        let err = super::launch_waiting(
+            Some(&home),
+            std::time::Duration::from_millis(100),
+            || {
+                spawned = true;
+                Err(std::io::Error::other("must not be called"))
+            },
+            |record, path| record.write(path),
+        )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(!spawned, "nothing is spawned without the section");
         drop(held);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A server whose record cannot be written is stopped again: the launch
+    /// fails and no server is left running out of the record.
+    #[test]
+    fn a_server_that_cannot_be_recorded_is_not_left_running() {
+        let home = temp_dir("unwritable");
+        let bin = temp_dir("unwritable-bin");
+        let exe = stand_in_exe(&bin);
+        let spawned_pid = std::cell::Cell::new(None);
+        let err = super::launch_waiting(
+            Some(&home),
+            std::time::Duration::ZERO,
+            || {
+                let child = spawn_stand_in(&exe)?;
+                spawned_pid.set(Some(child.id()));
+                Ok(child)
+            },
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected write failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("it was stopped"), "{err}");
+        let pid = spawned_pid.get().expect("a server was spawned");
+        assert_eq!(
+            groove_winproc::stop_process_if_image_matches(pid, "groove.exe").unwrap(),
+            groove_winproc::StopOutcome::NotRunning,
+            "the unrecorded server is gone"
+        );
+        assert_eq!(
+            ServeRecord::read(&ServeRecord::path_in(&home)).unwrap(),
+            None,
+            "and there is no record"
+        );
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(bin);
     }
 
     /// An old record whose server has exited does not stop a start, and is
