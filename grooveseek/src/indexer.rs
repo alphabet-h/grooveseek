@@ -1668,6 +1668,7 @@ pub fn rebuild_index(
     let CollectedSources {
         files: source_files,
         unspellable,
+        left_out: _,
     } = collect_source_files_counted(&kb_path, &kb_path, registry, &rules)?;
     eprintln!(
         "Found {} source files (extensions: {:?})",
@@ -4522,13 +4523,18 @@ fn name_is_left_out(kb_path: &Path, path: &Path) -> bool {
     index_rel_path(kb_path, path).is_some_and(|r| !crate::resources::rel_is_indexable_name(&r))
 }
 
-/// What [`collect_source_files_counted`] collected, and how many entries it
-/// left out for their names.
+/// What [`collect_source_files_counted`] collected, how many entries it
+/// left out for their names, and what it left out and why.
 #[derive(Debug)]
 pub(crate) struct CollectedSources {
     pub(crate) files: Vec<std::path::PathBuf>,
     /// See [`IndexResult::unspellable`].
     pub(crate) unspellable: u32,
+    /// (#660) Each entry the walk left out, one per entry in walk order (no order is
+    /// promised): a name the index cannot hold ([`SkipReason::UnspellableName`], a directory
+    /// once) or a hard link ([`SkipReason::HardLink`]). The path is spelled by
+    /// [`index_rel_path_or_whole`].
+    pub(crate) left_out: Vec<SkippedFile>,
 }
 
 /// [`collect_source_files_under`], also counting what it left out because the
@@ -4556,9 +4562,16 @@ pub(crate) fn collect_source_files_counted(
     // A `Cell`, because `filter_entry` holds its closure for as long as the
     // loop body runs and both of them count.
     let unspellable = std::cell::Cell::new(0u32);
+    // (#660) A `RefCell` for the same reason. Each push borrows within its own statement, so
+    // no guard outlives it into the other caller.
+    let left_out = std::cell::RefCell::new(Vec::<SkippedFile>::new());
     let leave_out = |path: &Path, is_dir: bool| {
         tracing::warn!("{}", crate::resources::unspellable_reason(path, is_dir));
         unspellable.set(unspellable.get() + 1);
+        left_out.borrow_mut().push(SkippedFile {
+            path: index_rel_path_or_whole(kb_path, path),
+            reason: SkipReason::UnspellableName { directory: is_dir },
+        });
     };
 
     // (AX-35) `follow_links(false)` leaves the root alone: walkdir follows a root that is a
@@ -4611,6 +4624,10 @@ pub(crate) fn collect_source_files_counted(
                 // what we were never going to index.
                 if crate::links::is_multiply_linked(entry.path()) {
                     tracing::warn!("{}", crate::links::refusal_reason(entry.path()));
+                    left_out.borrow_mut().push(SkippedFile {
+                        path: index_rel_path_or_whole(kb_path, entry.path()),
+                        reason: SkipReason::HardLink,
+                    });
                     continue;
                 }
                 files.push(entry.into_path());
@@ -4622,6 +4639,7 @@ pub(crate) fn collect_source_files_counted(
     Ok(CollectedSources {
         files,
         unspellable: unspellable.get(),
+        left_out: left_out.into_inner(),
     })
 }
 
@@ -6345,6 +6363,90 @@ mod tests {
         let got = collect_source_files_counted(&tmp.0, &tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
         assert_eq!(got.files.len(), 3, "{:?}", got.files);
         assert_eq!(got.unspellable, 0);
+    }
+
+    /// (#660, spec 5.5) Both names of a hard-linked file come back in `left_out` as
+    /// [`SkipReason::HardLink`], spelled as `index_rel_path_or_whole` spells them, and neither
+    /// is collected.
+    #[test]
+    fn collect_lists_a_hard_link_as_left_out() {
+        let tmp = mk_tmp("leftout-hardlink");
+        write_file(&tmp.0, "normal.md", "# normal");
+        write_file(&tmp.0, "a.md", "# a");
+        std::fs::hard_link(tmp.0.join("a.md"), tmp.0.join("b.md"))
+            .expect("hard links need no privilege");
+
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&tmp.0, &tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        let mut left: Vec<(String, SkipReason)> = got
+            .left_out
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        left.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            left,
+            vec![
+                (
+                    index_rel_path_or_whole(&tmp.0, &tmp.0.join("a.md")),
+                    SkipReason::HardLink
+                ),
+                (
+                    index_rel_path_or_whole(&tmp.0, &tmp.0.join("b.md")),
+                    SkipReason::HardLink
+                ),
+            ]
+        );
+        assert_eq!(left[0].0, "a.md");
+        assert_eq!(left[1].0, "b.md");
+        let names: Vec<String> = got
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["normal.md".to_string()]);
+        assert_eq!(got.unspellable, 0, "a hard link is not a name left out");
+    }
+
+    /// (#660, spec 5.5 / S6a) The names the walk cannot keep come back in `left_out`: `CON.md`
+    /// as a file, `dir.` and `sp ` as whole directories (one entry each, their files never
+    /// listed). `b.md.` / `b.md ` have no registered extension and never reach the check.
+    #[cfg(windows)]
+    #[test]
+    fn collect_lists_an_unspellable_name_and_dir_as_left_out() {
+        let (_tmp, _cleanup, kb) = kb_with_unspellable_names("leftout-unspellable");
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&kb, &kb, &reg, &excl(&kb, &[])).unwrap();
+        let mut left: Vec<(String, SkipReason)> = got
+            .left_out
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        left.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = vec![
+            (
+                index_rel_path_or_whole(&kb, &kb.join("CON.md")),
+                SkipReason::UnspellableName { directory: false },
+            ),
+            (
+                index_rel_path_or_whole(&kb, &kb.join("dir.")),
+                SkipReason::UnspellableName { directory: true },
+            ),
+            (
+                index_rel_path_or_whole(&kb, &kb.join("sp ")),
+                SkipReason::UnspellableName { directory: true },
+            ),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(left, expected);
+        assert_eq!(got.unspellable, 3);
+        for absent in [r"dir.\x.md", r"dir.\z.md", r"sp \y.md", "b.md.", "b.md "] {
+            let rel = index_rel_path_or_whole(&kb, &kb.join(absent));
+            assert!(
+                !left.iter().any(|(p, _)| *p == rel),
+                "{rel:?} must not be listed: {left:?}"
+            );
+        }
     }
 
     /// A row stored for a name the walk no longer collects is gone after the
