@@ -88,6 +88,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   path resolved once, the directory symlinks and junctions above it included, so a directory link
   repointed during the purge no longer moves the removal to another database, and a `.groove.db`
   symlink repointed meanwhile is left in place with a warning.
+- **`groove service uninstall` stops the running server on Windows.** The scheduled task's
+  Action is `groove-svc.exe`, which starts `groove.exe serve` detached and exits, so the task
+  is always `Ready` and `schtasks /End` stopped nothing: the server kept running after
+  `uninstall`, and `uninstall --purge --yes` waited out its 10 seconds for the writer lock every
+  time, then refused and kept the database and the config home. Uninstall, with or without
+  `--purge`, now stops the server by the pid `.groove.db.writer.json` records, believed only
+  while the writer lock beside it is held, only for a server's record (role `serve` or
+  `rebuild`), and only when that pid is `groove.exe` and was started before the record was
+  written (so a stale record whose pid was reused, even by another groove, is left alone); it
+  then waits up to 10 seconds for the lock to be released. A server it cannot stop is named
+  with its pid and how to stop it, and an uninstall without `--purge` now fails in that case
+  instead of leaving it running without a word. The refusal also gives `taskkill /F /PID <pid>`:
+  a server started without a console is refused by `taskkill /PID <pid>` alone ("can only be
+  terminated forcefully"). Removing a task that is already gone no longer prints schtasks'
+  `ERROR: The system cannot find the file specified.` twice. Linux and macOS are unchanged
+  (kuriya #650).
 
 ### Documentation
 

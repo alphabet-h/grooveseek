@@ -44,10 +44,16 @@ pub(crate) fn run_with_backend(
 }
 
 /// How long `--purge` waits for the index's writer lock before it gives up
-/// and deletes nothing. The backends stop the server without waiting for it
-/// to exit (Windows' `schtasks /End` returns at once), so a server that is
-/// stopping still holds the lock for a moment; one that is still holding it
-/// after this long is taken to be running.
+/// and deletes nothing. On Linux and macOS the backend stops the server
+/// (systemd / launchd stop the unit's process) without waiting for it to
+/// exit, so a server that is stopping still holds the lock for a moment. On
+/// Windows the backend cannot stop it (the task's process is `groove-svc.exe`,
+/// which detach-spawns the server and exits, so `schtasks /End` has nothing
+/// to end): uninstall stops the server itself by the pid its writer lock
+/// records ([`crate::service::serve_stop`], kuriya #650) and has already
+/// waited for the lock by the time this wait starts. Either way, a holder
+/// still there after this long was not stopped (another process, or a
+/// server that could not be), and is named in the refusal.
 const PURGE_WRITER_WAIT: Duration = Duration::from_secs(10);
 
 /// [`run_with_backend`] with the wait for the writer lock passed in, so a
@@ -100,6 +106,16 @@ fn run_with_backend_waiting(
                 // Resolved once, whole; everything removed below is named
                 // from this resolution (kuriya #645 review).
                 let target = PurgeTarget::new(&db);
+                // A server that could not be stopped is reported here and
+                // then met by the wait and refusal below, which name it and
+                // how to stop it.
+                #[cfg(target_os = "windows")]
+                if let Some((holder, why)) = stop_serve(&target.resolved) {
+                    eprintln!(
+                        "Warning: could not stop the groove server (pid {}): {why}",
+                        holder.pid
+                    );
+                }
                 purge_under_writer_lock(&target, &home, &name, writer_wait, remove_config_home)?;
             }
             Ok(None) => {
@@ -121,15 +137,74 @@ fn run_with_backend_waiting(
                 return Err(undecidable_database(&why, &home, &name));
             }
         }
-    } else if let Some(home) = config_home
-        && home.exists()
-    {
-        eprintln!(
-            "Kept config home: {} (use --purge --yes to remove)",
-            home.display()
-        );
+    } else if let Some(home) = config_home {
+        #[cfg(target_os = "windows")]
+        stop_serve_named_by(home, &name)?;
+        if home.exists() {
+            eprintln!(
+                "Kept config home: {} (use --purge --yes to remove)",
+                home.display()
+            );
+        }
     }
     Ok(())
+}
+
+/// Stop the `groove serve` holding the writer lock of the database at
+/// `resolved` ([`crate::service::serve_stop`], kuriya #650): on Windows the
+/// backend's `schtasks /End` cannot, since the task's process is the launcher
+/// that already exited. `None` when there was no server or it was stopped
+/// (said on stderr); otherwise the holder record and why it was not stopped.
+#[cfg(target_os = "windows")]
+fn stop_serve(resolved: &Path) -> Option<(HolderInfo, String)> {
+    use crate::service::serve_stop::{SERVE_LOCK_RELEASE_WAIT, ServeStop, stop_serve_of};
+    match stop_serve_of(resolved, SERVE_LOCK_RELEASE_WAIT) {
+        ServeStop::NoServe => None,
+        ServeStop::Stopped { pid } => {
+            eprintln!("Stopped the groove server (pid {pid}).");
+            None
+        }
+        ServeStop::NotStopped { holder, why } => Some((holder, why)),
+    }
+}
+
+/// The uninstall without `--purge`: stop the server of the database
+/// `home`'s `groove.toml` names, and fail, naming it and how to stop it,
+/// when it cannot be stopped. A config home that names no database has no
+/// server to look for, so that is only a warning.
+#[cfg(target_os = "windows")]
+fn stop_serve_named_by(home: &Path, name: &str) -> Result<()> {
+    let db = match database_named_by(home) {
+        Ok(Some(db)) => db,
+        Ok(None) => return Ok(()),
+        Err(why) => {
+            eprintln!(
+                "Warning: {why}; the index database is unknown, so no running groove server \
+                 was looked for"
+            );
+            return Ok(());
+        }
+    };
+    let target = PurgeTarget::new(&db);
+    let Some((holder, why)) = stop_serve(&target.resolved) else {
+        return Ok(());
+    };
+    let busy = WriterBusy {
+        lock_path: with_suffix(&target.resolved, ".writer-lock"),
+        info_path: with_suffix(&target.resolved, ".writer.json"),
+        holder: Some(holder.clone()),
+        waited: Duration::ZERO,
+    };
+    Err(anyhow!(
+        "The service unit for '{name}' was removed, but a groove server (pid {}, {}, as \
+         recorded in {}, which can be stale) still holds the writer lock at {}: {why}. \
+         Stop {}.",
+        holder.pid,
+        holder.role.as_str(),
+        busy.info_path.display(),
+        busy.lock_path.display(),
+        busy.how_to_stop()
+    ))
 }
 
 /// Delete the database `target` names and then the config home `home`, with
@@ -441,7 +516,9 @@ impl WriterBusy {
                  can belong to an earlier holder and be reused by now \
                  (Windows: `tasklist /FI \"PID eq {pid}\"`; Linux / macOS: `ps -p {pid}`), \
                  and only if it is, stop it \
-                 (Windows: `taskkill /PID {pid}`; Linux / macOS: `kill {pid}`); \
+                 (Windows: `taskkill /PID {pid}`, and `taskkill /F /PID {pid}` when that \
+                 answers the process can only be terminated forcefully, as a server the \
+                 scheduled task started without a console does; Linux / macOS: `kill {pid}`); \
                  if it is not groove, do not stop it: the record is stale, and the lock \
                  is held by another groove process, to be found by its name",
                 pid = h.pid
@@ -452,7 +529,7 @@ impl WriterBusy {
 }
 
 /// Take the writer lock on `target`'s database, waiting up to `wait` for a
-/// server the backend has told to stop to let go of it; or report the
+/// server that is being stopped to let go of it; or report the
 /// process that would not let go ([`WriterBusy`]).
 ///
 /// What the lock does not cover: a process that opens the database without
@@ -657,7 +734,7 @@ fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
 /// is not called, because it also checks every other key against this
 /// build's schema, and a config this build would refuse for an unrelated key
 /// still names the database to purge.
-fn database_named_by(home: &Path) -> std::result::Result<Option<PathBuf>, String> {
+pub(super) fn database_named_by(home: &Path) -> std::result::Result<Option<PathBuf>, String> {
     let toml_path = home.join("groove.toml");
     let Some(bytes) = crate::links::read_required_following(
         &toml_path,
@@ -1303,6 +1380,98 @@ mod tests {
         );
         assert!(msg.contains("if it is not groove, do not stop it"), "{msg}");
         assert!(db.exists(), "the database is kept");
+    }
+
+    /// kuriya #650. A server started by the scheduled task runs without a
+    /// console (CREATE_NO_WINDOW), and `taskkill /PID` without `/F` answers
+    /// that it "can only be terminated forcefully": the refusal gives the
+    /// `/F` form too, after the plain one.
+    #[test]
+    fn the_refusal_gives_the_forced_taskkill_too() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let _lease = crate::writer_lease::WriterLease::try_acquire(
+            &db,
+            crate::writer_lease::Role::Serve,
+            &kb_root.path().join("kb"),
+        )
+        .expect("nobody else holds the lease");
+        let pid = std::process::id();
+
+        let msg = run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect_err("a held writer lock must stop the purge")
+        .to_string();
+
+        let plain = format!("`taskkill /PID {pid}`");
+        let forced = format!("`taskkill /F /PID {pid}`");
+        let at = |needle: &str| {
+            msg.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {msg}"))
+        };
+        assert!(at(&plain) < at(&forced), "plain first, then /F: {msg}");
+        assert!(msg.contains("forcefully"), "{msg}");
+    }
+
+    /// kuriya #650. Without `--purge`, uninstall stops the service's server
+    /// too; one it cannot stop (here the holder record names this test
+    /// process, which is never stopped) is reported with the pid and how to
+    /// stop it, and the uninstall fails rather than leave it running silently.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn uninstall_without_purge_reports_a_server_it_could_not_stop() {
+        let home = TempHome::new();
+        let (kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let _lease = crate::writer_lease::WriterLease::try_acquire(
+            &db,
+            crate::writer_lease::Role::Serve,
+            &kb_root.path().join("kb"),
+        )
+        .expect("nobody else holds the lease");
+        let pid = std::process::id();
+
+        let be = FakeBackend::ok();
+        let msg =
+            run_with_backend_waiting(&be, Some(home.path()), params(false, false), Duration::ZERO)
+                .expect_err("a server left running must be reported")
+                .to_string();
+
+        assert_eq!(
+            be.uninstalled.take().as_deref(),
+            Some("au28"),
+            "the unit is removed first"
+        );
+        assert!(msg.contains(&format!("pid {pid}, serve")), "{msg}");
+        assert!(msg.contains(&format!("`taskkill /F /PID {pid}`")), "{msg}");
+        assert!(db.exists(), "nothing is deleted without --purge");
+        assert!(
+            home.path().exists(),
+            "the config home is kept without --purge"
+        );
+    }
+
+    /// kuriya #650. Without `--purge` and with nobody holding the lock,
+    /// uninstall stops nothing and succeeds, as before.
+    #[test]
+    fn uninstall_without_purge_and_without_a_server_succeeds() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(false, false),
+            Duration::ZERO,
+        )
+        .expect("no server, nothing to stop");
+        assert!(db.exists());
+        assert!(home.path().exists());
     }
 
     /// The refusal names `pid` as recorded and possibly stale, and gives the

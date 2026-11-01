@@ -60,6 +60,23 @@ fn run_schtasks(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// [`run_schtasks`] with stdout and stderr captured instead of shown, for the
+/// calls whose result is ignored.
+fn run_schtasks_quiet(args: &[&str]) -> Result<()> {
+    let out = Command::new("schtasks")
+        .args(args)
+        .output()
+        .with_context(|| format!("could not run schtasks {}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "schtasks {} failed (status: {})",
+            args.join(" "),
+            out.status
+        ));
+    }
+    Ok(())
+}
+
 /// The subcommand word a console-binary Action has to supply itself.
 ///
 /// **Invariant, enforced jointly with `crates/groove-svc/src/main.rs`:** exactly
@@ -395,9 +412,17 @@ impl ServiceBackend for TaskScheduler {
         Ok(())
     }
     fn uninstall(&self, service_name: &str) -> Result<()> {
+        // `/End` stops the server only on an install whose Action is
+        // `groove.exe` itself (before v0.9.1); with the `groove-svc.exe`
+        // launcher the task's process has already exited, and the uninstall
+        // command stops the server by its pid (`serve_stop`, kuriya #650).
+        // Both results are ignored, as before, so their output is captured
+        // rather than shown: a task that is already gone printed schtasks'
+        // "ERROR: The system cannot find the file specified." twice on a
+        // successful uninstall.
         let task = task_name(service_name);
-        let _ = run_schtasks(&["/End", "/TN", &task]);
-        let _ = run_schtasks(&["/Delete", "/TN", &task, "/F"]);
+        let _ = run_schtasks_quiet(&["/End", "/TN", &task]);
+        let _ = run_schtasks_quiet(&["/Delete", "/TN", &task, "/F"]);
         Ok(())
     }
     fn status(&self, service_name: &str) -> Result<ServiceState> {
@@ -439,8 +464,25 @@ impl ServiceBackend for TaskScheduler {
         }
         Ok(result)
     }
+    /// `schtasks /End` alone stops nothing on an install whose Action is the
+    /// `groove-svc.exe` launcher (the task is `Ready` while the server runs),
+    /// so the server is stopped by the pid its writer lock records, checked
+    /// to be the `groove.exe` that wrote the record (kuriya #650).
     fn stop(&self, service_name: &str) -> Result<()> {
-        run_schtasks(&["/End", "/TN", &task_name(service_name)])
+        use super::serve_stop::{SERVE_LOCK_RELEASE_WAIT, ServeStop, stop_serve_of};
+        let _ = run_schtasks_quiet(&["/End", "/TN", &task_name(service_name)]);
+        let home = super::resolve_config_home(service_name)?;
+        let Some(db) = super::uninstall::database_named_by(&home).map_err(|e| anyhow!(e))? else {
+            return Ok(());
+        };
+        let resolved = crate::writer_lease::WriterLease::resolved_db_path(&db);
+        match stop_serve_of(&resolved, SERVE_LOCK_RELEASE_WAIT) {
+            ServeStop::NoServe | ServeStop::Stopped { .. } => Ok(()),
+            ServeStop::NotStopped { holder, why } => Err(anyhow!(
+                "could not stop the groove server of '{service_name}' (pid {}): {why}",
+                holder.pid
+            )),
+        }
     }
 }
 
