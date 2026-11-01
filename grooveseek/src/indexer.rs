@@ -882,7 +882,7 @@ fn frontmatter_topic_of(registry: &Registry, rel: &str, bytes: &[u8]) -> Option<
 /// row stays, under [`HASH_AWAITING_REPARSE`] so that no later fast path keeps the old parser's
 /// chunks.
 ///
-/// A further read of a crossed rename this kept awaiting -- [`read_crossed_rename_again`] in
+/// A further read of a crossed rename this kept awaiting -- [`read_crossed_rename_again_explained`] in
 /// [`rebuild_index`], or the watcher's reread ([`crate::watcher`]) -- does not come here: it is
 /// settled by [`settle_further_crossed_read`] (#544, local Codex r4/r5). `Ok(true)` when the
 /// row was dropped.
@@ -915,7 +915,7 @@ pub(crate) fn settle_cross_parser_rename(
 }
 
 /// (#544, local Codex r4/r5, D5) The settlement of a further read of a crossed rename this
-/// branch adds after the first read kept the row awaiting: [`read_crossed_rename_again`] in
+/// branch adds after the first read kept the row awaiting: [`read_crossed_rename_again_explained`] in
 /// [`rebuild_index`], and the watcher's crossed rereads ([`crate::watcher`]). Both ask the read
 /// to check its bytes against its own hash before parsing (`row_dropped_unless_updated` on
 /// [`index_single_disk_entry`]), and only results of such a read come here.
@@ -986,6 +986,10 @@ pub(crate) fn settle_further_crossed_read(
 /// that changed again and (local Codex r4, D5) for a read that failed, which checked no bytes.
 /// A refusal records the length it measured first; the row it lands on is then deleted, which
 /// leaves nothing behind.
+///
+/// (#660) [`rebuild_index`] calls [`read_crossed_rename_again_explained`]; this wrapper is kept
+/// for the tests that read the result alone.
+#[cfg(test)]
 fn read_crossed_rename_again(
     db: &Database,
     embedder: &mut Embedder,
@@ -1007,7 +1011,7 @@ fn read_crossed_rename_again(
     .map(|r| r.result)
 }
 
-/// [`read_crossed_rename_again`] with the reason the file was not indexed (#660): the body. A
+/// `read_crossed_rename_again` with the reason the file was not indexed (#660): the body. A
 /// refused or failed re-read gives its own reason (spec R2 / R3); the rest come from
 /// [`index_single_disk_entry_explained`].
 fn read_crossed_rename_again_explained(
@@ -1237,7 +1241,7 @@ pub const REJECTIONS_NAMED_ABOVE: &str = "see the warnings above";
 pub const REJECTIONS_NAMED_ON_SERVER_STDERR: &str = "each named on the server's stderr";
 
 /// Summary returned by [`rebuild_index`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IndexResult {
     pub total_documents: u32,
     pub updated: u32,
@@ -1245,8 +1249,15 @@ pub struct IndexResult {
     /// `documents.path` だけが UPDATE された数。
     pub renamed: u32,
     pub deleted: u32,
-    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
+    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文、
+    /// hard link、index が保持できない名前)。path 単位で数え、[`Self::skipped_files`] の
+    /// 件数と常に等しい (#660)。[`Self::unspellable`] と [`Self::embed_rejected`] はこの内訳。
     pub skipped: u32,
+    /// (#660) Every file counted in [`Self::skipped`], one entry each, sorted by `path`.
+    /// `skipped_files.len() == skipped as usize` for every value [`rebuild_index`] returns,
+    /// completed or [`Self::cancelled`]. A hard link and a name the index cannot hold
+    /// ([`Self::unspellable`]) are in both.
+    pub skipped_files: Vec<SkippedFile>,
     /// Markdown files this run named with `warning: <path>: failed to parse
     /// YAML frontmatter` (#251): the ones indexed with empty metadata and the
     /// `frontmatter:unparsed` tag, the ones skipped for having no chunks after
@@ -1259,8 +1270,9 @@ pub struct IndexResult {
     /// (ADR-0023) Entries the walk left out because their name is not one the
     /// index can hold ([`crate::resources::doc_is_addressable`]): a file, or a
     /// directory together with everything under it, counted once each and
-    /// each named on stderr. Not part of [`Self::skipped`], which counts files
-    /// that were collected and then could not be read or parsed.
+    /// each named on stderr. (#660) Part of [`Self::skipped`]: the entries of
+    /// [`Self::skipped_files`] whose reason is [`SkipReason::UnspellableName`],
+    /// counted by path like the rest of the list.
     pub unspellable: u32,
     /// (AW-04) Files skipped because the embedding endpoint refused their
     /// input before accepting any of it. Also counted in [`Self::skipped`]. A
@@ -1714,11 +1726,29 @@ pub fn rebuild_index(
 
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
-    let CollectedSources {
-        files: source_files,
-        unspellable,
-        left_out: _,
-    } = collect_source_files_counted(&kb_path, &kb_path, registry, &rules)?;
+    let collected = collect_source_files_counted(&kb_path, &kb_path, registry, &rules)?;
+    let source_files = collected.files;
+    // (#660, spec 6) The run's list of the files it did not index, one reason per path. Only
+    // `upsert` and `remove` change it, at the write points W0-W7; `complete_index_result` turns
+    // it into `skipped_files`, `skipped` and `unspellable` once (F), for a completed run and a
+    // stopped one alike.
+    let mut skip_ledger = skip::SkipLedger::default();
+    // (#660, spec 5.5) The walk counts each name it leaves out as it pushes it to `left_out`,
+    // before the ledger folds equal paths, so the two counts agree.
+    debug_assert_eq!(
+        collected.unspellable as usize,
+        collected
+            .left_out
+            .iter()
+            .filter(|f| matches!(f.reason, SkipReason::UnspellableName { .. }))
+            .count(),
+        "the walk's count of names left out disagrees with its list"
+    );
+    // W0: what the walk left out (hard links, names the index cannot hold). Not guarded from
+    // the prune (A8): a hard link's row goes, as before.
+    for left in &collected.left_out {
+        skip_ledger.upsert(&left.path, left.reason);
+    }
     eprintln!(
         "Found {} source files (extensions: {:?})",
         source_files.len(),
@@ -1727,10 +1757,7 @@ pub fn rebuild_index(
     // (feature-60) What this run has done so far, in the shape it returns. Counted here as the
     // run goes and completed by `complete_index_result`, whether the run finishes or stops at
     // a check point, so the two returns cannot count differently.
-    let mut tally = IndexResult {
-        unspellable,
-        ..IndexResult::default()
-    };
+    let mut tally = IndexResult::default();
     // (feature-60) The declared-field pass a stopped run closes, built once and handed to every
     // check point (C1-C4). Only shared borrows: `pass_token`, `stored_declared` and
     // `declared_json` are read, never changed, for the rest of the run.
@@ -1794,8 +1821,17 @@ pub fn rebuild_index(
 
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
+    // W1 (#660): each file the scan declined, with its reason; a path declined twice (a lossy
+    // spelling shared by two files) is one entry.
+    for (rel, why) in scan.skipped.iter().zip(&scan.skipped_why) {
+        skip_ledger.upsert(rel, *why);
+    }
     let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
-    tally.skipped = skipped_paths.len() as u32;
+    // (#660, spec 6 I3) Every path the prune guards is listed.
+    debug_assert!(
+        skipped_paths.iter().all(|rel| skip_ledger.contains(rel)),
+        "a path the scan skipped is not in the skip ledger"
+    );
 
     // (feature-60) Check points C1 and C2. C1: the observer above stopped the scan at a file.
     // C2: the token was set after the last file -- or, on an empty knowledge base, where there
@@ -1803,7 +1839,16 @@ pub fn rebuild_index(
     // nothing, and the renames below are the next write, so this is the last point where the
     // index reads as it did before the scan.
     if scan_flow.is_break() || progress.is_cancelled() {
-        return stop_cancelled_run(db, embedder, progress, pass_to_close, tally, None, start);
+        return stop_cancelled_run(
+            db,
+            embedder,
+            progress,
+            pass_to_close,
+            tally,
+            skip_ledger,
+            None,
+            start,
+        );
     }
 
     // rename 検出 + atomically な rename 適用。
@@ -2010,6 +2055,7 @@ pub fn rebuild_index(
                 progress,
                 pass_to_close,
                 tally,
+                skip_ledger,
                 Some(embedded_since),
                 start,
             );
@@ -2036,7 +2082,10 @@ pub fn rebuild_index(
         // it embedded, and the rest of an updated document's chunks were reused.
         let texts_before = embedder.texts_embedded();
         let crossed = crossed_parser_renames.contains(&entry.rel);
-        let single_result = index_single_disk_entry(
+        let Reindexed {
+            result: single_result,
+            reason: skip_reason,
+        } = index_single_disk_entry_explained(
             db,
             embedder,
             entry,
@@ -2110,7 +2159,8 @@ pub fn rebuild_index(
                 reason,
                 frontmatter_unparsed: fm_unparsed,
             } => {
-                tally.skipped += 1;
+                // W2 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, skip_reason);
                 // A refusal that came after an accepted batch of the same file proves the
                 // endpoint works, so it is not counted toward "every input rejected".
                 if reason == SKIPPED_EMBED_REJECTED
@@ -2149,7 +2199,8 @@ pub fn rebuild_index(
             SingleResult::Refused
             | SingleResult::OutsideKnowledgeBaseDeindexed
             | SingleResult::NothingToIndex { .. } => {
-                tally.skipped += 1;
+                // W3 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, skip_reason);
                 if refresh_any && indexed_hash_for(db, registry, &entry.rel, "md")?.is_some() {
                     refresh_pending_rows.insert(entry.rel.clone());
                 }
@@ -2177,17 +2228,23 @@ pub fn rebuild_index(
 
     // (#544, local Codex r1) A crossed rename the loop kept awaiting a reparse holds the old
     // parser's chunks: it gets one further read of the bytes on disk before the run returns
-    // ([`read_crossed_rename_again`]), whose result alone decides the row and replaces the skip
-    // the loop counted for it. Ahead of C4, so a cancel stops it between two reads: a row not
-    // read again keeps the sentinel, which no fast path trusts. Not reported to `progress`,
-    // which already counted the file.
+    // ([`read_crossed_rename_again_explained`]), whose result alone decides the row and replaces
+    // the skip the loop counted for it. Ahead of C4, so a cancel stops it between two reads: a
+    // row not read again keeps the sentinel, which no fast path trusts. Not reported to
+    // `progress`, which already counted the file.
+    // (#660, spec 7 I-reread) W4 and W5-W8 run one after the other within an iteration, with no
+    // cancel check and no early return but `?` between them, so at every break each crossed
+    // path is listed either with the loop's `ChangedDuringRead` or with this read's outcome.
     for entry in crossed_awaiting {
         if progress.is_cancelled() {
             break;
         }
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
         let texts_before = embedder.texts_embedded();
-        let again = read_crossed_rename_again(
+        let Reindexed {
+            result: again,
+            reason: again_reason,
+        } = read_crossed_rename_again_explained(
             db,
             embedder,
             entry,
@@ -2208,7 +2265,12 @@ pub fn rebuild_index(
             unsettled.remove(&entry.rel);
             refresh_pending_rows.remove(&entry.rel);
         }
-        tally.skipped = tally.skipped.saturating_sub(1);
+        // W4 (#660): this read's outcome replaces the loop's `ChangedDuringRead` -- unless the
+        // scan also skipped this path (a lossy spelling shared with another file), which keeps
+        // it guarded and so listed (I3).
+        if !skipped_paths.contains(&entry.rel) {
+            skip_ledger.remove(&entry.rel);
+        }
         match again {
             SingleResult::Updated {
                 chunks,
@@ -2230,7 +2292,8 @@ pub fn rebuild_index(
                 reason,
                 frontmatter_unparsed: fm_unparsed,
             } => {
-                tally.skipped += 1;
+                // W5 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, again_reason);
                 if reason == SKIPPED_EMBED_REJECTED
                     && embedder.documents_refused_after_accepting()
                         == refused_after_accepting_before
@@ -2245,17 +2308,19 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
                 ..
             } => {
-                // Dropped, by the read and by the settlement above.
-                tally.skipped += 1;
+                // Dropped, by the read and by the settlement above. W6 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, again_reason);
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
                 }
             }
             SingleResult::Refused | SingleResult::OutsideKnowledgeBaseDeindexed => {
-                tally.skipped += 1;
+                // W7 (#660).
+                list_skip(&mut skip_ledger, &entry.rel, again_reason);
             }
             // Neither comes back for a row under the sentinel: no hash matches it, and
             // `Reindex::Event` runs no one-time check. Named so a new variant is a compile error.
+            // W8 (#660): nothing to list; W4 took the loop's entry off.
             SingleResult::Unchanged | SingleResult::MetadataRefreshed { .. } => {}
         }
     }
@@ -2271,6 +2336,7 @@ pub fn rebuild_index(
             progress,
             pass_to_close,
             tally,
+            skip_ledger,
             Some(embedded_since),
             start,
         );
@@ -2297,6 +2363,11 @@ pub fn rebuild_index(
     //    still match it; a deleted row is counted after its batch commits.
     let mut snapshot_paths: Vec<String> = snapshot.keys().cloned().collect();
     snapshot_paths.sort_unstable();
+    // (#660, spec 6 I3) Again before the prune reads the guard: W4 changed the ledger since W1.
+    debug_assert!(
+        skipped_paths.iter().all(|rel| skip_ledger.contains(rel)),
+        "a path the prune guards is not in the skip ledger"
+    );
     let candidates = documents_to_delete(&snapshot_paths, &visited_paths, &skipped_paths);
     // (ADR-0031) Under `--force` each batch marks the rows it keeps in the transaction that
     // keeps them: the code chunk policy this forced run recorded before its walk claims every
@@ -2366,7 +2437,15 @@ pub fn rebuild_index(
         kept.is_empty() && (force || !refresh_fields || !refresh_pending),
     )?;
 
-    let result = complete_index_result(db, embedder, tally, Some(embedded_since), start, false)?;
+    let result = complete_index_result(
+        db,
+        embedder,
+        tally,
+        skip_ledger,
+        Some(embedded_since),
+        start,
+        false,
+    )?;
     // (feature-62) Recorded last -- after the deletion sweep, for the reason the frontmatter
     // key is, and after every other step of the run that can fail, so a run that returns an
     // `Err` or stops at a check point never records it (I-4) -- together with the placeholder
@@ -2484,14 +2563,29 @@ impl ChunkVectorCounts {
 /// an [`IndexResult`] is completed, for a run that finished and for one that stopped at a
 /// check point alike (AGENTS.md "One question gets one implementation"). `embedded_since` is
 /// `None` for a run stopped before the per-document loop, which embedded nothing.
+///
+/// (#660, spec 6 F) Also the one place [`IndexResult::skipped_files`], [`IndexResult::skipped`]
+/// and [`IndexResult::unspellable`] are written: all three from `ledger`, the run's list of the
+/// files it did not index, so the count and the list cannot disagree (I1, I7).
 fn complete_index_result(
     db: &Database,
     embedder: &Embedder,
     mut tally: IndexResult,
+    ledger: skip::SkipLedger,
     embedded_since: Option<EmbeddedBaseline>,
     start: Instant,
     cancelled: bool,
 ) -> Result<IndexResult> {
+    let skipped_files = ledger.finish();
+    tally.skipped = u32::try_from(skipped_files.len()).unwrap_or(u32::MAX);
+    tally.unspellable = u32::try_from(
+        skipped_files
+            .iter()
+            .filter(|f| matches!(f.reason, SkipReason::UnspellableName { .. }))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    tally.skipped_files = skipped_files;
     tally.embedded = embedded_since.map_or(0, |baseline| baseline.accepted_since(embedder));
     // Count total documents remaining (includes unchanged ones)
     tally.total_documents = db.document_count()?;
@@ -2524,12 +2618,14 @@ struct PassToClose<'a> {
 /// result is completed by [`complete_index_result`] before
 /// [`progress::ProgressReporter::finish_cancelled`] emits
 /// [`progress::ProgressEvent::Cancelled`].
+#[allow(clippy::too_many_arguments)]
 fn stop_cancelled_run(
     db: &Database,
     embedder: &Embedder,
     progress: progress::ProgressReporter,
     pass: PassToClose<'_>,
     tally: IndexResult,
+    ledger: skip::SkipLedger,
     embedded_since: Option<EmbeddedBaseline>,
     start: Instant,
 ) -> Result<IndexResult> {
@@ -2542,9 +2638,23 @@ fn stop_cancelled_run(
             false,
         )?;
     }
-    let result = complete_index_result(db, embedder, tally, embedded_since, start, true)?;
+    let result = complete_index_result(db, embedder, tally, ledger, embedded_since, start, true)?;
     progress.finish_cancelled();
     Ok(result)
+}
+
+/// (#660, spec 6 W2/W3/W5-W7) List `rel` with the reason the indexing body gave a result the
+/// run counts as skipped. That body names one for every such result (I4); a `None` here is a
+/// return point that forgot to, caught in a debug build and otherwise left off the list (the
+/// count follows the list, so the result stays consistent).
+fn list_skip(ledger: &mut skip::SkipLedger, rel: &str, reason: Option<SkipReason>) {
+    debug_assert!(
+        reason.is_some(),
+        "{rel}: a result counted as skipped came back with no reason (I4)"
+    );
+    if let Some(reason) = reason {
+        ledger.upsert(rel, reason);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8185,7 +8295,7 @@ mod tests {
         let both = IndexResult {
             chunks_embedded: 5,
             chunks_reused: 135,
-            ..clean
+            ..clean.clone()
         };
         assert_eq!(
             both.summary_line(),
@@ -8197,7 +8307,7 @@ mod tests {
         let reused_only = IndexResult {
             chunks_embedded: 0,
             chunks_reused: 3,
-            ..clean
+            ..clean.clone()
         };
         assert_eq!(
             reused_only.summary_line(),
@@ -8208,7 +8318,7 @@ mod tests {
         );
         let with_unspellable = IndexResult {
             unspellable: 2,
-            ..both
+            ..both.clone()
         };
         assert_eq!(
             with_unspellable.summary_line(),
@@ -12467,5 +12577,303 @@ mod tests {
             let explained = explain_reparsed_table_rows(result);
             assert_eq!(explained.reason, expected, "{rel}: {explained:?}");
         }
+    }
+
+    /// #660 (spec 9, PR-2): the list invariants every [`rebuild_index`] result keeps, completed
+    /// or cancelled -- I1 (one entry per skipped file), I2 / I6 (paths strictly ascending, so no
+    /// path twice) and I7 (`unspellable` is part of `skipped`). `embed_rejected` is per file and
+    /// not checked (spec 6 I7).
+    fn assert_skip_ledger(r: &IndexResult) {
+        assert_eq!(
+            r.skipped_files.len(),
+            r.skipped as usize,
+            "I1: one entry per skipped file: {r:?}"
+        );
+        assert!(
+            r.skipped_files.windows(2).all(|w| w[0].path < w[1].path),
+            "I2 / I6: paths ascending and unique: {r:?}"
+        );
+        assert!(
+            r.unspellable <= r.skipped,
+            "I7: unspellable is part of skipped: {r:?}"
+        );
+    }
+
+    /// #660: `(path, reason)` of each entry of a result's list, in its order.
+    fn listed(r: &IndexResult) -> Vec<(String, SkipReason)> {
+        r.skipped_files
+            .iter()
+            .map(|f| (f.path.clone(), f.reason))
+            .collect()
+    }
+
+    /// #660: a full run of `kb` with `registry` and the stub embedder, reporting to `progress`.
+    fn i660_rebuild(
+        db: &Database,
+        kb: &Path,
+        registry: &Registry,
+        progress: progress::ProgressReporter,
+    ) -> IndexResult {
+        rebuild_index(
+            db,
+            &mut Embedder::stub_for_tests(2),
+            kb,
+            None,
+            false,
+            None,
+            &[],
+            registry,
+            progress,
+            ContextMode::Off,
+        )
+        .unwrap()
+    }
+
+    /// #660 T-L11 (the rebuild side): the full index lists the files of
+    /// [`explained_gives_the_reason_for_each_kind`] with the reason the watcher's single-file
+    /// entry gives each of them (A7).
+    #[test]
+    fn rebuild_and_watcher_agree() {
+        let dir = mk_tmp("i660-rebuild-watcher-agree");
+        let db = reparse_db();
+        let registry = i660_explain_registry();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/binary/encrypted.pdf"),
+            dir.0.join("encrypted.pdf"),
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.0.join("sjis.txt"), b"\x82\xa0\x82\xa2").unwrap();
+
+        let result = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        let paths: Vec<&str> = result
+            .skipped_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["big.txt", "empty.md", "encrypted.pdf", "sjis.txt"],
+            "{result:?}"
+        );
+        for file in &result.skipped_files {
+            let watcher = reindex_single_file_explained(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &dir.0,
+                &file.path,
+                None,
+                &registry,
+            )
+            .unwrap();
+            assert_eq!(
+                watcher.reason,
+                Some(file.reason),
+                "{}: the rebuild and the watcher disagree: {watcher:?}",
+                file.path
+            );
+        }
+        assert_skip_ledger(&result);
+    }
+
+    /// #660 T-L6b (I3, A8): a run whose scan declines a file over the size cap and whose walk
+    /// leaves out both names of a hard link. The scan's skip is listed and guarded from the
+    /// prune (the two `debug_assert!`s of I3 run in this debug build); the walk's entries are
+    /// listed but not guarded, so the row of a document that became a hard link is pruned and
+    /// counted in `deleted`, while the file is listed as [`SkipReason::HardLink`].
+    #[test]
+    fn scan_skips_and_walk_hard_links_meet_the_prune_guard() {
+        use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
+        let dir = mk_tmp("i660-scan-and-walk-prune");
+        let db = reparse_db();
+        let limits = FileSizeLimits {
+            text: FileSizeLimit::Bytes(16),
+            ..FileSizeLimits::default()
+        };
+        let ids = ["md".to_string(), "txt".to_string()];
+        let registry =
+            Registry::from_enabled_with_plugins(&ids, &CodeParsersConfig::default(), None, limits)
+                .expect("md + txt");
+        std::fs::write(dir.0.join("h.md"), b"# H\n\nhi\n").unwrap();
+        std::fs::write(dir.0.join("big.txt"), [b'x'; 64]).unwrap();
+
+        let first = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        assert_eq!(
+            first.updated, 1,
+            "h.md was meant to be indexed first: {first:?}"
+        );
+        assert_skip_ledger(&first);
+
+        std::fs::hard_link(dir.0.join("h.md"), dir.0.join("h2.md"))
+            .expect("hard links need no privilege");
+        let result = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+
+        assert!(
+            result.deleted >= 1,
+            "the hard link's row was guarded: {result:?}"
+        );
+        assert_eq!(db.get_document_hash("h.md").unwrap(), None, "{result:?}");
+        assert_eq!(
+            listed(&result),
+            vec![
+                (
+                    "big.txt".to_string(),
+                    SkipReason::TooLarge {
+                        size: 64,
+                        limit: 16,
+                        key: LimitKey::MaxTextFileSize,
+                    }
+                ),
+                ("h.md".to_string(), SkipReason::HardLink),
+                ("h2.md".to_string(), SkipReason::HardLink),
+            ],
+            "{result:?}"
+        );
+        assert_skip_ledger(&result);
+    }
+
+    /// #660: [`crossed_rename_rewritten_during_the_run`] as it is, but with `cancel` (when given)
+    /// on the reporter and set from the loop's event for the crossed file -- the last document
+    /// of a knowledge base that holds only it.
+    fn i660_crossed_rename_run(
+        tag: &str,
+        (old_rel, new_rel): (&str, &str),
+        scanned: &'static [u8],
+        rewritten: &'static [u8],
+        cancel: Option<progress::CancelToken>,
+    ) -> (TmpDir, Database, IndexResult) {
+        let dir = mk_tmp(tag);
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "docx".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&registry, old_rel, new_rel),
+            "the pair was meant to cross a parser"
+        );
+        std::fs::write(dir.0.join(new_rel), scanned).unwrap();
+        let old = parse_doc(&registry, "md", old_rel, SCANNED_BYTES).chunks;
+        write_row(&db, old_rel, &sha256_hex_bytes(scanned), &old);
+        let full = dir.0.join(new_rel);
+        let (old_owned, new_owned) = (old_rel.to_string(), new_rel.to_string());
+        let token_cb = cancel.clone();
+        let progress = progress::ProgressReporter::with_callback(Box::new(move |event| {
+            match event {
+                progress::ProgressEvent::Renamed { old, new }
+                    if old == old_owned && new == new_owned =>
+                {
+                    std::fs::write(&full, rewritten).unwrap();
+                }
+                // The loop's event for the crossed file, its last document.
+                progress::ProgressEvent::Unchanged { rel, .. } if rel == new_owned => {
+                    if let Some(token) = &token_cb {
+                        token.cancel();
+                    }
+                }
+                _ => {}
+            }
+        }));
+        let progress = match cancel {
+            Some(token) => progress.with_cancel(token),
+            None => progress,
+        };
+        let result = i660_rebuild(&db, &dir.0, &registry, progress);
+        (dir, db, result)
+    }
+
+    /// #660 T-L7 (I2): the further read of a crossed rename replaces the loop's
+    /// [`SkipReason::ChangedDuringRead`] entry: a read that indexes the file takes it off the
+    /// list, and one that skips it lists the new reason instead.
+    #[test]
+    fn a_crossed_rename_reread_replaces_its_entry() {
+        let (_dir, _db, updated) = i660_crossed_rename_run(
+            "i660-crossed-reread-updated",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            SECOND_READ_BYTES,
+            None,
+        );
+        assert_eq!(updated.updated, 1, "{updated:?}");
+        assert_eq!(listed(&updated), vec![], "{updated:?}");
+        assert_skip_ledger(&updated);
+
+        let (_dir, _db, skipped) = i660_crossed_rename_run(
+            "i660-crossed-reread-skipped",
+            ("note.md", "note.docx"),
+            b"not a zip archive, as scanned",
+            b"not a zip archive, as rewritten",
+            None,
+        );
+        assert_eq!(
+            listed(&skipped),
+            vec![("note.docx".to_string(), SkipReason::CorruptOrUnsupported)],
+            "{skipped:?}"
+        );
+        assert_skip_ledger(&skipped);
+    }
+
+    /// #660 T-L8b (spec 7): a run cancelled from the loop's event for its last document, a
+    /// crossed rename kept awaiting, stops before the further read (C3 does not hold back a
+    /// renamed path; the further read breaks before its first entry; C4 stops the run). The
+    /// entry stays the loop's [`SkipReason::ChangedDuringRead`], and the result keeps I1.
+    #[test]
+    fn a_run_cancelled_before_the_reread_keeps_changed_during_read() {
+        let (_dir, _db, result) = i660_crossed_rename_run(
+            "i660-crossed-reread-cancelled",
+            ("note.txt", "note.md"),
+            SCANNED_BYTES,
+            SECOND_READ_BYTES,
+            Some(progress::CancelToken::new()),
+        );
+        assert!(result.cancelled, "{result:?}");
+        assert_eq!(result.updated, 0, "the further read ran: {result:?}");
+        assert_eq!(
+            listed(&result),
+            vec![("note.md".to_string(), SkipReason::ChangedDuringRead)],
+            "{result:?}"
+        );
+        assert_skip_ledger(&result);
+    }
+
+    /// #660 T-L7b (I2, path by path): two names whose lossy spelling is the same
+    /// (`a\u{FFFD}.md`), both empty, are one entry and one skip. Linux only: macOS refuses to
+    /// create a name that is not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn colliding_lossy_names_count_once() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = mk_tmp("i660-lossy-collision");
+        let db = reparse_db();
+        let registry = Registry::from_enabled(&["md".into()]).unwrap();
+        for name in [&b"a\xff.md"[..], &b"a\xfe.md"[..]] {
+            std::fs::write(dir.0.join(std::ffi::OsStr::from_bytes(name)), b"").unwrap();
+        }
+        let result = i660_rebuild(
+            &db,
+            &dir.0,
+            &registry,
+            progress::ProgressReporter::new(progress::ProgressMode::Quiet),
+        );
+        assert_eq!(result.skipped, 1, "{result:?}");
+        assert_eq!(
+            listed(&result),
+            vec![("a\u{FFFD}.md".to_string(), SkipReason::NoText)],
+            "{result:?}"
+        );
+        assert_skip_ledger(&result);
     }
 }
