@@ -3,12 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
 use super::ooxml::{RawRowSpan, chunk_table_rows, push_row_line, row_line};
-use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
+use super::{Chunk, ParseCause, ParsedDocument, Parser, single_text_chunk, unindexable};
 
 pub struct DocxParser {
     /// (feature-61) 文書 1 本の展開後合計の上限 (`[index].max_decompressed_size`)。
@@ -79,8 +79,12 @@ fn parse_with_budget(
     exclude_headings: &[&str],
     cap: u64,
 ) -> Result<ParsedDocument> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| anyhow!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}"))?;
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
+        unindexable(
+            super::ooxml::cause_of_unopenable_ooxml(bytes),
+            format!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}"),
+        )
+    })?;
     // 文書単位の累積展開済みバイト数。word/document.xml + docProps/core.xml
     // の両読み出しで共有し、累積が cap を超えたら Err にする (codex P2,
     // PR #70 round 2 zip-bomb hardening: 個々のエントリが cap 未満でも
@@ -89,7 +93,16 @@ fn parse_with_budget(
     let mut budget: u64 = 0;
     let doc_xml =
         super::ooxml::read_zip_part(&mut zip, path_hint, "word/document.xml", &mut budget, cap)?
-            .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
+            .ok_or_else(|| {
+                // (#660) `read_zip_part` says `None` both when the part is absent or cannot be
+                // read as declared and when it declares more than `cap`; only the last is
+                // readable by raising the key.
+                let cause = match zip.by_name("word/document.xml") {
+                    Ok(f) if f.size() > cap => ParseCause::OverExtractionLimit { limit: cap },
+                    _ => ParseCause::CorruptOrUnsupported,
+                };
+                unindexable(cause, format!("{path_hint}: word/document.xml missing"))
+            })?;
     // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
     let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget, cap)?;
     // (feature-62) After core.xml, so the parts that were always read take the budget in the
@@ -1777,6 +1790,70 @@ mod tests {
     /// `docProps/core.xml` read as well. document.xml fits; document.xml plus
     /// core.xml is one byte over, so the parse fails at core.xml, which it
     /// would not if that read still used the 50 MiB constant.
+    #[test]
+    fn an_encrypted_docx_is_encrypted_and_keeps_its_message() {
+        let err = DocxParser::default()
+            .parse_bytes(
+                &crate::parser::ooxml::synthetic_encrypted_cfb(),
+                "locked.docx",
+                &[],
+            )
+            .expect_err("a compound file is not a zip");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::Encrypted)
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot open docx zip (corrupt or encrypted)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_document_xml_over_the_cap_is_over_extraction_limit() {
+        let bytes = make_minimal_docx(&[(None, "body text")]);
+        let declared = {
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+            zip.by_name("word/document.xml").unwrap().size()
+        };
+        let cap = declared - 1;
+        let err = DocxParser::with_budget(cap)
+            .parse_bytes(&bytes, "big.docx", &[])
+            .expect_err("document.xml declares one byte more than the cap");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::OverExtractionLimit { limit: cap })
+        );
+        assert!(
+            err.to_string().contains("word/document.xml missing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_zip_without_document_xml_is_corrupt() {
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            zip.start_file("word/other.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"<x/>").unwrap();
+            zip.finish().unwrap();
+        }
+        let err = DocxParser::default()
+            .parse_bytes(&bytes, "hollow.docx", &[])
+            .expect_err("no word/document.xml");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::CorruptOrUnsupported)
+        );
+        assert!(
+            err.to_string().contains("word/document.xml missing"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn ooxml_budget_follows_the_docx_parser_it_was_built_with() {
         let doc_xml: &[u8] = br#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>"#;

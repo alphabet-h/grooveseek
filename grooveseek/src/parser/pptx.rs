@@ -5,12 +5,12 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use super::ooxml::RawRowSpan;
-use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
+use super::{Chunk, ParsedDocument, Parser, single_text_chunk, unindexable};
 
 pub struct PptxParser {
     /// (feature-61) 文書 1 本の展開後合計の上限 (`[index].max_decompressed_size`)。
@@ -74,8 +74,12 @@ impl Parser for PptxParser {
 // ---------------------------------------------------------------------------
 
 fn parse_bytes_impl(bytes: &[u8], path_hint: &str, cap: u64) -> Result<ParsedDocument> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| anyhow!("{path_hint}: cannot open pptx zip (corrupt or encrypted): {e}"))?;
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
+        unindexable(
+            super::ooxml::cause_of_unopenable_ooxml(bytes),
+            format!("{path_hint}: cannot open pptx zip (corrupt or encrypted): {e}"),
+        )
+    })?;
 
     // 文書単位の累積展開済みバイト数。この pptx から読む全エントリ (slides /
     // notes / rels / presentation.xml / core.xml) で共有し、累積が cap を
@@ -879,6 +883,26 @@ mod tests {
             .parse_bytes(b"not a real pptx", "x.pptx", &[])
             .expect_err("garbage bytes must be Err");
         assert!(err.to_string().contains("cannot open pptx zip"));
+    }
+
+    #[test]
+    fn an_encrypted_pptx_is_encrypted_and_keeps_its_message() {
+        let err = PptxParser::default()
+            .parse_bytes(
+                &crate::parser::ooxml::synthetic_encrypted_cfb(),
+                "locked.pptx",
+                &[],
+            )
+            .expect_err("a compound file is not a zip");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::Encrypted)
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot open pptx zip (corrupt or encrypted)"),
+            "{err}"
+        );
     }
 
     #[test]

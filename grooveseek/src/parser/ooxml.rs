@@ -7,11 +7,49 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use quick_xml::events::{BytesRef, Event};
 use quick_xml::reader::Reader;
 
-use super::Frontmatter;
+use super::{Frontmatter, ParseCause, unindexable};
+
+/// The first 8 bytes of an OLE compound file (CFB), which is what an encrypted OOXML package is.
+const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// (#660) What bytes that are not a zip are, for an OOXML extension: `Encrypted` when they are a
+/// compound file (magic D0 CF 11 E0 A1 B1 1A E1) holding the UTF-16LE name "EncryptedPackage",
+/// `CorruptOrUnsupported` otherwise (a legacy .doc / .xls renamed, a truncated file).
+///
+/// The compound file is not parsed: a search for the name's bytes is enough, and the one way it
+/// can be wrong (an unencrypted compound file that happens to hold those bytes) still tells the
+/// user to open the file in Office again. Called only once a zip has failed to open, so a
+/// document that opens pays nothing.
+pub(crate) fn cause_of_unopenable_ooxml(bytes: &[u8]) -> ParseCause {
+    if !bytes.starts_with(&CFB_MAGIC) {
+        return ParseCause::CorruptOrUnsupported;
+    }
+    let name: Vec<u8> = "EncryptedPackage"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    if bytes.windows(name.len()).any(|w| w == name.as_slice()) {
+        ParseCause::Encrypted
+    } else {
+        ParseCause::CorruptOrUnsupported
+    }
+}
+
+/// (#660) A compound file that [`cause_of_unopenable_ooxml`] reads as encrypted: the CFB magic,
+/// zero padding, then the UTF-16LE name "EncryptedPackage". Not a valid compound file; the
+/// docx / pptx / xlsx tests share it.
+#[cfg(test)]
+pub(crate) fn synthetic_encrypted_cfb() -> Vec<u8> {
+    let mut bytes = CFB_MAGIC.to_vec();
+    bytes.resize(512, 0);
+    bytes.extend("EncryptedPackage".encode_utf16().flat_map(u16::to_le_bytes));
+    bytes.resize(1024, 0);
+    bytes
+}
 
 /// zip 内 `name` エントリを、cap に [`super::DEFAULT_MAX_DECOMPRESSED_BYTES`] を固定して
 /// 読む (test 専用)。
@@ -200,9 +238,12 @@ fn read_zip_part_within(
     }
     *budget = budget.saturating_add(buf.len() as u64);
     if *budget > cap {
-        bail!(
-            "cumulative decompressed size across zip entries exceeds {cap} bytes (zip-bomb guard; raise [index].max_decompressed_size to admit this file)"
-        );
+        return Err(unindexable(
+            ParseCause::OverExtractionLimit { limit: cap },
+            format!(
+                "cumulative decompressed size across zip entries exceeds {cap} bytes (zip-bomb guard; raise [index].max_decompressed_size to admit this file)"
+            ),
+        ));
     }
     Ok(Some(buf))
 }
@@ -751,6 +792,75 @@ mod tests {
             second.is_err(),
             "cumulative budget (20 bytes) exceeding cap (15 bytes) across 2 within-cap \
              entries must be Err"
+        );
+    }
+
+    #[test]
+    fn cfb_with_encrypted_package_is_encrypted() {
+        assert_eq!(
+            cause_of_unopenable_ooxml(&synthetic_encrypted_cfb()),
+            ParseCause::Encrypted
+        );
+    }
+
+    #[test]
+    fn cfb_without_the_stream_name_is_corrupt() {
+        let mut bytes = CFB_MAGIC.to_vec();
+        bytes.resize(CFB_MAGIC.len() + 512, 0);
+        assert_eq!(
+            cause_of_unopenable_ooxml(&bytes),
+            ParseCause::CorruptOrUnsupported
+        );
+    }
+
+    #[test]
+    fn empty_and_random_bytes_are_corrupt() {
+        assert_eq!(
+            cause_of_unopenable_ooxml(b""),
+            ParseCause::CorruptOrUnsupported
+        );
+        // A fixed linear congruential sequence, so the input is the same on every run.
+        let mut state: u32 = 0x1234_5678;
+        let random: Vec<u8> = (0..64)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        assert_eq!(
+            cause_of_unopenable_ooxml(&random),
+            ParseCause::CorruptOrUnsupported
+        );
+    }
+
+    #[test]
+    fn cumulative_budget_overrun_is_over_extraction_limit() {
+        // Built like `test_read_zip_entry_capped_rejects_cumulative_budget_over_cap`.
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("a.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap();
+            zip.start_file("b.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap();
+            zip.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        let mut budget: u64 = 0;
+        let cap: u64 = 15;
+        read_zip_entry_capped(&mut archive, "a.bin", &mut budget, cap).unwrap();
+        let err = read_zip_entry_capped(&mut archive, "b.bin", &mut budget, cap)
+            .expect_err("20 bytes in all is over a cap of 15");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: cap })
+        );
+        assert!(
+            err.to_string()
+                .contains("cumulative decompressed size across zip entries exceeds 15 bytes"),
+            "{err}"
         );
     }
 
