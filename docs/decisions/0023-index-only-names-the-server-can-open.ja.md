@@ -58,6 +58,11 @@ PR #319 の review は 3 round 続けて、この同じ軸で別の事例を見�
   skip する。どちらも 1 件 1 行の warning を出し、`groove index` の `Done in` 行に件数を
   出す (MCP の `rebuild_index` の返答には件数は載らない)。walk が名前を判定するのは、
   `kb_path` の綴りのままの KB の配下にあるパスだけ。
+  *(2026-11-01、v1.24.0)* この件数は `skipped` に含まれるようになった。MCP の
+  `rebuild_index` の返答の `skipped` も同じ: walk が名前で外したものはそこに数えられ、
+  `Done in` 行の `not indexed` の件数はもう足さない。どれも library の
+  `IndexResult::skipped_files` の entry にもなる
+  ([ADR-0032](0032-report-why-each-file-was-not-indexed.ja.md))。決定は変わらない。
 - watcher は拡張子の判定の後で、イベントから取り戻した相対パスについて同じ述語に訊く。
   だから KB の別の綴りで届いたパスも判定される。訊くのは行を書きうるところ —
   reindex・rename の新しい側・新しく現れたディレクトリが持ち込んだファイル — で、

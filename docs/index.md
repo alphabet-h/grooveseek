@@ -84,6 +84,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 29. Re-read unchanged documents once per format, by a policy key per format | [en](decisions/0029-reread-unchanged-documents-once-per-format.md) | [ja](decisions/0029-reread-unchanged-documents-once-per-format.ja.md) |
 | 30. Mark table rows per chunk in a nullable column, and catch up through per-format keys | [en](decisions/0030-mark-table-rows-per-chunk.md) | [ja](decisions/0030-mark-table-rows-per-chunk.ja.md) |
 | 31. One writer per index, by an operating-system lock | [en](decisions/0031-one-writer-per-index-by-an-os-lock.md) | [ja](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md) |
+| 32. Report why each file was not indexed; the count is derived from the list | [en](decisions/0032-report-why-each-file-was-not-indexed.md) | [ja](decisions/0032-report-why-each-file-was-not-indexed.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

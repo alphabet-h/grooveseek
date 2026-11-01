@@ -67,6 +67,13 @@ Chosen option: 3.
   `groove index` `Done in` line (the MCP `rebuild_index` reply does not carry
   the count). The walk judges only paths under the knowledge base as `kb_path`
   spells it.
+  *(2026-11-01, v1.24.0)* This count is now part of `skipped`, and so is the
+  `skipped` of the MCP `rebuild_index` reply: a name the walk leaves out is
+  counted there, and the `not indexed` count of the `Done in` line is no longer
+  added to it. Each one is also an entry of the library's
+  `IndexResult::skipped_files`
+  ([ADR-0032](0032-report-why-each-file-was-not-indexed.md)). The decision is
+  unchanged.
 - The watcher asks it after the extension filter, of the relative path it
   recovered from the event, so a path reached under another spelling of the
   knowledge base is judged too. It asks wherever a row may be written — a
