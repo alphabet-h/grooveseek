@@ -3,16 +3,26 @@
 //!
 //! Two halves:
 //!
-//! - [`ServeRecord`]: what `groove-svc.exe` writes beside the service's
+//! - [`crate::ServeRecord`]: what `groove-svc.exe` writes beside the service's
 //!   `groove.toml` when it starts `groove.exe serve` — the child's pid and the
 //!   time the OS created it. Plain file I/O, compiled on every OS.
-//! - On Windows, `stop_process_if_matches` and friends: open a pid once,
+// The process functions exist on Windows only, so the bullet that names them
+// is written twice: a link where the item is there, plain words elsewhere
+// (a link there would be broken, a bare name an unchecked one).
+#![cfg_attr(
+    windows,
+    doc = "- On Windows, [`crate::stop_process_if_matches`] and friends: open a pid once,"
+)]
+#![cfg_attr(
+    not(windows),
+    doc = "- On Windows (not compiled into this build), functions that open a pid once,"
+)]
 //!   check its image file name (and, given a record, its creation time), and
 //!   terminate it through that same handle, waiting for it to exit. The handle
 //!   pins the process: a pid reused after `OpenProcess` cannot be reached
 //!   through it, and the checks reject a pid reused before it.
 //!
-//! The tray used to carry the process half alone (`crates/groove-tray/src/process.rs`);
+//! The tray used to carry the process half alone, in its own process module;
 //! `groove service uninstall` needed the same thing plus the creation-time
 //! check, so both now use this crate.
 
@@ -46,7 +56,7 @@ impl ServeRecord {
         config_home.join(SERVE_RECORD_FILE)
     }
 
-    /// Read the record at `path`. `Ok(None)` when there is no file; an
+    /// Read the record at the given path. `Ok(None)` when there is no file; an
     /// `InvalidData` error when there is one that is not a record.
     pub fn read(path: &Path) -> io::Result<Option<Self>> {
         let file = match std::fs::File::open(path) {
@@ -67,7 +77,7 @@ impl ServeRecord {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    /// Write the record to `path` whole or not at all: to a temporary file
+    /// Write the record to the given path whole or not at all: to a temporary file
     /// beside it first, then renamed over it, so a reader never sees half a
     /// record.
     pub fn write(&self, path: &Path) -> io::Result<()> {

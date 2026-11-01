@@ -77,7 +77,7 @@ fn run_schtasks_quiet(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// What `uninstall` reports for `schtasks /Delete`, given whether the task is
+/// What [`ServiceBackend::uninstall`] reports for `schtasks /Delete`, given whether the task is
 /// still registered afterwards (`None`: that could not be found out):
 /// success, a task that is not registered (already gone: nothing to remove,
 /// which is what uninstall asks for), a failure that left the task
@@ -95,7 +95,7 @@ fn delete_outcome(deleted: Result<()>, still_registered: Option<bool>) -> Result
 }
 
 /// Whether the root-folder task `task` is registered, from the CSV listing
-/// `list` reads too (only the ASCII name column is matched, so the code-page
+/// [`ServiceBackend::list`] reads too (only the ASCII name column is matched, so the code-page
 /// encoding of the output does not matter). `None` when the listing itself
 /// fails: then nothing can be said either way.
 fn task_registered(task: &str) -> Option<bool> {

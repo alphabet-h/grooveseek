@@ -1,7 +1,7 @@
 //! Stopping a service's `groove serve` on Windows (kuriya #650).
 //!
 //! The scheduled task's Action is `groove-svc.exe`, which detach-spawns
-//! `groove.exe serve` and exits at once (`crates/groove-svc/src/main.rs`).
+//! `groove.exe serve` and exits at once (the `groove-svc` crate's `main`).
 //! Task Scheduler therefore sees a task that has finished, in state `Ready`,
 //! and `schtasks /End` has nothing to end: the server kept running after
 //! `groove service uninstall`, and `--purge` waited out its whole wait for a
@@ -91,7 +91,7 @@ pub(crate) fn stop_recorded_serve(config_home: &Path) -> ServeStop {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! A stand-in server for the tests here and in `uninstall.rs`: `ping.exe`
+    //! A stand-in server for the tests here and in [`crate::service::uninstall`]: `ping.exe`
     //! copied as `groove.exe`, recorded the way `groove-svc` records it.
 
     use super::SERVE_IMAGE;

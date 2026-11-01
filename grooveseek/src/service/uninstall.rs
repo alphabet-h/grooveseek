@@ -50,7 +50,7 @@ pub(crate) fn run_with_backend(
 /// Windows the backend cannot stop it (the task's process is `groove-svc.exe`,
 /// which detach-spawns the server and exits, so `schtasks /End` has nothing
 /// to end): uninstall stops the server `groove-svc` recorded itself
-/// (`service/serve_stop.rs`, kuriya #650), waiting up to 10 s for it to exit,
+/// (on Windows only, from [`run_with_backend`]; kuriya #650), waiting up to 10 s for it to exit,
 /// before this wait starts, so the two add up to about 20 s at most. Either
 /// way, a holder still there after this long was not stopped (another
 /// process, such as a second server on the same knowledge base, or a server

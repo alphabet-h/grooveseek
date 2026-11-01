@@ -136,7 +136,7 @@ fn clear_old_record(extra: &[String]) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// The directory the `groove_winproc::ServeRecord` goes in: the one holding
+/// The directory the [`groove_winproc::ServeRecord`] goes in: the one holding
 /// the `groove.toml` the Action passes as `--config <config_home>\groove.toml`
 /// (BU-07), which is the service's config home. `None` when the Action passes
 /// no `--config` (an install from before BU-07), so nothing is recorded.
