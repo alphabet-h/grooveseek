@@ -132,7 +132,7 @@ struct DiskEntry {
 struct DiskScan {
     entries: Vec<DiskEntry>,
     skipped: Vec<String>,
-    /// (#660) Why each file in `skipped` was declined, at the same index. Written only through
+    /// (#660) Why each file in [`DiskScan::skipped`] was declined, at the same index. Written only through
     /// [`DiskScan::skip`], which pushes both, so the two never come apart.
     skipped_why: Vec<SkipReason>,
     /// size cap で撥ねたファイルの **実測サイズ** (rel path, bytes)。
@@ -153,8 +153,8 @@ struct DiskScan {
 }
 
 impl DiskScan {
-    /// Decline `rel` for `why`: the one way into `skipped`, so `skipped[i]` and
-    /// `skipped_why[i]` are always the same file (#660).
+    /// Decline `rel` for `why`: the one way into [`Self::skipped`], so entry `i` of it and entry
+    /// `i` of [`Self::skipped_why`] are always the same file (#660).
     fn skip(&mut self, rel: String, why: SkipReason) {
         self.skipped.push(rel);
         self.skipped_why.push(why);
@@ -212,7 +212,7 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 ///
 /// The second element is the refusal itself (#660), so a caller can both name why
 /// ([`reason_of_unread`]) and take the length **when the refusal was about size**
-/// ([`measured`], codex P2 round 5). `size_cap_exceeded` stats the path and this reads the
+/// ([`measured`], codex P2 round 5). [`size_cap_exceeded`] stats the path and this reads the
 /// handle, so a file can cross the cap *between* the two — and then this check
 /// is the one that catches it. A wrapper that dropped the length existed for
 /// one round; it turned out every caller wanted it, because a row that says a
@@ -257,7 +257,7 @@ fn measured(refused: &Option<crate::links::Refused>) -> Option<u64> {
 }
 
 /// (#660, spec R2) The reason a read-time refusal gives: a hard link, something other than a
-/// regular file, or a file over `key`'s cap measured on the handle.
+/// regular file, or a file over the cap of the given [`LimitKey`], measured on the handle.
 fn reason_of_refusal(r: crate::links::Refused, key: LimitKey) -> SkipReason {
     match r {
         crate::links::Refused::MultiplyLinked => SkipReason::HardLink,
@@ -273,8 +273,8 @@ fn reason_of_refusal(r: crate::links::Refused, key: LimitKey) -> SkipReason {
 /// (#660) The reason for a [`read_for_index_under`] that returned no bytes. The one place
 /// every `Ok((None, refused))` arm takes its reason from.
 ///
-/// `read_for_index_under` never returns `(None, None)` (its body: it returns `None` bytes only
-/// in the `Content::Refused` arm, and there a refusal is always present). The `None` arm exists
+/// [`read_for_index_under`] never returns `(None, None)` (its body: it returns `None` bytes only
+/// in the [`crate::links::Content::Refused`] arm, and there a refusal is always present). The `None` arm exists
 /// only so the match over the type is exhaustive.
 fn reason_of_unread(refused: Option<crate::links::Refused>, key: LimitKey) -> SkipReason {
     refused.map_or(
@@ -1011,7 +1011,8 @@ fn read_crossed_rename_again(
     .map(|r| r.result)
 }
 
-/// `read_crossed_rename_again` with the reason the file was not indexed (#660): the body. A
+/// The re-read of a file whose rename crossed a parser, with the reason the file was not
+/// indexed (#660): the body, which the test-only wrapper above calls and drops the reason of. A
 /// refused or failed re-read gives its own reason (spec R2 / R3); the rest come from
 /// [`index_single_disk_entry_explained`].
 fn read_crossed_rename_again_explained(
@@ -1253,9 +1254,9 @@ pub struct IndexResult {
     /// hard link、index が保持できない名前)。path 単位で数え、[`Self::skipped_files`] の
     /// 件数と常に等しい (#660)。[`Self::unspellable`] と [`Self::embed_rejected`] はこの内訳。
     pub skipped: u32,
-    /// (#660) Every file counted in [`Self::skipped`], one entry each, sorted by `path`.
-    /// `skipped_files.len() == skipped as usize` for every value [`rebuild_index`] returns,
-    /// completed or [`Self::cancelled`]. A hard link and a name the index cannot hold
+    /// (#660) Every file counted in [`Self::skipped`], one entry each, sorted by
+    /// [`SkippedFile::path`]. Its length equals [`Self::skipped`] for every value
+    /// [`rebuild_index`] returns, completed or [`Self::cancelled`]. A hard link and a name the index cannot hold
     /// ([`Self::unspellable`]) are in both.
     pub skipped_files: Vec<SkippedFile>,
     /// Markdown files this run named with `warning: <path>: failed to parse
@@ -1492,19 +1493,20 @@ pub enum SingleResult {
     },
 }
 
-/// [`SingleResult`] and, when the file was not indexed, why (#660). `reason` is `Some` exactly when
-/// [`rebuild_index`] would count this result in [`IndexResult::skipped`], except for a path
-/// reached through a link (the file itself a symlink included): that is `Refused` or
-/// `OutsideKnowledgeBaseDeindexed` with `reason: None`, because the full index leaves such a
-/// file out on purpose and lists it nowhere.
+/// [`SingleResult`] and, when the file was not indexed, why (#660). [`Reindexed::reason`] is
+/// `Some` exactly when [`rebuild_index`] would count this result in [`IndexResult::skipped`],
+/// except for a path reached through a link (the file itself a symlink included): that is
+/// [`SingleResult::Refused`] or [`SingleResult::OutsideKnowledgeBaseDeindexed`] with no reason,
+/// because the full index leaves such a file out on purpose and lists it nowhere.
 /// At the watcher's entry a failure to stat or resolve the file, or the first read of it, is
 /// still an `Err`, as before. The second read (the one the indexing body does after the hash
-/// check) failing is a `Skipped` with `Some(SkipReason::Unreadable { .. })` here as in the full
-/// index, with any cause; it is also where a refusal of that read (hard link, not a plain file,
-/// too large) comes from.
-/// `reindex_single_file_explained` does not itself refuse a path whose name the index cannot store or that
-/// `.grooveignore` excludes: that check is the caller's (the watcher makes it before calling), so
-/// for such a path the reason here can differ from the one `rebuild_index` lists.
+/// check) failing is a [`SingleResult::Skipped`] with the reason [`SkipReason::Unreadable`] here
+/// as in the full index, with any cause; it is also where a refusal of that read (hard link, not
+/// a plain file, too large) comes from.
+/// [`reindex_single_file_explained`] does not itself refuse a path whose name the index cannot
+/// store or that `.grooveignore` excludes: that check is the caller's (the watcher makes it
+/// before calling), so for such a path the reason here can differ from the one
+/// [`rebuild_index`] lists.
 #[derive(Debug, PartialEq)]
 pub struct Reindexed {
     pub result: SingleResult,
@@ -2899,7 +2901,8 @@ fn write_reparsed_table_rows(
 /// (#660, spec R4) The reason for what [`write_reparsed_table_rows`] returned, and only for that:
 /// its one skip, [`SKIPPED_CHANGED_DURING_READ`], is [`SkipReason::ChangedDuringRead`]; its other
 /// result, [`SingleResult::Unchanged`], has none. Not a general map from [`SingleResult`] to a
-/// reason -- a `Refused` there could be either of two reasons, or none (spec §5.7).
+/// reason -- a [`SingleResult::Refused`] there could be either of two reasons, or none (spec
+/// §5.7).
 fn explain_reparsed_table_rows(result: SingleResult) -> Reindexed {
     let reason = match &result {
         SingleResult::Skipped { reason, .. } if *reason == SKIPPED_CHANGED_DURING_READ => {
@@ -3947,7 +3950,7 @@ pub fn reindex_single_file(
 }
 
 /// [`reindex_single_file`] with the reason the file was not indexed (#660): see [`Reindexed`]
-/// for when `reason` is `Some`.
+/// for when [`Reindexed::reason`] is `Some`.
 pub fn reindex_single_file_explained(
     db: &Database,
     embedder: &mut Embedder,
@@ -6698,7 +6701,7 @@ mod tests {
     }
 
     /// (#660, spec 5.5) Both names of a hard-linked file come back in `left_out` as
-    /// [`SkipReason::HardLink`], spelled as `index_rel_path_or_whole` spells them, and neither
+    /// [`SkipReason::HardLink`], spelled as [`index_rel_path_or_whole`] spells them, and neither
     /// is collected.
     #[test]
     fn collect_lists_a_hard_link_as_left_out() {
@@ -7074,8 +7077,8 @@ mod tests {
         );
     }
 
-    /// (#660) Every skip carries its reason at the same index: `skipped[i]` and
-    /// `skipped_why[i]` are one file.
+    /// (#660) Every skip carries its reason at the same index: entry `i` of
+    /// [`DiskScan::skipped`] and entry `i` of [`DiskScan::skipped_why`] are one file.
     #[test]
     fn scan_records_why_beside_each_skip() {
         let tmp = mk_tmp("scanwhy");
@@ -7117,7 +7120,7 @@ mod tests {
     }
 
     /// (#660) The harness of
-    /// `test_scan_disk_entries_refuses_a_hard_link_that_appeared_after_the_walk`: the read's
+    /// [`test_scan_disk_entries_refuses_a_hard_link_that_appeared_after_the_walk`]: the read's
     /// refusal is named, not only counted.
     #[test]
     fn scan_names_a_hard_link_that_appeared_after_the_walk() {
@@ -7142,7 +7145,7 @@ mod tests {
     }
 
     /// (#660) A file replaced by a named pipe after the walk is refused at the read
-    /// (`O_NONBLOCK` keeps the open from waiting) and named `NotPlainFile`.
+    /// (`O_NONBLOCK` keeps the open from waiting) and named [`SkipReason::NotPlainFile`].
     #[cfg(unix)]
     #[test]
     fn scan_names_a_fifo_not_plain_file() {
@@ -7171,7 +7174,7 @@ mod tests {
     }
 
     /// (#660 T-L10) A file another process holds open without sharing it (an editor's lock)
-    /// is `Unreadable { InUse }`, not a generic failure.
+    /// is [`SkipReason::Unreadable`] with [`ReadFailure::InUse`], not a generic failure.
     #[cfg(windows)]
     #[test]
     fn scan_names_a_file_held_without_sharing_in_use() {
@@ -7203,7 +7206,8 @@ mod tests {
         );
     }
 
-    /// (#660) A file the OS refuses to open is `Unreadable { PermissionDenied }`. root reads
+    /// (#660) A file the OS refuses to open is [`SkipReason::Unreadable`] with
+    /// [`ReadFailure::PermissionDenied`]. root reads
     /// through `chmod 000`, so the test has nothing to show there and returns.
     #[cfg(unix)]
     #[test]
@@ -12387,7 +12391,8 @@ mod tests {
         assert!(note.is_ascii());
     }
 
-    /// #660: `md`, `txt` and `pdf` enabled, with the text cap lowered to 16 bytes so a small
+    /// #660: the [`crate::parser::markdown`], [`crate::parser::txt`] and [`crate::parser::pdf`]
+    /// parsers enabled, with the text cap lowered to 16 bytes so a small
     /// `.txt` is over it. Every other text fixture of these tests stays at 16 bytes or under.
     fn i660_explain_registry() -> Registry {
         use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
@@ -12477,7 +12482,7 @@ mod tests {
         );
     }
 
-    /// #660 T-L12 (I4): `reason` is `Some` exactly for the results the rebuild loop counts as
+    /// #660 T-L12 (I4): [`Reindexed::reason`] is `Some` exactly for the results the rebuild loop counts as
     /// skipped, except a path through a link (R10).
     #[test]
     fn reason_is_some_exactly_when_the_loop_counts_it() {
@@ -12586,8 +12591,8 @@ mod tests {
 
     /// #660 (spec 9, PR-2): the list invariants every [`rebuild_index`] result keeps, completed
     /// or cancelled -- I1 (one entry per skipped file), I2 / I6 (paths strictly ascending, so no
-    /// path twice) and I7 (`unspellable` is part of `skipped`). `embed_rejected` is per file and
-    /// not checked (spec 6 I7).
+    /// path twice) and I7 ([`IndexResult::unspellable`] is part of [`IndexResult::skipped`]).
+    /// [`IndexResult::embed_rejected`] is per file and not checked (spec 6 I7).
     fn assert_skip_ledger(r: &IndexResult) {
         assert_eq!(
             r.skipped_files.len(),
@@ -12604,7 +12609,8 @@ mod tests {
         );
     }
 
-    /// #660: `(path, reason)` of each entry of a result's list, in its order.
+    /// #660: the [`SkippedFile::path`] and [`SkippedFile::reason`] of each entry of a result's
+    /// list, in its order.
     fn listed(r: &IndexResult) -> Vec<(String, SkipReason)> {
         r.skipped_files
             .iter()
@@ -12612,7 +12618,8 @@ mod tests {
             .collect()
     }
 
-    /// #660: a full run of `kb` with `registry` and the stub embedder, reporting to `progress`.
+    /// #660: a full run of the given knowledge base with the given [`Registry`] and the stub
+    /// embedder, reporting to the given reporter.
     fn i660_rebuild(
         db: &Database,
         kb: &Path,
@@ -12691,7 +12698,7 @@ mod tests {
     /// leaves out both names of a hard link. The scan's skip is listed and guarded from the
     /// prune (the two `debug_assert!`s of I3 run in this debug build); the walk's entries are
     /// listed but not guarded, so the row of a document that became a hard link is pruned and
-    /// counted in `deleted`, while the file is listed as [`SkipReason::HardLink`].
+    /// counted in [`IndexResult::deleted`], while the file is listed as [`SkipReason::HardLink`].
     #[test]
     fn scan_skips_and_walk_hard_links_meet_the_prune_guard() {
         use crate::parser::{CodeParsersConfig, FileSizeLimit, FileSizeLimits};
@@ -12753,7 +12760,7 @@ mod tests {
         assert_skip_ledger(&result);
     }
 
-    /// #660: [`crossed_rename_rewritten_during_the_run`] as it is, but with `cancel` (when given)
+    /// #660: [`crossed_rename_rewritten_during_the_run`] as it is, but with the given [`progress::CancelToken`] (if any)
     /// on the reporter and set from the loop's event for the crossed file -- the last document
     /// of a knowledge base that holds only it.
     fn i660_crossed_rename_run(

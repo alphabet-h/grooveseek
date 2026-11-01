@@ -1,7 +1,8 @@
 //! (#660, ADR-0023) On Windows, a name the index cannot hold is in
 //! [`grooveseek::indexer::IndexResult::skipped_files`] as
-//! [`grooveseek::indexer::SkipReason::UnspellableName`], counted in both `skipped` and
-//! `unspellable`. A directory whose name the index cannot hold is one entry, whatever it holds,
+//! [`grooveseek::indexer::SkipReason::UnspellableName`], counted in both
+//! [`grooveseek::indexer::IndexResult::skipped`] and
+//! [`grooveseek::indexer::IndexResult::unspellable`]. A directory whose name the index cannot hold is one entry, whatever it holds,
 //! and its contents are never walked.
 //!
 //! These call [`grooveseek::indexer::rebuild_index`] in-process against the mock endpoint of
@@ -87,7 +88,7 @@ fn listed(result: &IndexResult) -> Vec<(String, SkipReason)> {
 }
 
 /// Spec §6 I1, I2, I6 and I7 on one value [`rebuild_index`] returned (the same checks as the
-/// helper of `index_skipped_files.rs`; each test crate carries its own).
+/// helper of the other skipped-file test crate; each test crate carries its own).
 fn assert_skip_ledger(result: &IndexResult) {
     assert_eq!(
         result.skipped as usize,
@@ -127,7 +128,7 @@ fn assert_skip_ledger(result: &IndexResult) {
 }
 
 /// T-L5: `CON.md` is listed as a file whose name the index cannot hold, counted once in
-/// `unspellable` and in `skipped`, and the Done line still names it the way it did.
+/// [`IndexResult::unspellable`] and in [`IndexResult::skipped`], and the Done line still names it the way it did.
 #[test]
 fn an_unspellable_file_is_listed_and_counted() {
     if run_in_hermetic_child("an_unspellable_file_is_listed_and_counted") {

@@ -1,10 +1,13 @@
-//! (#660) Why a file present on disk was not indexed: the public [`SkippedFile`] /
-//! [`SkipReason`] types, the one classification of a parse failure
-//! (`reason_of_parse_error`) and of a read failure (`read_failure_of`), and the run-local
-//! `SkipLedger` the rebuild loop keeps.
+//! (#660) Why a file present on disk was not indexed: the public
+//! [`crate::indexer::skip::SkippedFile`] / [`crate::indexer::skip::SkipReason`] types, the one
+//! classification of a parse failure ([`crate::indexer::skip::reason_of_parse_error`]) and of a
+//! read failure ([`crate::indexer::skip::read_failure_of`]), and the run-local
+//! [`crate::indexer::skip::SkipLedger`] the rebuild loop keeps.
 //!
-//! Every name lives here once: the MCP `reason` names only in [`SkipReason::kind`], the
-//! `[index]` keys only in [`LimitKey::key`] and [`SkipReason::limit_key`].
+//! Every name lives here once: the reason names of the MCP reply only in
+//! [`crate::indexer::skip::SkipReason::kind`], the `[index]` keys
+//! ([`crate::config::IndexConfig`]) only in [`crate::indexer::skip::LimitKey::key`] and
+//! [`crate::indexer::skip::SkipReason::limit_key`].
 
 use std::collections::BTreeMap;
 
@@ -13,7 +16,7 @@ use crate::parser::{ParseCause, Unindexable};
 /// One file this run did not index, and why. (#660)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedFile {
-    /// kb_path-relative, forward slashes -- the spelling `documents.path` uses. For a name the
+    /// Relative to the knowledge base root, forward slashes -- the spelling `documents.path` uses. For a name the
     /// index cannot hold ([`SkipReason::UnspellableName`]) it is the walk's lossy spelling.
     pub path: String,
     pub reason: SkipReason,
@@ -29,7 +32,8 @@ pub enum SkipReason {
         limit: u64,
         key: LimitKey,
     },
-    /// Decompressed bytes or extracted text passed `[index].max_decompressed_size`.
+    /// Decompressed bytes or extracted text passed `[index].max_decompressed_size`
+    /// ([`crate::config::IndexConfig::max_decompressed_size`]).
     OverExtractionLimit { limit: u64 },
     /// Over a fixed size limit of the parser itself that no key raises (source code over the
     /// code parser's raw byte cap).
@@ -61,19 +65,22 @@ pub enum SkipReason {
     NotPlainFile,
     /// The file has more than one name (a hard link).
     HardLink,
-    /// The name is not one get_document or a kb:// URI can take (ADR-0023). `directory`: a whole
+    /// The name is not one the `get_document` tool ([`crate::server`]) or a `kb://` URI can take
+    /// (ADR-0023). `directory`: a whole
     /// directory was left out, counted once, whether or not it held a file the index would have
     /// read (its subtree is never walked). Show it as a folder, not as an unreadable file.
     UnspellableName { directory: bool },
 }
 
-/// The `[index]` key that sets a file size cap.
+/// The `[index]` key ([`crate::config::IndexConfig`]) that sets a file size cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LimitKey {
-    /// `[index].max_binary_file_size` (pdf / docx / xlsx / pptx).
+    /// `[index].max_binary_file_size` ([`crate::config::IndexConfig::max_binary_file_size`]):
+    /// pdf / docx / xlsx / pptx.
     MaxBinaryFileSize,
-    /// `[index].max_text_file_size` (md / txt / source code).
+    /// `[index].max_text_file_size` ([`crate::config::IndexConfig::max_text_file_size`]):
+    /// md / txt / source code.
     MaxTextFileSize,
 }
 
@@ -114,9 +121,10 @@ impl SkipReason {
         }
     }
 
-    /// The key under `[index]` that would admit this file: `TooLarge` → `Some(key.key())`,
-    /// `OverExtractionLimit` → `Some("max_decompressed_size")`, every other variant (including
-    /// `OverParserLimit`, a fixed limit) → `None`. The MCP reply reads `limit_key` from here only.
+    /// The key under `[index]` ([`crate::config::IndexConfig`]) that would admit this file:
+    /// [`Self::TooLarge`] → its [`LimitKey`]'s [`LimitKey::key`], [`Self::OverExtractionLimit`] →
+    /// `Some("max_decompressed_size")`, every other variant (including [`Self::OverParserLimit`],
+    /// a fixed limit) → `None`. The MCP reply takes its limit key from here only.
     pub fn limit_key(&self) -> Option<&'static str> {
         match self {
             Self::TooLarge { key, .. } => Some(key.key()),
@@ -140,7 +148,7 @@ impl SkipReason {
 }
 
 impl LimitKey {
-    /// The key under `[index]`: `"max_binary_file_size"` / `"max_text_file_size"`.
+    /// The key under `[index]` ([`crate::config::IndexConfig`]): `"max_binary_file_size"` / `"max_text_file_size"`.
     pub fn key(&self) -> &'static str {
         match self {
             Self::MaxBinaryFileSize => "max_binary_file_size",
@@ -210,7 +218,7 @@ pub(crate) fn read_failure_of(e: &std::io::Error) -> ReadFailure {
 pub(crate) struct SkipLedger(BTreeMap<String, SkipReason>);
 
 impl SkipLedger {
-    /// Record `reason` for `rel`, replacing any earlier reason for the same path.
+    /// Record the given reason for `rel`, replacing any earlier reason for the same path.
     pub(crate) fn upsert(&mut self, rel: &str, reason: SkipReason) {
         self.0.insert(rel.to_owned(), reason);
     }

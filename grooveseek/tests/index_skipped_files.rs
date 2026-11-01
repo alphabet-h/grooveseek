@@ -113,7 +113,8 @@ fn indexed_paths(fx: &Fixture) -> Vec<String> {
         .expect("document paths")
 }
 
-/// The list as `(path, reason)` pairs, for a readable assertion.
+/// The list as pairs of [`grooveseek::indexer::SkippedFile::path`] and
+/// [`grooveseek::indexer::SkippedFile::reason`], for a readable assertion.
 fn listed(result: &IndexResult) -> Vec<(String, SkipReason)> {
     result
         .skipped_files
@@ -127,8 +128,9 @@ fn entry(path: &str, reason: SkipReason) -> (String, SkipReason) {
 }
 
 /// Spec §6 I1, I2, I6 and I7 on one value [`rebuild_index`] returned: the list has one entry per
-/// file counted in `skipped`, no path twice, in ascending byte order, and `unspellable` is the
-/// number of [`SkipReason::UnspellableName`] entries, so it never exceeds `skipped`.
+/// file counted in [`IndexResult::skipped`], no path twice, in ascending byte order, and
+/// [`IndexResult::unspellable`] is the number of [`SkipReason::UnspellableName`] entries, so it
+/// never exceeds [`IndexResult::skipped`].
 fn assert_skip_ledger(result: &IndexResult) {
     assert_eq!(
         result.skipped as usize,
@@ -302,8 +304,8 @@ fn intended_exclusions_are_not_listed() {
 }
 
 /// T-L4 (C3): both names of a hard-linked file are listed as [`SkipReason::HardLink`] and
-/// counted in `skipped`. A document indexed before it became a hard link loses its row --
-/// counted in `deleted` -- and is listed as well.
+/// counted in [`IndexResult::skipped`]. A document indexed before it became a hard link loses
+/// its row -- counted in [`IndexResult::deleted`] -- and is listed as well.
 #[test]
 fn hard_links_are_listed_and_counted() {
     if run_in_hermetic_child("hard_links_are_listed_and_counted") {
@@ -362,8 +364,8 @@ fn cancel_kb(prefix: &str) -> Fixture {
 }
 
 /// T-L8: a run stopped at the end of the scan (C1 on the last file, the return it shares with
-/// C2) and one stopped in the loop (C3) both return `cancelled` with a list that matches
-/// `skipped`.
+/// C2) and one stopped in the loop (C3) both return [`IndexResult::cancelled`] with a list that
+/// matches [`IndexResult::skipped`].
 #[test]
 fn cancelled_runs_still_match_their_count() {
     if run_in_hermetic_child("cancelled_runs_still_match_their_count") {
@@ -443,7 +445,7 @@ fn an_endpoint_refusal_is_listed_with_its_status() {
 }
 
 /// Review Focus 1: an indexed document whose bytes stop being UTF-8 is listed as
-/// [`SkipReason::NotUtf8`], and its row stays (`total_documents` does not move).
+/// [`SkipReason::NotUtf8`], and its row stays ([`IndexResult::total_documents`] does not move).
 #[test]
 fn a_document_that_turns_unreadable_is_listed_and_keeps_its_row() {
     if run_in_hermetic_child("a_document_that_turns_unreadable_is_listed_and_keeps_its_row") {
