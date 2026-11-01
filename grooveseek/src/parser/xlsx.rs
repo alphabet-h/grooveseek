@@ -4,7 +4,7 @@ use std::io::Cursor;
 use anyhow::{Result, anyhow};
 use calamine::{Data, Reader};
 
-use super::{ParsedDocument, Parser, single_text_chunk};
+use super::{ParseCause, ParsedDocument, Parser, single_text_chunk, unindexable};
 
 pub struct XlsxParser {
     /// (feature-61) 文書 1 本の展開後合計の上限 (`[index].max_decompressed_size`)。
@@ -301,6 +301,16 @@ fn parse_xlsx_bytes_limited(
     extract_xlsx_workbook(bytes, path_hint, limits, guard)
 }
 
+/// (#660) Why `calamine::Xlsx::new` could not open `bytes`: calamine's own `Password` verdict
+/// first, then [`super::ooxml::cause_of_unopenable_ooxml`] sniffs the bytes (the preflight lets
+/// bytes that are not a zip through, so an encrypted package fails here).
+fn cause_of_unopenable_xlsx(e: &calamine::XlsxError, bytes: &[u8]) -> ParseCause {
+    match e {
+        calamine::XlsxError::Password => ParseCause::Encrypted,
+        _ => super::ooxml::cause_of_unopenable_ooxml(bytes),
+    }
+}
+
 /// preflight を通った workbook を開いてシートを読む ([`parse_xlsx_bytes_limited`] の後半)。
 /// `guard` は preflight の前に作ったもの (時間は preflight から数える)。unit test はここを
 /// 直接呼んで、preflight を通った後の判定点 (シートの境目など) を踏む。
@@ -319,8 +329,12 @@ fn extract_xlsx_workbook(
     // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
     // ではなく、登録拡張子に一致する reader を明示的に使う (WorkbookFormat
     // の doc comment 参照)。
-    let mut xlsx = calamine::Xlsx::new(cursor)
-        .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
+    let mut xlsx = calamine::Xlsx::new(cursor).map_err(|e| {
+        unindexable(
+            cause_of_unopenable_xlsx(&e, bytes),
+            format!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"),
+        )
+    })?;
     guard.check(0)?;
 
     let frontmatter = xlsx_frontmatter(bytes, path_hint, limits.decompressed_budget);
@@ -534,19 +548,27 @@ impl DocumentGuard<'_> {
 
     fn check(&self, pending: usize) -> Result<()> {
         if self.past_deadline() {
-            return Err(anyhow!(
-                "{}: xlsx text extraction exceeded {} s after {} sheet(s) (decompression-bomb guard)",
-                self.path_hint,
-                self.timeout.as_secs_f64(),
-                self.sheets
+            return Err(unindexable(
+                ParseCause::ExtractionTimedOut {
+                    seconds: self.timeout.as_secs(),
+                },
+                format!(
+                    "{}: xlsx text extraction exceeded {} s after {} sheet(s) (decompression-bomb guard)",
+                    self.path_hint,
+                    self.timeout.as_secs_f64(),
+                    self.sheets
+                ),
             ));
         }
         if self.used.saturating_add(pending) > self.cap {
-            return Err(anyhow!(
-                "{}: extracted text exceeds {} bytes across {} sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)",
-                self.path_hint,
-                self.cap,
-                self.sheets
+            return Err(unindexable(
+                ParseCause::OverExtractionLimit {
+                    limit: self.cap as u64,
+                },
+                format!(
+                    "{}: extracted text exceeds {} bytes across {} sheet(s) (decompression-bomb guard; raise [index].max_decompressed_size to admit this file)",
+                    self.path_hint, self.cap, self.sheets
+                ),
             ));
         }
         Ok(())
@@ -1061,8 +1083,13 @@ fn preflight_xlsx_decompression_budget_timed(
     let expired = || deadline.is_some_and(|(started, timeout)| started.elapsed() > timeout);
     let timed_out = |name: &str| {
         let seconds = deadline.map_or(0.0, |(_, timeout)| timeout.as_secs_f64());
-        anyhow!(
-            "{path_hint}: xlsx decompression preflight exceeded {seconds} s at entry {name:?} (decompression-bomb guard)"
+        unindexable(
+            ParseCause::ExtractionTimedOut {
+                seconds: deadline.map_or(0, |(_, t)| t.as_secs()),
+            },
+            format!(
+                "{path_hint}: xlsx decompression preflight exceeded {seconds} s at entry {name:?} (decompression-bomb guard)"
+            ),
         )
     };
     // 全 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
@@ -1090,9 +1117,12 @@ fn preflight_xlsx_decompression_budget_timed(
         // 層 1: 申告値だけで既に budget 超過 = 展開を試みるまでもなく拒否。
         let remaining = cap.saturating_sub(total);
         if declared > remaining {
-            anyhow::bail!(
-                "{path_hint}: declared entry size exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declares {declared} bytes with {remaining} bytes of budget left; raise [index].max_decompressed_size to admit this file)"
-            );
+            return Err(unindexable(
+                ParseCause::OverExtractionLimit { limit: cap },
+                format!(
+                    "{path_hint}: declared entry size exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declares {declared} bytes with {remaining} bytes of budget left; raise [index].max_decompressed_size to admit this file)"
+                ),
+            ));
         }
 
         // 層 2: 申告値は信用できないので実際に展開して数える。申告 size ちょうどまで
@@ -1124,25 +1154,36 @@ fn preflight_xlsx_decompression_budget_timed(
         ) {
             Inflation::Counted(actual) => actual,
             Inflation::Expired => return Err(timed_out(&name)),
-            Inflation::UnreadableAsDeclared => anyhow::bail!(
-                "{path_hint}: entry {name:?} cannot be read as declared (zip-bomb guard; it declares {declared} bytes but holds more, or is corrupt; the archive is rejected whatever [index].max_decompressed_size is)"
-            ),
+            Inflation::UnreadableAsDeclared => {
+                return Err(unindexable(
+                    ParseCause::CorruptOrUnsupported,
+                    format!(
+                        "{path_hint}: entry {name:?} cannot be read as declared (zip-bomb guard; it declares {declared} bytes but holds more, or is corrupt; the archive is rejected whatever [index].max_decompressed_size is)"
+                    ),
+                ));
+            }
         };
         unique_counts.finish();
         total = total.saturating_add(actual);
         if total > cap {
-            anyhow::bail!(
-                "{path_hint}: actual decompressed size of the archive exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declared {declared} bytes but expands past the remaining budget; raise [index].max_decompressed_size to admit this file)"
-            );
+            return Err(unindexable(
+                ParseCause::OverExtractionLimit { limit: cap },
+                format!(
+                    "{path_hint}: actual decompressed size of the archive exceeds {cap} bytes cap (zip-bomb guard; entry {name:?} declared {declared} bytes but expands past the remaining budget; raise [index].max_decompressed_size to admit this file)"
+                ),
+            ));
         }
         // `uniqueCount` の上限はそれが書かれていた entry の実展開 bytes / 5 (`actual` は
         // 上の判定を通ったので打ち切られていない)。cap に依らないので、上げる案内は付けない。
         let unique_limit = actual / MIN_SHARED_STRING_BYTES;
         if unique_counts.largest > unique_limit {
             let largest = unique_counts.largest;
-            anyhow::bail!(
-                "{path_hint}: entry {name:?} declares uniqueCount {largest}, more shared strings than its {actual} bytes can hold (at most {unique_limit}) (zip-bomb guard; the workbook reader reserves memory for the declared count up front; the archive is rejected whatever [index].max_decompressed_size is)"
-            );
+            return Err(unindexable(
+                ParseCause::CorruptOrUnsupported,
+                format!(
+                    "{path_hint}: entry {name:?} declares uniqueCount {largest}, more shared strings than its {actual} bytes can hold (at most {unique_limit}) (zip-bomb guard; the workbook reader reserves memory for the declared count up front; the archive is rejected whatever [index].max_decompressed_size is)"
+                ),
+            ));
         }
     }
     Ok(())
@@ -3605,5 +3646,174 @@ mod tests {
             .parse_bytes_for_read(&bytes, "dup.xlsx", &[])
             .expect("parse");
         assert_eq!(doc.chunks.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // (#660) Typed parse-failure causes
+    // -----------------------------------------------------------------------
+
+    use crate::parser::{ParseCause, cause_of};
+
+    /// (#660, spec §9 T-P5) The synthetic compound file (CFB magic and the UTF-16LE name only) is
+    /// not a compound file calamine's `Cfb::new` can read, so `Xlsx::new` does not answer
+    /// `XlsxError::Password` for it: the cause comes from sniffing the bytes. The `Password` arm
+    /// is pinned by `calamine_password_error_is_encrypted`; both paths give the same answer.
+    #[test]
+    fn a_synthetic_encrypted_xlsx_is_encrypted_by_sniffing_not_by_calamine_password() {
+        let bytes = crate::parser::ooxml::synthetic_encrypted_cfb();
+        assert!(
+            !matches!(
+                calamine::Xlsx::<Cursor<&[u8]>>::new(Cursor::new(&bytes[..])),
+                Err(calamine::XlsxError::Password)
+            ),
+            "premise: calamine does not read the synthetic CFB as password-protected"
+        );
+        let err = XlsxParser::default()
+            .parse_bytes(&bytes, "enc.xlsx", &[])
+            .expect_err("a compound file is not a workbook");
+        assert_eq!(cause_of(&err), Some(ParseCause::Encrypted), "{err:#}");
+        assert!(
+            err.to_string()
+                .contains("cannot open workbook (encrypted or corrupt)"),
+            "{err}"
+        );
+    }
+
+    /// (#660, spec §9 T-P5) calamine's own verdict on a password-protected package.
+    #[test]
+    fn calamine_password_error_is_encrypted() {
+        assert_eq!(
+            cause_of_unopenable_xlsx(&calamine::XlsxError::Password, b""),
+            ParseCause::Encrypted
+        );
+    }
+
+    /// (#660, spec §9 T-P6) The document text cap names its limit, and the guard's time mark
+    /// (past the preflight) names the timeout. The time is checked on an already-expired guard
+    /// directly, because a zero timeout through `parse_xlsx_bytes_limited` stops in the
+    /// preflight first (`test_xlsx_time_budget_covers_the_preflight`).
+    #[test]
+    fn xlsx_text_cap_and_time_limit_name_their_causes() {
+        let err = parse_xlsx_bytes_limited(
+            &three_small_sheets(),
+            "three.xlsx",
+            limits(42, super::super::pdf::PDF_DOC_EXTRACT_TIMEOUT),
+        )
+        .expect_err("43 bytes do not fit 42");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: 42 }),
+            "{err}"
+        );
+
+        // Started a second ago with a zero timeout: spent even when the clock has not ticked
+        // since `Instant::now()` (`elapsed() > ZERO` is false at the same instant).
+        let a_second_ago = || {
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("the clock is past one second")
+        };
+        let expired = DocumentGuard {
+            started: a_second_ago(),
+            timeout: std::time::Duration::ZERO,
+            ..live_guard()
+        };
+        let err = expired.check(0).expect_err("a spent deadline");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::ExtractionTimedOut { seconds: 0 }),
+            "{err}"
+        );
+
+        let zero = limits(usize::MAX, std::time::Duration::ZERO);
+        let guard = DocumentGuard {
+            path_hint: "slow.xlsx",
+            used: 0,
+            cap: zero.doc_text_cap,
+            started: a_second_ago(),
+            timeout: zero.timeout,
+            sheets: 0,
+        };
+        let err = extract_xlsx_workbook(&three_small_sheets(), "slow.xlsx", zero, guard)
+            .expect_err("past the preflight, the guard sees the time");
+        assert!(
+            err.to_string().contains("xlsx text extraction exceeded"),
+            "premise: the guard, not the preflight: {err}"
+        );
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::ExtractionTimedOut { seconds: 0 }),
+            "{err}"
+        );
+    }
+
+    /// (#660, spec §9 T-P6) A declaration past the cap is readable by raising the key.
+    #[test]
+    fn preflight_declared_overrun_is_over_extraction_limit() {
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+        let err = preflight_xlsx_decompression_budget_capped(&bytes, "x.xlsx", 5)
+            .expect_err("declared worksheet xml size over the injected 5-byte cap must be Err");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: 5 }),
+            "{err}"
+        );
+    }
+
+    /// (#660, spec §9 T-P6) An entry that cannot be read as declared, and a `uniqueCount` past
+    /// what its entry can hold, are refused whatever the key says.
+    #[test]
+    fn preflight_lying_declaration_and_unique_count_are_corrupt() {
+        const REAL: u32 = 64 * 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
+        let err = preflight_xlsx_decompression_budget_capped(&forged, "ok.xlsx", REAL as u64)
+            .expect_err("a lying declaration is refused");
+        assert!(
+            err.to_string().contains("cannot be read as declared"),
+            "{err}"
+        );
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::CorruptOrUnsupported),
+            "{err}"
+        );
+
+        let bytes = workbook_with_unique_count(r#"uniqueCount="100000000000""#, 0);
+        let err = preflight_xlsx_decompression_budget_capped(
+            &bytes,
+            "sst.xlsx",
+            crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .expect_err("a uniqueCount beyond the entry is refused");
+        assert!(err.to_string().contains("uniqueCount"), "{err}");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::CorruptOrUnsupported),
+            "{err}"
+        );
+    }
+
+    /// (#660, spec §9 T-P6) The preflight's own time limit is `ExtractionTimedOut`.
+    #[test]
+    fn preflight_time_limit_is_extraction_timed_out() {
+        let err = parse_xlsx_bytes_limited(
+            &three_small_sheets(),
+            "slow.xlsx",
+            limits(usize::MAX, std::time::Duration::ZERO),
+        )
+        .expect_err("a zero timeout has always passed");
+        assert!(err.to_string().contains("preflight"), "premise: {err}");
+        assert!(
+            matches!(cause_of(&err), Some(ParseCause::ExtractionTimedOut { .. })),
+            "{err}"
+        );
     }
 }
