@@ -1845,9 +1845,9 @@ mod tests {
     ///
     /// The fixture `mostly_blank.pdf` is not used here: its one text page
     /// (221 chars) clears the gate, so it parses `Ok`
-    /// (`test_pdf_mostly_blank_pages_not_misclassified_as_scanned`). The
+    /// ([`test_pdf_mostly_blank_pages_not_misclassified_as_scanned`]). The
     /// mostly blank case that does fail the gate — blank pages around one
-    /// thin page — goes through `reject_unindexable_pages` directly.
+    /// thin page — goes through [`reject_unindexable_pages`] directly.
     #[test]
     fn empty_and_mostly_blank_pdfs_are_too_little_text() {
         const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/binary/empty_text.pdf");

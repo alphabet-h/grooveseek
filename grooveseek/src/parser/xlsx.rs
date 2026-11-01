@@ -3655,9 +3655,9 @@ mod tests {
     use crate::parser::{ParseCause, cause_of};
 
     /// (#660, spec §9 T-P5) The synthetic compound file (CFB magic and the UTF-16LE name only) is
-    /// not a compound file calamine's `Cfb::new` can read, so `Xlsx::new` does not answer
+    /// not a compound file calamine's `Cfb::new` can read, so `calamine::Xlsx::new` does not answer
     /// `XlsxError::Password` for it: the cause comes from sniffing the bytes. The `Password` arm
-    /// is pinned by `calamine_password_error_is_encrypted`; both paths give the same answer.
+    /// is pinned by [`calamine_password_error_is_encrypted`]; both paths give the same answer.
     #[test]
     fn a_synthetic_encrypted_xlsx_is_encrypted_by_sniffing_not_by_calamine_password() {
         let bytes = crate::parser::ooxml::synthetic_encrypted_cfb();
@@ -3690,8 +3690,8 @@ mod tests {
 
     /// (#660, spec §9 T-P6) The document text cap names its limit, and the guard's time mark
     /// (past the preflight) names the timeout. The time is checked on an already-expired guard
-    /// directly, because a zero timeout through `parse_xlsx_bytes_limited` stops in the
-    /// preflight first (`test_xlsx_time_budget_covers_the_preflight`).
+    /// directly, because a zero timeout through [`parse_xlsx_bytes_limited`] stops in the
+    /// preflight first ([`test_xlsx_time_budget_covers_the_preflight`]).
     #[test]
     fn xlsx_text_cap_and_time_limit_name_their_causes() {
         let err = parse_xlsx_bytes_limited(

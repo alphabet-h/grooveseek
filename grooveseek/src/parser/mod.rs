@@ -1500,8 +1500,8 @@ mod tests {
     }
 
     /// #660 (spec T-P11): the non-UTF-8 error a text parser returns through the public
-    /// `ParserExt::parse_bytes` entrance still downcasts to `Utf8Error`, so the indexer can tell
-    /// it apart from a typed `Unindexable` cause without reading the message.
+    /// [`ParserExt::parse_bytes`] entrance still downcasts to `Utf8Error`, so the indexer can tell
+    /// it apart from a typed [`Unindexable`] cause without reading the message.
     #[test]
     fn a_non_utf8_markdown_error_still_downcasts_to_utf8_error() {
         let err = MarkdownParser
