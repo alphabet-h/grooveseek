@@ -21,12 +21,91 @@ pub fn run(params: UninstallParams) -> Result<()> {
     // would have turned that into a hard failure.
     let config_home = resolve_config_home(&name).ok();
     // (kuriya #650) On Windows the registered task names the config home the
-    // service runs with (its `--config`), which is where groove-svc records
-    // the server and what --purge must remove, whatever GROOVE_CONFIG_HOME is
-    // now. Read before `run_with_backend` removes the task.
+    // service runs with (its `--config`), where groove-svc records the
+    // server. Read before the task is removed, it is used only to find that
+    // record: a stop checks the process's image and creation time, so a
+    // wrong value stops nothing. What --purge deletes is never taken from it
+    // ([`purge_target_check`]): only from the config home resolved here.
     #[cfg(target_os = "windows")]
-    let config_home = crate::service::windows::service_config_home(&name, config_home);
+    {
+        use crate::service::windows::{choose_config_home, registered_config_home};
+        let task_home = registered_config_home(&name);
+        if params.purge && params.yes {
+            purge_target_check(&name, task_home.as_deref(), config_home.as_deref())
+                .map_err(|e| anyhow!(e))?;
+        }
+        let (record_home, note) = choose_config_home(task_home, config_home.clone());
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
+        run_with_homes(
+            backend().as_ref(),
+            record_home.as_deref(),
+            config_home.as_deref(),
+            params,
+            PURGE_WRITER_WAIT,
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
     run_with_backend(backend().as_ref(), config_home.as_deref(), params)
+}
+
+/// (kuriya #650) Whether `--purge` may go ahead: it deletes only the config
+/// home resolved in this shell (`resolved`: `GROOVE_CONFIG_HOME` or the OS
+/// default), never one read from the registered task (`from_task`), which
+/// anyone who can edit the task controls. When the task names another config
+/// home (or this shell resolves none), the purge is refused before anything
+/// is touched — the task, its server and every file stay — with both paths
+/// and how to run it again so that they agree. Nothing to compare (no task,
+/// or one that names no config home) passes.
+#[cfg(target_os = "windows")]
+fn purge_target_check(
+    name: &str,
+    from_task: Option<&Path>,
+    resolved: Option<&Path>,
+) -> std::result::Result<(), String> {
+    use crate::service::windows::same_path;
+    let Some(task) = from_task else {
+        return Ok(());
+    };
+    if resolved.is_some_and(|now| same_path(task, now)) {
+        return Ok(());
+    }
+    let now = resolved.map_or_else(
+        || "no config home (neither GROOVE_CONFIG_HOME nor the OS config directory)".to_string(),
+        |p| p.display().to_string(),
+    );
+    // The config home is <GROOVE_CONFIG_HOME>\groove\<name>; say which value
+    // makes it the task's, when the task's has that shape.
+    let how = match task.parent().zip(task.file_name()) {
+        Some((groove, leaf))
+            if leaf.eq_ignore_ascii_case(name)
+                && groove
+                    .file_name()
+                    .is_some_and(|g| g.eq_ignore_ascii_case("groove")) =>
+        {
+            match groove.parent() {
+                Some(base) => format!(
+                    "Set GROOVE_CONFIG_HOME={} in this shell and run \
+                     `groove service uninstall --service-name {name} --purge --yes` again",
+                    base.display()
+                ),
+                None => "Remove that config home by hand".to_string(),
+            }
+        }
+        _ => format!(
+            "GROOVE_CONFIG_HOME cannot name that config home; run \
+             `groove service uninstall --service-name {name}` (without --purge) and remove \
+             the config home and its database by hand"
+        ),
+    };
+    Err(format!(
+        "--purge was refused and nothing was changed (the scheduled task, its server and every \
+         file are as they were): the scheduled task runs '{name}' with the config home {}, but \
+         this shell resolves {now}. --purge deletes only the config home this shell resolves, \
+         and only when the task names the same one. {how}.",
+        task.display()
+    ))
 }
 
 /// [`run`] with its two ambient dependencies passed in (AU-28).
@@ -41,6 +120,7 @@ pub fn run(params: UninstallParams) -> Result<()> {
 /// `config_home` is optional because it is only *required* by `--purge`, which
 /// cannot decide what to delete without it. Everything else treats it as
 /// informational.
+#[cfg_attr(all(target_os = "windows", not(test)), allow(dead_code))] // `run` uses `run_with_homes` there
 pub(crate) fn run_with_backend(
     be: &dyn ServiceBackend,
     config_home: Option<&Path>,
@@ -67,6 +147,23 @@ const PURGE_WRITER_WAIT: Duration = Duration::from_secs(10);
 /// test of the refusal need not sit out [`PURGE_WRITER_WAIT`].
 fn run_with_backend_waiting(
     be: &dyn ServiceBackend,
+    config_home: Option<&Path>,
+    params: UninstallParams,
+    writer_wait: Duration,
+) -> Result<()> {
+    run_with_homes(be, config_home, config_home, params, writer_wait)
+}
+
+/// [`run_with_backend_waiting`] with the two uses of a config home apart
+/// (kuriya #650): `record_home` is only where the record of the server
+/// groove-svc started is looked for (on Windows, the registered task's when
+/// it names one; a wrong one stops nothing, since a stop checks the process),
+/// and `config_home` is the one resolved from this shell, the only one
+/// `--purge` deletes. The two are the same everywhere but in [`run`] on
+/// Windows.
+fn run_with_homes(
+    be: &dyn ServiceBackend,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] record_home: Option<&Path>,
     config_home: Option<&Path>,
     params: UninstallParams,
     writer_wait: Duration,
@@ -101,7 +198,7 @@ fn run_with_backend_waiting(
     // purge's lock wait would not catch it, since a server running as a
     // reader or with its watcher off holds no writer lock.
     #[cfg(target_os = "windows")]
-    if let Some(home) = config_home
+    if let Some(home) = record_home
         && let Some((pid, why)) = stop_recorded_serve(home, !params.purge)
     {
         return Err(serve_left_running(&name, home, pid, &why, params.purge));
@@ -1566,6 +1663,96 @@ mod tests {
             purge.contains("`groove service uninstall --service-name au28 --purge --yes`"),
             "{purge}"
         );
+    }
+
+    /// kuriya #650 (Codex r3). A config home read from the task never becomes
+    /// what --purge deletes: when it differs from the one this shell resolves
+    /// (or this shell resolves none), the purge is refused with both paths and
+    /// how to make them agree; when they agree, or there is nothing to
+    /// compare, it may go ahead.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn purge_is_refused_when_the_task_names_another_config_home() {
+        let task = Path::new(r"C:\Users\me\Documents");
+        let now = Path::new(r"C:\Users\me\AppData\Roaming\groove\au28");
+        let msg = purge_target_check("au28", Some(task), Some(now)).unwrap_err();
+        assert!(msg.contains("nothing was changed"), "{msg}");
+        assert!(msg.contains(r"C:\Users\me\Documents"), "{msg}");
+        assert!(
+            msg.contains(r"C:\Users\me\AppData\Roaming\groove\au28"),
+            "{msg}"
+        );
+        assert!(msg.contains("without --purge"), "{msg}");
+
+        let alt = Path::new(r"D:\alt\groove\au28");
+        let msg = purge_target_check("au28", Some(alt), Some(now)).unwrap_err();
+        assert!(msg.contains(r"GROOVE_CONFIG_HOME=D:\alt"), "{msg}");
+
+        let msg = purge_target_check("au28", Some(alt), None).unwrap_err();
+        assert!(msg.contains("no config home"), "{msg}");
+
+        assert!(purge_target_check("au28", Some(now), Some(now)).is_ok());
+        assert!(
+            purge_target_check(
+                "au28",
+                Some(Path::new(r"c:\users\ME\appdata\roaming\GROOVE\au28")),
+                Some(now)
+            )
+            .is_ok(),
+            "the same path in another case agrees"
+        );
+        assert!(purge_target_check("au28", None, Some(now)).is_ok());
+        assert!(purge_target_check("au28", None, None).is_ok());
+    }
+
+    /// kuriya #650 (Codex r3) regression. The record home (from the task) is
+    /// only where the server's record is looked for; --purge deletes the
+    /// config home this shell resolved and nothing under the record home, even
+    /// when the record home is an unrelated directory.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn purge_never_deletes_the_record_home() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let unrelated = TempHome::new();
+        let keep = unrelated.path().join("keep.txt");
+        std::fs::write(&keep, b"user data").unwrap();
+
+        run_with_homes(
+            &FakeBackend::ok(),
+            Some(unrelated.path()),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect("the purge of the resolved config home goes through");
+
+        assert!(keep.exists(), "nothing under the record home is deleted");
+        assert!(unrelated.path().exists());
+        assert!(!home.path().exists(), "the resolved config home is deleted");
+        assert!(!db.exists());
+    }
+
+    /// kuriya #650 (Codex r3). When the task's config home is the resolved
+    /// one, the check passes and the purge deletes it as before.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn purge_goes_ahead_when_the_task_and_the_shell_agree() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        assert!(purge_target_check("au28", Some(home.path()), Some(home.path())).is_ok());
+        run_with_homes(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect("purge");
+        assert!(!home.path().exists());
+        assert!(!db.exists());
     }
 
     /// kuriya #650. Without a record, the server holding the index's lock is

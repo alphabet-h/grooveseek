@@ -110,11 +110,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   record before it starts the server, and a server whose record it then cannot write is
   stopped again and the start fails (in the task history): no server is left running out of the
   record, and uninstall finds no record (a warning) rather than an old one read as "that server
-  has exited". The service's config home is the one its registered task names (the
-  `--config <config home>\groove.toml` of its Action), read before the task is removed: uninstall
-  (with `--purge`, that is the config home it deletes), `install --force` and the service's stop
-  use it rather than whatever `GROOVE_CONFIG_HOME` is now, say on stderr when the two differ, and
-  fall back to `GROOVE_CONFIG_HOME` or the default when the task is gone or names none. A start of the task
+  has exited". To find that record, uninstall, `install --force` and the service's stop use the
+  config home the registered task names (the `--config <config home>\groove.toml` of its
+  Action, read before the task is removed) rather than whatever `GROOVE_CONFIG_HOME` is now,
+  say on stderr when the two differ, and fall back to `GROOVE_CONFIG_HOME` or the default when
+  the task is gone or names none; a wrong value there stops nothing, since the stop checks the
+  process. What `--purge` deletes is never taken from the task: only the config home this shell
+  resolves (`GROOVE_CONFIG_HOME` or the default), and when the task names a different one (or
+  the shell resolves none) the purge is refused before anything is touched — the task, its
+  server and every file stay — with both paths and the `GROOVE_CONFIG_HOME` that makes them
+  agree. A start of the task
   while the recorded server runs (a manual `/Run`, the next logon, the tray's Start) spawns
   nothing and keeps the record, instead of starting a second server that fails to bind and
   taking the running one out of the record; the check, the spawn and the record, and every

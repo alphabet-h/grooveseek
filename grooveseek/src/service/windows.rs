@@ -377,7 +377,7 @@ fn config_home_in_arguments(arguments: &str) -> Option<PathBuf> {
 /// The config home of the service as its registered task names it, read
 /// before the task is removed (kuriya #650). `None` when there is no such
 /// task or its arguments name none.
-fn registered_config_home(service_name: &str) -> Option<PathBuf> {
+pub(crate) fn registered_config_home(service_name: &str) -> Option<PathBuf> {
     let task = task_name(service_name);
     let out =
         run_powershell_capture(&build_action_arguments_script(&task), "Get-ScheduledTask").ok()?;
@@ -393,7 +393,7 @@ fn registered_config_home(service_name: &str) -> Option<PathBuf> {
 /// records the server beside the `groove.toml` it names; otherwise the one
 /// resolved now (`resolved`: `GROOVE_CONFIG_HOME` or the OS default). Also a
 /// note for stderr when the two differ, saying which was used.
-fn choose_config_home(
+pub(crate) fn choose_config_home(
     from_task: Option<PathBuf>,
     resolved: Option<PathBuf>,
 ) -> (Option<PathBuf>, Option<String>) {
@@ -413,7 +413,7 @@ fn choose_config_home(
 }
 
 /// Windows paths compare case-insensitively.
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     a.as_os_str()
         .to_string_lossy()
         .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
