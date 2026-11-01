@@ -92,18 +92,28 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Action is `groove-svc.exe`, which starts `groove.exe serve` detached and exits, so the task
   is always `Ready` and `schtasks /End` stopped nothing: the server kept running after
   `uninstall`, and `uninstall --purge --yes` waited out its 10 seconds for the writer lock every
-  time, then refused and kept the database and the config home. Uninstall, with or without
-  `--purge`, now stops the server by the pid `.groove.db.writer.json` records, believed only
-  while the writer lock beside it is held, only for a server's record (role `serve` or
-  `rebuild`), and only when that pid is `groove.exe` and was started before the record was
-  written (so a stale record whose pid was reused, even by another groove, is left alone); it
-  then waits up to 10 seconds for the lock to be released. A server it cannot stop is named
-  with its pid and how to stop it, and an uninstall without `--purge` now fails in that case
-  instead of leaving it running without a word. The refusal also gives `taskkill /F /PID <pid>`:
-  a server started without a console is refused by `taskkill /PID <pid>` alone ("can only be
-  terminated forcefully"). Removing a task that is already gone no longer prints schtasks'
-  `ERROR: The system cannot find the file specified.` twice. Linux and macOS are unchanged
-  (kuriya #650).
+  time, then refused and kept the database and the config home. `groove-svc` now records the
+  server it starts, its pid and the creation time the OS gave that process, in
+  `serve-pid.json` in the service's config home (written to a temporary file and renamed), and
+  uninstall, with or without `--purge`, stops that process: only when the pid is still
+  `groove.exe` with exactly the recorded creation time, so a pid reused since, even by another
+  groove, is left alone. It waits up to 10 seconds for the server to exit; with `--purge`, the
+  wait of up to 10 seconds for the writer lock follows, so about 20 seconds at most. The
+  index's writer lock is not used to find the server: when another server on the same knowledge
+  base (such as a client's stdio server) took the lock first, the service's server holds none,
+  and the holder is not the service's. A server that was started before this record existed
+  (by an older `groove-svc`, or by an Action that runs `groove.exe` itself) is not stopped: the
+  uninstall warns, names the lock's holder as a lead when there is one, and without `--purge`
+  still exits 0; `--purge` then waits for the lock and refuses as before. A recorded server that
+  is running but cannot be stopped makes an uninstall without `--purge` fail, naming its pid
+  and how to stop it. The refusals also give `taskkill /F /PID <pid>`: a server started without
+  a console is refused by `taskkill /PID <pid>` alone ("can only be terminated forcefully").
+  Removing a task that is already gone no longer prints schtasks'
+  `ERROR: The system cannot find the file specified.` twice, and a `/Delete` that fails while
+  the task stays registered is now an error instead of "Removed service unit". The tray's Stop
+  uses the same record first, with the same check, and falls back to the status endpoint's pid
+  as before; its process handling moved to a new internal crate, `groove-winproc`, which
+  `groove` and `groove-svc` share. Linux and macOS are unchanged (kuriya #650).
 
 ### Documentation
 

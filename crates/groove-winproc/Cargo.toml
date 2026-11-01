@@ -1,0 +1,27 @@
+[package]
+name = "groove-winproc"
+version = "1.23.0"
+edition = "2024"
+description = "Windows process identity and stop helpers shared by groove, groove-svc and groove-tray"
+authors = ["koshian"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alphabet-h/grooveseek"
+homepage = "https://github.com/alphabet-h/grooveseek"
+# Internal library crate (kuriya #650): no binary, not a release asset of its
+# own. publish = false avoids the crates.io readme/metadata validation.
+publish = false
+
+[dependencies]
+# The record groove-svc writes beside the service's groove.toml. Plain file I/O,
+# compiled on every OS so its round trip is tested on every CI leg.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# windows-sys rather than windows: grooveseek already uses windows-sys 0.59,
+# and 0.59 is in the lock, so neither the tray nor groove pulls a new version.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+# rustdoc lint levels come from the workspace root, where the reasoning lives.
+[lints]
+workspace = true

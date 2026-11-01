@@ -23,6 +23,11 @@ targets = ["x86_64-pc-windows-msvc"]
 name = "groove-svc"
 path = "src/main.rs"
 
+# (kuriya #650) The record of the server it starts, beside the service's
+# groove.toml, with the child's creation time read from its handle.
+[target.'cfg(windows)'.dependencies]
+groove-winproc = { path = "../groove-winproc" }
+
 # rustdoc lint levels come from the workspace root, where the reasoning lives.
 [lints]
 workspace = true

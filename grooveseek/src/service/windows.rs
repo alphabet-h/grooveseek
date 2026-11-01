@@ -77,6 +77,17 @@ fn run_schtasks_quiet(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// What `uninstall` reports for `schtasks /Delete`: success, a task that is
+/// not registered (already gone: nothing to remove, which is what uninstall
+/// asks for), or a failure that left the task registered, which is an error.
+fn delete_outcome(deleted: Result<()>, still_registered: bool) -> Result<()> {
+    match deleted {
+        Ok(()) => Ok(()),
+        Err(_) if !still_registered => Ok(()),
+        Err(e) => Err(e.context("the scheduled task is still registered")),
+    }
+}
+
 /// The subcommand word a console-binary Action has to supply itself.
 ///
 /// **Invariant, enforced jointly with `crates/groove-svc/src/main.rs`:** exactly
@@ -415,15 +426,19 @@ impl ServiceBackend for TaskScheduler {
         // `/End` stops the server only on an install whose Action is
         // `groove.exe` itself (before v0.9.1); with the `groove-svc.exe`
         // launcher the task's process has already exited, and the uninstall
-        // command stops the server by its pid (`serve_stop`, kuriya #650).
-        // Both results are ignored, as before, so their output is captured
-        // rather than shown: a task that is already gone printed schtasks'
-        // "ERROR: The system cannot find the file specified." twice on a
-        // successful uninstall.
+        // command stops the server groove-svc recorded (`serve_stop`, kuriya
+        // #650). Its result is ignored, as before. The output of both calls is
+        // captured rather than shown: a task that is already gone printed
+        // schtasks' "ERROR: The system cannot find the file specified." twice
+        // on a successful uninstall. A `/Delete` that fails is then told apart
+        // by asking whether the task is still registered: gone is what was
+        // asked for; still there is an error, not "Removed service unit".
         let task = task_name(service_name);
         let _ = run_schtasks_quiet(&["/End", "/TN", &task]);
-        let _ = run_schtasks_quiet(&["/Delete", "/TN", &task, "/F"]);
-        Ok(())
+        let deleted = run_schtasks_quiet(&["/Delete", "/TN", &task, "/F"]);
+        let still_registered =
+            deleted.is_err() && run_schtasks_quiet(&["/Query", "/TN", &task]).is_ok();
+        delete_outcome(deleted, still_registered)
     }
     fn status(&self, service_name: &str) -> Result<ServiceState> {
         let task = task_name(service_name);
@@ -466,22 +481,18 @@ impl ServiceBackend for TaskScheduler {
     }
     /// `schtasks /End` alone stops nothing on an install whose Action is the
     /// `groove-svc.exe` launcher (the task is `Ready` while the server runs),
-    /// so the server is stopped by the pid its writer lock records, checked
-    /// to be the `groove.exe` that wrote the record (kuriya #650).
+    /// so the server `groove-svc` recorded is stopped, when the recorded pid
+    /// is still that process (kuriya #650, [`super::serve_stop`]). Without a
+    /// record there is nothing to go by, and nothing more is stopped.
     fn stop(&self, service_name: &str) -> Result<()> {
-        use super::serve_stop::{SERVE_LOCK_RELEASE_WAIT, ServeStop, stop_serve_of};
+        use super::serve_stop::{ServeStop, stop_recorded_serve};
         let _ = run_schtasks_quiet(&["/End", "/TN", &task_name(service_name)]);
         let home = super::resolve_config_home(service_name)?;
-        let Some(db) = super::uninstall::database_named_by(&home).map_err(|e| anyhow!(e))? else {
-            return Ok(());
-        };
-        let resolved = crate::writer_lease::WriterLease::resolved_db_path(&db);
-        match stop_serve_of(&resolved, SERVE_LOCK_RELEASE_WAIT) {
-            ServeStop::NoServe | ServeStop::Stopped { .. } => Ok(()),
-            ServeStop::NotStopped { holder, why } => Err(anyhow!(
-                "could not stop the groove server of '{service_name}' (pid {}): {why}",
-                holder.pid
+        match stop_recorded_serve(&home) {
+            ServeStop::NotStopped { pid, why } => Err(anyhow!(
+                "could not stop the groove server of '{service_name}' (pid {pid}): {why}"
             )),
+            _ => Ok(()),
         }
     }
 }
@@ -528,6 +539,20 @@ mod tests {
     /// as a tray that controls a task nobody registered — so both sides pin
     /// the literal. The counterpart is `task_name_uses_grooveseek_prefix` in
     /// `crates/groove-tray/src/daemon.rs`; the two must agree.
+    /// kuriya #650 (I2). Silencing `schtasks /Delete` must not silence a real
+    /// failure: only a task that is no longer registered counts as removed.
+    #[test]
+    fn a_failed_delete_is_an_error_only_while_the_task_is_still_registered() {
+        assert!(delete_outcome(Ok(()), false).is_ok());
+        assert!(
+            delete_outcome(Err(anyhow!("schtasks /Delete failed")), false).is_ok(),
+            "already gone is what uninstall asked for"
+        );
+        let err = delete_outcome(Err(anyhow!("schtasks /Delete failed")), true)
+            .expect_err("a task still registered was not removed");
+        assert!(format!("{err:#}").contains("still registered"), "{err:#}");
+    }
+
     #[test]
     fn task_name_matches_the_tray_copy() {
         assert_eq!(task_name("personal"), "groove-personal");

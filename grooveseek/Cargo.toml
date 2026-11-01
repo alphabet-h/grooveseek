@@ -170,9 +170,10 @@ groove-tray = { path = "../crates/groove-tray" }
 # and walkdir's metadata comes from `WIN32_FIND_DATAW`, which carries no link
 # count at all. Already in the dependency tree at this version (via the tray and
 # several transitive deps), so this adds no new build.
-# (kuriya #650) `Win32_System_Threading` for stopping a service's `groove serve`
-# by its process on uninstall (`service/serve_stop.rs`).
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# (kuriya #650) Stopping the server groove-svc recorded, on uninstall
+# (`service/serve_stop.rs`); the same crate the tray stops it with.
+groove-winproc = { path = "../crates/groove-winproc" }
 
 [features]
 # (feature-56) The Rust grammar, compiled in. On by default: it is the language

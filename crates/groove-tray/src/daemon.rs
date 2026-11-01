@@ -1,4 +1,4 @@
-use crate::process::{StopOutcome, stop_process_if_image_matches};
+use crate::process::{StopOutcome, stop_process_if_image_matches, stop_recorded_process};
 use anyhow::{Context, Result, bail};
 use groove_tray::powershell::{CREATE_NO_WINDOW, decode_diagnostic, with_utf8_output};
 use std::time::Duration;
@@ -55,7 +55,12 @@ enum DaemonProbe {
 /// launcher alive would not have helped: measured on a probe task, stopping a
 /// running task killed its own process and left the child alive.
 ///
-/// So the pid from `/api/admin/status` drives the stop, terminated through
+/// Since kuriya #650, `groove-svc` records the server it starts (pid and
+/// creation time) beside `groove.toml`; when that record names a running
+/// process created at the recorded time, it is stopped first
+/// ([`stop_recorded_process`]). Otherwise, as before:
+///
+/// The pid from `/api/admin/status` drives the stop, terminated through
 /// [`stop_process_if_image_matches`]. That covers pre-v0.9.1 installs too,
 /// where the daemon *is* the task's own process, leaving `Stop-ScheduledTask`
 /// as a best-effort tidy-up rather than the mechanism.
@@ -71,6 +76,30 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
     // the scheduled task was missing, which `restart` would then turn into
     // "never started" (caught by the end-to-end test below).
     let mut fallback_error: Option<anyhow::Error> = None;
+    // (kuriya #650) The server groove-svc recorded, checked against its
+    // creation time, comes first: it is the service's own server even when
+    // another groove answers on the port. Anything short of a stop falls
+    // through to the status endpoint's pid, as before.
+    if let Some(record) = recorded_server(service_name) {
+        match stop_recorded_process(record.pid, DAEMON_IMAGE, record.created) {
+            Ok(StopOutcome::Terminated) => {
+                if let Err(e) = stop_scheduled_task(service_name).await {
+                    tracing::debug!(
+                        "Stop-ScheduledTask after the recorded stop failed (ignored): {e}"
+                    );
+                }
+                return confirm_stopped(bind).await;
+            }
+            Ok(other) => tracing::debug!(
+                "recorded server pid {} not stopped ({other:?}); using the status endpoint",
+                record.pid
+            ),
+            Err(e) => tracing::warn!(
+                "could not stop the recorded server pid {}: {e}; using the status endpoint",
+                record.pid
+            ),
+        }
+    }
     match probe_daemon(status_url).await {
         DaemonProbe::Pid(pid) => {
             match stop_process_if_image_matches(pid, DAEMON_IMAGE)? {
@@ -78,7 +107,7 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
                 StopOutcome::NotRunning => {
                     tracing::debug!("pid {pid} had already exited");
                 }
-                StopOutcome::NotOurProcess => {
+                StopOutcome::NotOurProcess | StopOutcome::Reused => {
                     // A stale status response whose pid has been recycled. The
                     // daemon may still be running under a different pid, which
                     // `confirm_stopped` will catch.
@@ -109,6 +138,18 @@ pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()
             Some(fe) => e.context(format!("Stop-ScheduledTask also failed: {fe}")),
             None => e,
         })
+}
+
+/// The record `groove-svc` wrote of the server it started, in the service's
+/// config home as the tray finds it (`<config dir>/groove/<service>`, the
+/// same place [`crate::config::resolve`] reads `groove.toml` from). `None`
+/// when there is none or it cannot be read: a server started by an older
+/// `groove-svc`, or not by the task at all.
+fn recorded_server(service_name: &str) -> Option<groove_winproc::ServeRecord> {
+    let home = dirs::config_dir()?.join("groove").join(service_name);
+    groove_winproc::ServeRecord::read(&groove_winproc::ServeRecord::path_in(&home))
+        .ok()
+        .flatten()
 }
 
 /// Stop then start, with a short grace period so the listening socket is

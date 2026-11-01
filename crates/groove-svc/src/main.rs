@@ -93,7 +93,7 @@ fn main() -> std::io::Result<()> {
     // installer.
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 
-    Command::new(&grooveseek_exe)
+    let child = Command::new(&grooveseek_exe)
         .args(child_args(&extra_args))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -101,7 +101,37 @@ fn main() -> std::io::Result<()> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
 
+    // (kuriya #650) Record which process is the service's server, so
+    // `groove service uninstall` can stop it: this process exits right away,
+    // so Task Scheduler sees a finished task and `schtasks /End` stops nothing.
+    // Best-effort: the server is already running, and failing here would only
+    // put an error in the task history while it runs anyway.
+    if let Some(home) = record_dir(&extra_args) {
+        use std::os::windows::io::AsRawHandle;
+        if let Ok(created) = groove_winproc::creation_time_of(child.as_raw_handle()) {
+            let record = groove_winproc::ServeRecord {
+                pid: child.id(),
+                created,
+            };
+            let _ = record.write(&groove_winproc::ServeRecord::path_in(&home));
+        }
+    }
+    // Dropping `child` closes its handle and leaves the server running.
     Ok(())
+}
+
+/// The directory the [`groove_winproc::ServeRecord`] goes in: the one holding
+/// the `groove.toml` the Action passes as `--config <config_home>\groove.toml`
+/// (BU-07), which is the service's config home. `None` when the Action passes
+/// no `--config` (an install from before BU-07), so nothing is recorded.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn record_dir(extra: &[String]) -> Option<std::path::PathBuf> {
+    let at = extra.iter().position(|a| a == "--config")?;
+    let config = std::path::Path::new(extra.get(at + 1)?);
+    config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -117,6 +147,44 @@ fn main() {
 /// This crate's half of the "exactly one `serve`" invariant. The installer's
 /// half is asserted in
 /// `grooveseek/tests/service_install_integration.rs::windows_register_script_*`.
+/// (kuriya #650) Where groove-svc records the server it starts.
+#[cfg(test)]
+mod record_dir_tests {
+    use super::record_dir;
+
+    /// A backslash is a separator only on Windows, where this runs for real.
+    #[cfg(windows)]
+    #[test]
+    fn the_record_goes_beside_the_groove_toml_the_action_names() {
+        let extra = vec![
+            "--config".to_string(),
+            "C:\\Users\\me\\AppData\\Roaming\\groove\\work\\groove.toml".to_string(),
+        ];
+        assert_eq!(
+            record_dir(&extra).unwrap(),
+            std::path::Path::new("C:\\Users\\me\\AppData\\Roaming\\groove\\work")
+        );
+    }
+
+    #[test]
+    fn without_a_config_argument_nothing_is_recorded() {
+        assert_eq!(record_dir(&[]), None);
+        assert_eq!(record_dir(&["--config".to_string()]), None);
+        assert_eq!(
+            record_dir(&["--config".to_string(), "groove.toml".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_config_records_beside_it() {
+        assert_eq!(
+            record_dir(&["--config".to_string(), "home/groove.toml".to_string()]),
+            Some(std::path::PathBuf::from("home"))
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::child_args;

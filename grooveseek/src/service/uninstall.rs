@@ -49,11 +49,12 @@ pub(crate) fn run_with_backend(
 /// exit, so a server that is stopping still holds the lock for a moment. On
 /// Windows the backend cannot stop it (the task's process is `groove-svc.exe`,
 /// which detach-spawns the server and exits, so `schtasks /End` has nothing
-/// to end): uninstall stops the server itself by the pid its writer lock
-/// records ([`crate::service::serve_stop`], kuriya #650) and has already
-/// waited for the lock by the time this wait starts. Either way, a holder
-/// still there after this long was not stopped (another process, or a
-/// server that could not be), and is named in the refusal.
+/// to end): uninstall stops the server `groove-svc` recorded itself
+/// (`service/serve_stop.rs`, kuriya #650), waiting up to 10 s for it to exit,
+/// before this wait starts, so the two add up to about 20 s at most. Either
+/// way, a holder still there after this long was not stopped (another
+/// process, such as a second server on the same knowledge base, or a server
+/// that could not be), and is named in the refusal.
 const PURGE_WRITER_WAIT: Duration = Duration::from_secs(10);
 
 /// [`run_with_backend`] with the wait for the writer lock passed in, so a
@@ -87,6 +88,23 @@ fn run_with_backend_waiting(
         }
     }
 
+    // (kuriya #650) On Windows the backend cannot stop the server; stop the
+    // one groove-svc recorded. With --purge, one that could not be stopped is
+    // warned about here and then met by the purge's wait and refusal, which
+    // name the lock's holder and how to stop it; without --purge it fails the
+    // uninstall, since nothing else would say it is still running.
+    #[cfg(target_os = "windows")]
+    if let Some(home) = config_home
+        && let Some((pid, why)) = stop_recorded_serve(home, !params.purge)
+    {
+        if !params.purge {
+            return Err(serve_left_running(&name, home, pid, &why));
+        }
+        eprintln!(
+            "Warning: could not stop the groove server this service started (pid {pid}): {why}"
+        );
+    }
+
     if params.purge {
         let home = config_home
             .ok_or_else(|| {
@@ -106,16 +124,6 @@ fn run_with_backend_waiting(
                 // Resolved once, whole; everything removed below is named
                 // from this resolution (kuriya #645 review).
                 let target = PurgeTarget::new(&db);
-                // A server that could not be stopped is reported here and
-                // then met by the wait and refusal below, which name it and
-                // how to stop it.
-                #[cfg(target_os = "windows")]
-                if let Some((holder, why)) = stop_serve(&target.resolved) {
-                    eprintln!(
-                        "Warning: could not stop the groove server (pid {}): {why}",
-                        holder.pid
-                    );
-                }
                 purge_under_writer_lock(&target, &home, &name, writer_wait, remove_config_home)?;
             }
             Ok(None) => {
@@ -137,74 +145,114 @@ fn run_with_backend_waiting(
                 return Err(undecidable_database(&why, &home, &name));
             }
         }
-    } else if let Some(home) = config_home {
-        #[cfg(target_os = "windows")]
-        stop_serve_named_by(home, &name)?;
-        if home.exists() {
-            eprintln!(
-                "Kept config home: {} (use --purge --yes to remove)",
-                home.display()
-            );
-        }
+    } else if let Some(home) = config_home
+        && home.exists()
+    {
+        eprintln!(
+            "Kept config home: {} (use --purge --yes to remove)",
+            home.display()
+        );
     }
     Ok(())
 }
 
-/// Stop the `groove serve` holding the writer lock of the database at
-/// `resolved` ([`crate::service::serve_stop`], kuriya #650): on Windows the
-/// backend's `schtasks /End` cannot, since the task's process is the launcher
-/// that already exited. `None` when there was no server or it was stopped
-/// (said on stderr); otherwise the holder record and why it was not stopped.
+/// Stop the server `groove-svc` recorded in `home`
+/// ([`crate::service::serve_stop`], kuriya #650): on Windows the backend's
+/// `schtasks /End` cannot, since the task's process is the launcher that has
+/// already exited. Says what happened on stderr. `Some((pid, why))` when the
+/// recorded server is running and could not be stopped.
+///
+/// Without a record nothing is stopped, and the warning says so; when the
+/// index's writer lock is held and `hint_holder` is set, it also names the
+/// process its `.groove.db.writer.json` records, only as a lead (it may be
+/// another server on the same knowledge base, not this service's).
 #[cfg(target_os = "windows")]
-fn stop_serve(resolved: &Path) -> Option<(HolderInfo, String)> {
-    use crate::service::serve_stop::{SERVE_LOCK_RELEASE_WAIT, ServeStop, stop_serve_of};
-    match stop_serve_of(resolved, SERVE_LOCK_RELEASE_WAIT) {
-        ServeStop::NoServe => None,
+fn stop_recorded_serve(home: &Path, hint_holder: bool) -> Option<(u32, String)> {
+    use crate::service::serve_stop::ServeStop;
+    match crate::service::serve_stop::stop_recorded_serve(home) {
         ServeStop::Stopped { pid } => {
-            eprintln!("Stopped the groove server (pid {pid}).");
+            eprintln!("Stopped the groove server this service started (pid {pid}).");
             None
         }
-        ServeStop::NotStopped { holder, why } => Some((holder, why)),
+        ServeStop::NotRunning { pid, detail } => {
+            eprintln!(
+                "The groove server this service started (pid {pid}) is not running ({detail}); \
+                 nothing to stop."
+            );
+            None
+        }
+        ServeStop::NotStopped { pid, why } => Some((pid, why)),
+        ServeStop::NoRecord { path } => {
+            eprintln!(
+                "Warning: there is no record of the server this service started ({}), so no \
+                 server was stopped. A server started before groove kept that record (by an \
+                 older groove-svc) may still be running; stop it by hand.{}",
+                path.display(),
+                if hint_holder {
+                    lock_holder_hint(home)
+                } else {
+                    String::new()
+                }
+            );
+            None
+        }
+        ServeStop::BadRecord { path, why } => {
+            eprintln!(
+                "Warning: {} is not a record of the server this service started ({why}), so no \
+                 server was stopped; a server it started may still be running.{}",
+                path.display(),
+                if hint_holder {
+                    lock_holder_hint(home)
+                } else {
+                    String::new()
+                }
+            );
+            None
+        }
     }
 }
 
-/// The uninstall without `--purge`: stop the server of the database
-/// `home`'s `groove.toml` names, and fail, naming it and how to stop it,
-/// when it cannot be stopped. A config home that names no database has no
-/// server to look for, so that is only a warning.
+/// For a warning about a server that was not looked for: the process that
+/// holds the writer lock of the database `home`'s `groove.toml` names, and
+/// how to stop it, or nothing when that is unknown or the lock is free.
 #[cfg(target_os = "windows")]
-fn stop_serve_named_by(home: &Path, name: &str) -> Result<()> {
-    let db = match database_named_by(home) {
-        Ok(Some(db)) => db,
-        Ok(None) => return Ok(()),
-        Err(why) => {
-            eprintln!(
-                "Warning: {why}; the index database is unknown, so no running groove server \
-                 was looked for"
-            );
-            return Ok(());
-        }
+fn lock_holder_hint(home: &Path) -> String {
+    let Ok(Some(db)) = database_named_by(home) else {
+        return String::new();
     };
-    let target = PurgeTarget::new(&db);
-    let Some((holder, why)) = stop_serve(&target.resolved) else {
-        return Ok(());
+    let resolved = PurgeTarget::new(&db).resolved;
+    let Err(LeaseError::Busy {
+        lock_path,
+        holder: Some(holder),
+    }) = BareWriterLock::try_hold(&resolved)
+    else {
+        return String::new();
     };
     let busy = WriterBusy {
-        lock_path: with_suffix(&target.resolved, ".writer-lock"),
-        info_path: with_suffix(&target.resolved, ".writer.json"),
-        holder: Some(holder.clone()),
+        lock_path,
+        info_path: with_suffix(&resolved, ".writer.json"),
+        holder: Some(holder),
         waited: Duration::ZERO,
     };
-    Err(anyhow!(
-        "The service unit for '{name}' was removed, but a groove server (pid {}, {}, as \
-         recorded in {}, which can be stale) still holds the writer lock at {}: {why}. \
-         Stop {}.",
-        holder.pid,
-        holder.role.as_str(),
-        busy.info_path.display(),
-        busy.lock_path.display(),
+    format!(
+        " The index's writer lock is held: {}. If that is this service's server, stop {}.",
+        busy.describe_holder(),
         busy.how_to_stop()
-    ))
+    )
+}
+
+/// The uninstall without `--purge` fails when the server this service
+/// started is running and could not be stopped: confirmed by its image and
+/// creation time, it is the service's own, so it is named with how to stop it.
+#[cfg(target_os = "windows")]
+fn serve_left_running(name: &str, home: &Path, pid: u32, why: &str) -> anyhow::Error {
+    anyhow!(
+        "The service unit for '{name}' was removed, but the groove server it started (pid \
+         {pid}, as recorded in {}) could not be stopped: {why}. Stop it \
+         (`taskkill /PID {pid}`, or `taskkill /F /PID {pid}` when that answers the process \
+         can only be terminated forcefully).",
+        groove_winproc::ServeRecord::path_in(home).display()
+    )
 }
 
 /// Delete the database `target` names and then the config home `home`, with
@@ -505,6 +553,21 @@ impl WriterBusy {
         }
     }
 
+    /// Who holds the lock, as `<db>.writer.json` records it, without the wait
+    /// [`Self::describe`] reports: for a warning that is only a lead.
+    #[cfg(target_os = "windows")]
+    fn describe_holder(&self) -> String {
+        match &self.holder {
+            Some(h) => format!(
+                "pid {}, {}, as recorded in {}, which can be stale",
+                h.pid,
+                h.role.as_str(),
+                self.info_path.display()
+            ),
+            None => format!("by an unknown process, at {}", self.lock_path.display()),
+        }
+    }
+
     /// The process to stop before purge is run again. When a pid is recorded,
     /// the way to confirm it is groove comes before the command that stops
     /// it: the record can be stale ([`Self::describe`]), and a reused pid
@@ -734,7 +797,7 @@ fn kept_sidecars(db: &Path, base: &Path) -> Vec<PathBuf> {
 /// is not called, because it also checks every other key against this
 /// build's schema, and a config this build would refuse for an unrelated key
 /// still names the database to purge.
-pub(super) fn database_named_by(home: &Path) -> std::result::Result<Option<PathBuf>, String> {
+fn database_named_by(home: &Path) -> std::result::Result<Option<PathBuf>, String> {
     let toml_path = home.join("groove.toml");
     let Some(bytes) = crate::links::read_required_following(
         &toml_path,
@@ -1418,13 +1481,65 @@ mod tests {
         assert!(msg.contains("forcefully"), "{msg}");
     }
 
-    /// kuriya #650. Without `--purge`, uninstall stops the service's server
-    /// too; one it cannot stop (here the holder record names this test
-    /// process, which is never stopped) is reported with the pid and how to
-    /// stop it, and the uninstall fails rather than leave it running silently.
+    /// kuriya #650. Without `--purge`, uninstall stops the server groove-svc
+    /// recorded (a stand-in `groove.exe` here) and succeeds; the database and
+    /// the config home are kept.
     #[cfg(target_os = "windows")]
     #[test]
-    fn uninstall_without_purge_reports_a_server_it_could_not_stop() {
+    fn uninstall_without_purge_stops_the_recorded_server() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let mut server = crate::service::serve_stop::test_support::StandIn::start();
+        server
+            .record()
+            .write(&groove_winproc::ServeRecord::path_in(home.path()))
+            .unwrap();
+
+        let be = FakeBackend::ok();
+        run_with_backend_waiting(&be, Some(home.path()), params(false, false), Duration::ZERO)
+            .expect("the recorded server is stopped");
+
+        assert_eq!(be.uninstalled.take().as_deref(), Some("au28"));
+        assert!(!server.is_running(), "the recorded server has exited");
+        assert!(db.exists(), "nothing is deleted without --purge");
+        assert!(home.path().exists(), "the config home is kept");
+    }
+
+    /// kuriya #650. With `--purge --yes`, the recorded server is stopped
+    /// first, and the purge then goes all the way: database and config home.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn purge_stops_the_recorded_server_and_deletes() {
+        let home = TempHome::new();
+        let (_kb_root, db) = kb_outside(&home);
+        std::fs::write(&db, b"main").unwrap();
+        let mut server = crate::service::serve_stop::test_support::StandIn::start();
+        server
+            .record()
+            .write(&groove_winproc::ServeRecord::path_in(home.path()))
+            .unwrap();
+
+        run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(true, true),
+            Duration::ZERO,
+        )
+        .expect("purge goes through once the server is stopped");
+
+        assert!(!server.is_running(), "the recorded server has exited");
+        assert!(!db.exists(), "the database is deleted");
+        assert!(!home.path().exists(), "the config home is deleted");
+    }
+
+    /// kuriya #650. Without a record, the server holding the index's lock is
+    /// not taken for this service's (it may be another server on the same
+    /// knowledge base, such as a client's stdio server): nothing is stopped,
+    /// and an uninstall without `--purge` still succeeds, with a warning.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn without_a_record_the_lock_holder_is_not_stopped() {
         let home = TempHome::new();
         let (kb_root, db) = kb_outside(&home);
         std::fs::write(&db, b"main").unwrap();
@@ -1434,26 +1549,16 @@ mod tests {
             &kb_root.path().join("kb"),
         )
         .expect("nobody else holds the lease");
-        let pid = std::process::id();
 
-        let be = FakeBackend::ok();
-        let msg =
-            run_with_backend_waiting(&be, Some(home.path()), params(false, false), Duration::ZERO)
-                .expect_err("a server left running must be reported")
-                .to_string();
-
-        assert_eq!(
-            be.uninstalled.take().as_deref(),
-            Some("au28"),
-            "the unit is removed first"
-        );
-        assert!(msg.contains(&format!("pid {pid}, serve")), "{msg}");
-        assert!(msg.contains(&format!("`taskkill /F /PID {pid}`")), "{msg}");
-        assert!(db.exists(), "nothing is deleted without --purge");
-        assert!(
-            home.path().exists(),
-            "the config home is kept without --purge"
-        );
+        run_with_backend_waiting(
+            &FakeBackend::ok(),
+            Some(home.path()),
+            params(false, false),
+            Duration::ZERO,
+        )
+        .expect("no record: a warning, not a failure");
+        assert!(db.exists());
+        assert!(home.path().exists());
     }
 
     /// kuriya #650. Without `--purge` and with nobody holding the lock,

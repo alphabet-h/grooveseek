@@ -3,6 +3,7 @@ members = [
     "grooveseek",
     "crates/groove-tray",
     "crates/groove-svc",
+    "crates/groove-winproc",
     "crates/groove-grammar-abi",
     "crates/groove-grammar-python",
     "crates/groove-grammar-php",

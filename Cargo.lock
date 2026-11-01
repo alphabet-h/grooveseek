@@ -1924,6 +1924,9 @@ dependencies = [
 [[package]]
 name = "groove-svc"
 version = "1.23.0"
+dependencies = [
+ "groove-winproc",
+]
 
 [[package]]
 name = "groove-tray"
@@ -1932,6 +1935,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "groove-winproc",
  "image",
  "reqwest 0.13.3",
  "serde",
@@ -1945,6 +1949,15 @@ dependencies = [
  "tray-icon",
  "windows",
  "winresource",
+]
+
+[[package]]
+name = "groove-winproc"
+version = "1.23.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1962,6 +1975,7 @@ dependencies = [
  "globset",
  "groove-grammar-abi",
  "groove-tray",
+ "groove-winproc",
  "http",
  "ignore",
  "indicatif 0.18.4",
