@@ -33,7 +33,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::sync::Once;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 thread_local! {
     /// parse 中 (= [`catch_parser_panic`] の `catch_unwind` 内) は true。
@@ -126,9 +126,12 @@ pub(crate) fn catch_parser_panic<T>(
 
     match result {
         Ok(inner) => inner,
-        Err(payload) => Err(anyhow!(
-            "{path_hint}: {stage} parser panicked: {}",
-            panic_payload_message(payload.as_ref())
+        Err(payload) => Err(super::unindexable(
+            super::ParseCause::CorruptOrUnsupported,
+            format!(
+                "{path_hint}: {stage} parser panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ),
         )),
     }
 }
@@ -154,6 +157,7 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn test_catch_parser_panic_passes_through_ok() {
@@ -179,6 +183,26 @@ mod tests {
         .expect_err("a panicking parser must yield Err, not unwind to the caller");
         let msg = err.to_string();
         assert!(msg.contains("docs/broken.xlsx"), "got: {msg}");
+        assert!(msg.contains("xlsx parser panicked"), "got: {msg}");
+        assert!(
+            msg.contains("attempt to subtract with overflow"),
+            "panic payload must be preserved in the error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_parser_panic_is_corrupt_or_unsupported() {
+        // #660 (spec T-P8): a panic is classified as a damaged / unsupported file, and the
+        // payload still reaches the message (罠 5: the payload must not be dropped).
+        let err = catch_parser_panic::<()>("docs/broken.xlsx", "xlsx", || {
+            panic!("attempt to subtract with overflow");
+        })
+        .expect_err("a panicking parser must yield Err");
+        assert_eq!(
+            crate::parser::cause_of(&err),
+            Some(crate::parser::ParseCause::CorruptOrUnsupported)
+        );
+        let msg = err.to_string();
         assert!(msg.contains("xlsx parser panicked"), "got: {msg}");
         assert!(
             msg.contains("attempt to subtract with overflow"),
