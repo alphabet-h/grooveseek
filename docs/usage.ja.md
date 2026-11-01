@@ -248,7 +248,7 @@ groove service install --kb-path C:\path\to\kb --with-tray
 - **赤** — daemon 1 分以上応答なし (= 5sec interval で 12 連続失敗)
 - **灰** — 初回 polling 待ち (= 起動直後 5 秒)
 
-right-click で 6 menu items: **Status** (read-only) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**。**Start** は scheduled task を実行、**Stop** は `/api/admin/status` が報告する pid のプロセスを終了させ (v0.14.0+)、daemon の bind アドレスを bind できることで停止を確認する — `Stop-ScheduledTask` が止めていたのは即座に終了する launcher だけで、実質何もしていなかった。`groove-svc` がサーバの記録 (`serve-pid.json`、v1.24.0+) を残していれば、**Stop** はまずその記録のサーバを (image と作成時刻を確かめてから) 止める。startup の shortcut は tray に `--config-home <config home>` を渡すので (v1.24.0+)、`GROOVE_CONFIG_HOME` で install したサービスでも記録と `groove.toml` が見つかる (既存の shortcut は `tray-install` か `install --with-tray` を打ち直すまで既定の場所を見る)。
+right-click で 6 menu items: **Status** (read-only) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**。**Start** は scheduled task を実行、**Stop** は `/api/admin/status` が報告する pid のプロセスを終了させ (v0.14.0+)、daemon の bind アドレスを bind できることで停止を確認する — `Stop-ScheduledTask` が止めていたのは即座に終了する launcher だけで、実質何もしていなかった。`groove-svc` がサーバの記録 (`serve-pid.json`、v1.24.0+) を残していれば、**Stop** はまずその記録のサーバを (image と作成時刻を確かめてから) 止める。startup の shortcut は tray に `--config-home <config home>` を渡すので (v1.24.0+)、`GROOVE_CONFIG_HOME` で install したサービスでも記録と `groove.toml` が見つかる (既存の shortcut は `tray-install --force` か `install --force --with-tray` を打ち直すまで既定の場所を見る。`--force` が無いと既存の shortcut は上書きされず拒まれる)。
 
 Tray log は `%LOCALAPPDATA%\groove\logs\tray.YYYY-MM-DD` (= 日次 rotation)。verbose 出力には `GROOVE_TRAY_LOG=debug` を設定、`--debug` flag で console attach して stdout/stderr を直接見る。
 

@@ -160,7 +160,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   as before; the tray's startup shortcut now passes the service's config home
   (`--config-home`), so the tray finds `groove.toml` and the record for a service installed
   under `GROOVE_CONFIG_HOME` too (an existing shortcut keeps the default place until
-  `tray-install` or `install --with-tray` is run again); its process handling moved to a new internal crate, `groove-winproc`, which
+  `tray-install --force` or `install --force --with-tray` is run again); its process handling moved to a new internal crate, `groove-winproc`, which
   `groove` and `groove-svc` share. Linux and macOS are unchanged (kuriya #650).
 
 ### Internal
