@@ -1502,6 +1502,9 @@ pub enum SingleResult {
 /// check) failing is a `Skipped` with `Some(SkipReason::Unreadable { .. })` here as in the full
 /// index, with any cause; it is also where a refusal of that read (hard link, not a plain file,
 /// too large) comes from.
+/// `reindex_single_file_explained` does not itself refuse a path whose name the index cannot store or that
+/// `.grooveignore` excludes: that check is the caller's (the watcher makes it before calling), so
+/// for such a path the reason here can differ from the one `rebuild_index` lists.
 #[derive(Debug, PartialEq)]
 pub struct Reindexed {
     pub result: SingleResult,
@@ -2646,7 +2649,7 @@ fn stop_cancelled_run(
 /// (#660, spec 6 W2/W3/W5-W7) List `rel` with the reason the indexing body gave a result the
 /// run counts as skipped. That body names one for every such result (I4); a `None` here is a
 /// return point that forgot to, caught in a debug build and otherwise left off the list (the
-/// count follows the list, so the result stays consistent).
+/// count follows the list, so the result stays consistent) with a warning naming the file.
 fn list_skip(ledger: &mut skip::SkipLedger, rel: &str, reason: Option<SkipReason>) {
     debug_assert!(
         reason.is_some(),
@@ -2654,6 +2657,8 @@ fn list_skip(ledger: &mut skip::SkipLedger, rel: &str, reason: Option<SkipReason
     );
     if let Some(reason) = reason {
         ledger.upsert(rel, reason);
+    } else {
+        tracing::warn!("{rel} was skipped with no reason given; it is left off the skipped list");
     }
 }
 

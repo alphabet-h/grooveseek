@@ -361,14 +361,19 @@ fn cancel_kb(prefix: &str) -> Fixture {
     fx
 }
 
-/// T-L8: a run stopped after the scan (C2) and one stopped in the loop (C3) both return
-/// `cancelled` with a list that matches `skipped`.
+/// T-L8: a run stopped at the end of the scan (C1 on the last file, the return it shares with
+/// C2) and one stopped in the loop (C3) both return `cancelled` with a list that matches
+/// `skipped`.
 #[test]
 fn cancelled_runs_still_match_their_count() {
     if run_in_hermetic_child("cancelled_runs_still_match_their_count") {
         return;
     }
-    // C2: the token is set by the last file's `Scanning`, so no document is read.
+    // The token is set by the last file's `Scanning`, so no document is read. The observer
+    // sees it right after that file, which is C1 on the last file; C2 is the same return
+    // reached by a token set from another thread after the observer's last look, and no
+    // callback can set one in that gap, so C2 cannot be told apart from C1 here (as in
+    // `tests/index_cancel.rs`). What this pins is the property both share.
     let fx = cancel_kb("groove-660-cancel-c2");
     let after_scan = rebuild_cancelling(
         &fx,
