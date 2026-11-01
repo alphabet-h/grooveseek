@@ -1901,8 +1901,8 @@ mod tests {
     }
 
     /// Rewrites the uncompressed size `forged`'s entries declare from `real` to `fake`, in the
-    /// local file header (+22) and the central directory header (+24), as the ooxml tests'
-    /// `forge_declared_size` does.
+    /// local file header (+22) and the central directory header (+24), as `forge_declared_size`
+    /// in the tests of [`crate::parser::ooxml`] does.
     fn forge_document_xml_size(zip_bytes: &[u8], real: u32, fake: u32) -> Vec<u8> {
         let mut data = zip_bytes.to_vec();
         let mut patched = 0;
