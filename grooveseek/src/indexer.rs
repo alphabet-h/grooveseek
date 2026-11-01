@@ -11,6 +11,9 @@ use crate::parser::{ParserExt, Registry};
 use crate::quality;
 
 pub mod progress;
+pub mod skip;
+
+pub use skip::{LimitKey, ReadFailure, SkipReason, SkippedFile};
 
 // ---------------------------------------------------------------------------
 // Hardcoded denylist (F-62)
