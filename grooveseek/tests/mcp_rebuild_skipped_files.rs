@@ -1,5 +1,6 @@
-//! #660 (spec 5.4, T-M4): MCP `rebuild_index` names each file it skipped,
-//! with its reason, over a real `groove serve`.
+//! #660 (spec 5.4, T-M4): the MCP tool that rebuilds the index (served by
+//! [`grooveseek::server::KbServer`]) names each file it skipped, with its
+//! reason, over a real `groove serve`.
 //!
 //! The server embeds through the in-process mock
 //! ([`crate::common::embed_mock`]) under the shared fixture
@@ -18,7 +19,7 @@ use std::path::Path;
 /// UTF-8 as written, never the server's absolute path.
 ///
 /// The knowledge base is indexed once before the server starts, as every
-/// other `spawn_serve_with` test does; the empty note is skipped again on
+/// other [`spawn_serve_with`] test does; the empty note is skipped again on
 /// the second run, so it is listed then too.
 ///
 /// Red if the reply drops `skipped_files`, lists the absolute path or a

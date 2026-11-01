@@ -573,8 +573,8 @@ fn with_foreign_writes<T: Serialize>(
 /// counted (`skipped_files_omitted`). Keeps the tool reply small; the lib's list is not cut.
 const SKIPPED_FILES_IN_REPLY: usize = 50;
 
-/// One skipped file in the reply: `path`, `reason` ([`indexer::SkipReason::kind`]) and the
-/// flat detail keys its reason has. A key the reason does not have is absent, not null.
+/// One skipped file in the reply: [`Self::path`], [`Self::reason`] ([`indexer::SkipReason::kind`])
+/// and the flat detail keys its reason has. A key the reason does not have is absent, not null.
 #[derive(Serialize)]
 struct SkippedFileJson {
     path: String,
@@ -595,8 +595,9 @@ struct SkippedFileJson {
     directory: Option<bool>,
 }
 
-/// The reply's copy of `f`. `limit_key` comes from [`indexer::SkipReason::limit_key`] only,
-/// the one place the `[index]` key names live.
+/// The reply's copy of `f`. [`SkippedFileJson::limit_key`] comes from
+/// [`indexer::SkipReason::limit_key`] only, the one place the `[index]`
+/// ([`crate::config::IndexConfig`]) key names live.
 fn skipped_file_json(f: &indexer::SkippedFile) -> SkippedFileJson {
     use indexer::SkipReason;
     let mut json = SkippedFileJson {
@@ -646,8 +647,9 @@ struct WithSkippedFiles<T: Serialize> {
     skipped_files_omitted: usize,
 }
 
-/// `body` with the skipped files of `result`. Both keys come from `result.skipped_files`
-/// alone (spec I5), never from `result.skipped`.
+/// `body` with the skipped files of `result`. Both keys come from
+/// [`indexer::IndexResult::skipped_files`] alone (spec I5), never from
+/// [`indexer::IndexResult::skipped`].
 fn with_skipped_files<T: Serialize>(body: T, result: &indexer::IndexResult) -> WithSkippedFiles<T> {
     WithSkippedFiles {
         body,
@@ -2317,8 +2319,9 @@ mod tests {
         }
     }
 
-    /// (#660 T-M3, spec 5.4) Each reason serializes to `path`, `reason` and only the flat
-    /// detail keys it has; `limit_key` is absent where no key raises the limit.
+    /// (#660 T-M3, spec 5.4) Each reason serializes to [`SkippedFileJson::path`],
+    /// [`SkippedFileJson::reason`] and only the flat detail keys it has;
+    /// [`SkippedFileJson::limit_key`] is absent where no key raises the limit.
     #[test]
     fn each_reason_serializes_to_its_flat_shape() {
         use indexer::{LimitKey, ReadFailure, SkipReason};
