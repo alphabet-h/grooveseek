@@ -2605,7 +2605,7 @@ pub(crate) struct CountedReindex {
     pub(crate) counts: ChunkVectorCounts,
 }
 
-/// (kuriya 621) Run `index`, one of the indexing bodies that take a `&mut ChunkVectorCounts`, and
+/// (kuriya 621) Run the given indexing body, one that takes a `&mut` [`ChunkVectorCounts`], and
 /// pair its result with the counts it set. The counts are kept only for a
 /// [`SingleResult::Updated`] result, so a body that set them and then did not update the
 /// document cannot report chunks it did not write.
