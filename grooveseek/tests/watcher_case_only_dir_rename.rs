@@ -111,13 +111,9 @@ struct IndexReader {
     /// `None` once dropped, which ends the thread's loop.
     ask: Option<mpsc::Sender<()>>,
     answers: mpsc::Receiver<Result<Snapshot, String>>,
-    /// Disconnected once the thread has closed the connection.
-    closed: mpsc::Receiver<()>,
+    /// The reader thread, which owns the connection; `None` once joined.
+    thread: Option<std::thread::JoinHandle<()>>,
 }
-
-/// How long dropping an [`IndexReader`] waits for its thread to close the connection: past
-/// the connection's 30 s busy timeout, so a read stuck in it still ends first.
-const CLOSE_WAIT: Duration = Duration::from_secs(40);
 
 impl IndexReader {
     /// Move `db` to a reader thread that reads `rels` each time it is asked.
@@ -125,22 +121,20 @@ impl IndexReader {
         let rels: Vec<String> = rels.iter().map(|r| r.to_string()).collect();
         let (ask, asked) = mpsc::channel::<()>();
         let (answer, answers) = mpsc::channel();
-        let (close, closed) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             while asked.recv().is_ok() {
                 if answer.send(snapshot(&db, &rels)).is_err() {
                     break;
                 }
             }
-            // The connection first, then the signal: the fixture deletes the index's
-            // directory once the reader is gone, which Windows refuses while a handle is open.
-            drop(db);
-            drop(close);
+            // `db` is dropped here, when the thread ends: [`IndexReader`]'s `Drop` joins it,
+            // so the connection is closed before the fixture deletes the index's directory,
+            // which Windows refuses while a handle is open.
         });
         Self {
             ask: Some(ask),
             answers,
-            closed,
+            thread: Some(thread),
         }
     }
 
@@ -170,10 +164,20 @@ impl IndexReader {
 }
 
 impl Drop for IndexReader {
-    /// End the thread and wait (up to [`CLOSE_WAIT`]) until it has closed the connection.
+    /// End the thread's loop and join it, so the connection is closed when this returns.
+    ///
+    /// The join has no time limit: a read still running finishes first, which at worst is the
+    /// sum of its queries' 30 s busy timeouts. A slow teardown is preferred to a detached
+    /// thread whose handle keeps the fixture's temp directory from being deleted on Windows.
+    /// A panic of the thread is only reported here, never raised again (this may run while the
+    /// test is already unwinding).
     fn drop(&mut self) {
         self.ask = None;
-        let _ = self.closed.recv_timeout(CLOSE_WAIT);
+        if let Some(thread) = self.thread.take()
+            && let Err(panic) = thread.join()
+        {
+            eprintln!("the index reader thread panicked: {panic:?}");
+        }
     }
 }
 
@@ -244,6 +248,8 @@ fn watcher_follows_a_case_only_directory_rename() {
     let db_path = grooveseek::resolve_db_path(fx.kb());
     let db = Database::open_read_only(&db_path.to_string_lossy(), fx.kb())
         .unwrap_or_else(|e| panic!("open the index as a reader: {e:#}"));
+    // Declared after `fx` and `guard`, so it is dropped before them, unwinding included (locals
+    // drop in reverse order): the connection is closed before the fixture deletes its directory.
     let reader = IndexReader::spawn(db, &want);
 
     let before = poll_until(&reader, READ_BUDGET, |_| true).unwrap_or_else(|last| {
