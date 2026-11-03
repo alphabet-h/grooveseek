@@ -185,16 +185,30 @@ fn spawn_serve(
     extra_args: &[&str],
     startup: Duration,
 ) -> (ServerGuard, String) {
-    spawn_serve_configured(kb_path, config_path, watch, extra_args, startup, |_| {})
+    spawn_serve_configured(
+        kb_path,
+        config_path,
+        watch,
+        watch,
+        extra_args,
+        startup,
+        |_| {},
+    )
 }
 
 /// [`spawn_serve`] with a last say over the child's `Command` before it is
 /// spawned -- its environment, in practice. `configure` runs after the helper
 /// has set `RUST_LOG`, so a caller can override that too.
+///
+/// `wait_armed` is whether the readiness wait also waits for
+/// `watcher: watching `. It is `watch` for every caller but
+/// [`spawn_reader_serve_with`]: a server that starts as a reader never arms
+/// its watcher, so waiting for it would only time out.
 fn spawn_serve_configured(
     kb_path: &Path,
     config_path: &Path,
     watch: bool,
+    wait_armed: bool,
     extra_args: &[&str],
     startup: Duration,
     configure: impl FnOnce(&mut Command),
@@ -259,7 +273,7 @@ fn spawn_serve_configured(
 
     let deadline = Instant::now() + startup;
     let mut addr: Option<String> = None;
-    let mut armed = !watch;
+    let mut armed = !wait_armed;
     while addr.is_none() || !armed {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ready::Addr(a)) => addr = Some(a),
@@ -344,7 +358,35 @@ pub fn spawn_serve_with(
     watch: bool,
     configure: impl FnOnce(&mut Command),
 ) -> (ServerGuard, String) {
-    spawn_serve_configured(kb_path, config_path, watch, &[], DEFAULT_STARTUP, configure)
+    spawn_serve_configured(
+        kb_path,
+        config_path,
+        watch,
+        watch,
+        &[],
+        DEFAULT_STARTUP,
+        configure,
+    )
+}
+
+/// [`spawn_serve_with`] with the watch on, for a server expected to start as a
+/// reader (ADR-0031): another groove process holds the writer lease, so the
+/// server never arms its watcher. The readiness wait stops at the announced
+/// address and `/healthz` instead of waiting for `watcher: watching `.
+pub fn spawn_reader_serve_with(
+    kb_path: &Path,
+    config_path: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> (ServerGuard, String) {
+    spawn_serve_configured(
+        kb_path,
+        config_path,
+        true,
+        false,
+        &[],
+        DEFAULT_STARTUP,
+        configure,
+    )
 }
 
 /// Stand up a one-document knowledge base with the given `groove.toml`, and

@@ -972,3 +972,93 @@ fn a_static_rename_of_an_untitled_file_embeds_every_chunk_again() {
     assert_index_consistent(&fx);
     assert_dir_empty(&fx.cache);
 }
+
+/// `rel`'s chunks as stored, read through a reader connection (`query_only`), so a read made
+/// while `groove serve` runs between two tool calls neither writes nor takes the writer lease.
+fn vectors_read_only(fx: &Fixture, rel: &str) -> Vec<StoredChunkVector> {
+    let path = grooveseek::resolve_db_path(fx.kb());
+    Database::open_read_only(path.to_str().expect("a UTF-8 index path"), fx.kb())
+        .expect("open the index as a reader")
+        .stored_chunk_vectors_for_path(rel)
+        .expect("read the stored vectors")
+}
+
+/// (kuriya 627, AX-42 item 10b) The MCP tool that rebuilds the index, over a real `groove serve`,
+/// reuses every stored vector when no embedding input changed, and recomputes every one under
+/// `force`.
+///
+/// Without `force`, a document whose sections were only reordered is updated with all four of
+/// its stored vectors copied over: nothing reaches the endpoint and each chunk keeps its bytes;
+/// the unchanged `other.md` is left to the hash fast path and counted in neither number. With
+/// `force` (spec: [`grooveseek::indexer::IndexResult::chunks_reused`] is always 0 under it), every
+/// chunk of both documents is sent and none is counted as reused. The CLI pins the same two
+/// answers for `groove index` ([`a_reordered_document_sends_nothing_to_the_endpoint`],
+/// [`force_recomputes_every_vector`]); [`mcp_rebuild_index_returns_the_chunk_counts`] pins the
+/// tool's counts for a partial reuse and an unchanged run, not that a full reuse sends nothing,
+/// nor the forced call.
+///
+/// Red if the served tool drops the reuse (a reordered document re-embeds), or if `force`
+/// through the tool keeps a stored vector.
+#[test]
+fn mcp_rebuild_index_reuses_every_vector_and_force_recomputes_them() {
+    const OTHER: &str = "The ferry timetable changes on the first Monday of each month.";
+    let fx = fixture(
+        "ax42-mcp-reuse",
+        &[
+            (RUNBOOK, &runbook(&[S1, S2, S3, S4])),
+            ("other.md", &note("Other", OTHER)),
+        ],
+        "",
+    );
+    index_ok(&fx);
+    let runbook_before = chunk_rows(&vectors(&fx, RUNBOOK));
+    let other_before = chunk_rows(&vectors(&fx, "other.md"));
+    assert_eq!(runbook_before.len(), 4, "{runbook_before:?}");
+    fx.layout.write(RUNBOOK, &runbook(&[S2, S1, S3, S4]));
+
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    let before = fx.mock.requests().len();
+    let plain = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    let sent_plain = chunk_inputs_since(&fx, before);
+    let runbook_after = vectors_read_only(&fx, RUNBOOK);
+    let other_after = chunk_rows(&vectors_read_only(&fx, "other.md"));
+
+    let before = fx.mock.requests().len();
+    let forced = mcp_tool_call(
+        &base,
+        &session,
+        "rebuild_index",
+        serde_json::json!({"force": true}),
+    );
+    let mut sent_forced = chunk_inputs_since(&fx, before);
+    drop(guard);
+
+    assert!(plain.get("error").is_none(), "{plain}");
+    assert_eq!(count_in(&plain, "updated"), 1, "{plain}");
+    assert_eq!(count_in(&plain, "chunks_embedded"), 0, "{plain}");
+    assert_eq!(count_in(&plain, "chunks_reused"), 4, "{plain}");
+    assert_eq!(sent_plain, Vec::<String>::new());
+    assert_eq!(contents(&runbook_after), vec![S2.1, S1.1, S3.1, S4.1]);
+    assert_eq!(chunk_rows(&runbook_after), runbook_before);
+    assert_eq!(other_after, other_before);
+
+    assert!(forced.get("error").is_none(), "{forced}");
+    assert_eq!(count_in(&forced, "chunks_embedded"), 5, "{forced}");
+    assert_eq!(count_in(&forced, "chunks_reused"), 0, "{forced}");
+    sent_forced.sort();
+    let mut every = vec![
+        S1.1.to_string(),
+        S2.1.to_string(),
+        S3.1.to_string(),
+        S4.1.to_string(),
+        OTHER.to_string(),
+    ];
+    every.sort();
+    assert_eq!(sent_forced, every);
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}

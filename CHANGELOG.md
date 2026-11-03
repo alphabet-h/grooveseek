@@ -91,6 +91,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   run narrowed with `--lib`, `--tests` or `--test` does not build the grammar fixtures the
   `grammar_plugin_cli` tests open, so a split run builds them first with
   `cargo build --examples -p grooveseek` (audit AX-42, kuriya 627).
+- New integration tests: a full `groove index` after a directory is renamed and created again
+  under its old name keeps the files under both names and drops every row the disk no longer
+  backs, one by the rename and one by the prune (`tests/index_dir_rename_source_recreated.rs`);
+  the MCP `rebuild_index` tool over a real `groove serve` is refused, plain or forced, while
+  another process holds the writer lease, with nothing sent to the endpoint and no row changed,
+  per call on a `--no-watch` server and for the life of a server that started as a reader
+  (`tests/mcp_rebuild_index_refusal.rs`); and through the same tool a reordered document reuses
+  all four stored vectors and sends nothing, while `force` embeds every chunk and reuses none
+  (`tests/index_chunk_vector_reuse.rs`). The shared spawn helper gains a variant that does not
+  wait for the watcher to arm, for a server that starts as a reader (audit AX-42, kuriya 627).
 
 ## [1.24.0] - 2026-11-02
 
