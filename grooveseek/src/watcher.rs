@@ -8300,7 +8300,7 @@ mod tests {
         /// (AX-42) [`dir_rename_steps`] keeps one step per path under `old_dir/`, in the
         /// order handed in; each step's new path is `new_dir/` plus the rest of the old one;
         /// and each action is what [`rename_decision`] says for that one file, under the
-        /// rules handed in. Those rules are the default `exclude_dirs`, or those plus a
+        /// rules handed in. Those rules are the default excluded directories, or those plus a
         /// directory that the drawn paths name (`notes` as a new directory, `deep` below the
         /// first segment), so a version that judged with the default rules instead of the
         /// ones it was given would disagree. Nothing is on disk, as in the example tests.
@@ -8343,7 +8343,7 @@ mod tests {
     }
 
     /// (AX-42) [`dir_rename_steps`] judges with the rules it is handed, not the defaults:
-    /// a `.grooveignore` that ignores `archive/` and an `exclude_dirs` that adds `attic`.
+    /// a `.grooveignore` that ignores `archive/` and an excluded-directory list that adds `attic`.
     /// The expected actions are written out here rather than asked of [`rename_decision`],
     /// so the test does not repeat the code it checks. Under the default rules every one
     /// of these moves would be a [`RenameAction::Rename`].
