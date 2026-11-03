@@ -67,6 +67,8 @@ cargo check --workspace --locked         # その下限でビルドが通るか
 CHANGELOG の 1.17.1 にある。`cargo update` は Cargo.lock を書き換えるので、この 2 行は最後に置いた。
 lock に未 commit の変更が無い状態で打ち、check が通っても落ちても、後で自分で lock を戻す
 (`git restore Cargo.lock`)。CI の runner は使い捨てなので、戻す step は無い。
+CI はこの 2 行を Linux と Windows の両方で打つ。それぞれが相手の compile しない tokio の code
+(Unix socket の listener と tray) を持つためで、手で打つと自分の OS の code しか見ない。
 
 `cargo doc` が入っているのは、**doc コメントがツリーに無い名前を指している**という欠陥を
 他の誰も捕まえないため。バッククォートだけの名前は rustc から見えず、検査されるのは

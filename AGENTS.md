@@ -59,7 +59,7 @@ this crate's private modules, which is most of it, and `--all-features` is what
 makes it read the items `test-helpers` gates. `CONTRIBUTING.md` explains all
 three at length. The `cargo update` / `cargo check --workspace --locked` pair
 builds against the tokio floor the root `Cargo.toml` declares rather than the
-version Cargo.lock pins. It rewrites Cargo.lock, so it comes last: run it with
+version Cargo.lock pins (CI runs it on Linux and Windows). It rewrites Cargo.lock, so it comes last: run it with
 no uncommitted change to the lock, and restore the lock yourself afterwards
 (`git restore Cargo.lock`), whether or not the check passed.
 

@@ -106,7 +106,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   watcher, on every platform, the next full `groove index` leaves exactly the rows the disk
   backs, whatever the watcher wrote (`tests/watcher_dir_rename_recreated_full_index.rs`). A new
   CI job, `tokio-floor`, pins tokio in the lock to the `1.52.1` floor the workspace declares
-  and checks the workspace against it, so the floor stays true after the lock moves on; the
+  and checks the workspace against it on Linux and Windows, so the floor stays true after the
+  lock moves on; the
   command block in `AGENTS.md` / `CONTRIBUTING.md` lists it. A manual nightly run with the new
   `watcher_repeat` input (1 to 50) runs the watcher end-to-end tests that many times on macOS
   and tallies the failures per test, skipping the rest of the nightly; the scheduled run is

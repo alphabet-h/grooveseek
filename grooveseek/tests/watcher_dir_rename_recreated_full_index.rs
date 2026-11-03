@@ -13,11 +13,15 @@
 //! (the index test of a directory renamed and its source created again) runs no watcher, so it
 //! starts from the rows of the first index rather than from what a watcher wrote.
 //!
-//! Only the end state after the full index is asserted. What the watcher has written by the
-//! time it is stopped depends on the platform and on when its events were delivered, so an
-//! assertion on it would be a flaky gate on the macOS runner; the test waits for the watcher to
-//! go quiet, so the full index runs on the watcher's rows rather than on the first index's, and
-//! names those rows in its failure messages without judging them.
+//! Of the watcher's own work, one thing is asserted: that it wrote at least one row under the
+//! new name `notes/` before it was stopped. Without that the full index would start from the
+//! first index's rows and the test would quietly become the watcher-less one. The arrival end
+//! is indexed on macOS as well (trap 525 loses the old end, not the new one). Beyond that, the
+//! rows the watcher leaves are not judged: which old rows stay depends on the platform and on
+//! when its events were delivered, so an assertion on them would be a flaky gate on the macOS
+//! runner. The test waits for the watcher to go quiet, so the full index runs on the watcher's
+//! rows, and names those rows in its failure messages. The rest of what is asserted is the end
+//! state after the full index.
 //!
 //! On every platform, not only macOS: the claim is that a full index after the watcher needs no
 //! platform. Linux and Windows usually settle the edit in the watcher already, so there the full
@@ -30,11 +34,11 @@ mod common;
 
 use common::embed_cli::{Fixture, index_ok, index_ok_waiting, note, rows, served_watching};
 use common::embed_mock::{assert_dir_empty, wait_until};
+use common::mcp::ServerGuard;
 use common::rename::rename_retrying;
 use std::time::{Duration, Instant};
 
 /// How long the test gives the watcher to write a row under the new name of the directory.
-/// Not reaching it is not a failure: the full index runs either way.
 const ARRIVAL: Duration = Duration::from_secs(30);
 /// How long the rows must stay unchanged for the watcher to count as quiet: ten debounce windows
 /// of the `debounce_ms = 300` the fixture sets.
@@ -47,12 +51,20 @@ fn paths(rows: &[(String, String)]) -> Vec<&str> {
     rows.iter().map(|(p, _)| p.as_str()).collect()
 }
 
-/// Wait, without asserting anything, for the watcher to write a row under `notes/` and then to
-/// leave the rows alone for [`QUIET`]; the rows as they stand when the wait ends.
-fn let_the_watcher_settle(fx: &Fixture) -> Vec<(String, String)> {
-    let _ = wait_until(ARRIVAL, || {
+/// Require the watcher to write a row under `notes/` within [`ARRIVAL`], then wait, without
+/// asserting anything more, for it to leave the rows alone for [`QUIET`]; the rows as they stand
+/// when the wait ends.
+fn let_the_watcher_settle(fx: &Fixture, guard: &ServerGuard) -> Vec<(String, String)> {
+    let arrived = wait_until(ARRIVAL, || {
         rows(fx).iter().any(|(p, _)| p.starts_with("notes/"))
     });
+    assert!(
+        arrived,
+        "the watcher wrote no row under notes/ within {ARRIVAL:?}, so the full index would start \
+         from the first index's rows rather than from the watcher's; rows: {:?}\nserver stderr:\n{}",
+        paths(&rows(fx)),
+        guard.stderr().text()
+    );
     let mut last = rows(fx);
     let mut since = Instant::now();
     let end = Instant::now() + QUIET_AT_MOST;
@@ -89,7 +101,7 @@ fn a_full_index_after_the_watcher_saw_a_dir_rename_and_recreate_leaves_no_stale_
     std::fs::create_dir(&docs).expect("create docs again");
     fx.layout.write("docs/a.md", &note("Gamma", "gammamarker"));
 
-    let watched = let_the_watcher_settle(&fx);
+    let watched = let_the_watcher_settle(&fx, &guard);
     let server_said = guard.stderr().text();
     // Stopping the server lets go of the writer lease, so nothing writes the index while the full
     // index runs. The operating system releases the lease a moment after the process is reaped,

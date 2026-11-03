@@ -71,6 +71,9 @@ would get through unnoticed. Why the floor is not 1.52.0 is in the CHANGELOG
 under 1.17.1. `cargo update` rewrites Cargo.lock, which is why the pair comes
 last: run it with no uncommitted change to the lock, and put the lock back
 yourself afterwards (`git restore Cargo.lock`), whether or not the check passed.
+CI runs the pair on Linux and on Windows, because each compiles tokio code the
+other does not (a Unix socket listener; the tray); run by hand it checks your
+own platform's code only.
 CI needs no such step because its runner is thrown away.
 
 `cargo doc` is there because a doc comment that names something the tree no

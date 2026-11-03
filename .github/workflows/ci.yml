@@ -179,13 +179,15 @@ jobs:
   # them all while the manifest still promises 1.52.1 to anyone resolving
   # their own lock. This job builds the workspace against the floor itself.
   #
-  # Minimal on purpose: one OS and `cargo check` of the libraries and binaries.
-  # Linux because it compiles the Unix-only tokio use (`UnixListener` in
-  # `transport/http.rs`), which Windows would not, on the runner that is
-  # cheapest and most available (macOS would compile it too). What it leaves
-  # out is the Windows-only code of the tray, whose tokio features (`process`,
-  # `time`, `rt-multi-thread`, `macros`) are cross-platform ones. No `--all-targets`: the floor is what a user of the
-  # binary or the library gets, and tests are not built by them.
+  # Two OSes, each for code only it compiles: Linux for the Unix-only tokio
+  # use (`UnixListener` in `transport/http.rs`), Windows for the tray, whose
+  # use of tokio (`tokio::process`, `tokio::time`) sits under
+  # `cfg(windows)` and is type-checked nowhere else. macOS adds nothing
+  # neither of them compiles, and its runners are the scarce ones.
+  # `cargo check` of the libraries and binaries only. No `--all-targets`: the
+  # floor is what a user of the binary or the library gets, and tests are not
+  # built by them. Both commands read the same under bash and pwsh, the
+  # default shells of the two runners.
   #
   # `--precise` fails if anything in the tree needs a newer tokio, which is
   # itself the answer that the floor is no longer true. It rewrites Cargo.lock;
@@ -193,11 +195,17 @@ jobs:
   # command block in AGENTS.md / CONTRIBUTING.md tells a contributor to.
   #
   # The cache is saved from `main` only and restored everywhere: PR runs read
-  # the default branch's entry, so the job adds one entry to an Actions cache
-  # that is already over its limit, not one per branch.
+  # the default branch's entry, so the job adds one entry per OS to an Actions
+  # cache that is already over its limit, not one per branch. rust-cache keys
+  # by job id and runner OS, as the three legs of `test` above rely on, so the
+  # two legs neither share an entry with each other nor with another job.
   tokio-floor:
-    name: tokio floor (1.52.1)
-    runs-on: ubuntu-latest
+    name: tokio floor 1.52.1 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     # A check of the workspace on a warm cache; cold, the C build scripts
     # (sqlite, tree-sitter) dominate. 20 minutes, like clippy.
     timeout-minutes: 20
