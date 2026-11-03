@@ -10,7 +10,10 @@
 
 mod common;
 
-use common::embed_cli::{Fixture, REJECT_MARKER, fixture, note, rejects_marker, stderr_of};
+use common::embed_cli::{
+    Fixture, REJECT_MARKER, done_line as summary, fixture, index_ok, note, open_reader,
+    rejects_marker, stderr_of,
+};
 use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic};
 use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
 use common::temp::{TempKbLayout, TempRoot};
@@ -18,7 +21,7 @@ use grooveseek::config::Config;
 use grooveseek::db::{Database, StoredChunkVector};
 use grooveseek::embedder::Embedder;
 use grooveseek::indexer::{RenameOutcome, rename_single_file};
-use std::process::{Command, Output};
+use std::process::Command;
 
 const S1: (&str, &str) = (
     "Install",
@@ -106,26 +109,6 @@ fn assert_index_consistent(fx: &Fixture) {
         let scan = scan.unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(scan.is_clean(), "{name}: {scan:?}");
     }
-}
-
-/// The `Done in` line of `out`.
-fn summary(out: &Output) -> String {
-    stderr_of(out)
-        .lines()
-        .find(|l| l.contains("Done in"))
-        .unwrap_or_else(|| panic!("no Done in line:\n{}", stderr_of(out)))
-        .to_string()
-}
-
-/// `groove index`, which must succeed; its `Done in` line.
-fn index_ok(fx: &Fixture) -> String {
-    let out = fx.run_index();
-    assert!(
-        out.status.success(),
-        "groove index failed:\n{}",
-        stderr_of(&out)
-    );
-    summary(&out)
 }
 
 /// A knowledge base holding [`RUNBOOK`] with `sections`, indexed once.
@@ -973,12 +956,10 @@ fn a_static_rename_of_an_untitled_file_embeds_every_chunk_again() {
     assert_dir_empty(&fx.cache);
 }
 
-/// `rel`'s chunks as stored, read through a reader connection (`query_only`), so a read made
-/// while `groove serve` runs between two tool calls neither writes nor takes the writer lease.
+/// `rel`'s chunks as stored, read through [`open_reader`], so a read made while `groove serve`
+/// runs between two tool calls neither writes nor takes the writer lease.
 fn vectors_read_only(fx: &Fixture, rel: &str) -> Vec<StoredChunkVector> {
-    let path = grooveseek::resolve_db_path(fx.kb());
-    Database::open_read_only(path.to_str().expect("a UTF-8 index path"), fx.kb())
-        .expect("open the index as a reader")
+    open_reader(fx)
         .stored_chunk_vectors_for_path(rel)
         .expect("read the stored vectors")
 }

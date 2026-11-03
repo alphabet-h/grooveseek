@@ -20,51 +20,16 @@
 
 mod common;
 
-use common::embed_cli::{Fixture, fixture, stderr_of};
+use common::embed_cli::{fixture, index_ok, note, rows};
 use common::embed_mock::assert_dir_empty;
 use common::rename::rename_retrying;
-use grooveseek::db::Database;
 
-/// A Markdown note titled `title` with one section holding `marker`.
-fn note(title: &str, marker: &str) -> String {
-    format!(
-        "---\ntitle: {title}\n---\n\n## {title}\n\nThis note carries the marker {marker} in its only section.\n"
+/// A [`note`] titled `title` whose only section holds `marker`.
+fn marked(title: &str, marker: &str) -> String {
+    note(
+        title,
+        &format!("This note carries the marker {marker} in its only section."),
     )
-}
-
-/// `groove index`, which must succeed; its `Done in` line.
-fn index_ok(fx: &Fixture) -> String {
-    let out = fx.run_index();
-    let stderr = stderr_of(&out);
-    assert!(out.status.success(), "groove index failed:\n{stderr}");
-    stderr
-        .lines()
-        .find(|l| l.contains("Done in"))
-        .unwrap_or_else(|| panic!("no Done in line:\n{stderr}"))
-        .to_string()
-}
-
-/// Every `(path, chunk texts joined)` in the index, read through a reader connection
-/// (`query_only`).
-fn rows(fx: &Fixture) -> Vec<(String, String)> {
-    let db_path = grooveseek::resolve_db_path(fx.kb());
-    let db = Database::open_read_only(&db_path.to_string_lossy(), fx.kb())
-        .unwrap_or_else(|e| panic!("open the index as a reader: {e:#}"));
-    let mut paths = db.all_document_paths().expect("paths");
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|p| {
-            let text = db
-                .chunk_texts_for_path(&p)
-                .expect("chunk texts")
-                .into_iter()
-                .map(|(_, content)| content)
-                .collect::<Vec<_>>()
-                .join("\n");
-            (p, text)
-        })
-        .collect()
 }
 
 /// The markers each indexed path's text carries, of the ones this test writes.
@@ -91,9 +56,9 @@ fn a_full_index_after_a_dir_rename_and_recreate_leaves_no_stale_row() {
     let fx = fixture(
         "ax42-dir-recreated",
         &[
-            ("docs/a.md", &note("Alpha", "alphamarker")),
-            ("docs/b.md", &note("Bravo", "bravomarker")),
-            ("docs/c.md", &note("Charlie", "charliemarker")),
+            ("docs/a.md", &marked("Alpha", "alphamarker")),
+            ("docs/b.md", &marked("Bravo", "bravomarker")),
+            ("docs/c.md", &marked("Charlie", "charliemarker")),
         ],
         "",
     );
@@ -112,11 +77,13 @@ fn a_full_index_after_a_dir_rename_and_recreate_leaves_no_stale_row() {
     rename_retrying(&docs, &fx.kb().join("notes"));
     std::fs::create_dir(&docs).expect("create docs again");
     // The old name again, with another file's text; and a name the directory never held.
-    fx.layout.write("docs/a.md", &note("Gamma", "gammamarker"));
-    fx.layout.write("docs/d.md", &note("Delta", "deltamarker"));
+    fx.layout
+        .write("docs/a.md", &marked("Gamma", "gammamarker"));
+    fx.layout
+        .write("docs/d.md", &marked("Delta", "deltamarker"));
     // The moved copy of `c.md` is edited, so no file on disk has the hash of the row `docs/c.md`.
     fx.layout
-        .write("notes/c.md", &note("Charlie", "charlieeditedmarker"));
+        .write("notes/c.md", &marked("Charlie", "charlieeditedmarker"));
 
     let line = index_ok(&fx);
 

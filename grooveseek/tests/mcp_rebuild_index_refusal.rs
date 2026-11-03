@@ -15,10 +15,9 @@
 
 mod common;
 
-use common::embed_cli::{Fixture, fixture, note};
+use common::embed_cli::{Fixture, fixture, note, rows};
 use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic};
 use common::mcp::{mcp_initialize, mcp_tool_call, spawn_reader_serve_with, spawn_serve_with};
-use grooveseek::db::Database;
 use grooveseek::writer_lease::{Role, WriterLease};
 
 const ALPHA: &str = "The ferry timetable changes on the first Monday of each month.";
@@ -45,28 +44,6 @@ fn indexed_then_edited(prefix: &str) -> Fixture {
 fn hold_lease(fx: &Fixture) -> WriterLease {
     WriterLease::try_acquire(&grooveseek::resolve_db_path(fx.kb()), Role::Index, fx.kb())
         .expect("take the writer lease in the test")
-}
-
-/// Every `(path, chunk texts joined)` in the index, read through a reader connection
-/// (`query_only`), so reading cannot be what changes the rows.
-fn rows(fx: &Fixture) -> Vec<(String, String)> {
-    let db_path = grooveseek::resolve_db_path(fx.kb());
-    let db = Database::open_read_only(&db_path.to_string_lossy(), fx.kb())
-        .unwrap_or_else(|e| panic!("open the index as a reader: {e:#}"));
-    db.all_document_paths()
-        .expect("paths")
-        .into_iter()
-        .map(|p| {
-            let text = db
-                .chunk_texts_for_path(&p)
-                .expect("chunk texts")
-                .into_iter()
-                .map(|(_, content)| content)
-                .collect::<Vec<_>>()
-                .join("\n");
-            (p, text)
-        })
-        .collect()
 }
 
 /// The number of document-embedding requests the mock received since request `before`.

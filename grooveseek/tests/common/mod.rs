@@ -42,7 +42,9 @@
 //!   whose answer (headers included) a test can swap mid-run, and the CLI
 //!   calls made against it. Used by the AW-04 failure tests
 //!   (`openai_compatible_failures.rs`); `openai_compatible_provider.rs` keeps
-//!   its own older copy because existing tests are not edited.
+//!   its own older copy because existing tests are not edited. It also holds
+//!   the `groove index` summary line and the reader-connection snapshot of the
+//!   index rows that the AX-42 tests share.
 //! - [`crate::common::in_process`] — rerunning a test body in a hermetic child
 //!   and opening the index and the embedder in-process, for tests that call
 //!   the indexer's library functions against [`crate::common::embed_mock`].

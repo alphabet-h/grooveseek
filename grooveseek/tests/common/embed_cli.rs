@@ -16,6 +16,7 @@ use super::embed_mock::{
 };
 use super::mcp::grooveseek_bin;
 use super::temp::TempKbLayout;
+use grooveseek::db::Database;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -224,6 +225,55 @@ pub fn rejects_marker(status: u16) -> impl Fn(&Recorded) -> MockReply + Send + S
 /// stderr with ANSI colours removed.
 pub fn stderr_of(out: &Output) -> String {
     strip_ansi(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// The `Done in` line of a `groove index` run's stderr.
+pub fn done_line(out: &Output) -> String {
+    stderr_of(out)
+        .lines()
+        .find(|l| l.contains("Done in"))
+        .unwrap_or_else(|| panic!("no Done in line:\n{}", stderr_of(out)))
+        .to_string()
+}
+
+/// `groove index`, which must succeed; its `Done in` line.
+pub fn index_ok(fx: &Fixture) -> String {
+    let out = fx.run_index();
+    assert!(
+        out.status.success(),
+        "groove index failed:\n{}",
+        stderr_of(&out)
+    );
+    done_line(&out)
+}
+
+/// `fx`'s index opened through a reader connection (`query_only`), so a read neither writes
+/// nor takes the writer lease, even while a `groove serve` runs between two tool calls.
+pub fn open_reader(fx: &Fixture) -> Database {
+    let db_path = grooveseek::resolve_db_path(fx.kb());
+    Database::open_read_only(&db_path.to_string_lossy(), fx.kb())
+        .unwrap_or_else(|e| panic!("open the index as a reader: {e:#}"))
+}
+
+/// Every `(path, chunk texts joined by newlines)` in `fx`'s index, sorted by path, read
+/// through [`open_reader`] so reading cannot be what changes the rows.
+pub fn rows(fx: &Fixture) -> Vec<(String, String)> {
+    let db = open_reader(fx);
+    let mut paths = db.all_document_paths().expect("paths");
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let text = db
+                .chunk_texts_for_path(&p)
+                .expect("chunk texts")
+                .into_iter()
+                .map(|(_, content)| content)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (p, text)
+        })
+        .collect()
 }
 
 /// A Markdown note with one section.
