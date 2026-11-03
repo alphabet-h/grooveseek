@@ -2,8 +2,8 @@
 //! not yet notice.
 //!
 //! - audit AX-17 (kuriya 613): a chunk whose vector is reused is still written from the chunk
-//!   the new parse made, so its line range, symbol kind and table rows are the new ones, never
-//!   the old row's.
+//!   the new parse made, so its line range and table rows are the new ones, never the old
+//!   row's.
 //! - audit AX-18 (kuriya 614): `[embedding] max_input_chars` is not part of the match key, so
 //!   lowering it leaves the vectors computed from the longer input in place, on an edit and on a
 //!   rename. That test pins the current behaviour, which is a known limitation and not a
@@ -142,9 +142,10 @@ fn code_v2() -> String {
     )
 }
 
-/// kuriya 613 (AX-17): a code chunk whose vector is reused is written with the line range and
-/// symbol kind the new parse gave it -- here moved three lines down -- and keeps its stored
-/// vector bytes.
+/// kuriya 613 (AX-17): a code chunk whose vector is reused is written with the line range the
+/// new parse gave it -- here moved three lines down -- and keeps its stored vector bytes. Its
+/// symbol kind is the same in both parses (the text is the same), so the test only checks that
+/// the reused chunk still carries one, not which parse it came from.
 #[test]
 fn a_reused_code_chunk_carries_its_new_line_range() {
     let fx = fixture("ax17-code", &[("lib.rs", &code_v1())], "");
@@ -189,7 +190,7 @@ fn a_reused_code_chunk_carries_its_new_line_range() {
     );
     assert_eq!(
         after.symbol_kind, before.symbol_kind,
-        "the reused chunk's symbol kind is not the new parse's: {after:?}"
+        "the reused chunk lost its symbol kind: {after:?}"
     );
     assert_eq!(after.heading, before.heading);
     assert_dir_empty(&fx.cache);

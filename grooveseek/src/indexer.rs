@@ -3666,10 +3666,13 @@ fn index_single_disk_entry_explained(
     // 従来通り (heading, content) のみで比較する (挙動不変)。
     let chunks_unchanged = stored_chunks_match(db, &entry.rel, &parsed.chunks, context_mode);
     // (kuriya 670) The row under this path was written by another parser when the caller settles
-    // a rename across parsers (`row_dropped_unless_updated`): the rename's first read
-    // ([`Reindex::Renamed`]) and the further reads of one kept awaiting -- the full run's
-    // ([`read_crossed_rename_again_explained`], [`Reindex::Event`]) and the watcher's
-    // ([`reindex_single_file_checked`]). Matching chunk text says nothing about the columns only
+    // a rename across parsers (`row_dropped_unless_updated`): the rename's first read --
+    // [`Reindex::Renamed`] for same bytes, but [`Reindex::Incremental`] when the watcher's
+    // [`rename_single_file`] finds the bytes changed with the rename -- and the further reads of
+    // one kept awaiting -- the full run's ([`read_crossed_rename_again_explained`],
+    // [`Reindex::Event`]) and the watcher's ([`reindex_single_file_checked`]). Before this, the
+    // `Incremental` first read and both further reads could take the meta-only write. Matching
+    // chunk text says nothing about the columns only
     // the old parser writes (a code chunk's line range, which the meta-only write below leaves
     // in place when the new parser gives none), so such a read rewrites the row whole, as
     // [`Reindex::Renamed`] does, with the stored vectors reused.
@@ -11397,6 +11400,10 @@ mod tests {
             "premise: the first run indexed the old path"
         );
         let first = chunk_columns_in_file(&db_path, old_rel);
+        // Indexed by the second run's loop, ahead of the further read: a chunk row with a higher
+        // id than the old path's, so a row written again gets an id of its own (SQLite gives a
+        // new row the highest id plus one) while a meta-only write keeps the old one.
+        std::fs::write(kb.0.join(K670_OTHER_REL), K670_OTHER).unwrap();
         std::fs::rename(kb.0.join(old_rel), kb.0.join(new_rel)).unwrap();
         let full = kb.0.join(new_rel);
         let (old_owned, new_owned) = (old_rel.to_string(), new_rel.to_string());
@@ -11422,6 +11429,32 @@ mod tests {
     /// chunk of the scanned bytes.
     const K670_RS_REWRITTEN: &[u8] =
         b"// the deploy notes moved to the wiki; this file only keeps the pointer to them";
+    /// kuriya 670: a second document, indexed after the old path's, whose chunk row takes a
+    /// higher id. See [`k670_index_other`].
+    const K670_OTHER_REL: &str = "zz-other.md";
+    const K670_OTHER: &[u8] =
+        b"## Other\n\nA second document, so that a chunk row written again gets a new id.\n";
+
+    /// kuriya 670: index [`K670_OTHER`] the way a watcher event would, so its chunk row takes an
+    /// id above the old path's: a row written again afterwards gets a new id, while the meta-only
+    /// write keeps the old one. That makes "the row was rewritten whole" checkable.
+    fn k670_index_other(db: &Database, kb: &std::path::Path, registry: &Registry) {
+        std::fs::write(kb.join(K670_OTHER_REL), K670_OTHER).unwrap();
+        let result = reindex_single_file_checked(
+            db,
+            &mut Embedder::stub_for_tests(2),
+            kb,
+            K670_OTHER_REL,
+            None,
+            registry,
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(result, SingleResult::Updated { .. }),
+            "premise: the other document was indexed: {result:?}"
+        );
+    }
 
     /// kuriya 670: a crossed rename (`.rs` to `.txt`) the loop kept awaiting, because the file
     /// changed under its read, is read once more ([`read_crossed_rename_again_explained`]); the
@@ -11450,6 +11483,10 @@ mod tests {
         assert_eq!(db.get_document_hash("note.rs").unwrap(), None);
         let columns = chunk_columns_in_file(&db_path, "note.txt");
         assert_eq!(columns.len(), 1, "{columns:?}");
+        assert_ne!(
+            columns[0].0, first[0].0,
+            "the further read kept the old chunk row (the meta-only write), not a rewrite: {first:?} -> {columns:?}"
+        );
         let (_, start, end, kind, _) = &columns[0];
         assert_eq!(
             (start, end, kind),
@@ -11491,6 +11528,7 @@ mod tests {
             matches!(first.as_slice(), [(_, Some(_), Some(_), None, _)]),
             "premise: the code parser wrote one chunk with a line range: {first:?}"
         );
+        k670_index_other(&db, &kb.0, &registry);
         db.overwrite_content_hash(&["note.rs"], HASH_AWAITING_REPARSE)
             .unwrap();
         db.rename_document("note.rs", "note.txt", crate::db::FrontmatterTopic::Unread)
@@ -11518,6 +11556,74 @@ mod tests {
             Some(sha256_hex_bytes(K670_RS_REWRITTEN))
         );
         let columns = chunk_columns_in_file(&db_path, "note.txt");
+        assert!(
+            columns.len() == 1 && columns[0].0 != first[0].0,
+            "the further read kept the old chunk row (the meta-only write), not a rewrite: {first:?} -> {columns:?}"
+        );
+        assert!(
+            matches!(columns.as_slice(), [(_, None, None, None, _)]),
+            "the plain-text chunk kept the code parser's columns: {first:?} -> {columns:?}"
+        );
+    }
+
+    /// kuriya 670 (reviewer M1): the watcher's rename itself, when the bytes changed with it --
+    /// `note.rs` renamed to `note.txt` and its trailing newline dropped. [`rename_single_file`]
+    /// moves the row and reads the new bytes as an ordinary changed file
+    /// ([`Reindex::Incremental`], not [`Reindex::Renamed`]), settled as a crossed rename. The
+    /// plain-text chunk's text matches the code parser's row, and the row must still be written
+    /// whole: the meta-only write would keep the code parser's line range.
+    #[test]
+    fn a_crossed_rename_with_changed_bytes_does_not_keep_the_old_parsers_line_range() {
+        let kb = mk_tmp("k670-rename-changed");
+        let db_dir = mk_tmp("k670-rename-changed-db");
+        let db_path = db_dir.0.join("index.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.verify_embedding_meta("test-model", 2).unwrap();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "rs".into()]).unwrap();
+        std::fs::write(kb.0.join("note.rs"), K670_RS_SCANNED).unwrap();
+        rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb.0,
+            None,
+            false,
+            None,
+            &[],
+            &registry,
+            progress::ProgressReporter::with_callback(Box::new(|_| {})),
+            ContextMode::Off,
+        )
+        .unwrap();
+        let first = chunk_columns_in_file(&db_path, "note.rs");
+        assert!(
+            matches!(first.as_slice(), [(_, Some(_), Some(_), None, _)]),
+            "premise: the code parser wrote one chunk with a line range: {first:?}"
+        );
+        k670_index_other(&db, &kb.0, &registry);
+        std::fs::remove_file(kb.0.join("note.rs")).unwrap();
+        std::fs::write(kb.0.join("note.txt"), K670_RS_REWRITTEN).unwrap();
+
+        let outcome = rename_single_file(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb.0,
+            "note.rs",
+            "note.txt",
+            None,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_document_hash("note.txt").unwrap(),
+            Some(sha256_hex_bytes(K670_RS_REWRITTEN)),
+            "premise: the rename indexed the new bytes ({outcome:?})"
+        );
+        assert_eq!(db.get_document_hash("note.rs").unwrap(), None);
+        let columns = chunk_columns_in_file(&db_path, "note.txt");
+        assert!(
+            columns.len() == 1 && columns[0].0 != first[0].0,
+            "the rename kept the old chunk row (the meta-only write), not a rewrite: {first:?} -> {columns:?}"
+        );
         assert!(
             matches!(columns.as_slice(), [(_, None, None, None, _)]),
             "the plain-text chunk kept the code parser's columns: {first:?} -> {columns:?}"
