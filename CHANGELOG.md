@@ -26,6 +26,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   document keeps its breadcrumb, so renaming it, or the directory it is in, sends nothing to the
   embedding endpoint. `--force` still embeds every chunk. This replaces the feature-69 rule that
   a rename's forced re-read embeds every chunk (kuriya 608).
+- **The watcher deletes a removed file's rows in one write transaction.** A remove event used
+  to delete the path's own row, then the row an older version stored under its folded spelling,
+  then everything under the path (`rel/`), each in a write transaction of its own, the last
+  even for a plain file with nothing under it; while another process was writing the index, the
+  event held the index's lock through the busy timeout once for each. When the path's own row is
+  there and no directory is at the path, the three deletes now share one `BEGIN IMMEDIATE`, so
+  such an event waits at most once, and rows under the name (left when the watcher missed a
+  directory replaced by a file of the same name) still go with the file. A removed directory,
+  which holds no row at its own path, and a file replaced by a directory are handled as before
+  (kuriya 620).
+- **The watcher reads a renamed directory's files once.** After following a directory rename
+  file by file, the watcher scans the destination for files not indexed yet, and that scan used
+  to read and hash every file there again, holding the embedder and the index for each, although
+  the renames had just read them. A file whose rename settled its row is now left out of the
+  scan's reads; one whose rename did not (a failure, a destination that could not be looked at),
+  one that had no row at its old path (indexed as a new file, which may have been a skip) and
+  any file the renames did not cover are read as before. The scan's line
+  `a new directory arrived with N indexable files` counts only the files it reads, and is not
+  printed when there are none (kuriya 609).
 
 ### Internal
 
