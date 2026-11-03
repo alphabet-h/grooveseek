@@ -79,6 +79,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (kuriya 611); and the two debouncer tests of the macOS stale-create filter get versions that
   drain until a sentinel event comes out under a generous deadline instead of for a fixed
   800 ms (kuriya 612).
+- New property tests: the vector-reuse plan of a changed document (each chunk takes the first
+  stored row with its input or a slot of its own to embed, and the counts add up); the
+  directory-prefix listing and delete of the index against a `starts_with("dir/")` oracle, over
+  paths built around the bytes next to `/` (`.`, `0`), `_`, `%`, `-` and a multibyte character;
+  the `.docx` fold of headings with no body into the next section's body, with its table-row
+  spans moved by the bytes put before it; and the steps of a watched directory rename, which
+  match a single file's rename decision one by one. A watcher test pins that removing a
+  directory named like a file (`notes.md/`), reported as `Folder` or, as Windows reports it,
+  `Any`, drops the rows under it and keeps the file beside it. `CONTRIBUTING.md` says that a
+  run narrowed with `--lib`, `--tests` or `--test` does not build the grammar fixtures the
+  `grammar_plugin_cli` tests open, so a split run builds them first with
+  `cargo build --examples -p grooveseek` (audit AX-42, kuriya 627).
 
 ## [1.24.0] - 2026-11-02
 

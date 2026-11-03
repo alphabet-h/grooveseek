@@ -4142,4 +4142,125 @@ mod tests {
         assert_eq!(contents(&doc), vec!["alder\tbirch"]);
         assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 11)]);
     }
+
+    /// (AX-42) The parts of a [`DocxSection`] a property test draws: heading, level, ancestry,
+    /// body and row spans as `(table, start, end)`.
+    type Ax42Section = (
+        Option<String>,
+        Option<u8>,
+        Vec<String>,
+        String,
+        Vec<(usize, usize, usize)>,
+    );
+
+    fn ax42_section(parts: &Ax42Section) -> DocxSection {
+        let (heading, level, ancestry, body, spans) = parts.clone();
+        DocxSection {
+            heading,
+            level,
+            ancestry,
+            body,
+            spans: spans
+                .into_iter()
+                .map(|(table, start, end)| RawRowSpan { table, start, end })
+                .collect(),
+        }
+    }
+
+    /// (AX-42) Sections whose headings and bodies are often empty or whitespace only, so the
+    /// fold has headings to hold. A heading never holds a newline, so the lines it adds can
+    /// be read back one heading per line.
+    fn ax42_sections() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Section>> {
+        use proptest::prelude::*;
+        let text = |choices: &'static [&'static str]| {
+            proptest::sample::select(choices).prop_map(str::to_string)
+        };
+        let section = (
+            proptest::option::of(text(&["", " ", "\t", "Intro", "見出し"])),
+            proptest::option::of(1_u8..=6),
+            proptest::collection::vec(text(&["A", "B"]), 0..=2),
+            text(&["", " ", "\n", " \n\t", "body", "本文 x", "a\nb"]),
+            proptest::collection::vec((0_usize..3, 0_usize..20, 0_usize..20), 0..=2),
+        );
+        proptest::collection::vec(section, 0..=8)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) The contract of [`fold_empty_heading_sections`], read from its doc:
+        ///
+        /// - when every body is blank, the sections are kept as they are, less the ones with
+        ///   no heading;
+        /// - otherwise one section comes out per section with a non-blank body, in order,
+        ///   keeping its heading, level and ancestry; no body that comes out is blank;
+        /// - each body that comes out ends with the section's own body, and what stands before
+        ///   it is the non-blank headings of the blank sections just above it, one per line,
+        ///   in order (headings held after the last body are dropped);
+        /// - its row spans move by the bytes put before its body.
+        #[test]
+        fn prop_fold_empty_heading_sections_keeps_its_contract(parts in ax42_sections()) {
+            let folded =
+                fold_empty_heading_sections(parts.iter().map(ax42_section).collect());
+            let blank = |s: &str| s.trim().is_empty();
+            if parts.iter().all(|p| blank(&p.3)) {
+                let expected: Vec<&Ax42Section> =
+                    parts.iter().filter(|p| p.0.is_some()).collect();
+                proptest::prop_assert_eq!(folded.len(), expected.len());
+                for (out, p) in folded.iter().zip(expected) {
+                    proptest::prop_assert_eq!(&out.heading, &p.0);
+                    proptest::prop_assert_eq!(out.level, p.1);
+                    proptest::prop_assert_eq!(&out.ancestry, &p.2);
+                    proptest::prop_assert_eq!(&out.body, &p.3);
+                    // Kept as it was: every row span unmoved, table, start and end alike.
+                    let spans: Vec<(usize, usize, usize)> =
+                        out.spans.iter().map(|s| (s.table, s.start, s.end)).collect();
+                    proptest::prop_assert_eq!(&spans, &p.4);
+                }
+                return Ok(());
+            }
+
+            // The receiving sections, each with the headings held for it.
+            let mut receivers: Vec<(&Ax42Section, Vec<&str>)> = Vec::new();
+            let mut held: Vec<&str> = Vec::new();
+            for p in &parts {
+                if blank(&p.3) {
+                    if let Some(h) = p.0.as_deref().filter(|h| !blank(h)) {
+                        held.push(h);
+                    }
+                } else {
+                    receivers.push((p, std::mem::take(&mut held)));
+                }
+            }
+
+            proptest::prop_assert_eq!(folded.len(), receivers.len());
+            for (out, (p, held)) in folded.iter().zip(&receivers) {
+                proptest::prop_assert_eq!(&out.heading, &p.0);
+                proptest::prop_assert_eq!(out.level, p.1);
+                proptest::prop_assert_eq!(&out.ancestry, &p.2);
+                proptest::prop_assert!(!blank(&out.body));
+                proptest::prop_assert!(out.body.ends_with(&p.3), "{:?}", out.body);
+                let prefix = &out.body[..out.body.len() - p.3.len()];
+                if held.is_empty() {
+                    proptest::prop_assert_eq!(prefix, "");
+                } else {
+                    let lines = prefix.strip_suffix('\n');
+                    proptest::prop_assert!(lines.is_some(), "{:?}", out.body);
+                    let lines: Vec<&str> = lines.unwrap().split('\n').collect();
+                    proptest::prop_assert_eq!(&lines, held);
+                }
+                let shift = prefix.len();
+                proptest::prop_assert_eq!(out.spans.len(), p.4.len());
+                for (span, &(table, start, end)) in out.spans.iter().zip(&p.4) {
+                    proptest::prop_assert_eq!(
+                        *span,
+                        RawRowSpan { table, start: start + shift, end: end + shift }
+                    );
+                }
+            }
+        }
+    }
 }

@@ -8469,6 +8469,56 @@ mod tests {
         );
     }
 
+    /// Inputs drawn from a three-letter alphabet with lengths 0..=2, so the new and the
+    /// stored side share strings (and repeat them) often.
+    fn ax42_small_inputs(max: usize) -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        proptest::collection::vec("[ab ]{0,2}", 0..=max)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) The invariants of [`plan_vector_reuse`] over arbitrary inputs: one source per
+        /// new chunk; a stored source names the first stored row with the same input; a
+        /// computed source names the to-embed slot that holds this chunk, whose input the
+        /// stored side lacks; `to_embed` is strictly increasing; and the plan's counts add up
+        /// to the number of new chunks.
+        #[test]
+        fn prop_plan_vector_reuse_keeps_its_invariants(
+            new in ax42_small_inputs(12),
+            stored in ax42_small_inputs(12),
+        ) {
+            let plan = plan_vector_reuse(&new, &stored);
+            proptest::prop_assert_eq!(plan.sources.len(), new.len());
+            for (i, source) in plan.sources.iter().enumerate() {
+                match *source {
+                    VectorSource::Stored(j) => {
+                        proptest::prop_assert!(j < stored.len());
+                        proptest::prop_assert_eq!(&stored[j], &new[i]);
+                        let first = stored.iter().position(|s| s == &new[i]);
+                        proptest::prop_assert_eq!(first, Some(j));
+                    }
+                    VectorSource::Computed(k) => {
+                        proptest::prop_assert!(k < plan.to_embed.len());
+                        proptest::prop_assert_eq!(plan.to_embed[k], i);
+                        proptest::prop_assert!(!stored.contains(&new[i]));
+                    }
+                }
+            }
+            proptest::prop_assert!(plan.to_embed.windows(2).all(|w| w[0] < w[1]));
+            // Every to-embed slot is claimed by exactly the chunk it names.
+            for (k, &i) in plan.to_embed.iter().enumerate() {
+                proptest::prop_assert_eq!(plan.sources[i], VectorSource::Computed(k));
+            }
+            let counts = ChunkVectorCounts::of_plan(&plan);
+            proptest::prop_assert_eq!(counts.embedded as usize, plan.to_embed.len());
+            proptest::prop_assert_eq!((counts.embedded + counts.reused) as usize, new.len());
+        }
+    }
+
     /// (kuriya 621) [`counted`] keeps the counts a body set only when the body updated the
     /// document; any other result, and an error, report none. The embedder's counter is not
     /// read: nothing here embeds.
