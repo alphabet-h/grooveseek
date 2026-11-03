@@ -26,15 +26,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   document keeps its breadcrumb, so renaming it, or the directory it is in, sends nothing to the
   embedding endpoint. `--force` still embeds every chunk. This replaces the feature-69 rule that
   a rename's forced re-read embeds every chunk (kuriya 608).
-- **The watcher no longer opens a subtree delete after deleting a file's own row.** A remove
-  event used to run the delete of everything under its path (`rel/`) after handling the path
-  itself, also for a plain file, and that delete opens a write transaction of its own even when
-  nothing is under the path; while another process was writing the index, the event held the
-  index's lock through the busy timeout twice. When the path's own row was there and was
-  deleted, the path was a file and the subtree delete is left out; a removed directory, which
-  holds no row at its own path, is handled as before. Rows stored under `rel/` beside a row for
-  a file at `rel` itself (left when the watcher missed a directory replaced by a file of the
-  same name) now wait for the next full `groove index` (kuriya 620).
+- **The watcher deletes a removed file's rows in one write transaction.** A remove event used
+  to delete the path's own row, then the row an older version stored under its folded spelling,
+  then everything under the path (`rel/`), each in a write transaction of its own, the last
+  even for a plain file with nothing under it; while another process was writing the index, the
+  event held the index's lock through the busy timeout once for each. When the path's own row is
+  there and no directory is at the path, the three deletes now share one `BEGIN IMMEDIATE`, so
+  such an event waits at most once, and rows under the name (left when the watcher missed a
+  directory replaced by a file of the same name) still go with the file. A removed directory,
+  which holds no row at its own path, and a file replaced by a directory are handled as before
+  (kuriya 620).
 - **The watcher reads a renamed directory's files once.** After following a directory rename
   file by file, the watcher scans the destination for files not indexed yet, and that scan used
   to read and hash every file there again, holding the embedder and the index for each, although

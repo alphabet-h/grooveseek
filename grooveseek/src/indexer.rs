@@ -4370,7 +4370,10 @@ fn names_a_walked_path(key: &str) -> bool {
 /// too, without looking at `rel`; the folded spelling is still looked at below.
 ///
 /// **The decision and the delete it justifies share one `BEGIN IMMEDIATE`
-/// transaction** ([`Database::begin_immediate_transaction`]). Other processes
+/// transaction** ([`Database::begin_immediate_transaction`]; kuriya 620: the
+/// caller's, when one is open, which this then joins rather than failing on a
+/// nested `BEGIN`; the watcher opens one to delete a removed path's rows
+/// together). Other processes
 /// write this database too -- a `groove index` run, a second server -- and the
 /// caller's mutex does not serialize them. With the write lock held from
 /// before the first read, such a writer either committed a real document at
@@ -4394,8 +4397,11 @@ pub fn sweep_legacy_folded_row(
         return Ok(false);
     };
     // Every early return below drops `tx`, which rolls back; nothing has been
-    // written by then.
-    let tx = db.begin_immediate_transaction()?;
+    // written by then. (kuriya 620, AX-32) Inside a caller's transaction there is
+    // no `tx` of its own: the caller's, which must be `BEGIN IMMEDIATE` for the
+    // guarantee below, holds the decision and the delete, and an early return
+    // leaves it as it was.
+    let tx = db.begin_local_immediate()?;
     if require_real_key && db.get_document_hash(rel)?.is_none() {
         return Ok(false);
     }
@@ -4403,7 +4409,9 @@ pub fn sweep_legacy_folded_row(
         return Ok(false);
     }
     let removed = deindex_single_file(db, &legacy)?;
-    tx.commit()?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(removed)
 }
 
