@@ -3772,9 +3772,6 @@ fn index_single_disk_entry_explained(
         .iter()
         .map(|&i| embed_inputs[i].as_str())
         .collect();
-    // (kuriya 621) Read only to check, in a debug build, that the embedder took as many inputs as
-    // the plan sent it; the counts reported come from the plan, not from this counter.
-    let texts_before = embedder.texts_embedded();
     let embed_result = if texts.is_empty() {
         Ok(Vec::new())
     } else {
@@ -3822,12 +3819,6 @@ fn index_single_disk_entry_explained(
         entry.rel,
         plan.to_embed.len(),
         embeddings.len()
-    );
-    debug_assert_eq!(
-        embedder.texts_embedded() - texts_before,
-        plan.to_embed.len() as u64,
-        "{}: the embedder counted other inputs than the plan sent",
-        entry.rel
     );
     let vectors: Vec<ChunkVector<'_>> = plan
         .sources

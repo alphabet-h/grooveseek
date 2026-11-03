@@ -519,15 +519,20 @@ fn open_in_process(fx: &Fixture, cfg: &Config) -> (Database, Embedder) {
     (db, embedder)
 }
 
-/// Spec R7 on the watcher's side: a same-bytes rename under the static context re-parses the
-/// document with `Force`, which reads no stored vector, so every chunk is embedded again even
-/// though the title keeps every input as it was and an incremental pass would reuse them all.
+/// kuriya #608 (AX-12) on the watcher's side: a same-bytes rename under the static context is
+/// read again past the hash fast path, and that read reuses the stored vectors, so a titled
+/// document (whose breadcrumb does not come from its path) sends nothing to the endpoint and
+/// keeps each chunk's bytes. Feature-69 spec R7 was overturned on 2026-11-03 by kuriya #608;
+/// this test used to pin R7's opposite, that the rename's forced re-parse embedded every chunk
+/// again.
 #[test]
-fn a_static_same_bytes_rename_recomputes_every_chunk() {
-    if run_in_hermetic_child("a_static_same_bytes_rename_recomputes_every_chunk") {
+fn a_static_same_bytes_rename_reuses_every_stored_vector() {
+    if run_in_hermetic_child("a_static_same_bytes_rename_reuses_every_stored_vector") {
         return;
     }
     let fx = indexed_static_runbook("f69-static-rename", &[S1, S2, S3, S4]);
+    let before_rows = vectors(&fx, RUNBOOK);
+    assert_eq!(before_rows.len(), 4);
     std::fs::rename(fx.kb().join(RUNBOOK), fx.kb().join("renamed.md")).expect("rename");
 
     let cfg = Config::load_from(&fx.config).expect("load groove.toml");
@@ -545,17 +550,26 @@ fn a_static_same_bytes_rename_recomputes_every_chunk() {
         &registry,
     )
     .expect("rename the runbook");
+    // The row is rewritten whole under the new path (never the meta-only write), so the outcome
+    // is a reindex of all 4 chunks -- each written with its stored vector, none embedded.
     assert_eq!(outcome, RenameOutcome::RenamedAndReindexed { chunks: 4 });
-    let mut sent = embedded_since(&fx, before);
-    sent.sort();
-    let mut inputs: Vec<String> = [S1, S2, S3, S4]
+    let sent: Vec<String> = embedded_since(&fx, before)
         .into_iter()
-        .map(|s| static_input("Runbook", s))
+        .filter(|t| t != grooveseek::embedder::ENDPOINT_PROBE_TEXT)
         .collect();
-    inputs.sort();
-    assert_eq!(sent, inputs);
-
+    assert_eq!(sent, Vec::<String>::new());
     drop(db);
+
+    let after_rows = vectors(&fx, "renamed.md");
+    assert_eq!(after_rows.len(), 4);
+    for (heading, body) in [S1, S2, S3, S4] {
+        assert_eq!(
+            blob_of(&after_rows, body),
+            blob_of(&before_rows, body),
+            "{heading}"
+        );
+    }
+
     assert_index_consistent(&fx);
     assert_dir_empty(&fx.cache);
 }

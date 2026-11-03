@@ -1274,8 +1274,10 @@ impl Embedder {
     /// given, summed. The indexer passes one input per chunk it did not reuse, so the
     /// difference across a call for one document is the number of that document's chunks it
     /// embedded. Failed calls, queries and the probe are not counted. (kuriya 621) The indexer
-    /// reports its chunk counts from the document's own plan and reads this only to check, in a
-    /// debug build, that the two agree.
+    /// no longer reads it: its chunk counts come from each document's own plan, and a run-wide
+    /// counter read across a call is what another caller in between would throw off. Only this
+    /// module's tests read it now.
+    #[cfg(test)]
     pub(crate) fn texts_embedded(&self) -> u64 {
         self.texts_embedded
     }
