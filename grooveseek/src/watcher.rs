@@ -8227,6 +8227,71 @@ mod tests {
         assert!(!kb.exists(), "still nothing on disk");
     }
 
+    /// (AX-42) A stored path for the `dir_rename_steps` property: a first segment that is
+    /// the old directory, a name sharing it as a prefix, or something else, then one or two
+    /// more segments ending in an extension the default registry indexes or skips.
+    fn ax42_rename_path() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (
+            proptest::sample::select(&["docs", "docs-other", "docs.md", "Docs", "a"][..]),
+            proptest::collection::vec(proptest::sample::select(&["deep", "x", "日本"][..]), 0..=1),
+            proptest::sample::select(&["a.md", "b.txt", "c.markdown", "d"][..]),
+        )
+            .prop_map(|(head, mid, leaf)| {
+                let mut segments = vec![head];
+                segments.extend(mid);
+                segments.push(leaf);
+                segments.join("/")
+            })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) `dir_rename_steps` keeps one step per path under `old_dir/`, in the
+        /// order handed in; each step's new path is `new_dir/` plus the rest of the old one;
+        /// and each action is what `rename_decision` says for that one file. Nothing is on
+        /// disk, as in the example tests.
+        #[test]
+        fn prop_dir_rename_steps_follow_the_single_file_decision(
+            paths in proptest::collection::vec(ax42_rename_path(), 0..=8),
+            old_dir in proptest::sample::select(&["docs", "docs/deep", "Docs"][..]),
+            new_dir in proptest::sample::select(
+                &["notes", "docs", "node_modules/docs", "notes/.", "日本/x"][..]
+            ),
+        ) {
+            let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename-prop");
+            proptest::prop_assert!(!kb.exists(), "the KB must not exist on disk");
+            let registry = Registry::defaults();
+            let rules =
+                crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+
+            let steps = dir_rename_steps(&paths, &kb, old_dir, new_dir, &registry, &rules);
+
+            let prefix = format!("{old_dir}/");
+            let under: Vec<&String> = paths.iter().filter(|p| p.starts_with(&prefix)).collect();
+            proptest::prop_assert_eq!(steps.len(), under.len());
+            for (step, old) in steps.iter().zip(under) {
+                proptest::prop_assert_eq!(&step.old_rel, old);
+                let rest = &old[prefix.len()..];
+                proptest::prop_assert_eq!(&step.new_rel, &format!("{new_dir}/{rest}"));
+                let single = rename_decision(
+                    old,
+                    &kb.join(old),
+                    &step.new_rel,
+                    &kb.join(&step.new_rel),
+                    &registry,
+                    &rules,
+                );
+                proptest::prop_assert_eq!(&step.action, &single, "{:?}", step);
+            }
+            proptest::prop_assert!(!kb.exists(), "still nothing on disk");
+        }
+    }
+
     /// feature-68: a directory at the destination is a directory rename whose
     /// destination is to be scanned, decided before any listing.
     #[test]
@@ -12578,6 +12643,27 @@ mod tests {
             ["keep.md"],
             "the directory's subtree delete ran"
         );
+    }
+
+    /// (AX-42) A removed directory whose name carries an extension (`notes.md/`) is still a
+    /// directory: its remove event, whether it says `Folder` or, as Windows reports it, `Any`,
+    /// takes every row under the name and leaves the file beside it. Nothing named
+    /// `notes.md` is on disk.
+    #[test]
+    fn ax42_a_removed_directory_named_like_a_file_drops_the_rows_under_it() {
+        use notify_debouncer_full::notify::event::RemoveKind;
+        let kb = i6_dir_kb("groove-watcher-ax42-dotted-dir", &[], &[]);
+        assert!(!kb.0.join("notes.md").exists());
+        let rows = ["notes.md/a.md", "notes.md/sub/b.md", "keep.md"];
+
+        for kind in [RemoveKind::Folder, RemoveKind::Any] {
+            let removed = [mk_evt(EventKind::Remove(kind), vec![kb.0.join("notes.md")])];
+            assert_eq!(
+                i6_paths_after(&kb.0, &rows, &removed),
+                ["keep.md"],
+                "{kind:?}: the rows under notes.md/ went, keep.md stayed"
+            );
+        }
     }
 
     /// (kuriya 620, AX-32) [`handle_removed_path`] with [`SubtreeWithRow::Sweep`] answers

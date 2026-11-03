@@ -1873,6 +1873,97 @@ mod tests {
         }
     }
 
+    /// (AX-42) One path segment of one or two characters, drawn around the bytes that sit
+    /// next to `/` (`.` 0x2E, `/` 0x2F, `0` 0x30), the LIKE metacharacters `_` and `%`, `-`,
+    /// and a multibyte character.
+    fn ax42_segment() -> impl Strategy<Value = String> {
+        "[a.0_%あ-]{1,2}"
+    }
+
+    /// (AX-42) A `/`-separated KB path of one to three non-empty segments.
+    fn ax42_path() -> impl Strategy<Value = String> {
+        proptest::collection::vec(ax42_segment(), 1..=3).prop_map(|segments| segments.join("/"))
+    }
+
+    /// (AX-42) The paths of a small KB and a directory prefix: either the leading segments
+    /// of one of those paths (so the prefix usually holds something) or one drawn on its own
+    /// (so near misses such as `a.` against `a` are tried too). Never empty, never ending
+    /// in `/`.
+    fn ax42_paths_and_dir() -> impl Strategy<Value = (Vec<String>, String)> {
+        (
+            proptest::collection::vec(ax42_path(), 0..=12),
+            any::<bool>(),
+            any::<proptest::sample::Index>(),
+            1_usize..=3,
+            proptest::collection::vec(ax42_segment(), 1..=2),
+        )
+            .prop_map(|(paths, derive, pick, depth, own)| {
+                let dir = if derive && !paths.is_empty() {
+                    let segments: Vec<&str> = pick.get(&paths).split('/').collect();
+                    segments[..depth.min(segments.len())].join("/")
+                } else {
+                    own.join("/")
+                };
+                (paths, dir)
+            })
+    }
+
+    /// (AX-42) The oracle for the prefix range: the distinct paths that start with `dir/`,
+    /// sorted by bytes.
+    fn ax42_paths_starting_with(paths: &[String], dir: &str) -> Vec<String> {
+        let prefix = format!("{dir}/");
+        let set: std::collections::BTreeSet<String> = paths
+            .iter()
+            .filter(|p| p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        set.into_iter().collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) `document_paths_under(dir)` returns exactly the stored paths that start
+        /// with `dir/`, sorted, and leaves every row in place.
+        #[test]
+        fn prop_document_paths_under_matches_the_starts_with_oracle(
+            (paths, dir) in ax42_paths_and_dir(),
+        ) {
+            let db = db_with_384();
+            for p in &paths {
+                upsert_bare(&db, p);
+            }
+            let before = db.document_count().unwrap();
+            let listed = db.document_paths_under(&dir).unwrap();
+            prop_assert_eq!(listed, ax42_paths_starting_with(&paths, &dir), "dir {:?}", dir);
+            prop_assert_eq!(db.document_count().unwrap(), before);
+        }
+
+        /// (AX-42) `delete_documents_under(dir)` deletes and returns exactly the stored paths
+        /// that start with `dir/`, and what is left is the complement.
+        #[test]
+        fn prop_delete_documents_under_leaves_the_complement(
+            (paths, dir) in ax42_paths_and_dir(),
+        ) {
+            let db = db_with_384();
+            for p in &paths {
+                upsert_bare(&db, p);
+            }
+            let expected = ax42_paths_starting_with(&paths, &dir);
+            let deleted = db.delete_documents_under(&dir).unwrap();
+            prop_assert_eq!(&deleted, &expected, "dir {:?}", dir);
+            let all: std::collections::BTreeSet<String> = paths.iter().cloned().collect();
+            let complement: Vec<String> =
+                all.into_iter().filter(|p| !expected.contains(p)).collect();
+            let mut left = db.all_document_paths().unwrap();
+            left.sort();
+            prop_assert_eq!(left, complement, "dir {:?}", dir);
+        }
+    }
+
     /// feature-68: sharing the refusals with the listing must not change the
     /// prefix delete's messages by a single character.
     #[test]
