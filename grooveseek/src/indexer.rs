@@ -1007,6 +1007,7 @@ fn read_crossed_rename_again(
         registry,
         context_mode,
         declared,
+        &mut ChunkVectorCounts::default(),
     )
     .map(|r| r.result)
 }
@@ -1014,7 +1015,8 @@ fn read_crossed_rename_again(
 /// The re-read of a file whose rename crossed a parser, with the reason the file was not
 /// indexed (#660): the body, which the test-only wrapper above calls and drops the reason of. A
 /// refused or failed re-read gives its own reason (spec R2 / R3); the rest come from
-/// [`index_single_disk_entry_explained`].
+/// [`index_single_disk_entry_explained`], which also sets `counts` (kuriya 621).
+#[allow(clippy::too_many_arguments)]
 fn read_crossed_rename_again_explained(
     db: &Database,
     embedder: &mut Embedder,
@@ -1023,6 +1025,7 @@ fn read_crossed_rename_again_explained(
     registry: &Registry,
     context_mode: ContextMode,
     declared: DeclaredSet<'_>,
+    counts: &mut ChunkVectorCounts,
 ) -> Result<Reindexed> {
     let ext = entry
         .full
@@ -1083,6 +1086,7 @@ fn read_crossed_rename_again_explained(
         // ones hashed above are a changed-during-read skip before they are parsed, so a parse
         // failure is always one of the verified bytes.
         true,
+        counts,
     )
 }
 
@@ -1222,11 +1226,12 @@ fn renames_skipped_note(n: u32) -> Option<String> {
 }
 
 /// (feature-60) The order the per-document loop in [`rebuild_index`] visits `entries`: those
-/// whose `rel` is in `first` (the renames that force a re-parse), then the rest, each group in
+/// whose `rel` is in `first` (the renames read again past the hash fast path,
+/// [`Reindex::Renamed`]), then the rest, each group in
 /// the order `entries` already has -- the walk's, which sorts `PathBuf`s component by
 /// component. Split rather than re-sorted: sorting by the `rel` string would move `a-b/x.md`
 /// ahead of `a/b.md` and change the order of runs that have no rename at all. Putting the
-/// forced re-parses first bounds the stretch in which the loop does not stop for a cancel
+/// rename re-reads first bounds the stretch in which the loop does not stop for a cancel
 /// (it never stops before one of them) to their number.
 fn processing_order<'a>(entries: &'a [DiskEntry], first: &HashSet<String>) -> Vec<&'a DiskEntry> {
     let (mut order, rest): (Vec<&DiskEntry>, Vec<&DiskEntry>) =
@@ -1536,7 +1541,7 @@ pub struct Reindexed {
 ///
 /// (v1.14.0+) A reporter carrying a [`progress::CancelToken`]
 /// ([`progress::ProgressReporter::with_cancel`]) can stop the run at a check point: after each
-/// scanned file, before the renames, before each document (after any forced re-parses), and
+/// scanned file, before the renames, before each document (after any rename re-reads past the hash fast path), and
 /// before the deletion sweep. The run then returns `Ok` with [`IndexResult::cancelled`] set;
 /// see [`progress::CancelToken`] for how late a stop can come and [`IndexResult::cancelled`]
 /// for the index it leaves.
@@ -1859,7 +1864,8 @@ pub fn rebuild_index(
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
     // codex P2 (PR #73 F3): rename 先の new_path を集めておく。Static モードでは
-    // rename された entry だけ下の loop で force 扱いにし、same-hash fast path
+    // rename された entry だけ下の loop で hash の fast path を飛ばす読み直し
+    // (`Reindex::Renamed`、保存 vector は再利用する) にし、same-hash fast path
     // (index_single_disk_entry 冒頭の hash 一致 skip) を意図的に無効化する。
     // rename は path UPDATE のみで内容 (hash) は変わらないため、そのまま fast
     // path に乗ると、frontmatter title 無し文書で context 用 title が filename
@@ -2045,10 +2051,11 @@ pub fn rebuild_index(
 
     // 2. Process each file
     //
-    // (feature-60) Forced re-parses after a rename first, then the rest; see `processing_order`.
+    // (feature-60) The re-reads of renames (past the hash fast path, [`Reindex::Renamed`])
+    // first, then the rest; see `processing_order`.
     for entry in processing_order(&disk_entries, &renamed_new_paths) {
-        // (feature-60) Check point C3, before this document's embed starts. Not for a forced
-        // re-parse after a rename: the rename is already applied and the hash still matches,
+        // (feature-60) Check point C3, before this document's embed starts. Not for the re-read
+        // of a rename ([`Reindex::Renamed`]): the rename is already applied and the hash still matches,
         // so a run stopped here would leave the next one to take the fast path and keep the
         // old parser's title, tags and fields (or the old breadcrumb) until `--force`. Those
         // documents come first, so this holds a cancel back by at most
@@ -2067,10 +2074,14 @@ pub fn rebuild_index(
         }
         visited_paths.insert(entry.rel.clone());
 
-        // rename された entry (Static モードのみ) は force=true で再 parse/embed
-        // させ、他の unchanged file の hash fast path はそのまま活かす。
-        let mode = if force || renamed_new_paths.contains(&entry.rel) {
+        // rename された entry (Static モード、または parser を跨ぐもの) は hash fast path を
+        // 飛ばして再 parse させ、他の unchanged file の hash fast path はそのまま活かす。
+        // (kuriya 608) `Force` ではなく `Renamed`: 保存 vector を読み、入力が変わらなかった
+        // chunk はそれを使う (title のある文書なら全 chunk が再利用され、endpoint へは何も送らない)。
+        let mode = if force {
             Reindex::Force
+        } else if renamed_new_paths.contains(&entry.rel) {
+            Reindex::Renamed
         } else if rereads.contains(&entry.rel) {
             Reindex::Reparse
         } else {
@@ -2083,30 +2094,36 @@ pub fn rebuild_index(
         // (AW-04) Read before the call, so a refusal below can tell whether the endpoint
         // accepted part of this file first.
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
-        // (feature-69) Read before the call too: the inputs this document sends are the chunks
-        // it embedded, and the rest of an updated document's chunks were reused.
-        let texts_before = embedder.texts_embedded();
         let crossed = crossed_parser_renames.contains(&entry.rel);
-        let Reindexed {
-            result: single_result,
-            reason: skip_reason,
-        } = index_single_disk_entry_explained(
-            db,
-            embedder,
-            entry,
-            exclude_headings,
-            registry,
-            mode,
-            context_mode,
-            DeclaredSet::Known {
-                list: &declared_fields,
-                pass: pass_token.as_deref(),
-                generation: &declared_json,
-            },
-            crossed,
-        )?;
+        // (feature-69, kuriya 621) `counts` says how many of an updated document's chunks were
+        // embedded and how many reused, from the document's own plan.
+        let CountedReindex {
+            reindexed:
+                Reindexed {
+                    result: single_result,
+                    reason: skip_reason,
+                },
+            counts,
+        } = counted(|counts| {
+            index_single_disk_entry_explained(
+                db,
+                embedder,
+                entry,
+                exclude_headings,
+                registry,
+                mode,
+                context_mode,
+                DeclaredSet::Known {
+                    list: &declared_fields,
+                    pass: pass_token.as_deref(),
+                    generation: &declared_json,
+                },
+                crossed,
+                counts,
+            )
+        })?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
-        // as: if this was a forced reparse across a parser boundary and it did not end in
+        // as: if this was a rename re-read across a parser boundary and it did not end in
         // `Updated`, the row is stale under the new path and must go -- unless the second read
         // changed under it, which keeps the row awaiting a reparse (#544). See
         // `settle_cross_parser_rename`'s doc for why.
@@ -2153,7 +2170,6 @@ pub fn rebuild_index(
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
                 }
-                let counts = ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
                 tally.chunks_embedded = tally.chunks_embedded.saturating_add(counts.embedded);
                 tally.chunks_reused = tally.chunks_reused.saturating_add(counts.reused);
                 progress.report_indexed(&entry.rel, chunks);
@@ -2245,23 +2261,29 @@ pub fn rebuild_index(
             break;
         }
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
-        let texts_before = embedder.texts_embedded();
-        let Reindexed {
-            result: again,
-            reason: again_reason,
-        } = read_crossed_rename_again_explained(
-            db,
-            embedder,
-            entry,
-            exclude_headings,
-            registry,
-            context_mode,
-            DeclaredSet::Known {
-                list: &declared_fields,
-                pass: pass_token.as_deref(),
-                generation: &declared_json,
-            },
-        )?;
+        let CountedReindex {
+            reindexed:
+                Reindexed {
+                    result: again,
+                    reason: again_reason,
+                },
+            counts,
+        } = counted(|counts| {
+            read_crossed_rename_again_explained(
+                db,
+                embedder,
+                entry,
+                exclude_headings,
+                registry,
+                context_mode,
+                DeclaredSet::Known {
+                    list: &declared_fields,
+                    pass: pass_token.as_deref(),
+                    generation: &declared_json,
+                },
+                counts,
+            )
+        })?;
         // (#544, local Codex r3, J3) Settled as the loop's read was: bytes this read verified
         // and the new parser cannot index drop the row; only bytes that changed again keep it
         // awaiting. A dropped row holds nothing open. (local Codex r4, D5) A read that failed
@@ -2278,8 +2300,8 @@ pub fn rebuild_index(
         }
         match again {
             SingleResult::Updated {
-                chunks,
                 frontmatter_unparsed: fm_unparsed,
+                ..
             } => {
                 unsettled.remove(&entry.rel);
                 // (#544, local Codex r2) Written by this parser from the bytes on disk: the
@@ -2289,7 +2311,6 @@ pub fn rebuild_index(
                 if fm_unparsed {
                     tally.frontmatter_unparsed += 1;
                 }
-                let counts = ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
                 tally.chunks_embedded = tally.chunks_embedded.saturating_add(counts.embedded);
                 tally.chunks_reused = tally.chunks_reused.saturating_add(counts.reused);
             }
@@ -2537,8 +2558,11 @@ impl EmbeddedBaseline {
 /// (feature-69) How an updated document's chunks got their vectors: embedded this run, or
 /// reused from the store. The one place these two counts are worked out (AGENTS.md "One
 /// question gets one implementation"), and handed on as one value so the two cannot be
-/// swapped. Measured the way [`EmbeddedBaseline`] measures files: what the document did not
-/// send to the embedder was kept from the store.
+/// swapped. What the document did not send to the embedder was kept from the store.
+///
+/// (kuriya 621) Taken from the document's own plan ([`ChunkVectorCounts::of_plan`]), which
+/// [`index_single_disk_entry_explained`] hands back through [`counted`], not from the
+/// difference of the embedder's run-wide counter across the call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ChunkVectorCounts {
     pub(crate) embedded: u32,
@@ -2556,11 +2580,46 @@ impl ChunkVectorCounts {
         }
     }
 
-    /// The counts of a document that ended in [`SingleResult::Updated`] with `chunks`, where
-    /// `texts_before` is [`Embedder::texts_embedded`] read before it was indexed.
-    pub(crate) fn of_updated(chunks: u32, texts_before: u64, embedder: &Embedder) -> Self {
-        Self::from_texts(chunks, embedder.texts_embedded() - texts_before)
+    /// (kuriya 621) The counts of a document written under `plan`: one chunk per entry of
+    /// [`ReusePlan::sources`], of which the ones in [`ReusePlan::to_embed`] were embedded.
+    fn of_plan(plan: &ReusePlan) -> Self {
+        let chunks = u32::try_from(plan.sources.len()).unwrap_or(u32::MAX);
+        Self::from_texts(chunks, plan.to_embed.len() as u64)
     }
+
+    /// (kuriya 621) The counts of a document whose `chunks` all kept their stored vectors (the
+    /// meta-only write, which embeds nothing).
+    fn all_reused(chunks: u32) -> Self {
+        Self::from_texts(chunks, 0)
+    }
+}
+
+/// (kuriya 621) [`Reindexed`] with the [`ChunkVectorCounts`] of the document, for the callers in
+/// this crate that report them ([`rebuild_index`], the watcher through
+/// [`reindex_single_file_counted`]). Not a field of the public [`Reindexed`], whose shape stays
+/// as it is.
+#[derive(Debug)]
+pub(crate) struct CountedReindex {
+    pub(crate) reindexed: Reindexed,
+    /// Zero unless [`Reindexed::result`] is [`SingleResult::Updated`].
+    pub(crate) counts: ChunkVectorCounts,
+}
+
+/// (kuriya 621) Run the given indexing body, one that takes a `&mut` [`ChunkVectorCounts`], and
+/// pair its result with the counts it set. The counts are kept only for a
+/// [`SingleResult::Updated`] result, so a body that set them and then did not update the
+/// document cannot report chunks it did not write.
+fn counted(
+    index: impl FnOnce(&mut ChunkVectorCounts) -> Result<Reindexed>,
+) -> Result<CountedReindex> {
+    let mut counts = ChunkVectorCounts::default();
+    let reindexed = index(&mut counts)?;
+    let counts = if matches!(reindexed.result, SingleResult::Updated { .. }) {
+        counts
+    } else {
+        ChunkVectorCounts::default()
+    };
+    Ok(CountedReindex { reindexed, counts })
 }
 
 /// (feature-60) Fill in what a run measures rather than counts -- the files the endpoint
@@ -3093,7 +3152,8 @@ fn indexed_hash_for(
 
 /// (feature-62) Whether [`rebuild_index`] re-reads `entry` in the one-time `.docx` pass
 /// ([`Reindex::Reparse`]): the pass is running (`refresh_docx`), the entry is not already
-/// re-read by force (`renamed_new_paths`: a rename under Static mode, or one across parsers),
+/// re-read past the hash fast path as a rename ([`Reindex::Renamed`], `renamed_new_paths`: a
+/// rename under Static mode, or one across parsers),
 /// and the index holds a `.docx` row for it whose hash is the scan's. A `.docx` whose content
 /// changed is left to the ordinary path, which writes its new hash and metadata.
 ///
@@ -3113,7 +3173,8 @@ fn rereads_unchanged_docx(
 
 /// (feature-65) Whether the one-time pass of the format whose parser reports `extension`
 /// re-reads `entry` ([`Reindex::Reparse`], ADR-0029): that pass is running (`stale`), the entry
-/// is not already re-read by force (`renamed_new_paths`), and the index holds a row that
+/// is not already re-read as a rename ([`Reindex::Renamed`], `renamed_new_paths`), and the
+/// index holds a row that
 /// format's parser wrote for it ([`indexed_hash_for`]), whose hash is the scan's.
 fn rereads_unchanged_as(
     extension: &str,
@@ -3207,9 +3268,17 @@ fn pptx_rows_reread_notice(n: usize) -> String {
 /// `(true, false)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Reindex {
-    /// Re-parse and re-embed regardless of the stored hash (`--force`, or a
-    /// renamed entry under static context mode).
+    /// Re-parse and re-embed regardless of the stored hash (`--force`).
     Force,
+    /// (kuriya 608) The re-read of a renamed entry whose bytes did not change: a rename under
+    /// static context mode, whose path-derived breadcrumb may have moved, or one across a
+    /// parser. The hash fast path is skipped, as under [`Reindex::Force`], but the stored
+    /// vectors are read and matched as for any changed file ([`plan_vector_reuse`]), so only a
+    /// chunk whose embedding input changed with the path is embedded again. The meta-only
+    /// write is not taken: the row is rewritten whole, and a file that yields chunks comes
+    /// back [`SingleResult::Updated`]. Not [`Reindex::Reparse`], which writes nothing when the
+    /// chunks match and so would leave the moved row's path-derived fields as they were.
+    Renamed,
     /// Skip a file whose hash matches. With `check_frontmatter` set, an
     /// unchanged Markdown file is still read once so a frontmatter that fails
     /// to parse can be tagged without re-embedding ([`FRONTMATTER_POLICY`]).
@@ -3281,12 +3350,18 @@ fn index_single_disk_entry(
         context_mode,
         declared,
         row_dropped_unless_updated,
+        &mut ChunkVectorCounts::default(),
     )
     .map(|r| r.result)
 }
 
 /// [`index_single_disk_entry`] with the reason the file was not indexed (#660): the body. Each
 /// return point that does not index the file names its reason (spec §6.1, R1-R7, R11).
+///
+/// (kuriya 621) `counts` is set where the document ends in [`SingleResult::Updated`], from the
+/// plan that decided which chunks to embed ([`ChunkVectorCounts::of_plan`]) or, for the
+/// meta-only write, as every chunk kept ([`ChunkVectorCounts::all_reused`]). Callers that want
+/// it go through [`counted`], which keeps it only for an `Updated` result.
 #[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry_explained(
     db: &Database,
@@ -3298,17 +3373,20 @@ fn index_single_disk_entry_explained(
     context_mode: ContextMode,
     declared: DeclaredSet<'_>,
     row_dropped_unless_updated: bool,
+    counts: &mut ChunkVectorCounts,
 ) -> Result<Reindexed> {
     let force = mode == Reindex::Force;
     // (feature-62) A re-read the one-time docx pass asked for: past the fast path below, but
     // not a forced one.
     let reparse = mode == Reindex::Reparse;
+    // (kuriya 608) The re-read of a same-bytes rename: past the fast path, not forced either.
+    let renamed = mode == Reindex::Renamed;
     let (refresh_frontmatter, refresh_fields) = match mode {
         Reindex::Incremental {
             check_frontmatter,
             refresh_fields,
         } => (check_frontmatter, refresh_fields),
-        Reindex::Force | Reindex::Reparse | Reindex::Event => (false, false),
+        Reindex::Force | Reindex::Renamed | Reindex::Reparse | Reindex::Event => (false, false),
     };
     // (AV-12) Every path that can put a document into an index arrives here, which is why the
     // chunking policy is resolved here rather than at each caller: the first attempt covered
@@ -3347,6 +3425,7 @@ fn index_single_disk_entry_explained(
     };
     let unchanged = !force
         && !reparse
+        && !renamed
         && db
             .get_document_hash(&entry.rel)?
             .is_some_and(|existing| existing == entry.hash);
@@ -3584,7 +3663,8 @@ fn index_single_disk_entry_explained(
     // (feature-66) Stage one of a table-rows write that re-embeds nothing, read beside the
     // comparison above; stage two reads the row again where it writes. Gated as the meta-only
     // write below is (`!force`; a re-read is not forced), so `--force` reads nothing extra.
-    let table_rows = if !force && chunks_unchanged {
+    // (kuriya 608) Nor does a rename's re-read, which takes neither write that reads it.
+    let table_rows = if !force && !renamed && chunks_unchanged {
         decide_table_rows(db, &entry.rel, &parsed.chunks)?
     } else {
         None
@@ -3625,7 +3705,10 @@ fn index_single_disk_entry_explained(
         };
     }
 
+    // (kuriya 608) Not for a rename's re-read: its row is rewritten whole (see
+    // [`Reindex::Renamed`]), with the stored vectors reused below.
     if !force
+        && !renamed
         && chunks_unchanged
         && let Some(done) = write_matching_chunks_meta(
             db,
@@ -3639,6 +3722,8 @@ fn index_single_disk_entry_explained(
             category.as_deref(),
         )?
     {
+        // (kuriya 621) Nothing was sent to the embedder: every chunk kept its vector.
+        *counts = ChunkVectorCounts::all_reused(parsed.chunks.len() as u32);
         return Ok(Reindexed {
             result: done,
             reason: None,
@@ -3656,8 +3741,12 @@ fn index_single_disk_entry_explained(
     // chunk is written with the stored vector as its BLOB, not through JSON: `vec_to_json`
     // prints with `%f` and would round it. The stored rows are read here, outside the tx; the
     // copy, the delete of the old rows and the insert of the new ones all happen in the one tx
-    // below. What a document sent and kept is counted by [`ChunkVectorCounts`]. `--force` and
-    // the forced re-parse of a rename read nothing and embed every chunk (spec R7).
+    // below. What a document sent and kept is counted by [`ChunkVectorCounts`], from this plan.
+    // `--force` reads nothing and embeds every chunk (spec R7). (kuriya 608) The re-read of a
+    // rename ([`Reindex::Renamed`]) reads the stored vectors like any other changed file: the
+    // rows have moved to the new path by then, and only a chunk whose input changed with the
+    // path (a breadcrumb taken from the file name) is embedded again. This replaces spec R7's
+    // rule that a rename's forced re-parse embeds every chunk.
     let embed_inputs: Vec<String> = parsed
         .chunks
         .iter()
@@ -3771,6 +3860,8 @@ fn index_single_disk_entry_explained(
     write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
     tx.commit()?;
 
+    // (kuriya 621) After the commit: a document whose write failed was not updated.
+    *counts = ChunkVectorCounts::of_plan(&plan);
     Ok(Reindexed {
         result: SingleResult::Updated {
             chunks: parsed.chunks.len() as u32,
@@ -3945,6 +4036,7 @@ pub fn reindex_single_file(
         exclude_headings,
         registry,
         false,
+        &mut ChunkVectorCounts::default(),
     )
     .map(|r| r.result)
 }
@@ -3967,7 +4059,33 @@ pub fn reindex_single_file_explained(
         exclude_headings,
         registry,
         false,
+        &mut ChunkVectorCounts::default(),
     )
+}
+
+/// (kuriya 621) [`reindex_single_file_explained`] with the [`ChunkVectorCounts`] of an updated
+/// document, for the watcher's `reindexed` line: taken from the document's own plan, not from
+/// the embedder's counter.
+pub(crate) fn reindex_single_file_counted(
+    db: &Database,
+    embedder: &mut Embedder,
+    kb_path: &Path,
+    rel: &str,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+) -> Result<CountedReindex> {
+    counted(|counts| {
+        reindex_single_file_checked_explained(
+            db,
+            embedder,
+            kb_path,
+            rel,
+            exclude_headings,
+            registry,
+            false,
+            counts,
+        )
+    })
 }
 
 /// (#544, local Codex r3, D5) [`reindex_single_file`] for the destination of a rename across a
@@ -3993,6 +4111,7 @@ pub(crate) fn reindex_single_file_checked(
         exclude_headings,
         registry,
         row_dropped_unless_updated,
+        &mut ChunkVectorCounts::default(),
     )
     .map(|r| r.result)
 }
@@ -4000,7 +4119,8 @@ pub(crate) fn reindex_single_file_checked(
 /// [`reindex_single_file_checked`] with the reason the file was not indexed (#660): the body.
 /// The watcher's entry gives R8 (gone), R9 (over the cap by the stat) and R2 (its first read
 /// refused) itself, and `None` for a path through a link (R10, spec §6.1); the rest come from
-/// [`index_single_disk_entry_explained`].
+/// [`index_single_disk_entry_explained`], which also sets `counts` (kuriya 621).
+#[allow(clippy::too_many_arguments)]
 fn reindex_single_file_checked_explained(
     db: &Database,
     embedder: &mut Embedder,
@@ -4009,6 +4129,7 @@ fn reindex_single_file_checked_explained(
     exclude_headings: Option<&[String]>,
     registry: &Registry,
     row_dropped_unless_updated: bool,
+    counts: &mut ChunkVectorCounts,
 ) -> Result<Reindexed> {
     let full = kb_path.join(rel);
     match look_at_single_path(kb_path, rel, &full)
@@ -4160,6 +4281,7 @@ fn reindex_single_file_checked_explained(
         context_mode,
         DeclaredSet::FromIndex,
         row_dropped_unless_updated,
+        counts,
     )
 }
 
@@ -4662,7 +4784,7 @@ pub fn rename_single_file(
     }
 
     // 内容が変わっている、または (Static モードの same-hash rename として)
-    // breadcrumb 更新のため強制的に再 embed する。size-cap 判定は既に上で
+    // breadcrumb 更新のため読み直す (入力が変わった chunk だけを再 embed する)。size-cap 判定は既に上で
     // 済んでいるので、読み込み済みの bytes/hash をそのまま再利用して
     // 二重 read を避ける (`reindex_single_file` を経由すると全 read をやり直す)。
     let entry = DiskEntry {
@@ -4672,10 +4794,12 @@ pub fn rename_single_file(
         size: new_bytes.len() as u64,
     };
     // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
-    // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
-    // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
+    // 場合のみ hash 一致 fast path をバイパスする。内容が変わって
+    // いる場合は通常の Incremental 経路 (frontmatter-only skip 判定含む) に任せる。
+    // (kuriya 608) `Force` ではなく `Renamed`: 保存 vector を読み、入力が変わらなかった chunk は
+    // それを使う。行はこの時点で new_rel に移っているので、読むのは移った行の vector。
     let mode = if same_hash {
-        Reindex::Force
+        Reindex::Renamed
     } else {
         Reindex::Incremental {
             check_frontmatter: false,
@@ -6952,7 +7076,7 @@ mod tests {
         assert_eq!(full.skipped, vec!["0-gone.md".to_string()]);
     }
 
-    /// (feature-60) Review Focus 1. The loop visits the forced re-parses first and the rest
+    /// (feature-60) Review Focus 1. The loop visits the rename re-reads first and the rest
     /// after, each group in the order the entries already have -- the walk's, which sorts
     /// `PathBuf`s component by component. That order puts `a/b.md` before `a-b/x.md`,
     /// although the string `"a-b/x.md"` sorts first; sorting by `rel` would reorder a run
@@ -8280,6 +8404,89 @@ mod tests {
                 reused: 0
             }
         );
+    }
+
+    /// (kuriya 621) An updated document's counts come from its own plan: the chunks the plan
+    /// sends to the embedder are the embedded ones, every other chunk is reused. Duplicates
+    /// are counted one by one, as the plan matches them.
+    #[test]
+    fn test_chunk_vector_counts_of_plan_count_the_plan_to_embed() {
+        for (new, stored) in [
+            (s(&["a", "b"]), Vec::new()),
+            (s(&["x", "a", "b"]), s(&["a", "b"])),
+            (s(&["b", "a"]), s(&["a", "b"])),
+            (s(&["a", "a", "c", "c"]), s(&["a", "a"])),
+            (Vec::new(), s(&["a"])),
+        ] {
+            let plan = plan_vector_reuse(&new, &stored);
+            let counts = ChunkVectorCounts::of_plan(&plan);
+            assert_eq!(counts.embedded as usize, plan.to_embed.len(), "{new:?}");
+            assert_eq!(
+                (counts.embedded + counts.reused) as usize,
+                new.len(),
+                "{new:?}"
+            );
+        }
+        assert_eq!(
+            ChunkVectorCounts::of_plan(&plan_vector_reuse(&s(&["x", "a", "b"]), &s(&["a", "b"]))),
+            ChunkVectorCounts {
+                embedded: 1,
+                reused: 2
+            }
+        );
+        assert_eq!(
+            ChunkVectorCounts::all_reused(4),
+            ChunkVectorCounts {
+                embedded: 0,
+                reused: 4
+            }
+        );
+    }
+
+    /// (kuriya 621) [`counted`] keeps the counts a body set only when the body updated the
+    /// document; any other result, and an error, report none. The embedder's counter is not
+    /// read: nothing here embeds.
+    #[test]
+    fn test_counted_keeps_counts_only_for_an_updated_document() {
+        let set = ChunkVectorCounts {
+            embedded: 2,
+            reused: 3,
+        };
+        let updated = counted(|counts| {
+            *counts = set;
+            Ok(Reindexed {
+                result: SingleResult::Updated {
+                    chunks: 5,
+                    frontmatter_unparsed: false,
+                },
+                reason: None,
+            })
+        })
+        .expect("updated");
+        assert_eq!(updated.counts, set);
+        for result in [
+            SingleResult::Unchanged,
+            SingleResult::Refused,
+            SingleResult::Skipped {
+                reason: SKIPPED_NO_CHUNKS,
+                frontmatter_unparsed: false,
+            },
+        ] {
+            let other = counted(|counts| {
+                *counts = set;
+                Ok(Reindexed {
+                    result,
+                    reason: None,
+                })
+            })
+            .expect("not updated");
+            assert_eq!(other.counts, ChunkVectorCounts::default(), "{other:?}");
+        }
+        let failed = counted(|counts| {
+            *counts = set;
+            anyhow::bail!("failed")
+        });
+        assert!(failed.is_err());
     }
 
     /// (feature-69) The `Done in` line gains this run's chunk counts only when either is not

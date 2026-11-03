@@ -14,6 +14,28 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **A rename that the indexer reads again reuses the stored vectors** (`groove index`, the MCP
+  `rebuild_index` tool and the live watcher alike). Under the static context
+  (`[contextual].enabled = true`), and for a rename into another parser in any mode, a file or
+  directory renamed without changing its content is read again so that what the new path
+  changes (the breadcrumb of a document with no title, which comes from the file name) is
+  rewritten. That read used to embed every chunk again; it now matches each chunk's embedding
+  input against the moved rows and embeds only the chunks whose input changed. A titled
+  document keeps its breadcrumb, so renaming it, or the directory it is in, sends nothing to the
+  embedding endpoint. `--force` still embeds every chunk. This replaces the feature-69 rule that
+  a rename's forced re-read embeds every chunk (kuriya 608).
+
+### Internal
+
+- The chunk counts of a document that a run updated (the `this run: N embedded, M reused` part
+  of the `Done in` line, `chunks_embedded` / `chunks_reused` in the `rebuild_index` reply, and
+  the watcher's `reindexed ... (N chunks, M reused)` line) come from that document's own reuse
+  plan, handed back through a crate-internal path, instead of the difference of the embedder's
+  run-wide input counter across the call. The public `SingleResult` and `Reindexed` are unchanged
+  (kuriya 621).
+
 ## [1.24.0] - 2026-11-02
 
 ### Added

@@ -2416,15 +2416,16 @@ fn reindex_after_write_locked(
         }
         WrittenPathCheck::Proceed => {}
     }
-    let texts_before = embedder.texts_embedded();
-    let result = indexer::reindex_single_file(
+    // (kuriya 621) The counts of an updated document come back with the result, from the
+    // document's own plan.
+    let (result, counts) = split_counted(indexer::reindex_single_file_counted(
         db,
         embedder,
         kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
-    );
+    ));
     let settled = settle_write_reindex(db, kb_path, rel, &result, lossy, || {
         written_path_on_disk(kb_path, rel, look)
     });
@@ -2444,7 +2445,7 @@ fn reindex_after_write_locked(
             &state.rules,
             written_path_on_disk(kb_path, rel, look),
         ) {
-            log_reindex_result(rel, result, texts_before, embedder);
+            log_reindex_result(rel, result, counts);
             // `deindex_removed_path` already swept the folded row as a removal.
             log_refused_link_deindexed(rel, outcome);
             return;
@@ -2453,12 +2454,12 @@ fn reindex_after_write_locked(
     match settled {
         WriteReindexSettled::Kept | WriteReindexSettled::LeftAsIs => {
             let require_real_key = sweep_requires_real_key(&result);
-            log_reindex_result(rel, result, texts_before, embedder);
+            log_reindex_result(rel, result, counts);
             sweep_legacy_row(db, kb_path, rel, require_real_key);
         }
         // `deindex_removed_path` already swept the folded row as a removal.
         WriteReindexSettled::Deindexed(outcome) => {
-            log_reindex_result(rel, result, texts_before, embedder);
+            log_reindex_result(rel, result, counts);
             log_written_path_gone(rel, outcome);
         }
     }
@@ -2666,25 +2667,24 @@ fn reindex_after_removal_locked(
         }
         RemovalInLocks::Skip => return,
     }
-    let texts_before = embedder.texts_embedded();
-    let result = indexer::reindex_single_file(
+    let (result, counts) = split_counted(indexer::reindex_single_file_counted(
         db,
         embedder,
         &state.kb_path,
         rel,
         state.exclude_headings.as_deref(),
         &state.registry,
-    );
+    ));
     let settled = settle_removal_reindex_looked(db, &state.kb_path, rel, &result, || {
         removed_path_on_disk(&state.kb_path, rel)
     });
     match settled {
         RemovalSettled::Settled(RemovalReindexSettled::Kept) => {
-            log_reindex_result(rel, result, texts_before, embedder);
+            log_reindex_result(rel, result, counts);
             sweep_legacy_row(db, &state.kb_path, rel, true);
         }
         RemovalSettled::Settled(RemovalReindexSettled::IndexerDeindexed(folded)) => {
-            log_reindex_result(rel, result, texts_before, embedder);
+            log_reindex_result(rel, result, counts);
             log_folded_sweep(rel, folded);
         }
         RemovalSettled::Settled(RemovalReindexSettled::Deindexed { reason, outcome }) => {
@@ -2941,19 +2941,30 @@ fn emptied_message(rel: &str) -> String {
     format!("watcher: {rel} has nothing to embed now; deindexed it")
 }
 
+/// (kuriya 621) [`indexer::reindex_single_file_counted`]'s answer as the result the settling
+/// steps read and the counts [`log_reindex_result`] prints. A failed reindex counts nothing.
+fn split_counted(
+    counted: Result<indexer::CountedReindex>,
+) -> (Result<indexer::SingleResult>, indexer::ChunkVectorCounts) {
+    match counted {
+        Ok(c) => (Ok(c.reindexed.result), c.counts),
+        Err(e) => (Err(e), indexer::ChunkVectorCounts::default()),
+    }
+}
+
 /// The line [`dispatch_reindex`] prints for what [`indexer::reindex_single_file`] returned.
+/// `counts` are the updated document's, as [`indexer::reindex_single_file_counted`] returned
+/// them (kuriya 621).
 fn log_reindex_result(
     rel: &str,
     result: Result<indexer::SingleResult>,
-    texts_before: u64,
-    embedder: &Embedder,
+    counts: indexer::ChunkVectorCounts,
 ) {
     match result {
         Ok(indexer::SingleResult::Updated {
-            chunks,
             frontmatter_unparsed,
+            ..
         }) => {
-            let counts = indexer::ChunkVectorCounts::of_updated(chunks, texts_before, embedder);
             wdiag!("{}", reindexed_message(rel, counts, frontmatter_unparsed));
         }
         // (#251) `MetadataRefreshed` cannot come back here: the one-time check
