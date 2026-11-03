@@ -2,14 +2,14 @@
 //! `groove serve`, while another groove process holds the writer lease (ADR-0031), and the
 //! refusal leaves the index as it was.
 //!
-//! The wording of each refusal is pinned in-process by the unit tests of
-//! `grooveseek::server::writer_slot` and `grooveseek::server`, against a slot built in the test.
+//! The wording of each refusal is pinned in-process by the unit tests of [`grooveseek::server`]
+//! and of its private `writer_slot` module, against a slot built in the test.
 //! These tests pin what those cannot: that the served tool reaches the refusal through the real
 //! lease file another process holds, that a refused call sends nothing to the embedding endpoint
 //! and writes no row, and which of the two refusals is per call and which lasts for the life of
 //! the server.
 //!
-//! The lease is taken by this test process ([`WriterLease::try_acquire`]), which is another
+//! The lease is taken by this test process ([`grooveseek::writer_lease::WriterLease::try_acquire`]), which is another
 //! process from the server's point of view, as a `groove index` run would hold it. The server
 //! embeds through the mock of [`crate::common::embed_cli`], so nothing is downloaded.
 

@@ -6,9 +6,10 @@
 //! the old directory before sweeping that prefix, so a recreated directory stops the sweep (the
 //! end-to-end watcher test of the recreated old end pins that, outside macOS). A row the watcher
 //! did not move then sits under a directory that exists again. The full index is what removes
-//! such a row: its prune ([`grooveseek::indexer::rebuild_index`], `documents_to_delete`) compares
-//! each indexed path with the files the walk visited, path by path, so a directory that exists
-//! again protects none of the rows under it. Rename detection (`detect_renames`) pairs only rows
+//! such a row: its prune ([`grooveseek::indexer::rebuild_index`], and the private
+//! `documents_to_delete` of [`grooveseek::indexer`]) compares each indexed path with the files the
+//! walk visited, path by path, so a directory that exists again protects none of the rows under
+//! it. Rename detection (the private `detect_renames` of [`grooveseek::indexer`]) pairs only rows
 //! whose path is gone from disk, so the recreated `docs/a.md` is read in place as an edit rather
 //! than taken for the far end of a rename.
 //!
