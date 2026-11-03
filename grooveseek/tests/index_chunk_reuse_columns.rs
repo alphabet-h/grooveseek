@@ -126,9 +126,11 @@ fn configure(fx: &Fixture, embedding_extra: &str, rest: &str) {
 
 /// The body of `alpha` in [`code_v1`] / [`code_v2`]: the same text in both, so its vector is
 /// reused.
+#[cfg(feature = "grammar-rust")]
 const ALPHA: &str = "fn alpha() -> u32 {\n    let total = 40 + 2;\n    total\n}";
 
 /// `alpha` on lines 1-4, `beta` on lines 6-9.
+#[cfg(feature = "grammar-rust")]
 fn code_v1() -> String {
     format!("{ALPHA}\n\nfn beta() -> u32 {{\n    let seven = 7;\n    seven\n}}\n")
 }
@@ -136,6 +138,7 @@ fn code_v1() -> String {
 /// [`code_v1`] with three lines inserted above `alpha` (now on lines 4-7) and `beta`'s body
 /// changed, so the document is re-embedded through the reuse plan rather than the meta-only
 /// write.
+#[cfg(feature = "grammar-rust")]
 fn code_v2() -> String {
     format!(
         "// three lines are inserted above alpha so every definition moves down\n\n\n{ALPHA}\n\nfn beta() -> u32 {{\n    let eight = 8;\n    eight\n}}\n"
@@ -145,7 +148,9 @@ fn code_v2() -> String {
 /// kuriya 613 (AX-17): a code chunk whose vector is reused is written with the line range the
 /// new parse gave it -- here moved three lines down -- and keeps its stored vector bytes. Its
 /// symbol kind is the same in both parses (the text is the same), so the test only checks that
-/// the reused chunk still carries one, not which parse it came from.
+/// the reused chunk still carries one, not which parse it came from. Needs the Rust parser, so
+/// it runs only with the `grammar-rust` feature.
+#[cfg(feature = "grammar-rust")]
 #[test]
 fn a_reused_code_chunk_carries_its_new_line_range() {
     let fx = fixture("ax17-code", &[("lib.rs", &code_v1())], "");

@@ -11325,11 +11325,13 @@ mod tests {
 
     /// kuriya 670: one chunk row's `(chunk id, start_line, end_line, symbol_kind,
     /// quality_score)`.
+    #[cfg(feature = "grammar-rust")]
     type K670Columns = (i64, Option<i64>, Option<i64>, Option<String>, f64);
 
     /// kuriya 670: the per-chunk columns of `rel`'s rows as the index file holds them, read
     /// through a connection of its own (the [`Database`] keeps its connection private), in
     /// chunk order.
+    #[cfg(feature = "grammar-rust")]
     fn chunk_columns_in_file(db_path: &std::path::Path, rel: &str) -> Vec<K670Columns> {
         let conn = rusqlite::Connection::open(db_path).unwrap();
         let mut stmt = conn
@@ -11355,6 +11357,7 @@ mod tests {
     /// columns [`Database`] has no accessor for. Returns the knowledge base, the directory of the
     /// index, the index file, the index, and the old path's chunk columns after the first run
     /// ([`chunk_columns_in_file`]).
+    #[cfg(feature = "grammar-rust")]
     fn crossed_rename_rewritten_after_an_earlier_run(
         tag: &str,
         (old_rel, new_rel): (&str, &str),
@@ -11422,22 +11425,27 @@ mod tests {
 
     /// kuriya 670: a Rust file with no definition, one comment line long enough that the code
     /// parser keeps it as a chunk (with a line range, and no heading or symbol kind).
+    #[cfg(feature = "grammar-rust")]
     const K670_RS_SCANNED: &[u8] =
         b"// the deploy notes moved to the wiki; this file only keeps the pointer to them\n";
     /// kuriya 670: [`K670_RS_SCANNED`] without its trailing newline: other bytes, whose one
     /// plain-text chunk has the same (empty) heading and the same text as the code parser's
     /// chunk of the scanned bytes.
+    #[cfg(feature = "grammar-rust")]
     const K670_RS_REWRITTEN: &[u8] =
         b"// the deploy notes moved to the wiki; this file only keeps the pointer to them";
     /// kuriya 670: a second document, indexed after the old path's, whose chunk row takes a
     /// higher id. See [`k670_index_other`].
+    #[cfg(feature = "grammar-rust")]
     const K670_OTHER_REL: &str = "zz-other.md";
+    #[cfg(feature = "grammar-rust")]
     const K670_OTHER: &[u8] =
         b"## Other\n\nA second document, so that a chunk row written again gets a new id.\n";
 
     /// kuriya 670: index [`K670_OTHER`] the way a watcher event would, so its chunk row takes an
     /// id above the old path's: a row written again afterwards gets a new id, while the meta-only
     /// write keeps the old one. That makes "the row was rewritten whole" checkable.
+    #[cfg(feature = "grammar-rust")]
     fn k670_index_other(db: &Database, kb: &std::path::Path, registry: &Registry) {
         std::fs::write(kb.join(K670_OTHER_REL), K670_OTHER).unwrap();
         let result = reindex_single_file_checked(
@@ -11464,6 +11472,7 @@ mod tests {
     /// which the text parser never writes, and nothing after it (the fast path holds the new
     /// hash) would take it off before `--force`.
     #[test]
+    #[cfg(feature = "grammar-rust")]
     fn a_further_crossed_read_does_not_keep_the_old_parsers_line_range() {
         let (_kb, _db_dir, db_path, db, first) = crossed_rename_rewritten_after_an_earlier_run(
             "k670-rs-to-txt",
@@ -11502,6 +11511,7 @@ mod tests {
     /// settled with [`settle_further_crossed_read`]. The plain-text chunk does not keep the code
     /// parser's line range.
     #[test]
+    #[cfg(feature = "grammar-rust")]
     fn the_watchers_further_crossed_read_does_not_keep_the_old_parsers_line_range() {
         let kb = mk_tmp("k670-watcher");
         let db_dir = mk_tmp("k670-watcher-db");
@@ -11573,6 +11583,7 @@ mod tests {
     /// plain-text chunk's text matches the code parser's row, and the row must still be written
     /// whole: the meta-only write would keep the code parser's line range.
     #[test]
+    #[cfg(feature = "grammar-rust")]
     fn a_crossed_rename_with_changed_bytes_does_not_keep_the_old_parsers_line_range() {
         let kb = mk_tmp("k670-rename-changed");
         let db_dir = mk_tmp("k670-rename-changed-db");
