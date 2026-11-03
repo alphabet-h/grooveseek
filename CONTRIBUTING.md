@@ -60,17 +60,18 @@ cargo check --no-default-features --all-targets -p grooveseek   # its tests and 
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
 cargo doc --no-deps --workspace --all-features --document-private-items
-cargo update -p tokio --precise 1.52.1   # the floor Cargo.toml promises; rewrites Cargo.lock
+cargo update -p tokio --precise 1.52.1   # last: rewrites Cargo.lock to the floor Cargo.toml promises
 cargo check --workspace --locked         # still builds against it
-git checkout -- Cargo.lock               # the committed lock back
 ```
 
-The lines from `cargo update` to `git checkout` check that the tokio floor (`tokio = "1.52.1"` in the root
+The `cargo update` and `cargo check --workspace --locked` lines check that the tokio floor (`tokio = "1.52.1"` in the root
 `Cargo.toml`) is still true. Every other line builds the versions Cargo.lock pins,
 so once a lock update moves tokio past 1.52.1, code that needs the newer tokio
 would get through unnoticed. Why the floor is not 1.52.0 is in the CHANGELOG
-under 1.17.1. The `git checkout` line puts the lock back, so running the block by hand
-does not leave Cargo.lock rewritten.
+under 1.17.1. `cargo update` rewrites Cargo.lock, which is why the pair comes
+last: run it with no uncommitted change to the lock, and put the lock back
+yourself afterwards (`git restore Cargo.lock`), whether or not the check passed.
+CI needs no such step because its runner is thrown away.
 
 `cargo doc` is there because a doc comment that names something the tree no
 longer has is a defect nothing else catches: a backticked name is invisible to

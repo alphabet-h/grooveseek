@@ -57,15 +57,16 @@ cargo check --no-default-features --all-targets -p grooveseek   # そのテス�
 cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
 cargo doc --no-deps --workspace --all-features --document-private-items
-cargo update -p tokio --precise 1.52.1   # Cargo.toml が約束する下限へ。Cargo.lock を書き換える
+cargo update -p tokio --precise 1.52.1   # 最後に。Cargo.lock を Cargo.toml が約束する下限へ書き換える
 cargo check --workspace --locked         # その下限でビルドが通るか
-git checkout -- Cargo.lock               # commit 済みの lock に戻す
 ```
 
-`cargo update` から `git checkout` までの行は tokio の下限 (root `Cargo.toml` の `tokio = "1.52.1"`) が今も本当かを見る。
+`cargo update` と `cargo check --workspace --locked` の行は tokio の下限 (root `Cargo.toml` の `tokio = "1.52.1"`) が今も本当かを見る。
 他の行は Cargo.lock が固定した版でビルドするので、lock の更新で tokio が 1.52.1 より先へ進むと、
 新しい tokio を要するコードが入っても誰も気づかない。1.52.0 を下限にしない理由は
-CHANGELOG の 1.17.1 にある。`git checkout` の行で lock を戻すので、手で打っても Cargo.lock は書き換わったまま残らない。
+CHANGELOG の 1.17.1 にある。`cargo update` は Cargo.lock を書き換えるので、この 2 行は最後に置いた。
+lock に未 commit の変更が無い状態で打ち、check が通っても落ちても、後で自分で lock を戻す
+(`git restore Cargo.lock`)。CI の runner は使い捨てなので、戻す step は無い。
 
 `cargo doc` が入っているのは、**doc コメントがツリーに無い名前を指している**という欠陥を
 他の誰も捕まえないため。バッククォートだけの名前は rustc から見えず、検査されるのは

@@ -41,7 +41,11 @@ on:
           many times, 1 to 50, to measure how often they fail (AX-42). 0, the
           default, is the ordinary nightly. Above 0 the run is that
           measurement alone: every other job is skipped and nothing is
-          reported to the tracking issue.
+          reported to the tracking issue. Above 50 the job fails at its first
+          step; a negative value runs the ordinary nightly and measures
+          nothing. Dispatch it on a branch other than main: this workflow's
+          concurrency group is per ref, so on main it queues behind, or
+          replaces a pending, scheduled nightly.
         type: number
         default: 0
 
@@ -293,8 +297,10 @@ jobs:
   # A loop on one runner, not a matrix of runners: the test binary is built
   # once, and macOS runners are the scarce ones. What it does not measure is
   # the spread between runner machines; dispatch it more than once for that.
-  # The run does not stop at the first failure, and it fails at the end if any
-  # run failed, so the summary is always complete.
+  # The loop does not stop at the first failure and fails at the end if any
+  # run failed. Each run is written to the summary as it ends, so a job cut
+  # short by its timeout or a cancel still shows the runs it finished; only the
+  # per-test tally needs the loop to complete.
   #
   # `--ignored`, not `--include-ignored`: every test in that file is ignored, so
   # the two run the same tests, and `cdylib_artifacts_built_in_ci.rs` finds the
@@ -310,6 +316,16 @@ jobs:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
       REPEAT: ${{ inputs.watcher_repeat }}
     steps:
+      # First, before a cold build spends half an hour on a run that cannot
+      # measure anything.
+      - name: Check watcher_repeat
+        shell: bash
+        run: |
+          if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [ "$REPEAT" -lt 1 ] || [ "$REPEAT" -gt 50 ]; then
+            echo "::error::watcher_repeat must be a whole number from 1 to 50, got '$REPEAT'"
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -318,45 +334,69 @@ jobs:
           # that is already over its limit; it builds cold if it must.
           save-if: false
 
-      # Restore only. The nightly leg owns this entry and saves it; a second
-      # writer of the same key would race it (see "Cache fastembed models").
-      - name: Restore fastembed models
+      # Restore only. The macOS leg of `ignored-tests` owns this entry and saves
+      # it; a second writer of the same key would race it (see "Cache fastembed
+      # models"). The paths are that leg's two, `.fastembed_cache` and its
+      # `default_model_dir`: the cache version hashes the paths, so restoring
+      # with fewer would miss every time (the coverage job does the same).
+      - name: Restore fastembed models (shared with ignored-tests)
         uses: actions/cache/restore@v5
         with:
-          path: .fastembed_cache
+          path: |
+            .fastembed_cache
+            ~/Library/Caches/fastembed
           key: fastembed-v4-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             fastembed-v4-${{ runner.os }}-
 
-      # One process downloads BGE-small if the restore missed, for the reason
-      # the pre-warm above gives; the tests below then start on a warm cache.
+      # One process downloads BGE-small if the restore missed, so the tests
+      # below start on a warm cache. Retried for the reason the pre-warm of
+      # `ignored-tests` gives.
       - name: Pre-warm embedding model cache (serial)
-        run: cargo test --test index_progress_cli -- --test-threads=1
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test --test index_progress_cli -- --test-threads=1; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
 
       - name: Build the watcher tests
         run: cargo test --test watcher_e2e --no-run
 
+      # Each run's line goes to the summary as soon as it ends, so a run cut
+      # short by the timeout or a cancel still shows what was measured; the
+      # per-test tally is added only when the loop finishes.
       - name: Run the watcher tests repeatedly
         shell: bash
         run: |
           set -uo pipefail
-          if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [ "$REPEAT" -lt 1 ] || [ "$REPEAT" -gt 50 ]; then
-            echo "::error::watcher_repeat must be a whole number from 1 to 50, got '$REPEAT'"
-            exit 1
-          fi
           mkdir -p watcher-runs
+          echo "### watcher_e2e on $RUNNER_OS, $REPEAT runs" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           failed=0
           for i in $(seq 1 "$REPEAT"); do
             log="watcher-runs/run-$i.log"
             if cargo test --test watcher_e2e -- --ignored > "$log" 2>&1; then
               echo "run $i: ok"
+              echo "- run $i: ok" >> "$GITHUB_STEP_SUMMARY"
             else
               failed=$((failed + 1))
               echo "::warning::run $i of $REPEAT failed"
-              grep -E '^test .* \.\.\. FAILED$' "$log"
+              names=$(sed -n -E 's/^test (.*) \.\.\. FAILED$/\1/p' "$log" | paste -sd ' ' -)
+              echo "$names"
+              echo "- run $i: failed ${names}" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          echo "### watcher_e2e on $RUNNER_OS: $failed of $REPEAT runs failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**$failed of $REPEAT runs failed**" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| test | runs it failed |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"

@@ -215,9 +215,9 @@ pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 /// A knowledge base holding `files`, indexed once and served with the watcher
 /// on ([`Fixture::serve_watching`]).
 ///
-/// `tests/watcher_rename_old_end_recreated.rs` carries an older copy of this
-/// (its private `served`); it is left as it is because this repository does
-/// not edit existing tests. A new watcher test uses this one.
+/// Existing watcher tests carry private copies of this fixture; they are left
+/// as they are because this repository does not edit existing tests. A new
+/// watcher test uses this one.
 pub fn served_watching(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
     let fx = fixture(prefix, files, WATCH_TOML);
     fx.index();
@@ -266,6 +266,27 @@ pub fn done_line(out: &Output) -> String {
         .find(|l| l.contains("Done in"))
         .unwrap_or_else(|| panic!("no Done in line:\n{}", stderr_of(out)))
         .to_string()
+}
+
+/// `groove index --wait <secs>`, which must succeed; its `Done in` line.
+///
+/// For a run right after a writer was stopped: the operating system releases
+/// the writer lease of a killed process a little after the process is reaped
+/// (`tests/writer_lease_cli.rs` polls for it for the same reason), and a plain
+/// `groove index` that arrives first is refused rather than kept waiting.
+pub fn index_ok_waiting(fx: &Fixture, secs: u64) -> String {
+    let out = fx
+        .cmd()
+        .args(["index", "--wait", &secs.to_string(), "--kb-path"])
+        .arg(fx.kb())
+        .output()
+        .expect("spawn groove index --wait");
+    assert!(
+        out.status.success(),
+        "groove index --wait {secs} failed:\n{}",
+        stderr_of(&out)
+    );
+    done_line(&out)
 }
 
 /// `groove index`, which must succeed; its `Done in` line.

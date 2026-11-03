@@ -122,6 +122,19 @@ impl StderrLog {
     pub fn contains(&self, needle: &str) -> bool {
         self.lines().iter().any(|l| l.contains(needle))
     }
+
+    /// What has been read so far, ANSI colours removed, one line per line: the
+    /// form a failure message quotes. Several watcher tests carry a private
+    /// copy of this (`stderr_text` / `stderr_lines`); they are left as they are
+    /// because this repository does not edit existing tests, and a new test
+    /// uses this one.
+    pub fn text(&self) -> String {
+        self.lines()
+            .iter()
+            .map(|l| super::ansi::strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// [`drain_stderr`], keeping the lines in `log` as they go past.

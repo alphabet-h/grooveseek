@@ -28,10 +28,8 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
-use common::embed_cli::{Fixture, index_ok, note, rows, served_watching};
+use common::embed_cli::{Fixture, index_ok, index_ok_waiting, note, rows, served_watching};
 use common::embed_mock::{assert_dir_empty, wait_until};
-use common::mcp::ServerGuard;
 use common::rename::rename_retrying;
 use std::time::{Duration, Instant};
 
@@ -69,16 +67,6 @@ fn let_the_watcher_settle(fx: &Fixture) -> Vec<(String, String)> {
     last
 }
 
-fn stderr_text(guard: &ServerGuard) -> String {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[test]
 fn a_full_index_after_the_watcher_saw_a_dir_rename_and_recreate_leaves_no_stale_row() {
     let (fx, guard) = served_watching(
@@ -102,12 +90,13 @@ fn a_full_index_after_the_watcher_saw_a_dir_rename_and_recreate_leaves_no_stale_
     fx.layout.write("docs/a.md", &note("Gamma", "gammamarker"));
 
     let watched = let_the_watcher_settle(&fx);
-    let server_said = stderr_text(&guard);
-    // Stopping the server releases the writer lease, so the full index is not refused, and
-    // nothing writes the index while it runs.
+    let server_said = guard.stderr().text();
+    // Stopping the server lets go of the writer lease, so nothing writes the index while the full
+    // index runs. The operating system releases the lease a moment after the process is reaped,
+    // so the run waits for it rather than being refused.
     drop(guard);
 
-    let line = index_ok(&fx);
+    let line = index_ok_waiting(&fx, 10);
     let after = rows(&fx);
     let context = format!(
         "rows the watcher left: {:?}\nindex: {line}\nserver stderr:\n{server_said}",
