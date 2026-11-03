@@ -41,8 +41,11 @@ of them.
 and only a plain `cargo test` builds those; a run narrowed with `--lib`,
 `--tests` or `--test <name>` does not, and adding `--examples` does not help
 (under `cargo test` it builds them as test executables). If you split the suite
-into such runs, run `cargo build --examples -p grooveseek` first. CI runs plain
-`cargo test`, so it is not affected.
+into such runs, run `cargo build --examples -p grooveseek` first. If those runs
+take `--release` (or another `--profile`), give the build the same flag
+(`cargo build --examples -p grooveseek --release`): the tests read the fixtures
+from that profile's directory only. CI runs plain `cargo test`, so it is not
+affected.
 
 To reproduce what CI runs, all of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails. `grooveseek/tests/docs_commands_pinned.rs` compares this block with the `run:` steps of `.github/workflows/ci.yml` -- the same commands, in each job's order, with the order between jobs free -- so a command added to one and not the other fails the suite:
 

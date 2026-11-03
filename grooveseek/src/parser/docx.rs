@@ -4143,7 +4143,7 @@ mod tests {
         assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 11)]);
     }
 
-    /// (AX-42) The parts of a `DocxSection` a property test draws: heading, level, ancestry,
+    /// (AX-42) The parts of a [`DocxSection`] a property test draws: heading, level, ancestry,
     /// body and row spans as `(table, start, end)`.
     type Ax42Section = (
         Option<String>,
@@ -4191,7 +4191,7 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
 
-        /// (AX-42) The contract of `fold_empty_heading_sections`, read from its doc:
+        /// (AX-42) The contract of [`fold_empty_heading_sections`], read from its doc:
         ///
         /// - when every body is blank, the sections are kept as they are, less the ones with
         ///   no heading;

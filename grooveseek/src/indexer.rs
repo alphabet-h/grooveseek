@@ -8481,7 +8481,7 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
 
-        /// (AX-42) The invariants of `plan_vector_reuse` over arbitrary inputs: one source per
+        /// (AX-42) The invariants of [`plan_vector_reuse`] over arbitrary inputs: one source per
         /// new chunk; a stored source names the first stored row with the same input; a
         /// computed source names the to-embed slot that holds this chunk, whose input the
         /// stored side lacks; `to_embed` is strictly increasing; and the plan's counts add up

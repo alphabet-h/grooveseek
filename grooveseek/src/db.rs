@@ -1889,21 +1889,39 @@ mod tests {
     /// of one of those paths (so the prefix usually holds something) or one drawn on its own
     /// (so near misses such as `a.` against `a` are tried too). Never empty, never ending
     /// in `/`.
+    ///
+    /// Beside those, up to three paths are put right at the edges of the range `[dir/, dir0)`:
+    /// `dir` followed by `.` (the byte just below `/`), `0` (the exclusive upper end), `-`,
+    /// or `/`, alone or with one more segment (`a.`, `a0/x`, `a-/x`, `a/x` for `a`). Drawn
+    /// paths alone reach those edges rarely.
     fn ax42_paths_and_dir() -> impl Strategy<Value = (Vec<String>, String)> {
+        let edge = (
+            proptest::sample::select(&['.', '0', '-', '/'][..]),
+            proptest::option::of(ax42_segment()),
+        );
         (
             proptest::collection::vec(ax42_path(), 0..=12),
             any::<bool>(),
             any::<proptest::sample::Index>(),
             1_usize..=3,
             proptest::collection::vec(ax42_segment(), 1..=2),
+            proptest::collection::vec(edge, 0..=3),
         )
-            .prop_map(|(paths, derive, pick, depth, own)| {
+            .prop_map(|(mut paths, derive, pick, depth, own, edges)| {
                 let dir = if derive && !paths.is_empty() {
                     let segments: Vec<&str> = pick.get(&paths).split('/').collect();
                     segments[..depth.min(segments.len())].join("/")
                 } else {
                     own.join("/")
                 };
+                for (next, tail) in edges {
+                    let path = match (next, tail) {
+                        ('/', tail) => format!("{dir}/{}", tail.unwrap_or_else(|| "x".into())),
+                        (next, None) => format!("{dir}{next}"),
+                        (next, Some(tail)) => format!("{dir}{next}/{tail}"),
+                    };
+                    paths.push(path);
+                }
                 (paths, dir)
             })
     }
@@ -1926,8 +1944,8 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
 
-        /// (AX-42) `document_paths_under(dir)` returns exactly the stored paths that start
-        /// with `dir/`, sorted, and leaves every row in place.
+        /// (AX-42) [`Database::document_paths_under`] (`dir`) returns exactly the stored
+        /// paths that start with `dir/`, sorted, and leaves every row in place.
         #[test]
         fn prop_document_paths_under_matches_the_starts_with_oracle(
             (paths, dir) in ax42_paths_and_dir(),
@@ -1942,8 +1960,8 @@ mod tests {
             prop_assert_eq!(db.document_count().unwrap(), before);
         }
 
-        /// (AX-42) `delete_documents_under(dir)` deletes and returns exactly the stored paths
-        /// that start with `dir/`, and what is left is the complement.
+        /// (AX-42) [`Database::delete_documents_under`] (`dir`) deletes and returns exactly
+        /// the stored paths that start with `dir/`, and what is left is the complement.
         #[test]
         fn prop_delete_documents_under_leaves_the_complement(
             (paths, dir) in ax42_paths_and_dir(),

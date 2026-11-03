@@ -8227,22 +8227,68 @@ mod tests {
         assert!(!kb.exists(), "still nothing on disk");
     }
 
-    /// (AX-42) A stored path for the `dir_rename_steps` property: a first segment that is
-    /// the old directory, a name sharing it as a prefix, or something else, then one or two
-    /// more segments ending in an extension the default registry indexes or skips.
-    fn ax42_rename_path() -> impl proptest::strategy::Strategy<Value = String> {
+    /// (AX-42) The rest of a stored path below its first segment: at most one more directory
+    /// (`deepx` is a near miss for `deep`), then a leaf whose extension the default registry
+    /// indexes or skips.
+    fn ax42_rename_rest() -> impl proptest::strategy::Strategy<Value = String> {
         use proptest::prelude::*;
         (
-            proptest::sample::select(&["docs", "docs-other", "docs.md", "Docs", "a"][..]),
-            proptest::collection::vec(proptest::sample::select(&["deep", "x", "日本"][..]), 0..=1),
+            proptest::collection::vec(
+                proptest::sample::select(&["deep", "deepx", "x", "日本"][..]),
+                0..=1,
+            ),
             proptest::sample::select(&["a.md", "b.txt", "c.markdown", "d"][..]),
         )
-            .prop_map(|(head, mid, leaf)| {
-                let mut segments = vec![head];
-                segments.extend(mid);
+            .prop_map(|(mid, leaf)| {
+                let mut segments = mid;
                 segments.push(leaf);
                 segments.join("/")
             })
+    }
+
+    /// (AX-42) A stored path for the [`dir_rename_steps`] property: a first segment that is
+    /// the old directory, a name sharing it as a prefix, an excluded directory, or something
+    /// else, then [`ax42_rename_rest`].
+    fn ax42_rename_path() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (
+            proptest::sample::select(
+                &[
+                    "docs",
+                    "docs-other",
+                    "docs.md",
+                    "Docs",
+                    "a",
+                    "node_modules/docs",
+                    ".obsidian",
+                ][..],
+            ),
+            ax42_rename_rest(),
+        )
+            .prop_map(|(head, rest)| format!("{head}/{rest}"))
+    }
+
+    /// (AX-42) The old directory of a rename (indexed ones, and excluded ones whose rows
+    /// an older version may have left, so a step can go from excluded to indexed) and the
+    /// stored paths: half are drawn as `old_dir/` plus [`ax42_rename_rest`], so the range
+    /// holds rows for every old directory, and half by [`ax42_rename_path`].
+    fn ax42_rename_case() -> impl proptest::strategy::Strategy<Value = (&'static str, Vec<String>)>
+    {
+        use proptest::prelude::*;
+        proptest::sample::select(
+            &[
+                "docs",
+                "docs/deep",
+                "Docs",
+                "node_modules/docs",
+                ".obsidian",
+            ][..],
+        )
+        .prop_flat_map(|old_dir| {
+            let under = ax42_rename_rest().prop_map(move |rest| format!("{old_dir}/{rest}"));
+            let path = prop_oneof![under, ax42_rename_path()];
+            (Just(old_dir), proptest::collection::vec(path, 0..=8))
+        })
     }
 
     proptest::proptest! {
@@ -8251,14 +8297,13 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
 
-        /// (AX-42) `dir_rename_steps` keeps one step per path under `old_dir/`, in the
+        /// (AX-42) [`dir_rename_steps`] keeps one step per path under `old_dir/`, in the
         /// order handed in; each step's new path is `new_dir/` plus the rest of the old one;
-        /// and each action is what `rename_decision` says for that one file. Nothing is on
+        /// and each action is what [`rename_decision`] says for that one file. Nothing is on
         /// disk, as in the example tests.
         #[test]
         fn prop_dir_rename_steps_follow_the_single_file_decision(
-            paths in proptest::collection::vec(ax42_rename_path(), 0..=8),
-            old_dir in proptest::sample::select(&["docs", "docs/deep", "Docs"][..]),
+            (old_dir, paths) in ax42_rename_case(),
             new_dir in proptest::sample::select(
                 &["notes", "docs", "node_modules/docs", "notes/.", "日本/x"][..]
             ),
