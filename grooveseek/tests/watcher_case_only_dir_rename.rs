@@ -52,21 +52,26 @@ fn note(title: &str, marker: &str) -> String {
     )
 }
 
-/// Every document path in the index, sorted. The index is opened beside the server (WAL, with
-/// a busy timeout) and closed again before this returns.
-fn paths(fx: &Fixture) -> Vec<String> {
+/// The index the server writes, opened beside it as a reader (`query_only`), the way the
+/// server's own readers open it while it holds the writer lease (ADR-0031): the schema is
+/// current once `groove index` ran, so no lease is asked for and nothing is written, and in
+/// WAL a reader does not wait on the writer. Closed again when the caller drops it.
+fn open_index(fx: &Fixture) -> Database {
     let db_path = grooveseek::resolve_db_path(fx.kb());
-    let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
-    let mut all = db.all_document_paths().expect("paths");
+    Database::open_read_only(&db_path.to_string_lossy(), fx.kb()).expect("open the index")
+}
+
+/// Every document path in the index, sorted.
+fn paths(fx: &Fixture) -> Vec<String> {
+    let mut all = open_index(fx).all_document_paths().expect("paths");
     all.sort();
     all
 }
 
 /// The chunk texts stored for `rel`, joined.
 fn text_of(fx: &Fixture, rel: &str) -> String {
-    let db_path = grooveseek::resolve_db_path(fx.kb());
-    let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
-    db.chunk_texts_for_path(rel)
+    open_index(fx)
+        .chunk_texts_for_path(rel)
         .expect("chunk texts")
         .into_iter()
         .map(|(_, content)| content)
