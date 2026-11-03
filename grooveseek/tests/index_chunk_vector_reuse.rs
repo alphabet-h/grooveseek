@@ -769,3 +769,192 @@ fn reused_vectors_rank_like_a_forced_rebuild() {
         }
     }
 }
+
+/// (kuriya 608) [`RUNBOOK`] inside a directory, for the directory renames below.
+const GUIDES_RUNBOOK: &str = "guides/runbook.md";
+/// Where [`GUIDES_RUNBOOK`] lands once `guides` is renamed to `manuals`.
+const MANUALS_RUNBOOK: &str = "manuals/runbook.md";
+
+/// The document inputs the mock was asked to embed since request `before`, the endpoint probe
+/// left out (a run may send it on its own schedule; it is not a chunk).
+fn chunk_inputs_since(fx: &Fixture, before: usize) -> Vec<String> {
+    embedded_since(fx, before)
+        .into_iter()
+        .filter(|t| t != grooveseek::embedder::ENDPOINT_PROBE_TEXT)
+        .collect()
+}
+
+/// Each stored chunk of `rows` as `(content, context, vector bytes)`, sorted by content: what a
+/// rename must carry over unchanged when the embedding inputs do not change.
+fn chunk_rows(rows: &[StoredChunkVector]) -> Vec<(String, Option<String>, Vec<u8>)> {
+    let mut out: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.content.clone(),
+                r.context_text.clone(),
+                r.embedding.clone(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// kuriya 608, rebuild side: under the static context a titled document's breadcrumb comes from
+/// its title, not from its path, so renaming the directory it sits in changes no embedding input.
+/// `groove index` pairs the rename by hash and re-reads the moved document past the fast path,
+/// and that re-read reuses every stored vector: nothing is sent to the endpoint and each chunk
+/// keeps the bytes it had. (This replaces feature-69 spec R7's "a rename's forced re-parse
+/// embeds every chunk".)
+#[test]
+fn a_static_directory_rename_in_a_rebuild_sends_nothing_to_the_endpoint() {
+    let fx = fixture(
+        "ax12-rebuild-dir",
+        &[(GUIDES_RUNBOOK, &runbook(&[S1, S2, S3, S4]))],
+        STATIC,
+    );
+    index_ok(&fx);
+    let before_rows = chunk_rows(&vectors(&fx, GUIDES_RUNBOOK));
+    assert_eq!(before_rows.len(), 4, "{before_rows:?}");
+    assert!(
+        before_rows
+            .iter()
+            .all(|(_, ctx, _)| ctx.as_deref().is_some_and(|c| c.starts_with("Runbook"))),
+        "premise: the breadcrumb comes from the title: {before_rows:?}"
+    );
+
+    std::fs::rename(fx.kb().join("guides"), fx.kb().join("manuals")).expect("rename the dir");
+    let before = fx.mock.requests().len();
+    let line = index_ok(&fx);
+
+    assert_eq!(chunk_inputs_since(&fx, before), Vec::<String>::new());
+    assert!(line.contains("(this run: 0 embedded, 4 reused)"), "{line}");
+    assert_eq!(chunk_rows(&vectors(&fx, MANUALS_RUNBOOK)), before_rows);
+    assert!(vectors(&fx, GUIDES_RUNBOOK).is_empty());
+
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// kuriya 608, watcher side: the same directory rename, followed for its one document the way
+/// the watcher follows it ([`rename_single_file`] per moved row, after the rename on disk). The
+/// re-read reuses every stored vector, so nothing reaches the endpoint and the BLOBs are the
+/// bytes they were.
+#[test]
+fn a_static_directory_rename_in_the_watcher_sends_nothing_to_the_endpoint() {
+    if run_in_hermetic_child(
+        "a_static_directory_rename_in_the_watcher_sends_nothing_to_the_endpoint",
+    ) {
+        return;
+    }
+    let fx = fixture(
+        "ax12-watcher-dir",
+        &[(GUIDES_RUNBOOK, &runbook(&[S1, S2, S3, S4]))],
+        STATIC,
+    );
+    index_ok(&fx);
+    let before_rows = chunk_rows(&vectors(&fx, GUIDES_RUNBOOK));
+    assert_eq!(before_rows.len(), 4, "{before_rows:?}");
+    std::fs::rename(fx.kb().join("guides"), fx.kb().join("manuals")).expect("rename the dir");
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let before = fx.mock.requests().len();
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        GUIDES_RUNBOOK,
+        MANUALS_RUNBOOK,
+        None,
+        &registry,
+    )
+    .expect("rename the runbook");
+    assert_eq!(outcome, RenameOutcome::RenamedAndReindexed { chunks: 4 });
+    assert_eq!(chunk_inputs_since(&fx, before), Vec::<String>::new());
+    drop(db);
+
+    assert_eq!(chunk_rows(&vectors(&fx, MANUALS_RUNBOOK)), before_rows);
+    assert!(vectors(&fx, GUIDES_RUNBOOK).is_empty());
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// A document with no frontmatter: one `##` section per `(heading, body)`, its title taken from
+/// the file name.
+fn untitled(sections: &[(&str, &str)]) -> String {
+    let mut md = String::new();
+    for (heading, body) in sections {
+        md.push_str(&format!("## {heading}\n\n{body}\n\n"));
+    }
+    md
+}
+
+/// kuriya 608: reusing on a rename does not keep a breadcrumb the rename made stale. A document
+/// with no title takes its breadcrumb from the file name, so renaming the file changes every
+/// chunk's embedding input, and the re-read embeds every chunk again under the new name.
+#[test]
+fn a_static_rename_of_an_untitled_file_embeds_every_chunk_again() {
+    if run_in_hermetic_child("a_static_rename_of_an_untitled_file_embeds_every_chunk_again") {
+        return;
+    }
+    let fx = fixture(
+        "ax12-untitled",
+        &[("alpha-notes.md", &untitled(&[S1, S2, S3, S4]))],
+        STATIC,
+    );
+    index_ok(&fx);
+    assert!(
+        vectors(&fx, "alpha-notes.md").iter().all(|r| r
+            .context_text
+            .as_deref()
+            .is_some_and(|c| c.contains("alpha notes"))),
+        "premise: the breadcrumb comes from the file name"
+    );
+    std::fs::rename(
+        fx.kb().join("alpha-notes.md"),
+        fx.kb().join("beta-notes.md"),
+    )
+    .expect("rename");
+
+    let cfg = Config::load_from(&fx.config).expect("load groove.toml");
+    let registry = cfg.build_parser_registry(fx.kb()).expect("parser registry");
+    let kb = fx.kb().canonicalize().expect("canonical kb");
+    let (db, mut embedder) = open_in_process(&fx, &cfg);
+    let before = fx.mock.requests().len();
+    let outcome = rename_single_file(
+        &db,
+        &mut embedder,
+        &kb,
+        "alpha-notes.md",
+        "beta-notes.md",
+        None,
+        &registry,
+    )
+    .expect("rename the notes");
+    assert_eq!(outcome, RenameOutcome::RenamedAndReindexed { chunks: 4 });
+    let sent = chunk_inputs_since(&fx, before);
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    assert!(
+        sent.iter()
+            .all(|t| t.contains("beta notes") && !t.contains("alpha notes")),
+        "{sent:?}"
+    );
+    drop(db);
+
+    let after = vectors(&fx, "beta-notes.md");
+    assert_eq!(after.len(), 4);
+    assert!(
+        after.iter().all(|r| r
+            .context_text
+            .as_deref()
+            .is_some_and(|c| c.contains("beta notes"))),
+        "{:?}",
+        after.iter().map(|r| &r.context_text).collect::<Vec<_>>()
+    );
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
