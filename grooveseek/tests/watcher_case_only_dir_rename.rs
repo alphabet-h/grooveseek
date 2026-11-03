@@ -32,18 +32,25 @@
 mod common;
 
 use common::ansi::strip_ansi;
-use common::embed_cli::{Fixture, fixture};
-use common::embed_mock::{hermetic, wait_until};
+use common::embed_cli::fixture;
+use common::embed_mock::hermetic;
 use common::mcp::{ServerGuard, spawn_serve_with};
 use common::rename::rename_retrying;
 use grooveseek::db::Database;
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// How long the test waits for the watcher to reach the rows it expects.
 const SETTLE: Duration = Duration::from_secs(30);
 /// How long the test keeps looking after the rows were reached, to see that they stay: ten
 /// debounce windows of the `debounce_ms = 300` the fixture sets.
 const HOLD: Duration = Duration::from_secs(3);
+/// How long a look that only needs one successful read (before the rename, after [`HOLD`])
+/// keeps trying.
+const READ_BUDGET: Duration = Duration::from_secs(10);
+/// The pause between two reads of a poll.
+const POLL: Duration = Duration::from_millis(100);
 
 /// A Markdown note titled `title` with one section holding `marker`.
 fn note(title: &str, marker: &str) -> String {
@@ -52,31 +59,146 @@ fn note(title: &str, marker: &str) -> String {
     )
 }
 
-/// The index the server writes, opened beside it as a reader (`query_only`), the way the
-/// server's own readers open it while it holds the writer lease (ADR-0031): the schema is
-/// current once `groove index` ran, so no lease is asked for and nothing is written, and in
-/// WAL a reader does not wait on the writer. Closed again when the caller drops it.
-fn open_index(fx: &Fixture) -> Database {
-    let db_path = grooveseek::resolve_db_path(fx.kb());
-    Database::open_read_only(&db_path.to_string_lossy(), fx.kb()).expect("open the index")
-}
-
 /// Every document path in the index, sorted.
-fn paths(fx: &Fixture) -> Vec<String> {
-    let mut all = open_index(fx).all_document_paths().expect("paths");
+fn paths(db: &Database) -> Result<Vec<String>, String> {
+    let mut all = db
+        .all_document_paths()
+        .map_err(|e| format!("listing the paths failed: {e:#}"))?;
     all.sort();
-    all
+    Ok(all)
 }
 
-/// The chunk texts stored for `rel`, joined.
-fn text_of(fx: &Fixture, rel: &str) -> String {
-    open_index(fx)
+/// The chunk texts stored for `rel`, joined (empty when there is no such row).
+fn text_of(db: &Database, rel: &str) -> Result<String, String> {
+    Ok(db
         .chunk_texts_for_path(rel)
-        .expect("chunk texts")
+        .map_err(|e| format!("reading the chunks of {rel} failed: {e:#}"))?
         .into_iter()
         .map(|(_, content)| content)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
+}
+
+/// What one read of the index saw: every path, and the text stored for each path asked for.
+#[derive(Debug)]
+struct Snapshot {
+    paths: Vec<String>,
+    texts: BTreeMap<String, String>,
+}
+
+/// One read of the index: [`paths`], then [`text_of`] for each of `rels`.
+fn snapshot(db: &Database, rels: &[String]) -> Result<Snapshot, String> {
+    let paths = paths(db)?;
+    let mut texts = BTreeMap::new();
+    for rel in rels {
+        texts.insert(rel.clone(), text_of(db, rel)?);
+    }
+    Ok(Snapshot { paths, texts })
+}
+
+/// The index the server writes, read beside it from a thread of its own, so that no read can
+/// hold the test past its deadline.
+///
+/// The one connection is opened before the rename, as a reader (`query_only`, the way the
+/// server's own readers open it while it holds the writer lease, ADR-0031: with the schema
+/// current no lease is asked for and nothing is written) and kept. Each read is a few
+/// autocommit `SELECT`s whose statements are finalized before the read returns, so between
+/// reads the connection holds no read transaction: it does not pin the WAL or hold up the
+/// server's checkpoints, and every read sees what the server committed before it began. The
+/// connection's busy timeout (30 s) is not the bound; [`IndexReader::read_by`] waits for an
+/// answer only until the caller's deadline and reports a read still running then as a failure.
+struct IndexReader {
+    /// `None` once dropped, which ends the thread's loop.
+    ask: Option<mpsc::Sender<()>>,
+    answers: mpsc::Receiver<Result<Snapshot, String>>,
+    /// Disconnected once the thread has closed the connection.
+    closed: mpsc::Receiver<()>,
+}
+
+/// How long dropping an [`IndexReader`] waits for its thread to close the connection: past
+/// the connection's 30 s busy timeout, so a read stuck in it still ends first.
+const CLOSE_WAIT: Duration = Duration::from_secs(40);
+
+impl IndexReader {
+    /// Move `db` to a reader thread that reads `rels` each time it is asked.
+    fn spawn(db: Database, rels: &[&str]) -> Self {
+        let rels: Vec<String> = rels.iter().map(|r| r.to_string()).collect();
+        let (ask, asked) = mpsc::channel::<()>();
+        let (answer, answers) = mpsc::channel();
+        let (close, closed) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            while asked.recv().is_ok() {
+                if answer.send(snapshot(&db, &rels)).is_err() {
+                    break;
+                }
+            }
+            // The connection first, then the signal: the fixture deletes the index's
+            // directory once the reader is gone, which Windows refuses while a handle is open.
+            drop(db);
+            drop(close);
+        });
+        Self {
+            ask: Some(ask),
+            answers,
+            closed,
+        }
+    }
+
+    /// One read, answered before `end` or reported as failed. A read that times out ends the
+    /// poll it belongs to ([`poll_until`] stops at the same `end`), so its late answer is never
+    /// taken for a later read's.
+    fn read_by(&self, end: Instant) -> Result<Snapshot, String> {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no time was left for a read".to_string());
+        }
+        self.ask
+            .as_ref()
+            .ok_or_else(|| "the reader was closed".to_string())?
+            .send(())
+            .map_err(|_| "the reader thread is gone".to_string())?;
+        match self.answers.recv_timeout(left) {
+            Ok(read) => read,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "a read of the index did not return within the {left:?} left"
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the reader thread is gone".to_string())
+            }
+        }
+    }
+}
+
+impl Drop for IndexReader {
+    /// End the thread and wait (up to [`CLOSE_WAIT`]) until it has closed the connection.
+    fn drop(&mut self) {
+        self.ask = None;
+        let _ = self.closed.recv_timeout(CLOSE_WAIT);
+    }
+}
+
+/// Read until a read is accepted, within `budget`. The time left is looked at before each
+/// read and bounds the read itself. A failed read counts as "not yet"; when the budget runs
+/// out, the error names the last outcome (the snapshot it held, or why it failed), so a read
+/// that never succeeds is a red test with its reason rather than a silent pass.
+fn poll_until(
+    reader: &IndexReader,
+    budget: Duration,
+    accept: impl Fn(&Snapshot) -> bool,
+) -> Result<Snapshot, String> {
+    let end = Instant::now() + budget;
+    let mut last = "no read was made".to_string();
+    loop {
+        if Instant::now() >= end {
+            return Err(last);
+        }
+        match reader.read_by(end) {
+            Ok(seen) if accept(&seen) => return Ok(seen),
+            Ok(seen) => last = format!("the last read held {seen:?}"),
+            Err(e) => last = format!("the last read failed: {e}"),
+        }
+        std::thread::sleep(POLL.min(end.saturating_duration_since(Instant::now())));
+    }
 }
 
 fn stderr_text(guard: &ServerGuard) -> String {
@@ -118,35 +240,50 @@ fn watcher_follows_a_case_only_directory_rename() {
     let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
         hermetic(c, &fx.cache);
     });
+    let want = ["Docs-other/c.md", "docs/a.md", "docs/deep/b.md"];
+    let db_path = grooveseek::resolve_db_path(fx.kb());
+    let db = Database::open_read_only(&db_path.to_string_lossy(), fx.kb())
+        .unwrap_or_else(|e| panic!("open the index as a reader: {e:#}"));
+    let reader = IndexReader::spawn(db, &want);
+
+    let before = poll_until(&reader, READ_BUDGET, |_| true).unwrap_or_else(|last| {
+        panic!(
+            "the index could not be read before the rename: {last}\nstderr:\n{}",
+            stderr_text(&guard)
+        )
+    });
     assert_eq!(
-        paths(&fx),
+        before.paths,
         ["Docs-other/c.md", "Docs/a.md", "Docs/deep/b.md"]
     );
 
     rename_retrying(&fx.kb().join("Docs"), &fx.kb().join("docs"));
 
-    let want = ["Docs-other/c.md", "docs/a.md", "docs/deep/b.md"];
-    let holds = |fx: &Fixture| {
-        text_of(fx, "docs/a.md").contains("alphamarker")
-            && text_of(fx, "docs/deep/b.md").contains("bravomarker")
-            && text_of(fx, "Docs-other/c.md").contains("charliemarker")
+    let settled = |s: &Snapshot| {
+        let text = |rel: &str| s.texts.get(rel).map(String::as_str).unwrap_or("");
+        s.paths == want
+            && text("docs/a.md").contains("alphamarker")
+            && text("docs/deep/b.md").contains("bravomarker")
+            && text("Docs-other/c.md").contains("charliemarker")
     };
-    let mut last = Vec::new();
-    let reached = wait_until(SETTLE, || {
-        last = paths(&fx);
-        last == want && holds(&fx)
+    if let Err(last) = poll_until(&reader, SETTLE, settled) {
+        panic!(
+            "case-only directory rename: the index never held exactly {want:?} within {SETTLE:?}; {last}\nstderr:\n{}",
+            stderr_text(&guard)
+        );
+    }
+    std::thread::sleep(HOLD);
+    let later = poll_until(&reader, READ_BUDGET, |_| true).unwrap_or_else(|last| {
+        panic!(
+            "case-only directory rename: the index held {want:?}, then could not be read again: {last}\nstderr:\n{}",
+            stderr_text(&guard)
+        )
     });
     assert!(
-        reached,
-        "case-only directory rename: the index never held exactly {want:?}; last seen {last:?}\nstderr:\n{}",
-        stderr_text(&guard)
-    );
-    std::thread::sleep(HOLD);
-    let later = paths(&fx);
-    assert!(
-        later == want && holds(&fx),
+        settled(&later),
         "case-only directory rename: the index held {want:?}, then {later:?}\nstderr:\n{}",
         stderr_text(&guard)
     );
+    drop(reader);
     drop(guard);
 }
