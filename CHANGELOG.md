@@ -46,6 +46,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `a new directory arrived with N indexable files` counts only the files it reads, and is not
   printed when there are none (kuriya 609).
 
+### Fixed
+
+- **A rename into another parser, read again after the file changed under the first read, no
+  longer keeps columns only the old parser writes.** When a rename crossed parsers (`notes.rs`
+  to `notes.txt`, say) and the file changed while the rename's first read was reading it, the
+  further read (`groove index` and the MCP `rebuild_index` tool before the run ends, and the
+  watcher's own further read of such a rename) could find chunk text matching the old parser's rows and update only the
+  document's metadata and hash, leaving, for example, a code chunk's line range on a plain-text
+  chunk until `--force`. That read now rewrites the row whole, as the rename's first read does,
+  still reusing the stored vectors (kuriya 670).
+
 ### Internal
 
 - The chunk counts of a document that a run updated (the `this run: N embedded, M reused` part

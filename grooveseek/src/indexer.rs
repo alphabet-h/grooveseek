@@ -979,6 +979,11 @@ pub(crate) fn settle_further_crossed_read(
 /// the rename's first read, so a failed parse is always one of the bytes this read hashed. A
 /// read that fails is the skip the loop gives one ([`SKIPPED_READ_FAILED`]), so the run goes on.
 ///
+/// (kuriya 670) The meta-only update is not taken here after all: the row holds the old
+/// parser's chunks, so even when their text matches, the row is rewritten whole, as the
+/// rename's first read ([`Reindex::Renamed`]) rewrites it, with the stored vectors reused
+/// ([`index_single_disk_entry_explained`] decides this from `row_dropped_unless_updated`).
+///
 /// (#544, local Codex r3, J3) The caller settles the result with
 /// [`settle_further_crossed_read`], as the loop settled the first read: the row is written from
 /// these bytes, or dropped when the new parser cannot index them (a refused read, a failed
@@ -3660,11 +3665,20 @@ fn index_single_disk_entry_explained(
     // 不要になったため撤去した。Off モードは context を embed/保存しないため、
     // 従来通り (heading, content) のみで比較する (挙動不変)。
     let chunks_unchanged = stored_chunks_match(db, &entry.rel, &parsed.chunks, context_mode);
+    // (kuriya 670) The row under this path was written by another parser when the caller settles
+    // a rename across parsers (`row_dropped_unless_updated`): the rename's first read
+    // ([`Reindex::Renamed`]) and the further reads of one kept awaiting -- the full run's
+    // ([`read_crossed_rename_again_explained`], [`Reindex::Event`]) and the watcher's
+    // ([`reindex_single_file_checked`]). Matching chunk text says nothing about the columns only
+    // the old parser writes (a code chunk's line range, which the meta-only write below leaves
+    // in place when the new parser gives none), so such a read rewrites the row whole, as
+    // [`Reindex::Renamed`] does, with the stored vectors reused.
+    let rewrites_whole = renamed || row_dropped_unless_updated;
     // (feature-66) Stage one of a table-rows write that re-embeds nothing, read beside the
     // comparison above; stage two reads the row again where it writes. Gated as the meta-only
     // write below is (`!force`; a re-read is not forced), so `--force` reads nothing extra.
     // (kuriya 608) Nor does a rename's re-read, which takes neither write that reads it.
-    let table_rows = if !force && !renamed && chunks_unchanged {
+    let table_rows = if !force && !rewrites_whole && chunks_unchanged {
         decide_table_rows(db, &entry.rel, &parsed.chunks)?
     } else {
         None
@@ -3706,9 +3720,10 @@ fn index_single_disk_entry_explained(
     }
 
     // (kuriya 608) Not for a rename's re-read: its row is rewritten whole (see
-    // [`Reindex::Renamed`]), with the stored vectors reused below.
+    // [`Reindex::Renamed`]), with the stored vectors reused below. (kuriya 670) Nor for any read
+    // of a row another parser wrote (`rewrites_whole` above).
     if !force
-        && !renamed
+        && !rewrites_whole
         && chunks_unchanged
         && let Some(done) = write_matching_chunks_meta(
             db,
@@ -11302,6 +11317,210 @@ mod tests {
             db.get_document_hash("note.md").unwrap().as_deref(),
             Some(HASH_AWAITING_REPARSE),
             "the refused row left the awaiting state"
+        );
+    }
+
+    /// kuriya 670: one chunk row's `(chunk id, start_line, end_line, symbol_kind,
+    /// quality_score)`.
+    type K670Columns = (i64, Option<i64>, Option<i64>, Option<String>, f64);
+
+    /// kuriya 670: the per-chunk columns of `rel`'s rows as the index file holds them, read
+    /// through a connection of its own (the [`Database`] keeps its connection private), in
+    /// chunk order.
+    fn chunk_columns_in_file(db_path: &std::path::Path, rel: &str) -> Vec<K670Columns> {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.start_line, c.end_line, c.symbol_kind, c.quality_score
+                   FROM chunks c JOIN documents d ON d.id = c.document_id
+                  WHERE d.path = ?1 ORDER BY c.chunk_index",
+            )
+            .unwrap();
+        stmt.query_map([rel], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// kuriya 670: `old_rel` indexed by a full run from `scanned`, then renamed on disk to
+    /// `new_rel` -- a pair that crosses a parser -- and a second full run whose loop finds the
+    /// file rewritten to `rewritten` once it has applied the rename, so that loop keeps the row
+    /// awaiting and the run's further read ([`read_crossed_rename_again_explained`]) reads
+    /// `rewritten`. The index lives in a file outside the knowledge base so the test can read
+    /// columns [`Database`] has no accessor for. Returns the knowledge base, the directory of the
+    /// index, the index file, the index, and the old path's chunk columns after the first run
+    /// ([`chunk_columns_in_file`]).
+    fn crossed_rename_rewritten_after_an_earlier_run(
+        tag: &str,
+        (old_rel, new_rel): (&str, &str),
+        scanned: &'static [u8],
+        rewritten: &'static [u8],
+    ) -> (
+        TmpDir,
+        TmpDir,
+        std::path::PathBuf,
+        Database,
+        Vec<K670Columns>,
+    ) {
+        let kb = mk_tmp(tag);
+        let db_dir = mk_tmp(&format!("{tag}-db"));
+        let db_path = db_dir.0.join("index.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.verify_embedding_meta("test-model", 2).unwrap();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "rs".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&registry, old_rel, new_rel),
+            "the pair was meant to cross a parser"
+        );
+        let run = |progress: progress::ProgressReporter| {
+            rebuild_index(
+                &db,
+                &mut Embedder::stub_for_tests(2),
+                &kb.0,
+                None,
+                false,
+                None,
+                &[],
+                &registry,
+                progress,
+                ContextMode::Off,
+            )
+            .unwrap()
+        };
+        std::fs::write(kb.0.join(old_rel), scanned).unwrap();
+        run(progress::ProgressReporter::with_callback(Box::new(|_| {})));
+        assert_eq!(
+            db.get_document_hash(old_rel).unwrap(),
+            Some(sha256_hex_bytes(scanned)),
+            "premise: the first run indexed the old path"
+        );
+        let first = chunk_columns_in_file(&db_path, old_rel);
+        std::fs::rename(kb.0.join(old_rel), kb.0.join(new_rel)).unwrap();
+        let full = kb.0.join(new_rel);
+        let (old_owned, new_owned) = (old_rel.to_string(), new_rel.to_string());
+        run(progress::ProgressReporter::with_callback(Box::new(
+            move |event| {
+                if let progress::ProgressEvent::Renamed { old, new } = event
+                    && old == old_owned
+                    && new == new_owned
+                {
+                    std::fs::write(&full, rewritten).unwrap();
+                }
+            },
+        )));
+        (kb, db_dir, db_path, db, first)
+    }
+
+    /// kuriya 670: a Rust file with no definition, one comment line long enough that the code
+    /// parser keeps it as a chunk (with a line range, and no heading or symbol kind).
+    const K670_RS_SCANNED: &[u8] =
+        b"// the deploy notes moved to the wiki; this file only keeps the pointer to them\n";
+    /// kuriya 670: [`K670_RS_SCANNED`] without its trailing newline: other bytes, whose one
+    /// plain-text chunk has the same (empty) heading and the same text as the code parser's
+    /// chunk of the scanned bytes.
+    const K670_RS_REWRITTEN: &[u8] =
+        b"// the deploy notes moved to the wiki; this file only keeps the pointer to them";
+
+    /// kuriya 670: a crossed rename (`.rs` to `.txt`) the loop kept awaiting, because the file
+    /// changed under its read, is read once more ([`read_crossed_rename_again_explained`]); the
+    /// bytes it finds give the new parser a chunk whose text matches the old parser's row. That
+    /// read must still write the row whole, as the rename's first read ([`Reindex::Renamed`])
+    /// would: the meta-only write would keep the code parser's line range on a plain-text chunk,
+    /// which the text parser never writes, and nothing after it (the fast path holds the new
+    /// hash) would take it off before `--force`.
+    #[test]
+    fn a_further_crossed_read_does_not_keep_the_old_parsers_line_range() {
+        let (_kb, _db_dir, db_path, db, first) = crossed_rename_rewritten_after_an_earlier_run(
+            "k670-rs-to-txt",
+            ("note.rs", "note.txt"),
+            K670_RS_SCANNED,
+            K670_RS_REWRITTEN,
+        );
+        assert!(
+            matches!(first.as_slice(), [(_, Some(_), Some(_), None, _)]),
+            "premise: the code parser wrote one chunk with a line range: {first:?}"
+        );
+        assert_eq!(
+            db.get_document_hash("note.txt").unwrap(),
+            Some(sha256_hex_bytes(K670_RS_REWRITTEN)),
+            "premise: the further read settled the row from the rewritten bytes"
+        );
+        assert_eq!(db.get_document_hash("note.rs").unwrap(), None);
+        let columns = chunk_columns_in_file(&db_path, "note.txt");
+        assert_eq!(columns.len(), 1, "{columns:?}");
+        let (_, start, end, kind, _) = &columns[0];
+        assert_eq!(
+            (start, end, kind),
+            (&None, &None, &None),
+            "the plain-text chunk kept the code parser's columns: {first:?} -> {columns:?}"
+        );
+    }
+
+    /// kuriya 670, the watcher's side: the same row (the code parser's chunk of
+    /// [`K670_RS_SCANNED`], moved to `note.txt` and kept under [`HASH_AWAITING_REPARSE`], as
+    /// [`rename_single_file`] leaves a crossed rename whose first read saw other bytes) read once
+    /// more the way the watcher reads it ([`reindex_single_file_checked`] with the check on) and
+    /// settled with [`settle_further_crossed_read`]. The plain-text chunk does not keep the code
+    /// parser's line range.
+    #[test]
+    fn the_watchers_further_crossed_read_does_not_keep_the_old_parsers_line_range() {
+        let kb = mk_tmp("k670-watcher");
+        let db_dir = mk_tmp("k670-watcher-db");
+        let db_path = db_dir.0.join("index.db");
+        let db = Database::open(db_path.to_str().unwrap()).unwrap();
+        db.verify_embedding_meta("test-model", 2).unwrap();
+        let registry = Registry::from_enabled(&["md".into(), "txt".into(), "rs".into()]).unwrap();
+        std::fs::write(kb.0.join("note.rs"), K670_RS_SCANNED).unwrap();
+        rebuild_index(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb.0,
+            None,
+            false,
+            None,
+            &[],
+            &registry,
+            progress::ProgressReporter::with_callback(Box::new(|_| {})),
+            ContextMode::Off,
+        )
+        .unwrap();
+        let first = chunk_columns_in_file(&db_path, "note.rs");
+        assert!(
+            matches!(first.as_slice(), [(_, Some(_), Some(_), None, _)]),
+            "premise: the code parser wrote one chunk with a line range: {first:?}"
+        );
+        db.overwrite_content_hash(&["note.rs"], HASH_AWAITING_REPARSE)
+            .unwrap();
+        db.rename_document("note.rs", "note.txt", crate::db::FrontmatterTopic::Unread)
+            .unwrap();
+        std::fs::remove_file(kb.0.join("note.rs")).unwrap();
+        std::fs::write(kb.0.join("note.txt"), K670_RS_REWRITTEN).unwrap();
+
+        let result = reindex_single_file_checked(
+            &db,
+            &mut Embedder::stub_for_tests(2),
+            &kb.0,
+            "note.txt",
+            None,
+            &registry,
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(result, SingleResult::Updated { chunks: 1, .. }),
+            "{result:?}"
+        );
+        assert!(!settle_further_crossed_read(&db, "note.txt", &result).unwrap());
+        assert_eq!(
+            db.get_document_hash("note.txt").unwrap(),
+            Some(sha256_hex_bytes(K670_RS_REWRITTEN))
+        );
+        let columns = chunk_columns_in_file(&db_path, "note.txt");
+        assert!(
+            matches!(columns.as_slice(), [(_, None, None, None, _)]),
+            "the plain-text chunk kept the code parser's columns: {first:?} -> {columns:?}"
         );
     }
 
