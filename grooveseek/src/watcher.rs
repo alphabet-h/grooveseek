@@ -818,14 +818,20 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
             }
             Classified::Deindex(paths) => {
                 for p in paths {
-                    if let Some(rel) = to_rel(&state.kb_path, p) {
-                        handle_removed_path(state, &rel, p);
-                    }
-                    // (feature-67) Always, whatever the gate above said: a
-                    // removed directory carries no extension, and its files'
-                    // own events may have been folded into this one.
+                    let row = match to_rel(&state.kb_path, p) {
+                        Some(rel) => handle_removed_path(state, &rel, p),
+                        None => RemovedPathRow::NotDeleted,
+                    };
+                    // (feature-67) Whatever the gate above said: a removed
+                    // directory carries no extension, and its files' own
+                    // events may have been folded into this one.
                     // (kuriya 557) It looks at the directory before it drops anything.
-                    dispatch_subtree_removal(state, p);
+                    // (kuriya 620, AX-32) Except when the path's own row was just deleted:
+                    // the path was an indexed file, and the subtree delete would open a
+                    // write transaction for nothing ([`subtree_removal_follows`]).
+                    if subtree_removal_follows(row) {
+                        dispatch_subtree_removal(state, p);
+                    }
                 }
             }
             Classified::Ignore => {}
@@ -837,7 +843,10 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
 /// path now decides, not the event kind alone. The event loop calls it for each removed path,
 /// and (kuriya 557) [`dispatch_subtree_removal`] for each row under a removed directory that is
 /// there again, as if that row's own removal had been reported.
-fn handle_removed_path(state: &WatcherState, rel: &str, full: &Path) {
+///
+/// (kuriya 620, AX-32) Returns what it did to the row at `rel` ([`RemovedPathRow`]), which
+/// the event loop reads to leave out the subtree delete after a file's own row went.
+fn handle_removed_path(state: &WatcherState, rel: &str, full: &Path) -> RemovedPathRow {
     match removal_dispatch(
         rel,
         removal_outcome(rel, full, &state.registry, &state.rules),
@@ -846,7 +855,60 @@ fn handle_removed_path(state: &WatcherState, rel: &str, full: &Path) {
             dispatch_removal(state, rel, full, RemovalCause::RemoveEvent)
         }
         RemovalDispatch::Deindex => dispatch_deindex(state, rel),
-        RemovalDispatch::Skip => {}
+        RemovalDispatch::Skip => RemovedPathRow::NotDeleted,
+    }
+}
+
+/// (kuriya 620, AX-32) What a removal did to the row stored at its own path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovedPathRow {
+    /// A row was at the path (under `rel`, or its folded legacy row) and was deleted: the path
+    /// was an indexed file.
+    Deleted,
+    /// Anything else: no row was there, the path was skipped, reindexed or left indexed, the
+    /// decision went on with both locks held, or the delete failed.
+    NotDeleted,
+}
+
+/// (kuriya 620, AX-32) The [`RemovedPathRow`] of a row delete's outcome: `Ok(true)` alone says
+/// a row was there and went.
+fn removed_path_row(outcome: &Result<bool>) -> RemovedPathRow {
+    match outcome {
+        Ok(true) => RemovedPathRow::Deleted,
+        Ok(false) | Err(_) => RemovedPathRow::NotDeleted,
+    }
+}
+
+/// (kuriya 620, AX-32) The [`RemovedPathRow`] of what [`dispatch_removal`] did under the
+/// database lock alone. Only [`RemovalUnderDatabaseLock::Deindexed`] deleted the row at the
+/// path itself; [`RemovalUnderDatabaseLock::NoRowLeft`] found none there (a rename had taken it)
+/// and swept only a folded row, and [`RemovalUnderDatabaseLock::NeedsBothLocks`] has decided
+/// nothing yet, so neither is read as a deleted file. Each named, so a new variant is a compile
+/// error here.
+fn removed_path_row_under_database_lock(under_db: &RemovalUnderDatabaseLock) -> RemovedPathRow {
+    match under_db {
+        RemovalUnderDatabaseLock::Deindexed(outcome) => removed_path_row(outcome),
+        RemovalUnderDatabaseLock::Skip
+        | RemovalUnderDatabaseLock::NeedsBothLocks
+        | RemovalUnderDatabaseLock::NoRowLeft(_) => RemovedPathRow::NotDeleted,
+    }
+}
+
+/// (kuriya 620, AX-32) Whether a remove event goes on to [`dispatch_subtree_removal`] after
+/// its own path was handled ([`handle_removed_path`]). Not when the path's own row was just
+/// deleted: the path was an indexed file, nothing is under a file, and the subtree delete would
+/// open its own write transaction ([`crate::db::Database::delete_documents_under`] takes no
+/// unlocked look first) and, under another process's write, wait out the busy timeout a second
+/// time while holding the db mutex. Every other answer goes on as before, a directory's own
+/// remove among them (no row is stored at a directory's path).
+///
+/// Known limitation: rows under `rel/` stored while `rel` was a directory, beside a row for a
+/// file at `rel` itself, are not reached here: the next full index drops them. The store holds
+/// both when the watcher missed the swap of a directory for a file of the same name.
+fn subtree_removal_follows(row: RemovedPathRow) -> bool {
+    match row {
+        RemovedPathRow::Deleted => false,
+        RemovedPathRow::NotDeleted => true,
     }
 }
 
@@ -1269,7 +1331,16 @@ fn remove_if_still_gone(
 /// (kuriya 259) `cause` goes with the decision both under the database lock and with both
 /// locks; for [`RemovalCause::RenamedAway`] a path with no row under `rel` any more is not
 /// looked at, and only its folded legacy row is swept.
-fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path, cause: RemovalCause) {
+///
+/// (kuriya 620, AX-32) Returns [`RemovedPathRow::Deleted`] only when the row at `rel` went
+/// under the database lock alone ([`removed_path_row_under_database_lock`]); a removal decided
+/// with both locks held answers [`RemovedPathRow::NotDeleted`] whatever it did.
+fn dispatch_removal(
+    state: &WatcherState,
+    rel: &str,
+    full: &Path,
+    cause: RemovalCause,
+) -> RemovedPathRow {
     let under_db = {
         let db = recover_db(state.lock_for_batch(&state.db));
         if cause == RemovalCause::RenamedAway && matches!(db.get_document_hash(rel), Ok(None)) {
@@ -1294,6 +1365,7 @@ fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path, cause: Removal
         }
         // `db` is dropped here, before the embedder lock can be taken.
     };
+    let row = removed_path_row_under_database_lock(&under_db);
     match under_db {
         RemovalUnderDatabaseLock::Deindexed(outcome) => log_removed_path_deindexed(rel, outcome),
         RemovalUnderDatabaseLock::Skip => {}
@@ -1302,6 +1374,7 @@ fn dispatch_removal(state: &WatcherState, rel: &str, full: &Path, cause: Removal
         }
         RemovalUnderDatabaseLock::NoRowLeft(outcome) => log_folded_sweep(rel, outcome),
     }
+    row
 }
 
 /// (#543, local Codex r2, medium) What a look at the disk found for a path a remove event
@@ -3009,14 +3082,20 @@ fn log_reindex_result(
 /// [`handle_removed_path`] alone calls: nothing at such a name is ever indexed, so the row
 /// leaves without a look at the disk. Every other event-driven deletion looks at the disk inside
 /// the database lock first ([`dispatch_removal`]).
-fn dispatch_deindex(state: &WatcherState, rel: &str) {
+///
+/// (kuriya 620, AX-32) Returns [`RemovedPathRow::Deleted`] when the row under `rel` was there
+/// and went ([`removed_path_row`]); the folded-row sweep after it does not change the answer.
+fn dispatch_deindex(state: &WatcherState, rel: &str) -> RemovedPathRow {
     let db = recover_db(state.lock_for_batch(&state.db));
-    match indexer::deindex_single_file(&db, rel) {
+    let outcome = indexer::deindex_single_file(&db, rel);
+    let row = removed_path_row(&outcome);
+    match outcome {
         Ok(true) => wdiag!("watcher: deindexed {rel}"),
         Ok(false) => { /* no-op: not in DB */ }
         Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
     sweep_legacy_row(&db, &state.kb_path, rel, false);
+    row
 }
 
 /// (feature-67) The range delete under a directory, for a caller holding the db
@@ -4592,12 +4671,14 @@ fn dispatch_directory_rename(
                     RenameAction::Rename => {
                         dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
                     }
-                    RenameAction::Deindex => dispatch_removal(
-                        state,
-                        &step.old_rel,
-                        &state.kb_path.join(&step.old_rel),
-                        RemovalCause::RenamedAway,
-                    ),
+                    RenameAction::Deindex => {
+                        dispatch_removal(
+                            state,
+                            &step.old_rel,
+                            &state.kb_path.join(&step.old_rel),
+                            RemovalCause::RenamedAway,
+                        );
+                    }
                     // (#544) No event path for a step (its `new_rel` is built from the
                     // row's), so it is read as not lossy and only whether a file is there
                     // is asked: a lossy row's step looks gone, the answer
@@ -11652,6 +11733,100 @@ mod tests {
         assert_eq!(
             state.db.lock().unwrap().all_document_paths().unwrap(),
             vec!["other.md".to_string()]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (kuriya 620, AX-32) A remove event whose own row went skips the subtree delete
+    // -----------------------------------------------------------------------
+
+    /// (kuriya 620, AX-32) Only a row delete that found a row (`Ok(true)`) reads as a deleted
+    /// file; no row there and a failed delete do not.
+    #[test]
+    fn ax32_only_a_row_that_was_there_and_went_reads_as_deleted() {
+        assert_eq!(removed_path_row(&Ok(true)), RemovedPathRow::Deleted);
+        assert_eq!(removed_path_row(&Ok(false)), RemovedPathRow::NotDeleted);
+        assert_eq!(
+            removed_path_row(&Err(anyhow::anyhow!("busy"))),
+            RemovedPathRow::NotDeleted
+        );
+    }
+
+    /// (kuriya 620, AX-32) Under the database lock alone, only a deindex that deleted the row
+    /// at the path reads as a deleted file. A folded-row sweep after a rename took the row
+    /// ([`RemovalUnderDatabaseLock::NoRowLeft`]) deleted nothing at the path, and a decision
+    /// handed on to both locks has deleted nothing yet.
+    #[test]
+    fn ax32_only_a_deindex_under_the_database_lock_reads_as_deleted() {
+        let cases = [
+            (
+                RemovalUnderDatabaseLock::Deindexed(Ok(true)),
+                RemovedPathRow::Deleted,
+            ),
+            (
+                RemovalUnderDatabaseLock::Deindexed(Ok(false)),
+                RemovedPathRow::NotDeleted,
+            ),
+            (
+                RemovalUnderDatabaseLock::Deindexed(Err(anyhow::anyhow!("busy"))),
+                RemovedPathRow::NotDeleted,
+            ),
+            (RemovalUnderDatabaseLock::Skip, RemovedPathRow::NotDeleted),
+            (
+                RemovalUnderDatabaseLock::NeedsBothLocks,
+                RemovedPathRow::NotDeleted,
+            ),
+            (
+                RemovalUnderDatabaseLock::NoRowLeft(Ok(true)),
+                RemovedPathRow::NotDeleted,
+            ),
+        ];
+        for (under_db, want) in cases {
+            let label = format!("{under_db:?}");
+            assert_eq!(
+                removed_path_row_under_database_lock(&under_db),
+                want,
+                "{label}"
+            );
+        }
+    }
+
+    /// (kuriya 620, AX-32) The subtree delete follows every removal but one whose own row
+    /// went.
+    #[test]
+    fn ax32_the_subtree_delete_follows_unless_the_paths_own_row_went() {
+        assert!(!subtree_removal_follows(RemovedPathRow::Deleted));
+        assert!(subtree_removal_follows(RemovedPathRow::NotDeleted));
+    }
+
+    /// (kuriya 620, AX-32) [`handle_removed_path`] answers [`RemovedPathRow::Deleted`] for an
+    /// indexed file that is gone (decided under the database lock alone, so the stub embedder
+    /// is never asked), and [`RemovedPathRow::NotDeleted`] for a removed directory, which holds
+    /// no row at its own path, so its subtree delete still runs.
+    #[test]
+    fn ax32_handle_removed_path_says_whether_the_paths_own_row_went() {
+        let kb = i549_kb("groove-watcher-ax32-removed-row");
+        std::fs::remove_file(kb.0.join("doc.md")).unwrap();
+        let state = until_state(&kb.0);
+        state
+            .db
+            .lock()
+            .unwrap()
+            .upsert_document("d/a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        let file = handle_removed_path(&state, "doc.md", &kb.0.join("doc.md"));
+        assert_eq!(file, RemovedPathRow::Deleted);
+        assert!(!subtree_removal_follows(file));
+
+        let dir = handle_removed_path(&state, "d", &kb.0.join("d"));
+        assert_eq!(dir, RemovedPathRow::NotDeleted);
+        assert!(subtree_removal_follows(dir));
+
+        assert_eq!(
+            state.db.lock().unwrap().all_document_paths().unwrap(),
+            vec!["d/a.md".to_string()],
+            "the file's row went; the directory's rows wait for the subtree delete"
         );
     }
 }
