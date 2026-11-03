@@ -848,8 +848,8 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
 /// and (kuriya 557) [`dispatch_subtree_removal`] for each row under a removed directory that is
 /// there again, as if that row's own removal had been reported.
 ///
-/// (kuriya 620, AX-32) `subtree` says whether the transaction that deletes the row at `rel`
-/// also sweeps the rows under `rel/` ([`SubtreeWithRow`]). Only the event loop's remove arm
+/// (kuriya 620, AX-32) The last argument ([`SubtreeWithRow`]) says whether the transaction
+/// that deletes the row at `rel` also sweeps the rows under `rel/`. Only the event loop's remove arm
 /// passes [`SubtreeWithRow::Sweep`], and reads the answer to leave out its own
 /// [`dispatch_subtree_removal`] when the sweep was done ([`subtree_removal_follows`]); every
 /// other caller passes [`SubtreeWithRow::Leave`], which runs as before AX-32.
