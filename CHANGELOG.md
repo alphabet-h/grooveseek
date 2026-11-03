@@ -46,6 +46,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `a new directory arrived with N indexable files` counts only the files it reads, and is not
   printed when there are none (kuriya 609).
 
+### Fixed
+
+- **A rename into another parser no longer keeps columns only the old parser writes.** When a
+  rename crossed parsers (`notes.rs` to `notes.txt`, say), a read of the moved row could find
+  chunk text matching the old parser's rows and update only the document's metadata and hash,
+  leaving, for example, a code chunk's line range on a plain-text chunk until `--force`. This
+  happened on the watcher's read of a rename whose content also changed (a trailing newline
+  dropped along with the rename), and on the further read of a rename whose file changed while
+  the first read was reading it (`groove index` and the MCP `rebuild_index` tool before the run
+  ends, and the watcher). Such a read now rewrites the row whole, as a same-content rename's
+  read does, still reusing the stored vectors (kuriya 670).
+
 ### Internal
 
 - The chunk counts of a document that a run updated (the `this run: N embedded, M reused` part
@@ -54,6 +66,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   plan, handed back through a crate-internal path, instead of the difference of the embedder's
   run-wide input counter across the call. The public `SingleResult` and `Reindexed` are unchanged
   (kuriya 621).
+- New tests in `tests/index_chunk_reuse_columns.rs`: a chunk whose stored vector is reused is
+  written with the new parse's line range and `.docx` table rows (kuriya 613); and
+  lowering `[embedding] max_input_chars` keeps the vectors computed from the longer inputs, on
+  an edit and on a rename, pinned as the current, documented limitation rather than a rule
+  (kuriya 614).
 
 ## [1.24.0] - 2026-11-02
 
