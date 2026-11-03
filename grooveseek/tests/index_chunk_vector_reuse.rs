@@ -10,7 +10,10 @@
 
 mod common;
 
-use common::embed_cli::{Fixture, REJECT_MARKER, fixture, note, rejects_marker, stderr_of};
+use common::embed_cli::{
+    Fixture, REJECT_MARKER, done_line as summary, fixture, index_ok, note, open_reader,
+    rejects_marker, stderr_of,
+};
 use common::embed_mock::{DOC_MODEL, assert_dir_empty, hermetic};
 use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
 use common::temp::{TempKbLayout, TempRoot};
@@ -18,7 +21,7 @@ use grooveseek::config::Config;
 use grooveseek::db::{Database, StoredChunkVector};
 use grooveseek::embedder::Embedder;
 use grooveseek::indexer::{RenameOutcome, rename_single_file};
-use std::process::{Command, Output};
+use std::process::Command;
 
 const S1: (&str, &str) = (
     "Install",
@@ -106,26 +109,6 @@ fn assert_index_consistent(fx: &Fixture) {
         let scan = scan.unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(scan.is_clean(), "{name}: {scan:?}");
     }
-}
-
-/// The `Done in` line of `out`.
-fn summary(out: &Output) -> String {
-    stderr_of(out)
-        .lines()
-        .find(|l| l.contains("Done in"))
-        .unwrap_or_else(|| panic!("no Done in line:\n{}", stderr_of(out)))
-        .to_string()
-}
-
-/// `groove index`, which must succeed; its `Done in` line.
-fn index_ok(fx: &Fixture) -> String {
-    let out = fx.run_index();
-    assert!(
-        out.status.success(),
-        "groove index failed:\n{}",
-        stderr_of(&out)
-    );
-    summary(&out)
 }
 
 /// A knowledge base holding [`RUNBOOK`] with `sections`, indexed once.
@@ -969,6 +952,105 @@ fn a_static_rename_of_an_untitled_file_embeds_every_chunk_again() {
         "{:?}",
         after.iter().map(|r| &r.context_text).collect::<Vec<_>>()
     );
+    assert_index_consistent(&fx);
+    assert_dir_empty(&fx.cache);
+}
+
+/// `rel`'s chunks as stored, read through [`open_reader`], so a read made while `groove serve`
+/// runs between two tool calls neither writes nor takes the writer lease.
+fn vectors_read_only(fx: &Fixture, rel: &str) -> Vec<StoredChunkVector> {
+    open_reader(fx)
+        .stored_chunk_vectors_for_path(rel)
+        .expect("read the stored vectors")
+}
+
+/// (kuriya 627, AX-42 item 10b) The MCP tool that rebuilds the index, over a real `groove serve`,
+/// reuses every stored vector when no embedding input changed, and recomputes every one under
+/// `force`.
+///
+/// Without `force`, a document whose sections were only reordered is updated with every one of
+/// its stored vectors copied over: nothing reaches the endpoint and each chunk keeps its bytes;
+/// the unchanged `other.md` is left to the hash fast path and counted in neither number. With
+/// `force` (spec: [`grooveseek::indexer::IndexResult::chunks_reused`] is always 0 under it), every
+/// chunk of both documents is sent and none is counted as reused. The CLI pins the same two
+/// answers for `groove index` ([`a_reordered_document_sends_nothing_to_the_endpoint`],
+/// [`force_recomputes_every_vector`]); [`mcp_rebuild_index_returns_the_chunk_counts`] pins the
+/// tool's counts for a partial reuse and an unchanged run, not that a full reuse sends nothing,
+/// nor the forced call.
+///
+/// Red if the served tool drops the reuse (a reordered document re-embeds), or if `force`
+/// through the tool keeps a stored vector.
+#[test]
+fn mcp_rebuild_index_reuses_every_vector_and_force_recomputes_them() {
+    const OTHER: &str = "The ferry timetable changes on the first Monday of each month.";
+    let fx = fixture(
+        "ax42-mcp-reuse",
+        &[
+            (RUNBOOK, &runbook(&[S1, S2, S3, S4])),
+            ("other.md", &note("Other", OTHER)),
+        ],
+        "",
+    );
+    index_ok(&fx);
+    let runbook_stored = vectors(&fx, RUNBOOK);
+    let other_stored = vectors(&fx, "other.md");
+    let runbook_before = chunk_rows(&runbook_stored);
+    let other_before = chunk_rows(&other_stored);
+    // The expected counts and inputs below come from these stored rows, not from literals, so
+    // a chunker change that splits the fixture differently moves them along with it.
+    assert!(!runbook_before.is_empty(), "{runbook_before:?}");
+    assert!(!other_before.is_empty(), "{other_before:?}");
+    let mut every: Vec<String> = contents(&runbook_stored)
+        .into_iter()
+        .chain(contents(&other_stored))
+        .map(str::to_string)
+        .collect();
+    every.sort();
+    fx.layout.write(RUNBOOK, &runbook(&[S2, S1, S3, S4]));
+
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    let before = fx.mock.requests().len();
+    let plain = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    let sent_plain = chunk_inputs_since(&fx, before);
+    let runbook_after = vectors_read_only(&fx, RUNBOOK);
+    let other_after = chunk_rows(&vectors_read_only(&fx, "other.md"));
+
+    let before = fx.mock.requests().len();
+    let forced = mcp_tool_call(
+        &base,
+        &session,
+        "rebuild_index",
+        serde_json::json!({"force": true}),
+    );
+    let mut sent_forced = chunk_inputs_since(&fx, before);
+    drop(guard);
+
+    assert!(plain.get("error").is_none(), "{plain}");
+    assert_eq!(count_in(&plain, "updated"), 1, "{plain}");
+    assert_eq!(count_in(&plain, "chunks_embedded"), 0, "{plain}");
+    assert_eq!(
+        count_in(&plain, "chunks_reused"),
+        runbook_before.len() as u64,
+        "{plain}"
+    );
+    assert_eq!(sent_plain, Vec::<String>::new());
+    assert_eq!(contents(&runbook_after), vec![S2.1, S1.1, S3.1, S4.1]);
+    assert_eq!(chunk_rows(&runbook_after), runbook_before);
+    assert_eq!(other_after, other_before);
+
+    assert!(forced.get("error").is_none(), "{forced}");
+    assert_eq!(
+        count_in(&forced, "chunks_embedded"),
+        every.len() as u64,
+        "{forced}"
+    );
+    assert_eq!(count_in(&forced, "chunks_reused"), 0, "{forced}");
+    sent_forced.sort();
+    assert_eq!(sent_forced, every);
+
     assert_index_consistent(&fx);
     assert_dir_empty(&fx.cache);
 }
