@@ -39,8 +39,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   file by file, the watcher scans the destination for files not indexed yet, and that scan used
   to read and hash every file there again, holding the embedder and the index for each, although
   the renames had just read them. A file whose rename settled its row is now left out of the
-  scan's reads; one whose rename did not (a failure, a destination that could not be looked at)
-  and any file the renames did not cover are read as before. The scan's line
+  scan's reads; one whose rename did not (a failure, a destination that could not be looked at),
+  one that had no row at its old path (indexed as a new file, which may have been a skip) and
+  any file the renames did not cover are read as before. The scan's line
   `a new directory arrived with N indexable files` counts only the files it reads, and is not
   printed when there are none (kuriya 609).
 

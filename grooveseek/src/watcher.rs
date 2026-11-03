@@ -3593,14 +3593,29 @@ fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
     }
 }
 
+/// (kuriya 609, AX-13) Whether a directory rename's destination scan may leave `new_rel` out
+/// of its reads after the indexer's rename returned `outcome`: a settled outcome
+/// ([`rename_outcome_is_settled`]) but [`indexer::RenameOutcome::OldPathMissing`]. That one
+/// stands for every result of indexing `new_rel` as a new file, a skip among them -- a read
+/// that failed for a moment (a sharing violation) or bytes that changed during the read -- so
+/// the scan reads it again, as it did before AX-13. No row was at the old path, which is rare
+/// under a renamed directory, so the second read costs little.
+fn rename_outcome_spares_the_scan(outcome: &Result<indexer::RenameOutcome>) -> bool {
+    match outcome {
+        Ok(indexer::RenameOutcome::OldPathMissing) => false,
+        _ => rename_outcome_is_settled(outcome),
+    }
+}
+
 /// (#544) A paired rename of `old_rel` to `new_rel`, with both locks held once: the destination
 /// is looked at as `look` says ([`written_path_on_disk`]) before anything is moved
 /// ([`rename_plan`], [`apply_rename_plan_before`]), and again after an indexer's rename that
 /// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
 /// is gone by then ([`finish_rename_locked`]).
 ///
-/// (kuriya 609, AX-13) Returns whether the indexer's rename settled the row at `new_rel`
-/// ([`finish_rename_locked_checked`]): a directory rename leaves such a destination out of its
+/// (kuriya 609, AX-13) Returns whether the indexer's rename settled the row at `new_rel` so
+/// that a scan need not read it again ([`finish_rename_locked_checked`],
+/// [`rename_outcome_spares_the_scan`]): a directory rename leaves such a destination out of its
 /// scan ([`settled_rename_destinations`]), since the rename already read the file there with
 /// both locks held.
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) -> bool {
@@ -4019,9 +4034,11 @@ fn finish_rename_locked<C, R>(
 /// The reindex still runs at most once per dispatch.
 ///
 /// (kuriya 609, AX-13) Returns whether the indexer's rename ran and settled the row at
-/// `new_rel` ([`rename_outcome_is_settled`]): the row then holds what the rename read at the
+/// `new_rel` so that a directory rename's scan need not read it again
+/// ([`rename_outcome_spares_the_scan`]): the row then holds what the rename read at the
 /// destination, or was dropped on what it read there. Every other path -- a plan that ran no
-/// rename, a failure, an outcome that left the row as it was -- returns false.
+/// rename, a failure, an outcome that left the row as it was, an old path with no row -- returns
+/// false.
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked_checked<C, R>(
     db: &Database,
@@ -4093,6 +4110,7 @@ where
     // failure that leaves such a row at the destination came after the move.
     let crossed_err = crosses_a_parser && failed && awaits_reparse_at(db, new_rel);
     let settled = rename_outcome_is_settled(&outcome);
+    let spares_the_scan = rename_outcome_spares_the_scan(&outcome);
     let kept = if crossed_err {
         Some(KeptRow::AwaitingReparse)
     } else {
@@ -4132,7 +4150,7 @@ where
     // nothing to embed sweeps it as a removal ([`sweep_requires_real_key`]).
     sweep_legacy_row(db, kb_path, old_rel, false);
     sweep_legacy_row(db, kb_path, new_rel, new_requires_real_key);
-    settled
+    spares_the_scan
 }
 
 /// (#552) Whether the row at `rel` holds [`indexer::HASH_AWAITING_REPARSE`]. A failed read of
@@ -11927,9 +11945,141 @@ mod tests {
         assert!(!settled);
     }
 
+    /// (kuriya 609, AX-13, review L1) Only an outcome that settled the row on a read of the
+    /// moved row spares the scan. [`indexer::RenameOutcome::OldPathMissing`] is settled, but it
+    /// stands for a skip of `new_rel` as well (a read that failed for a moment, bytes changed
+    /// during the read), so the scan still reads it; every unsettled outcome and an error do too.
+    #[test]
+    fn ax13_an_old_path_with_no_row_does_not_spare_the_scan() {
+        use indexer::RenameOutcome as O;
+        let cases: Vec<(Result<O>, bool)> = vec![
+            (Ok(O::Renamed), true),
+            (Ok(O::RenamedAndReindexed { chunks: 1 }), true),
+            (Ok(O::RenamedSizeCapped), true),
+            (Ok(O::RenamedSizeCappedAndDropped), true),
+            (Ok(O::RenamedButRefusedAndDropped), true),
+            (Ok(O::MovedOutOfTheKnowledgeBase), true),
+            (Ok(O::OldPathMissing), false),
+            (Ok(O::OldPathMissingAndRefused), false),
+            (Ok(O::RenamedButRefused), false),
+            (Ok(O::RenamedButNotReindexed), false),
+            (Ok(O::RenamedAcrossParsersAwaitingReparse), false),
+            (Err(anyhow::anyhow!("busy")), false),
+        ];
+        for (outcome, want) in cases {
+            let label = format!("{outcome:?}");
+            assert_eq!(rename_outcome_spares_the_scan(&outcome), want, "{label}");
+        }
+        // The settled set itself is unchanged: the old path with no row is still settled.
+        assert!(rename_outcome_is_settled(&Ok(O::OldPathMissing)));
+    }
+
+    /// (kuriya 609, AX-13, review L1) Through [`finish_rename_locked_checked`]: an indexer's
+    /// rename that found no row at the old path returns false, so the scan reads the
+    /// destination again.
+    #[test]
+    fn ax13_finish_rename_with_no_old_row_leaves_the_destination_to_the_scan() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-ax13-old-missing");
+        std::fs::write(kb.join("b.md"), "# b\n").unwrap();
+        let db = dir_rename_db(&["other.md"]);
+        let plan = rename_plan(&db, "a.md", "b.md", OnDisk::Present).unwrap();
+        assert_eq!(plan, RenamePlan::Rename);
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "b.md", &plan);
+        let spared = finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("a.md", "b.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Ok(indexer::RenameOutcome::OldPathMissing),
+            |_, _| panic!("a settled outcome reads nothing again"),
+        );
+        assert!(!spared);
+    }
+
+    /// (kuriya 609, AX-13, review L3) The plan's early exits return false: a row moved unread
+    /// because the destination could not be looked at ([`RenamePlan::MoveRowUnknown`]), and a
+    /// plan whose first part failed (`before` is an error). Neither runs the indexer's rename.
+    #[test]
+    fn ax13_finish_rename_early_exits_do_not_spare_the_scan() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-ax13-early-exits");
+        let db = dir_rename_db(&["a.md"]);
+        let plan = rename_plan(
+            &db,
+            "a.md",
+            "b.md",
+            OnDisk::Unknown(std::io::ErrorKind::PermissionDenied),
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            RenamePlan::MoveRowUnknown(std::io::ErrorKind::PermissionDenied)
+        );
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "b.md", &plan);
+        assert!(matches!(before, Ok(false)), "{before:?}");
+        let spared = finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("a.md", "b.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| panic!("an unread move runs no rename"),
+            |_, _| panic!("a move within one parser reads nothing again"),
+        );
+        assert!(!spared);
+        assert_eq!(db.all_document_paths().unwrap(), vec!["b.md".to_string()]);
+
+        let db = dir_rename_db(&["c.md"]);
+        let spared = finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("c.md", "d.md"),
+            WriteLook::Spelled,
+            (RenamePlan::Rename, Err(anyhow::anyhow!("injected"))),
+            &mut (),
+            |_| panic!("a failed plan runs no rename"),
+            |_, _| panic!("a failed plan that cleared nothing reads nothing"),
+        );
+        assert!(!spared);
+        assert_eq!(db.all_document_paths().unwrap(), vec!["c.md".to_string()]);
+    }
+
     // -----------------------------------------------------------------------
     // (kuriya 620, AX-32) A remove event whose own row went skips the subtree delete
     // -----------------------------------------------------------------------
+
+    /// (kuriya 620, AX-32, review L4) Through [`handle_events`]: the remove of an indexed file
+    /// whose row goes does not run the subtree delete, so a stale row under `doc.md/` (left by a
+    /// missed swap of a directory for the file) stays; the remove of a directory, which holds no
+    /// row at its own path, still sweeps the rows under it.
+    #[test]
+    fn ax32_a_files_remove_event_runs_no_subtree_delete_and_a_directorys_does() {
+        use notify_debouncer_full::notify::event::RemoveKind;
+        let kb = i549_kb("groove-watcher-ax32-events");
+        std::fs::remove_file(kb.0.join("doc.md")).unwrap();
+
+        let file_removed = [mk_evt(
+            EventKind::Remove(RemoveKind::File),
+            vec![kb.0.join("doc.md")],
+        )];
+        assert_eq!(
+            i6_paths_after(&kb.0, &["doc.md", "doc.md/x.md", "keep.md"], &file_removed),
+            ["doc.md/x.md", "keep.md"],
+            "the file's row went and no subtree delete ran"
+        );
+
+        let dir_removed = [mk_evt(
+            EventKind::Remove(RemoveKind::Folder),
+            vec![kb.0.join("d")],
+        )];
+        assert_eq!(
+            i6_paths_after(&kb.0, &["d/a.md", "keep.md"], &dir_removed),
+            ["keep.md"],
+            "the directory's subtree delete ran"
+        );
+    }
 
     /// (kuriya 620, AX-32) Only a row delete that found a row (`Ok(true)`) reads as a deleted
     /// file; no row there and a failed delete do not.
