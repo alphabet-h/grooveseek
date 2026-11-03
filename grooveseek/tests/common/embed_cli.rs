@@ -272,7 +272,7 @@ pub fn done_line(out: &Output) -> String {
 ///
 /// For a run right after a writer was stopped: the operating system releases
 /// the writer lease of a killed process a little after the process is reaped
-/// (`tests/writer_lease_cli.rs` polls for it for the same reason), and a plain
+/// (the writer lease CLI tests poll for it for the same reason), and a plain
 /// `groove index` that arrives first is refused rather than kept waiting.
 pub fn index_ok_waiting(fx: &Fixture, secs: u64) -> String {
     let out = fx

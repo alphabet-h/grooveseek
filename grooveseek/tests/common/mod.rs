@@ -45,8 +45,9 @@
 //!   its own older copy because existing tests are not edited. It also holds
 //!   the `groove index` summary line and the reader-connection snapshot of the
 //!   index rows that the AX-42 tests share, and the fixture served with the
-//!   watcher on (`served_watching`) for new watcher tests; the existing watcher
-//!   tests keep private copies of it because existing tests are not edited.
+//!   watcher on ([`crate::common::embed_cli::served_watching`]) for new watcher
+//!   tests; the existing watcher tests keep private copies of it because
+//!   existing tests are not edited.
 //! - [`crate::common::in_process`] — rerunning a test body in a hermetic child
 //!   and opening the index and the embedder in-process, for tests that call
 //!   the indexer's library functions against [`crate::common::embed_mock`].

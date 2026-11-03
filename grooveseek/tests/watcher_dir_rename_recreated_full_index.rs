@@ -8,10 +8,10 @@
 //! rename, and the rows under the old directory stay until the next full index. That sentence
 //! promises the full index is the way out. This test holds it to that promise on the state a
 //! live watcher actually produced, which no other test does: the watcher end-to-end test of the
-//! same edit (`tests/watcher_rename_old_end_recreated.rs`) is compiled out on macOS because of
-//! this very limit, and the full-index test of the same edit
-//! (`tests/index_dir_rename_source_recreated.rs`) runs no watcher, so it starts from the rows
-//! of the first index rather than from what a watcher wrote.
+//! same edit (the watcher test of a renamed directory whose old end is created again) is
+//! compiled out on macOS because of this very limit, and the full-index test of the same edit
+//! (the index test of a directory renamed and its source created again) runs no watcher, so it
+//! starts from the rows of the first index rather than from what a watcher wrote.
 //!
 //! Only the end state after the full index is asserted. What the watcher has written by the
 //! time it is stopped depends on the platform and on when its events were delivered, so an
