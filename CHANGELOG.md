@@ -65,6 +65,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   plan, handed back through a crate-internal path, instead of the difference of the embedder's
   run-wide input counter across the call. The public `SingleResult` and `Reindexed` are unchanged
   (kuriya 621).
+- New tests in `tests/index_chunk_reuse_columns.rs`: a chunk whose stored vector is reused is
+  written with the new parse's line range, symbol kind and `.docx` table rows (kuriya 613); and
+  lowering `[embedding] max_input_chars` keeps the vectors computed from the longer inputs, on
+  an edit and on a rename, pinned as the current, documented limitation rather than a rule
+  (kuriya 614).
 
 ## [1.24.0] - 2026-11-02
 
