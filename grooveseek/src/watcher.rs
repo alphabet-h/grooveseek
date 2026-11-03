@@ -8189,6 +8189,44 @@ mod tests {
         assert!(!kb.exists(), "still nothing on disk");
     }
 
+    /// (audit AX-14, kuriya 610) A rename that changes only the case of the
+    /// directory's name (`Docs` to `docs`): the listing is a byte range
+    /// ([`Database::document_paths_under`]), so `Docs` lists every row under
+    /// `Docs/` and none under `Docs-other/`, and each row maps to the new
+    /// spelling as written, as a plain file rename would. The listing under the
+    /// new spelling is empty, which pins that the store does not fold case on
+    /// its own. A look at the disk's spelling that ignored case is not reached
+    /// here; it is the end-to-end test `watcher_follows_a_case_only_directory_rename`
+    /// (in the integration tests) that goes red for it.
+    #[test]
+    fn test_dir_rename_steps_case_only_rename_moves_every_row() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
+        assert!(!kb.exists(), "the KB must not exist on disk");
+        let db = dir_rename_db(&["Docs/a.md", "Docs/deep/b.md", "Docs-other/c.md"]);
+        let registry = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+        let paths = db.document_paths_under("Docs").unwrap();
+        assert_eq!(
+            paths,
+            vec!["Docs/a.md".to_string(), "Docs/deep/b.md".to_string()]
+        );
+        assert!(
+            db.document_paths_under("docs").unwrap().is_empty(),
+            "the byte range of the new spelling holds no row before the move"
+        );
+
+        let steps = dir_rename_steps(&paths, &kb, "Docs", "docs", &registry, &rules);
+
+        assert_eq!(
+            steps,
+            vec![
+                dir_rename_step("Docs/a.md", "docs/a.md", RenameAction::Rename),
+                dir_rename_step("Docs/deep/b.md", "docs/deep/b.md", RenameAction::Rename),
+            ]
+        );
+        assert!(!kb.exists(), "still nothing on disk");
+    }
+
     /// feature-68: a directory at the destination is a directory rename whose
     /// destination is to be scanned, decided before any listing.
     #[test]
@@ -8698,6 +8736,246 @@ mod tests {
         assert!(
             got.contains(&(both, vec![from, to])),
             "the filtered debouncer must stitch the directory rename; got {got:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (audit AX-15 / AX-16, kuriya 611 / 612) The debouncer tests without a
+    // fixed drain. Each run injects a sentinel last, a `Create` of a file that
+    // is on disk (so [`is_stale_create`] keeps it), and drains until the
+    // sentinel comes out or a generous deadline passes. The debouncer flushes a
+    // path once its last event is a window old, and the sentinel's last event is
+    // the newest of the run, so every event injected before it has come out by
+    // the time it does: an absence read then is not "stopped listening early",
+    // and a slow tick under load only makes the drain longer, never wrong.
+    // -----------------------------------------------------------------------
+
+    /// How long a sentinel drain waits at most. Far beyond any window used
+    /// here; reached only if the debouncer stopped emitting.
+    const SENTINEL_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Every debounced event (kind, paths) up to and including the batch that
+    /// carries `sentinel`, or up to [`SENTINEL_DEADLINE`]. The second value is
+    /// whether the sentinel came out; a caller asserts it before reading the
+    /// events, so a deadline is a clear failure and not a silent absence.
+    fn drain_until_sentinel(
+        rx: &std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
+        sentinel: &Path,
+    ) -> (Vec<(EventKind, Vec<PathBuf>)>, bool) {
+        let end = std::time::Instant::now() + SENTINEL_DEADLINE;
+        let mut got = Vec::new();
+        while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(Ok(evs)) => {
+                    got.extend(evs.into_iter().map(|e| (e.event.kind, e.event.paths)));
+                    if got.iter().any(|(_, ps)| ps.iter().any(|p| p == sentinel)) {
+                        return (got, true);
+                    }
+                }
+                Ok(Err(errs)) => panic!("debouncer errors: {errs:?}"),
+                Err(_) => break,
+            }
+        }
+        (got, false)
+    }
+
+    /// The events of `got` that name the given path, the sentinel's left out.
+    fn events_naming(
+        got: &[(EventKind, Vec<PathBuf>)],
+        path: &Path,
+    ) -> Vec<(EventKind, Vec<PathBuf>)> {
+        got.iter()
+            .filter(|(_, ps)| ps.iter().any(|p| p == path))
+            .cloned()
+            .collect()
+    }
+
+    /// (audit AX-16, kuriya 612) The deadline form of
+    /// [`stale_create_filter_lets_the_remove_of_a_recently_created_file_through`]:
+    /// the same FSEvents record, a sentinel after it, and a drain that ends when
+    /// the sentinel comes out. Unfiltered, no `Remove` of the gone file comes out
+    /// before the sentinel does; filtered, exactly the `Remove` does.
+    #[test]
+    fn stale_create_filter_remove_arrives_within_a_generous_deadline() {
+        let root = crate::test_support::unique_temp_path("kb-watch-stale-create-rm-deadline");
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = RemoveDirOnDrop(root.clone());
+        let gone = root.join("a.md");
+        let sentinel = root.join("sentinel.md");
+        std::fs::write(&sentinel, "# sentinel\n").unwrap();
+
+        let run = |filtered: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let window = Duration::from_millis(100);
+            let cache = notify_debouncer_full::NoCache;
+            let cfg = notify::Config::default();
+            let _d: Box<dyn std::any::Any> = if filtered {
+                Box::new(
+                    new_debouncer_opt::<_, StaleCreateFilter<InjectWatcher>, _>(
+                        window, None, tx, cache, cfg,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                Box::new(
+                    new_debouncer_opt::<_, InjectWatcher, _>(window, None, tx, cache, cfg).unwrap(),
+                )
+            };
+            inject(EventKind::Create(CreateKind::File), &gone);
+            inject(EventKind::Remove(RemoveKind::File), &gone);
+            inject(
+                EventKind::Modify(ModifyKind::Data(
+                    notify_debouncer_full::notify::event::DataChange::Content,
+                )),
+                &gone,
+            );
+            inject(EventKind::Create(CreateKind::File), &sentinel);
+            let (got, seen) = drain_until_sentinel(&rx, &sentinel);
+            assert!(
+                seen,
+                "the sentinel never came out within {SENTINEL_DEADLINE:?} (filtered: {filtered}); got {got:?}"
+            );
+            events_naming(&got, &gone)
+        };
+
+        let unfiltered = run(false);
+        assert!(
+            !unfiltered
+                .iter()
+                .any(|(k, _)| matches!(k, EventKind::Remove(_))),
+            "control: the unfiltered debouncer is expected to drop a create+remove pair; \
+             if it now passes the Remove on, the filter may no longer be needed; got {unfiltered:?}"
+        );
+        assert_eq!(
+            run(true),
+            vec![(EventKind::Remove(RemoveKind::File), vec![gone.clone()])]
+        );
+    }
+
+    /// (audit AX-16, kuriya 612) The deadline form of
+    /// [`stale_create_filter_keeps_a_directory_rename_stitched`]: the same
+    /// records for a directory renamed shortly after it was created, a sentinel
+    /// after them, and a drain that ends when the sentinel comes out.
+    #[test]
+    fn stale_create_filter_directory_rename_is_stitched_within_a_generous_deadline() {
+        let root = crate::test_support::unique_temp_path("kb-watch-stale-create-mv-deadline");
+        let _cleanup = RemoveDirOnDrop(root.clone());
+
+        let run = |filtered: bool| {
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::write(root.join("docs").join("a.md"), "# a\n").unwrap();
+            let sentinel = root.join("sentinel.md");
+            std::fs::write(&sentinel, "# sentinel\n").unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let window = Duration::from_millis(100);
+            let cache = notify_debouncer_full::FileIdMap::new();
+            let cfg = notify::Config::default();
+            let mut kept: Vec<Box<dyn std::any::Any>> = Vec::new();
+            // `watch` seeds the file-id cache from disk while `docs/` is
+            // still there, as the watcher's initial watch does.
+            if filtered {
+                let mut d = new_debouncer_opt::<_, StaleCreateFilter<InjectWatcher>, _>(
+                    window, None, tx, cache, cfg,
+                )
+                .unwrap();
+                d.watch(&root, RecursiveMode::Recursive).unwrap();
+                kept.push(Box::new(d));
+            } else {
+                let mut d =
+                    new_debouncer_opt::<_, InjectWatcher, _>(window, None, tx, cache, cfg).unwrap();
+                d.watch(&root, RecursiveMode::Recursive).unwrap();
+                kept.push(Box::new(d));
+            }
+            let (from, to) = (root.join("docs"), root.join("notes"));
+            std::fs::rename(&from, &to).unwrap();
+            inject(EventKind::Create(CreateKind::Folder), &from);
+            inject(EventKind::Modify(ModifyKind::Name(RenameMode::Any)), &from);
+            inject(EventKind::Create(CreateKind::Folder), &to);
+            inject(EventKind::Modify(ModifyKind::Name(RenameMode::Any)), &to);
+            inject(EventKind::Create(CreateKind::File), &sentinel);
+            let (got, seen) = drain_until_sentinel(&rx, &sentinel);
+            assert!(
+                seen,
+                "the sentinel never came out within {SENTINEL_DEADLINE:?} (filtered: {filtered}); got {got:?}"
+            );
+            (got, from, to)
+        };
+
+        let both = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+        let (got, ..) = run(false);
+        assert!(
+            !got.iter().any(|(k, _)| *k == both),
+            "control: the unfiltered debouncer is expected to lose the rename; got {got:?}"
+        );
+        let (got, from, to) = run(true);
+        assert!(
+            got.contains(&(both, vec![from, to])),
+            "the filtered debouncer must stitch the directory rename; got {got:?}"
+        );
+    }
+
+    /// (audit AX-15, kuriya 611) Control for kuriya trap 503: notify-debouncer-full
+    /// drops the queued `Remove` of a file when the `Remove` of its parent
+    /// directory follows inside the same window (its `push_remove_event` retains
+    /// no queue under the removed path), which is why the watcher deindexes by
+    /// prefix from the directory's `Remove` alone. A child `Remove` with no
+    /// parent `Remove` after it comes out, so the drop is the parent's doing.
+    ///
+    /// This pins the debouncer, not groove: when notify or the debouncer is
+    /// upgraded and this goes red, the behavior changed, and the prefix deindex
+    /// of feature-67 should be looked at again (kept or simplified, not removed
+    /// blindly: other platforms or event orders may still need it).
+    #[test]
+    fn control_debouncer_drops_a_child_remove_when_its_parent_remove_follows() {
+        let root = crate::test_support::unique_temp_path("kb-watch-parent-remove-control");
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = RemoveDirOnDrop(root.clone());
+        let sub = root.join("sub");
+        let child = sub.join("a.md");
+        let sentinel = root.join("sentinel.md");
+        std::fs::write(&sentinel, "# sentinel\n").unwrap();
+
+        let run = |with_parent: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Far wider than the 100 ms above: the child and the parent `Remove`
+            // must land in one window, and a stall between the two injects (a
+            // loaded runner) must not split them and read as "the debouncer
+            // changed". The sentinel drain waits only about one window for it.
+            let window = Duration::from_secs(2);
+            let cache = notify_debouncer_full::NoCache;
+            let cfg = notify::Config::default();
+            let _d =
+                new_debouncer_opt::<_, InjectWatcher, _>(window, None, tx, cache, cfg).unwrap();
+            // The order the backends give for `rm sub/a.md; rmdir sub` (child
+            // first, as the Windows probe of feature-67 saw).
+            inject(EventKind::Remove(RemoveKind::File), &child);
+            if with_parent {
+                inject(EventKind::Remove(RemoveKind::Folder), &sub);
+            }
+            inject(EventKind::Create(CreateKind::File), &sentinel);
+            let (got, seen) = drain_until_sentinel(&rx, &sentinel);
+            assert!(
+                seen,
+                "the sentinel never came out within {SENTINEL_DEADLINE:?} (with_parent: {with_parent}); got {got:?}"
+            );
+            got.into_iter()
+                .filter(|(_, ps)| !ps.iter().any(|p| p == &sentinel))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            run(false),
+            vec![(EventKind::Remove(RemoveKind::File), vec![child.clone()])],
+            "a child Remove alone is expected to come out"
+        );
+        assert_eq!(
+            run(true),
+            vec![(EventKind::Remove(RemoveKind::Folder), vec![sub.clone()])],
+            "control (kuriya trap 503): the debouncer is expected to drop the child Remove when \
+             its parent's Remove follows in the same window and emit the parent's alone; if the \
+             child now comes out too, the debouncer changed and the prefix deindex of feature-67 \
+             can be looked at again"
         );
     }
 

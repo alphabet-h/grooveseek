@@ -71,6 +71,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   lowering `[embedding] max_input_chars` keeps the vectors computed from the longer inputs, on
   an edit and on a rename, pinned as the current, documented limitation rather than a rule
   (kuriya 614).
+- New watcher tests: a directory renamed so that only the case of its name changes (`Docs/` to
+  `docs/`) leaves every row under the new spelling, end to end in
+  `tests/watcher_case_only_dir_rename.rs` and for the directory-rename steps in a unit test
+  (kuriya 610); a control test pins that notify-debouncer-full drops a file's `Remove` when its
+  parent directory's `Remove` follows in the same window, so an upgrade that changes it shows up
+  (kuriya 611); and the two debouncer tests of the macOS stale-create filter get versions that
+  drain until a sentinel event comes out under a generous deadline instead of for a fixed
+  800 ms (kuriya 612).
 
 ## [1.24.0] - 2026-11-02
 
