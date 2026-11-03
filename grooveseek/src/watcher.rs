@@ -722,7 +722,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // looked at.
                 match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
                     RenameAction::Rename => {
-                        dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled)
+                        dispatch_rename(state, &old_rel, &new_rel, WriteLook::Spelled);
                     }
                     RenameAction::Deindex => {
                         dispatch_removal(state, &old_rel, from, RemovalCause::RenamedAway);
@@ -794,7 +794,12 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                                 // `db` is dropped here, before the scan locks it again.
                             };
                             if log_arrived_directory(&rel, arrival) {
-                                dispatch_new_directory(state, p, &rel);
+                                dispatch_new_directory(
+                                    state,
+                                    p,
+                                    &rel,
+                                    &std::collections::HashSet::new(),
+                                );
                             }
                         }
                         // A directory never had anything else to do here:
@@ -2214,7 +2219,19 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
 /// watcher ([`new_directory_entries`]). Re-checking with [`should_process`] here would be
 /// a second implementation of the same question, which is exactly how the
 /// watcher and the walk drifted apart twice before (AU-03, BU-19).
-fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
+///
+/// (kuriya 609, AX-13) `read_already` holds the `rel`s a directory rename's file renames just
+/// read and settled ([`settled_rename_destinations`]); they are not read again
+/// ([`entries_left_to_read`]). Each read takes both locks, so reading every renamed file a
+/// second time held the embedder and the store for the size of the directory. An arrival
+/// passes an empty set. The rows the walk did not find are still judged against everything it
+/// found.
+fn dispatch_new_directory(
+    state: &WatcherState,
+    dir: &Path,
+    rel: &str,
+    read_already: &std::collections::HashSet<String>,
+) {
     let found = match new_directory_entries(&state.kb_path, dir, &state.registry, &state.rules) {
         Ok(found) => found,
         Err(e) => {
@@ -2234,7 +2251,8 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
         }
     };
     hand_on_rows_the_walk_left_behind(state, rel, &found);
-    if found.is_empty() {
+    let to_read = entries_left_to_read(&found, read_already);
+    if to_read.is_empty() {
         return;
     }
     // Say how many, so a directory drop is never a silent bulk index.
@@ -2250,12 +2268,12 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
     wdiag!(
         "watcher: a new directory arrived with {} indexable file{}; indexing \
          them (their own events are not delivered on Linux).",
-        found.len(),
-        if found.len() == 1 { "" } else { "s" }
+        to_read.len(),
+        if to_read.len() == 1 { "" } else { "s" }
     );
     // (#544) Each file only asks whether a regular file is at its `rel`: the walk spelled
     // the directories on the way.
-    for (frel, f) in &found {
+    for (frel, f) in to_read {
         dispatch_reindex_from(
             state,
             frel,
@@ -3580,7 +3598,12 @@ fn rename_outcome_is_settled(outcome: &Result<indexer::RenameOutcome>) -> bool {
 /// ([`rename_plan`], [`apply_rename_plan_before`]), and again after an indexer's rename that
 /// did not settle the row ([`rename_outcome_is_settled`]), whose row goes when the destination
 /// is gone by then ([`finish_rename_locked`]).
-fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) {
+///
+/// (kuriya 609, AX-13) Returns whether the indexer's rename settled the row at `new_rel`
+/// ([`finish_rename_locked_checked`]): a directory rename leaves such a destination out of its
+/// scan ([`settled_rename_destinations`]), since the rename already read the file there with
+/// both locks held.
+fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: WriteLook) -> bool {
     let mut embedder = recover(state.lock_for_batch(&state.embedder), "embedder");
     let db = recover_db(state.lock_for_batch(&state.db));
     let kb_path = &state.kb_path;
@@ -3589,13 +3612,13 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
         Ok(plan) => plan,
         Err(e) => {
             log_rename_failed(old_rel, new_rel, &e);
-            return;
+            return false;
         }
     };
     let before = apply_rename_plan_before(&db, kb_path, old_rel, new_rel, &plan);
     let start = rename_start(&db, &state.registry, (old_rel, new_rel), plan, before);
     let exclude_headings = state.exclude_headings.as_deref();
-    finish_rename_locked_checked(
+    let settled = finish_rename_locked_checked(
         &db,
         kb_path,
         (old_rel, new_rel),
@@ -3632,6 +3655,7 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str, look: Wri
     {
         log_refused_link_deindexed(new_rel, outcome);
     }
+    settled
 }
 
 /// (kuriya 566 #28) After a rename with both locks held: when the destination `new_rel` is a
@@ -3993,6 +4017,11 @@ fn finish_rename_locked<C, R>(
 /// across a parser left with the old parser's chunks ([`read_awaiting_destination_again`],
 /// [`read_unread_move_again`]), whose result can drop the row; false for every other read.
 /// The reindex still runs at most once per dispatch.
+///
+/// (kuriya 609, AX-13) Returns whether the indexer's rename ran and settled the row at
+/// `new_rel` ([`rename_outcome_is_settled`]): the row then holds what the rename read at the
+/// destination, or was dropped on what it read there. Every other path -- a plan that ran no
+/// rename, a failure, an outcome that left the row as it was -- returns false.
 #[allow(clippy::too_many_arguments)]
 fn finish_rename_locked_checked<C, R>(
     db: &Database,
@@ -4003,7 +4032,8 @@ fn finish_rename_locked_checked<C, R>(
     ctx: &mut C,
     rename: impl FnOnce(&mut C) -> Result<indexer::RenameOutcome>,
     reindex: R,
-) where
+) -> bool
+where
     R: FnOnce(&mut C, bool) -> Result<indexer::SingleResult>,
 {
     let DispatchStart {
@@ -4043,10 +4073,10 @@ fn finish_rename_locked_checked<C, R>(
             };
             sweep_legacy_row(db, kb_path, old_rel, false);
             sweep_legacy_row(db, kb_path, new_rel, new_requires_real_key);
-            return;
+            return false;
         }
         // Dropping swept the folded rows as a removal; leaving touches nothing.
-        Ok(false) => return,
+        Ok(false) => return false,
         Err(e) => {
             log_rename_failed(old_rel, new_rel, &e);
             if cleared && let Some(reindex) = reindex.take() {
@@ -4054,7 +4084,7 @@ fn finish_rename_locked_checked<C, R>(
                 sweep_legacy_row(db, kb_path, old_rel, false);
                 sweep_legacy_row(db, kb_path, new_rel, true);
             }
-            return;
+            return false;
         }
     }
     let outcome = rename(ctx);
@@ -4102,6 +4132,7 @@ fn finish_rename_locked_checked<C, R>(
     // nothing to embed sweeps it as a removal ([`sweep_requires_real_key`]).
     sweep_legacy_row(db, kb_path, old_rel, false);
     sweep_legacy_row(db, kb_path, new_rel, new_requires_real_key);
+    settled
 }
 
 /// (#552) Whether the row at `rel` holds [`indexer::HASH_AWAITING_REPARSE`]. A failed read of
@@ -4622,6 +4653,9 @@ fn dispatch_directory_rename(
     // (#544 P1-S) Whether the rows move to `to`, from one look at its spelling taken in the
     // listing's lock region. A sweep-only entry moves nothing whatever this says.
     let mut moves = true;
+    // (kuriya 609, AX-13) The destinations whose rename already read them with both locks
+    // held, which the destination scan below does not read again.
+    let mut read_already = std::collections::HashSet::new();
     if entry == DirRenameEntry::ScanDestination {
         let (listed, to_spelled) = {
             let db = recover_db(state.lock_for_batch(&state.db));
@@ -4663,13 +4697,20 @@ fn dispatch_directory_rename(
             } else {
                 Vec::new()
             };
+            let mut renamed = Vec::with_capacity(steps.len());
             for step in &steps {
                 match step.action {
                     // (#544) Only whether a file is there: the destination directory was
                     // spelled once above, and below it a step's `new_rel` is the row's own
                     // spelling.
                     RenameAction::Rename => {
-                        dispatch_rename(state, &step.old_rel, &step.new_rel, WriteLook::ExistsOnly)
+                        let settled = dispatch_rename(
+                            state,
+                            &step.old_rel,
+                            &step.new_rel,
+                            WriteLook::ExistsOnly,
+                        );
+                        renamed.push((step, settled));
                     }
                     RenameAction::Deindex => {
                         dispatch_removal(
@@ -4694,6 +4735,7 @@ fn dispatch_directory_rename(
                     RenameAction::Skip => {}
                 }
             }
+            read_already = settled_rename_destinations(renamed);
             // (local Codex r1) Every listed row leaves its old path, whether or
             // not `from` is gone: a row the pass above did not move (a skip, a
             // reindex of the new path, a rename that failed) would otherwise stay
@@ -4752,9 +4794,41 @@ fn dispatch_directory_rename(
     // which is reindexed in place.
     dispatch_removal(state, old_rel, from, RemovalCause::RenamedAway);
     if entry == DirRenameEntry::ScanDestination && moves {
-        dispatch_new_directory(state, to, new_rel);
+        dispatch_new_directory(state, to, new_rel, &read_already);
     }
     true
+}
+
+/// (kuriya 609, AX-13) The destinations a directory rename's file renames settled
+/// ([`dispatch_rename`] returned true): the `new_rel` of each [`RenameAction::Rename`] step whose
+/// rename settled the row there. [`dispatch_new_directory`] leaves them out of the files it
+/// reads, since the rename read each with both locks held moments before; reading it again found
+/// the hash unchanged and wrote nothing. A step that did not settle (a failure, a destination
+/// that could not be looked at, a row left as it was) and a step of any other action are read
+/// by the scan as before.
+fn settled_rename_destinations<'a>(
+    renamed: impl IntoIterator<Item = (&'a DirRenameStep, bool)>,
+) -> std::collections::HashSet<String> {
+    renamed
+        .into_iter()
+        .filter(|(step, settled)| *settled && step.action == RenameAction::Rename)
+        .map(|(step, _)| step.new_rel.clone())
+        .collect()
+}
+
+/// (kuriya 609, AX-13) The entries of a destination scan ([`new_directory_entries`]) that
+/// [`dispatch_new_directory`] reads: every one but those whose `rel` is in `read_already`
+/// ([`settled_rename_destinations`]), in the walk's order. Only the reads: the rows the walk did
+/// not find are judged against every entry it found ([`hand_on_rows_the_walk_left_behind`]),
+/// or a moved row would be handed to the removal path.
+fn entries_left_to_read<'a>(
+    found: &'a [(String, PathBuf)],
+    read_already: &std::collections::HashSet<String>,
+) -> Vec<&'a (String, PathBuf)> {
+    found
+        .iter()
+        .filter(|(rel, _)| !read_already.contains(rel))
+        .collect()
 }
 
 // ===========================================================================
@@ -11734,6 +11808,123 @@ mod tests {
             state.db.lock().unwrap().all_document_paths().unwrap(),
             vec!["other.md".to_string()]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // (kuriya 609, AX-13) A directory rename's scan does not read again what its renames read
+    // -----------------------------------------------------------------------
+
+    /// (kuriya 609, AX-13) Only a rename step whose rename settled the row leaves its
+    /// destination out of the scan; one that did not settle, and a step of any other action
+    /// (whatever it is paired with), stays in.
+    #[test]
+    fn ax13_only_settled_rename_steps_are_left_out_of_the_scan() {
+        let settled = dir_rename_step("old/a.md", "new/a.md", RenameAction::Rename);
+        let unsettled = dir_rename_step("old/b.md", "new/b.md", RenameAction::Rename);
+        let reindex = dir_rename_step("old/c.txt", "new/c.md", RenameAction::Reindex);
+        let deindex = dir_rename_step("old/d.md", "new/node_modules/d.md", RenameAction::Deindex);
+        let skip = dir_rename_step("old/e.txt", "new/e.txt", RenameAction::Skip);
+
+        let left_out = settled_rename_destinations([
+            (&settled, true),
+            (&unsettled, false),
+            (&reindex, true),
+            (&deindex, true),
+            (&skip, true),
+        ]);
+        assert_eq!(
+            left_out,
+            std::collections::HashSet::from(["new/a.md".to_string()])
+        );
+        assert!(settled_rename_destinations(std::iter::empty()).is_empty());
+    }
+
+    /// (kuriya 609, AX-13) The scan reads every entry the walk found but those left out, in
+    /// the walk's order; with nothing left out (an arrival) it reads every one.
+    #[test]
+    fn ax13_the_scan_reads_every_entry_but_those_already_read() {
+        let found: Vec<(String, PathBuf)> = ["new/a.md", "new/b.md", "new/sub/c.md"]
+            .iter()
+            .map(|rel| (rel.to_string(), PathBuf::from(rel)))
+            .collect();
+        let rels = |entries: Vec<&(String, PathBuf)>| -> Vec<String> {
+            entries.into_iter().map(|(rel, _)| rel.clone()).collect()
+        };
+
+        let read_already = std::collections::HashSet::from([
+            "new/a.md".to_string(),
+            "new/sub/c.md".to_string(),
+            // Not found by the walk (the file left again): changes nothing.
+            "new/gone.md".to_string(),
+        ]);
+        assert_eq!(
+            rels(entries_left_to_read(&found, &read_already)),
+            ["new/b.md"]
+        );
+        assert_eq!(
+            rels(entries_left_to_read(
+                &found,
+                &std::collections::HashSet::new()
+            )),
+            ["new/a.md", "new/b.md", "new/sub/c.md"]
+        );
+    }
+
+    /// (kuriya 609, AX-13) A rename that settled the row returns true from
+    /// [`finish_rename_locked_checked`]; one whose plan ran no rename (the destination is
+    /// gone) returns false. The stub rename stands for the indexer's.
+    #[test]
+    fn ax13_finish_rename_says_whether_the_rename_settled_the_row() {
+        let (kb, _cleanup) = i544_scratch_kb("groove-watcher-ax13-settled");
+        std::fs::write(kb.join("b.md"), "# b\n").unwrap();
+        let db = dir_rename_db(&["a.md"]);
+        let plan = rename_plan(&db, "a.md", "b.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "a.md", "b.md", &plan);
+        let settled = finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("a.md", "b.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| {
+                db.rename_document("a.md", "b.md", crate::db::FrontmatterTopic::Unread)?;
+                Ok(indexer::RenameOutcome::Renamed)
+            },
+            |_, _| panic!("a settled rename reads nothing again"),
+        );
+        assert!(settled);
+
+        let db = dir_rename_db(&["c.md"]);
+        let plan = rename_plan(&db, "c.md", "gone.md", OnDisk::Gone).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "c.md", "gone.md", &plan);
+        let settled = finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("c.md", "gone.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| panic!("a dropped pair runs no rename"),
+            |_, _| panic!("a dropped pair reads nothing"),
+        );
+        assert!(!settled);
+
+        let db = dir_rename_db(&["e.md"]);
+        std::fs::write(kb.join("f.md"), "# f\n").unwrap();
+        let plan = rename_plan(&db, "e.md", "f.md", OnDisk::Present).unwrap();
+        let before = apply_rename_plan_before(&db, &kb, "e.md", "f.md", &plan);
+        let settled = finish_rename_locked_checked(
+            &db,
+            &kb,
+            ("e.md", "f.md"),
+            WriteLook::Spelled,
+            (plan, before),
+            &mut (),
+            |_| Err(anyhow::anyhow!("busy")),
+            |_, _| Ok(indexer::SingleResult::Unchanged),
+        );
+        assert!(!settled);
     }
 
     // -----------------------------------------------------------------------
