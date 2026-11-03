@@ -8196,8 +8196,8 @@ mod tests {
     /// spelling as written, as a plain file rename would. The listing under the
     /// new spelling is empty, which pins that the store does not fold case on
     /// its own. A look at the disk's spelling that ignored case is not reached
-    /// here; it is the end-to-end test in `tests/watcher_case_only_dir_rename.rs`
-    /// that goes red for it.
+    /// here; it is the end-to-end test `watcher_follows_a_case_only_directory_rename`
+    /// (in the integration tests) that goes red for it.
     #[test]
     fn test_dir_rename_steps_case_only_rename_moves_every_row() {
         let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
@@ -8779,7 +8779,7 @@ mod tests {
         (got, false)
     }
 
-    /// The events of `got` that name `path`, the sentinel's left out.
+    /// The events of `got` that name the given path, the sentinel's left out.
     fn events_naming(
         got: &[(EventKind, Vec<PathBuf>)],
         path: &Path,
