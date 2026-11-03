@@ -987,7 +987,7 @@ fn vectors_read_only(fx: &Fixture, rel: &str) -> Vec<StoredChunkVector> {
 /// reuses every stored vector when no embedding input changed, and recomputes every one under
 /// `force`.
 ///
-/// Without `force`, a document whose sections were only reordered is updated with all four of
+/// Without `force`, a document whose sections were only reordered is updated with every one of
 /// its stored vectors copied over: nothing reaches the endpoint and each chunk keeps its bytes;
 /// the unchanged `other.md` is left to the hash fast path and counted in neither number. With
 /// `force` (spec: [`grooveseek::indexer::IndexResult::chunks_reused`] is always 0 under it), every
@@ -1011,9 +1011,20 @@ fn mcp_rebuild_index_reuses_every_vector_and_force_recomputes_them() {
         "",
     );
     index_ok(&fx);
-    let runbook_before = chunk_rows(&vectors(&fx, RUNBOOK));
-    let other_before = chunk_rows(&vectors(&fx, "other.md"));
-    assert_eq!(runbook_before.len(), 4, "{runbook_before:?}");
+    let runbook_stored = vectors(&fx, RUNBOOK);
+    let other_stored = vectors(&fx, "other.md");
+    let runbook_before = chunk_rows(&runbook_stored);
+    let other_before = chunk_rows(&other_stored);
+    // The expected counts and inputs below come from these stored rows, not from literals, so
+    // a chunker change that splits the fixture differently moves them along with it.
+    assert!(!runbook_before.is_empty(), "{runbook_before:?}");
+    assert!(!other_before.is_empty(), "{other_before:?}");
+    let mut every: Vec<String> = contents(&runbook_stored)
+        .into_iter()
+        .chain(contents(&other_stored))
+        .map(str::to_string)
+        .collect();
+    every.sort();
     fx.layout.write(RUNBOOK, &runbook(&[S2, S1, S3, S4]));
 
     let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
@@ -1039,24 +1050,24 @@ fn mcp_rebuild_index_reuses_every_vector_and_force_recomputes_them() {
     assert!(plain.get("error").is_none(), "{plain}");
     assert_eq!(count_in(&plain, "updated"), 1, "{plain}");
     assert_eq!(count_in(&plain, "chunks_embedded"), 0, "{plain}");
-    assert_eq!(count_in(&plain, "chunks_reused"), 4, "{plain}");
+    assert_eq!(
+        count_in(&plain, "chunks_reused"),
+        runbook_before.len() as u64,
+        "{plain}"
+    );
     assert_eq!(sent_plain, Vec::<String>::new());
     assert_eq!(contents(&runbook_after), vec![S2.1, S1.1, S3.1, S4.1]);
     assert_eq!(chunk_rows(&runbook_after), runbook_before);
     assert_eq!(other_after, other_before);
 
     assert!(forced.get("error").is_none(), "{forced}");
-    assert_eq!(count_in(&forced, "chunks_embedded"), 5, "{forced}");
+    assert_eq!(
+        count_in(&forced, "chunks_embedded"),
+        every.len() as u64,
+        "{forced}"
+    );
     assert_eq!(count_in(&forced, "chunks_reused"), 0, "{forced}");
     sent_forced.sort();
-    let mut every = vec![
-        S1.1.to_string(),
-        S2.1.to_string(),
-        S3.1.to_string(),
-        S4.1.to_string(),
-        OTHER.to_string(),
-    ];
-    every.sort();
     assert_eq!(sent_forced, every);
 
     assert_index_consistent(&fx);
