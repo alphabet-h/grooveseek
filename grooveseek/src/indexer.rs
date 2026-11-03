@@ -1226,11 +1226,12 @@ fn renames_skipped_note(n: u32) -> Option<String> {
 }
 
 /// (feature-60) The order the per-document loop in [`rebuild_index`] visits `entries`: those
-/// whose `rel` is in `first` (the renames that force a re-parse), then the rest, each group in
+/// whose `rel` is in `first` (the renames read again past the hash fast path,
+/// [`Reindex::Renamed`]), then the rest, each group in
 /// the order `entries` already has -- the walk's, which sorts `PathBuf`s component by
 /// component. Split rather than re-sorted: sorting by the `rel` string would move `a-b/x.md`
 /// ahead of `a/b.md` and change the order of runs that have no rename at all. Putting the
-/// forced re-parses first bounds the stretch in which the loop does not stop for a cancel
+/// rename re-reads first bounds the stretch in which the loop does not stop for a cancel
 /// (it never stops before one of them) to their number.
 fn processing_order<'a>(entries: &'a [DiskEntry], first: &HashSet<String>) -> Vec<&'a DiskEntry> {
     let (mut order, rest): (Vec<&DiskEntry>, Vec<&DiskEntry>) =
@@ -1540,7 +1541,7 @@ pub struct Reindexed {
 ///
 /// (v1.14.0+) A reporter carrying a [`progress::CancelToken`]
 /// ([`progress::ProgressReporter::with_cancel`]) can stop the run at a check point: after each
-/// scanned file, before the renames, before each document (after any forced re-parses), and
+/// scanned file, before the renames, before each document (after any rename re-reads past the hash fast path), and
 /// before the deletion sweep. The run then returns `Ok` with [`IndexResult::cancelled`] set;
 /// see [`progress::CancelToken`] for how late a stop can come and [`IndexResult::cancelled`]
 /// for the index it leaves.
@@ -1863,7 +1864,8 @@ pub fn rebuild_index(
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
     // codex P2 (PR #73 F3): rename 先の new_path を集めておく。Static モードでは
-    // rename された entry だけ下の loop で force 扱いにし、same-hash fast path
+    // rename された entry だけ下の loop で hash の fast path を飛ばす読み直し
+    // (`Reindex::Renamed`、保存 vector は再利用する) にし、same-hash fast path
     // (index_single_disk_entry 冒頭の hash 一致 skip) を意図的に無効化する。
     // rename は path UPDATE のみで内容 (hash) は変わらないため、そのまま fast
     // path に乗ると、frontmatter title 無し文書で context 用 title が filename
@@ -2049,10 +2051,11 @@ pub fn rebuild_index(
 
     // 2. Process each file
     //
-    // (feature-60) Forced re-parses after a rename first, then the rest; see `processing_order`.
+    // (feature-60) The re-reads of renames (past the hash fast path, [`Reindex::Renamed`])
+    // first, then the rest; see `processing_order`.
     for entry in processing_order(&disk_entries, &renamed_new_paths) {
-        // (feature-60) Check point C3, before this document's embed starts. Not for a forced
-        // re-parse after a rename: the rename is already applied and the hash still matches,
+        // (feature-60) Check point C3, before this document's embed starts. Not for the re-read
+        // of a rename ([`Reindex::Renamed`]): the rename is already applied and the hash still matches,
         // so a run stopped here would leave the next one to take the fast path and keep the
         // old parser's title, tags and fields (or the old breadcrumb) until `--force`. Those
         // documents come first, so this holds a cancel back by at most
@@ -2120,7 +2123,7 @@ pub fn rebuild_index(
             )
         })?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
-        // as: if this was a forced reparse across a parser boundary and it did not end in
+        // as: if this was a rename re-read across a parser boundary and it did not end in
         // `Updated`, the row is stale under the new path and must go -- unless the second read
         // changed under it, which keeps the row awaiting a reparse (#544). See
         // `settle_cross_parser_rename`'s doc for why.
@@ -3149,7 +3152,8 @@ fn indexed_hash_for(
 
 /// (feature-62) Whether [`rebuild_index`] re-reads `entry` in the one-time `.docx` pass
 /// ([`Reindex::Reparse`]): the pass is running (`refresh_docx`), the entry is not already
-/// re-read by force (`renamed_new_paths`: a rename under Static mode, or one across parsers),
+/// re-read past the hash fast path as a rename ([`Reindex::Renamed`], `renamed_new_paths`: a
+/// rename under Static mode, or one across parsers),
 /// and the index holds a `.docx` row for it whose hash is the scan's. A `.docx` whose content
 /// changed is left to the ordinary path, which writes its new hash and metadata.
 ///
@@ -3169,7 +3173,8 @@ fn rereads_unchanged_docx(
 
 /// (feature-65) Whether the one-time pass of the format whose parser reports `extension`
 /// re-reads `entry` ([`Reindex::Reparse`], ADR-0029): that pass is running (`stale`), the entry
-/// is not already re-read by force (`renamed_new_paths`), and the index holds a row that
+/// is not already re-read as a rename ([`Reindex::Renamed`], `renamed_new_paths`), and the
+/// index holds a row that
 /// format's parser wrote for it ([`indexed_hash_for`]), whose hash is the scan's.
 fn rereads_unchanged_as(
     extension: &str,
@@ -7071,7 +7076,7 @@ mod tests {
         assert_eq!(full.skipped, vec!["0-gone.md".to_string()]);
     }
 
-    /// (feature-60) Review Focus 1. The loop visits the forced re-parses first and the rest
+    /// (feature-60) Review Focus 1. The loop visits the rename re-reads first and the rest
     /// after, each group in the order the entries already have -- the walk's, which sorts
     /// `PathBuf`s component by component. That order puts `a/b.md` before `a-b/x.md`,
     /// although the string `"a-b/x.md"` sorts first; sorting by `rel` would reorder a run
