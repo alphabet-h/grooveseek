@@ -14,7 +14,7 @@ use super::embed_mock::{
     EmbedMock, Framing, MockReply, MockResponse, Recorded, default_response, hermetic,
     openai_config_toml,
 };
-use super::mcp::grooveseek_bin;
+use super::mcp::{ServerGuard, grooveseek_bin, spawn_serve_with};
 use super::temp::TempKbLayout;
 use grooveseek::db::Database;
 
@@ -124,6 +124,21 @@ impl Fixture {
         );
     }
 
+    /// `groove serve` over this knowledge base with the watcher on, under the
+    /// pinned environment. Returns only after the server printed
+    /// `watcher: watching`, so an edit the caller makes next cannot fall
+    /// before the debouncer is armed. The fixture's `groove.toml` has to turn
+    /// the watcher on itself; [`served_watching`] builds one that does.
+    ///
+    /// Dropping the guard kills the server, which releases the writer lease,
+    /// so a `groove index` run after that is not refused.
+    pub fn serve_watching(&self) -> ServerGuard {
+        let (guard, _base) = spawn_serve_with(self.kb(), &self.config, true, |c| {
+            hermetic(c, &self.cache);
+        });
+        guard
+    }
+
     /// `groove index --force`, whatever the exit code.
     pub fn index_force(&self) -> Output {
         self.cmd()
@@ -191,6 +206,23 @@ impl Fixture {
         );
         serde_json::from_slice(&out.stdout).expect("search stdout is JSON")
     }
+}
+
+/// The `[watch]` section [`served_watching`] appends: the watcher on, with a
+/// debounce short enough for a test to wait out.
+pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
+
+/// A knowledge base holding `files`, indexed once and served with the watcher
+/// on ([`Fixture::serve_watching`]).
+///
+/// `tests/watcher_rename_old_end_recreated.rs` carries an older copy of this
+/// (its private `served`); it is left as it is because this repository does
+/// not edit existing tests. A new watcher test uses this one.
+pub fn served_watching(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
+    let fx = fixture(prefix, files, WATCH_TOML);
+    fx.index();
+    let guard = fx.serve_watching();
+    (fx, guard)
 }
 
 /// A reply of `status` carrying [`BODY_SENTINEL`] and `headers`.

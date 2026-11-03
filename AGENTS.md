@@ -45,6 +45,9 @@ cargo check --no-default-features --all-targets -p grooveseek   # its tests and 
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
 cargo doc --no-deps --workspace --all-features --document-private-items
+cargo update -p tokio --precise 1.52.1   # the floor Cargo.toml promises; rewrites Cargo.lock
+cargo check --workspace --locked         # still builds against it
+git checkout -- Cargo.lock               # the committed lock back
 ```
 
 Clippy runs **twice** because the second pass is the only one that compiles the
@@ -55,7 +58,9 @@ in parallel they race on the HuggingFace download lock. `cargo doc` is a check
 rather than a build step here — `--document-private-items` is what makes it read
 this crate's private modules, which is most of it, and `--all-features` is what
 makes it read the items `test-helpers` gates. `CONTRIBUTING.md` explains all
-three at length.
+three at length. The `cargo update` / `cargo check --workspace --locked` pair
+builds against the tokio floor the root `Cargo.toml` declares rather than the
+version Cargo.lock pins, and `git checkout -- Cargo.lock` undoes the rewrite.
 
 Windows needs no extra DLLs: ONNX Runtime and SQLite are linked in statically.
 

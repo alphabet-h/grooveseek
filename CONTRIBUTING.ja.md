@@ -57,7 +57,15 @@ cargo check --no-default-features --all-targets -p grooveseek   # そのテス�
 cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
 cargo doc --no-deps --workspace --all-features --document-private-items
+cargo update -p tokio --precise 1.52.1   # Cargo.toml が約束する下限へ。Cargo.lock を書き換える
+cargo check --workspace --locked         # その下限でビルドが通るか
+git checkout -- Cargo.lock               # commit 済みの lock に戻す
 ```
+
+`cargo update` から `git checkout` までの行は tokio の下限 (root `Cargo.toml` の `tokio = "1.52.1"`) が今も本当かを見る。
+他の行は Cargo.lock が固定した版でビルドするので、lock の更新で tokio が 1.52.1 より先へ進むと、
+新しい tokio を要するコードが入っても誰も気づかない。1.52.0 を下限にしない理由は
+CHANGELOG の 1.17.1 にある。`git checkout` の行で lock を戻すので、手で打っても Cargo.lock は書き換わったまま残らない。
 
 `cargo doc` が入っているのは、**doc コメントがツリーに無い名前を指している**という欠陥を
 他の誰も捕まえないため。バッククォートだけの名前は rustc から見えず、検査されるのは
