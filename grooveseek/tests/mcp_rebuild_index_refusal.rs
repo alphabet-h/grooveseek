@@ -90,8 +90,8 @@ fn error_of(resp: &serde_json::Value) -> &str {
 /// that process has let go.
 ///
 /// Red if the served tool skips the claim (the rows change, or the endpoint is asked), if a
-/// forced call reaches the reset before the claim (the index is emptied), or if a refusal
-/// sticks to a server that never became a reader.
+/// forced call writes anything before the claim (the rows change), or if a refusal sticks to
+/// a server that never became a reader.
 #[test]
 fn a_no_watch_server_refuses_rebuild_while_another_process_holds_the_lease() {
     let fx = indexed_then_edited("ax42-refuse-busy");
