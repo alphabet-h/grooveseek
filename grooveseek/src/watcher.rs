@@ -8299,20 +8299,25 @@ mod tests {
 
         /// (AX-42) [`dir_rename_steps`] keeps one step per path under `old_dir/`, in the
         /// order handed in; each step's new path is `new_dir/` plus the rest of the old one;
-        /// and each action is what [`rename_decision`] says for that one file. Nothing is on
-        /// disk, as in the example tests.
+        /// and each action is what [`rename_decision`] says for that one file, under the
+        /// rules handed in. Those rules are the default `exclude_dirs`, or those plus a
+        /// directory that the drawn paths name (`notes` as a new directory, `deep` below the
+        /// first segment), so a version that judged with the default rules instead of the
+        /// ones it was given would disagree. Nothing is on disk, as in the example tests.
         #[test]
         fn prop_dir_rename_steps_follow_the_single_file_decision(
             (old_dir, paths) in ax42_rename_case(),
             new_dir in proptest::sample::select(
                 &["notes", "docs", "node_modules/docs", "notes/.", "日本/x"][..]
             ),
+            extra_excluded in proptest::sample::select(&[None, Some("notes"), Some("deep")][..]),
         ) {
             let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename-prop");
             proptest::prop_assert!(!kb.exists(), "the KB must not exist on disk");
             let registry = Registry::defaults();
-            let rules =
-                crate::exclusion::ExclusionRules::from_exclude_dirs(default_exclude_dirs());
+            let mut exclude_dirs = default_exclude_dirs();
+            exclude_dirs.extend(extra_excluded.map(str::to_string));
+            let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(exclude_dirs);
 
             let steps = dir_rename_steps(&paths, &kb, old_dir, new_dir, &registry, &rules);
 
@@ -8335,6 +8340,79 @@ mod tests {
             }
             proptest::prop_assert!(!kb.exists(), "still nothing on disk");
         }
+    }
+
+    /// (AX-42) [`dir_rename_steps`] judges with the rules it is handed, not the defaults:
+    /// a `.grooveignore` that ignores `archive/` and an `exclude_dirs` that adds `attic`.
+    /// The expected actions are written out here rather than asked of [`rename_decision`],
+    /// so the test does not repeat the code it checks. Under the default rules every one
+    /// of these moves would be a [`RenameAction::Rename`].
+    #[test]
+    fn ax42_dir_rename_steps_judge_with_the_rules_handed_in() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename-rules");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+        std::fs::write(kb.join(crate::exclusion::IGNORE_FILE_NAME), "archive/\n").unwrap();
+        let mut exclude_dirs = default_exclude_dirs();
+        exclude_dirs.push("attic".to_string());
+        let rules = crate::exclusion::ExclusionRules::load(&kb, exclude_dirs);
+        assert_eq!(
+            rules.ignore_file_patterns(),
+            Some(1),
+            "the .grooveignore must have compiled, or this proves nothing"
+        );
+        let registry = Registry::defaults();
+        let paths = vec!["docs/a.md".to_string(), "docs/deep/b.md".to_string()];
+        let archived = vec!["archive/a.md".to_string(), "archive/deep/b.md".to_string()];
+        let attic = vec!["attic/a.md".to_string()];
+
+        // Into a directory the .grooveignore ignores: out of the index.
+        assert_eq!(
+            dir_rename_steps(&paths, &kb, "docs", "archive", &registry, &rules),
+            vec![
+                dir_rename_step("docs/a.md", "archive/a.md", RenameAction::Deindex),
+                dir_rename_step("docs/deep/b.md", "archive/deep/b.md", RenameAction::Deindex),
+            ]
+        );
+        // Out of it: into the index.
+        assert_eq!(
+            dir_rename_steps(&archived, &kb, "archive", "docs", &registry, &rules),
+            vec![
+                dir_rename_step("archive/a.md", "docs/a.md", RenameAction::Reindex),
+                dir_rename_step("archive/deep/b.md", "docs/deep/b.md", RenameAction::Reindex),
+            ]
+        );
+        // Into, and out of, a directory only the configured `exclude_dirs` names.
+        assert_eq!(
+            dir_rename_steps(&paths, &kb, "docs", "attic", &registry, &rules),
+            vec![
+                dir_rename_step("docs/a.md", "attic/a.md", RenameAction::Deindex),
+                dir_rename_step("docs/deep/b.md", "attic/deep/b.md", RenameAction::Deindex),
+            ]
+        );
+        assert_eq!(
+            dir_rename_steps(&attic, &kb, "attic", "docs", &registry, &rules),
+            vec![dir_rename_step(
+                "attic/a.md",
+                "docs/a.md",
+                RenameAction::Reindex
+            )]
+        );
+        // Between the two excluded places: nothing to do.
+        assert_eq!(
+            dir_rename_steps(&attic, &kb, "attic", "archive", &registry, &rules),
+            vec![dir_rename_step(
+                "attic/a.md",
+                "archive/a.md",
+                RenameAction::Skip
+            )]
+        );
     }
 
     /// feature-68: a directory at the destination is a directory rename whose

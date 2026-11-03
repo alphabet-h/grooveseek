@@ -4215,7 +4215,10 @@ mod tests {
                     proptest::prop_assert_eq!(out.level, p.1);
                     proptest::prop_assert_eq!(&out.ancestry, &p.2);
                     proptest::prop_assert_eq!(&out.body, &p.3);
-                    proptest::prop_assert_eq!(out.spans.len(), p.4.len());
+                    // Kept as it was: every row span unmoved, table, start and end alike.
+                    let spans: Vec<(usize, usize, usize)> =
+                        out.spans.iter().map(|s| (s.table, s.start, s.end)).collect();
+                    proptest::prop_assert_eq!(&spans, &p.4);
                 }
                 return Ok(());
             }
