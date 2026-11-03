@@ -35,6 +35,13 @@ cargo test -p grooveseek --lib <name>  # 名前指定で 1 本だけ実行 (work
 `--bin groove` で拾う。どのターゲットにあるか分からない時は、絞り込みを外して
 `cargo test <name>` に全部を探させる。
 
+**target を絞ると grammar の fixture も build されない。** `grammar_plugin_cli` の
+テストは `target/<profile>/examples/` の fixture の `cdylib` を開くが、それを build
+するのは素の `cargo test` だけで、`--lib` / `--tests` / `--test <name>` で絞った
+実行は build しない。`--examples` を足しても直らない (`cargo test` の下では test の
+実行ファイルとして build する)。こうした実行に分けて打つなら、先に
+`cargo build --examples -p grooveseek` を打つ。CI は素の `cargo test` なので影響しない。
+
 CI と同じ検証をローカルで再現するには、次のすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる。英語版 `CONTRIBUTING.md` の block は `grooveseek/tests/docs_commands_pinned.rs` が `.github/workflows/ci.yml` の `run:` step と比較し (同じコマンド集合、各 job の中では job の順、job を跨ぐ順序は自由)、この block は `docs_commands_twins.rs` が英語版と比較する。どれか 1 つにだけコマンドを足すとスイートが落ちる:
 
 ```bash
