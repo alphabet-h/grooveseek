@@ -8190,12 +8190,14 @@ mod tests {
     }
 
     /// (audit AX-14, kuriya 610) A rename that changes only the case of the
-    /// directory's name (`Docs` to `docs`) is not read as a rename onto itself:
-    /// the listing is a byte range ([`Database::document_paths_under`]), so
-    /// `Docs` lists every row under `Docs/` and none under `Docs-other/`, and
-    /// each row maps to the new spelling as a plain file rename would. The
-    /// listing under the new spelling is empty, which pins that the store does
-    /// not fold case on its own.
+    /// directory's name (`Docs` to `docs`): the listing is a byte range
+    /// ([`Database::document_paths_under`]), so `Docs` lists every row under
+    /// `Docs/` and none under `Docs-other/`, and each row maps to the new
+    /// spelling as written, as a plain file rename would. The listing under the
+    /// new spelling is empty, which pins that the store does not fold case on
+    /// its own. A look at the disk's spelling that ignored case is not reached
+    /// here; it is the end-to-end test in `tests/watcher_case_only_dir_rename.rs`
+    /// that goes red for it.
     #[test]
     fn test_dir_rename_steps_case_only_rename_moves_every_row() {
         let kb = crate::test_support::unique_temp_path("groove-watcher-dir-rename");
@@ -8936,9 +8938,11 @@ mod tests {
 
         let run = |with_parent: bool| {
             let (tx, rx) = std::sync::mpsc::channel();
-            // Wider than the 100 ms above: the child and the parent `Remove` must
-            // land in one window, and they are injected back to back.
-            let window = Duration::from_millis(500);
+            // Far wider than the 100 ms above: the child and the parent `Remove`
+            // must land in one window, and a stall between the two injects (a
+            // loaded runner) must not split them and read as "the debouncer
+            // changed". The sentinel drain waits only about one window for it.
+            let window = Duration::from_secs(2);
             let cache = notify_debouncer_full::NoCache;
             let cfg = notify::Config::default();
             let _d =

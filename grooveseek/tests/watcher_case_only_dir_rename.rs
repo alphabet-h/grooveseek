@@ -1,15 +1,28 @@
 //! (audit AX-14, kuriya 610) A directory renamed so that only the case of its name changes
 //! (`Docs/` to `docs/`), with the watcher running.
 //!
-//! On a case-insensitive volume (Windows NTFS, macOS APFS as the CI runners format it) the old
-//! spelling still opens the renamed directory, so this is the case where the source of a
-//! directory rename looks present and the destination is the same directory. The rows are keyed
-//! by their byte spelling ([`grooveseek::db::Database::document_paths_under`] lists a BINARY
-//! range), so every one of them has to leave `Docs/` and land under `docs/`.
+//! On a case-insensitive volume (Windows NTFS, macOS APFS as the CI runners format it: the
+//! macOS-only `a_case_only_rename_leaves_one_row` of `tests/watcher_row_survival.rs` renames
+//! `Old.md` to `old.md` there) the old spelling still opens the renamed directory, so this is
+//! the case where the source of a directory rename looks present and the destination is the
+//! same directory. The rows are keyed by their byte spelling
+//! ([`grooveseek::db::Database::document_paths_under`] lists a BINARY range), so every one of
+//! them has to leave `Docs/` and land under `docs/`.
 //!
-//! On Linux (case-sensitive) `Docs` and `docs` are two names, and the same rename is an ordinary
-//! directory rename: the expected end state is the same, so the test runs there too and pins
-//! that the two spellings are never folded together.
+//! The path each OS takes to that end state:
+//!
+//! - Windows: observed (see the test's doc comment): the `Remove` of `Docs` sweeps its rows, and
+//!   `docs` arrives as a new directory that is scanned.
+//! - macOS: estimated from reading the code, not observed. On a case-insensitive APFS `Docs`
+//!   still stats, so notify-debouncer-full 0.6.0 takes the `Name(Any)` records down its
+//!   rename-to branch (`handle_rename_to`) and does not pair them; both `Docs` and `docs` reach
+//!   groove as arrived directories, and the arrival of `Docs`, a directory not on disk under that
+//!   spelling, drops the rows under it (`ArrivedDirectory::Dropped`, a subtree deindex), while
+//!   `docs` is scanned. The end state is expected to match Windows; the CI macOS leg checks it.
+//! - Linux (case-sensitive): estimated, not observed. `Docs` and `docs` are two names, inotify
+//!   pairs the rename through its cookie, and it is an ordinary paired directory rename that moves
+//!   the rows. The expected end state is the same, so the test runs there too and pins that the
+//!   two spellings are never folded together.
 //!
 //! Drives `groove serve` with the watcher on against the mock endpoint of
 //! [`crate::common::embed_cli`], so nothing downloads a model, and reads the rows the server left
