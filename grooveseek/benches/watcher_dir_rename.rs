@@ -129,22 +129,36 @@ fn rename_and_settle(
     took
 }
 
-/// Wait, off the clock, until the loop is idle and no batch was emitted, started or finished
-/// for a quiet window longer than the debounce window with room to spare: the debouncer has
-/// nothing left of the last rename to hand over. Read again after the window, so a batch
-/// emitted just after the first read restarts the wait.
+/// Wait, off the clock, until no batch was emitted, started or finished for a quiet window
+/// longer than the debounce window with room to spare, and every batch emitted was started and
+/// finished: the debouncer has nothing left of the last rename to hand over, and the loop
+/// handled all it was handed. Read again after the window, so a batch emitted just after the
+/// first read restarts the wait.
+///
+/// `emitted` moves before the channel send and a batch taken off the channel moves `started`
+/// and then `finished`, so the three are equal exactly when no batch is waiting in the channel,
+/// none is being handled, and none was dropped on a full channel. A batch in the channel is
+/// taken within the quiet window; one that is not after the window was dropped, and its events
+/// (part of a rename) were never handled, so that fails the bench instead of timing the next
+/// sample on top of it. The clock in [`rename_and_settle`] does not ask for the equality: it
+/// covers the batch that moved the rows, and a batch emitted after it is judged here, before
+/// the next sample starts.
 fn quiesce(probe: &WatchBatchProbe) {
     let quiet = Duration::from_millis(3 * DEBOUNCE_MS + 300);
     let start = Instant::now();
     loop {
         let seen = counts(probe);
-        if idle(probe).is_some() {
-            std::thread::sleep(quiet);
-            if counts(probe) == seen && idle(probe).is_some() {
-                return;
-            }
-        } else {
-            std::thread::sleep(POLL);
+        std::thread::sleep(quiet);
+        let (emitted, started, finished) = seen;
+        // A batch still being handled (one rename can take seconds) is not quiet yet, however
+        // long the counts stand still.
+        if counts(probe) == seen && started == finished {
+            assert_eq!(
+                emitted, started,
+                "the watcher was quiet for {quiet:?} with batches (emitted, started, finished) = \
+                 {seen:?}: a batch emitted and never handled was dropped on a full channel"
+            );
+            return;
         }
         assert!(
             start.elapsed() < SETTLE_LIMIT,
@@ -275,17 +289,30 @@ fn bench_watcher_dir_rename(c: &mut Criterion) {
     // The loop returns at its next batch boundary; nudge it with one more event in case it is
     // waiting on the channel, then wait for it. A send that fails means the loop already
     // ended, so its result is read first: an error it ended with is the cause worth showing,
-    // not the failed send. A loop still running after the wait is left to the runtime's
-    // shutdown, since the numbers above are already taken.
+    // not the failed send. A loop that does not return within the wait is stuck, which fails
+    // the bench too: the task is aborted first, so the runtime can shut down.
+    let mut watch = watch;
     let stop_sent = stop_tx.send(true).is_ok();
     if stop_sent {
         kb.write("stop.md", "stop\n");
     }
-    let stopped =
-        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), watch).await });
-    if let Ok(joined) = stopped {
-        joined.expect("watch task").expect("watch loop");
-    }
+    let stop_wait = Duration::from_secs(30);
+    let stopped = runtime.block_on(async { tokio::time::timeout(stop_wait, &mut watch).await });
+    let joined = match stopped {
+        Ok(joined) => joined,
+        Err(_) => {
+            watch.abort();
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            panic!(
+                "the watch loop did not stop within {stop_wait:?} of the stop signal: batches \
+                 (emitted, started, finished) = {:?}",
+                counts(&probe)
+            );
+        }
+    };
+    joined
+        .expect("the watch task panicked or was cancelled")
+        .expect("the watch loop ended with an error");
     assert!(
         stop_sent,
         "the watch loop ended with Ok before it was told to stop"
