@@ -201,7 +201,14 @@ fn bench_watcher_dir_rename(c: &mut Criterion) {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 let (from, to) = (NAMES[at], NAMES[1 - at]);
+                // Read outside the clock, like the timed renames' own check below.
+                let before = embedder.lock().expect("embedder lock").texts_embedded();
                 total += rename_and_settle(&kb, &db, &probe, from, to);
+                let sent = embedder.lock().expect("embedder lock").texts_embedded() - before;
+                assert_eq!(
+                    sent, 0,
+                    "following the rename of {from} to {to} embedded {sent} inputs"
+                );
                 at = 1 - at;
             }
             total
@@ -209,17 +216,24 @@ fn bench_watcher_dir_rename(c: &mut Criterion) {
     });
     group.finish();
 
-    stop_tx.send(true).expect("stop the watch loop");
     // The loop returns at its next batch boundary; nudge it with one more event in case it is
-    // waiting on the channel, then wait for it. A loop that ended in an error fails the bench;
-    // one still running after the wait is left to the runtime's shutdown, since the numbers
-    // above are already taken.
-    kb.write("stop.md", "stop\n");
+    // waiting on the channel, then wait for it. A send that fails means the loop already
+    // ended, so its result is read first: an error it ended with is the cause worth showing,
+    // not the failed send. A loop still running after the wait is left to the runtime's
+    // shutdown, since the numbers above are already taken.
+    let stop_sent = stop_tx.send(true).is_ok();
+    if stop_sent {
+        kb.write("stop.md", "stop\n");
+    }
     let stopped =
         runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), watch).await });
     if let Ok(joined) = stopped {
         joined.expect("watch task").expect("watch loop");
     }
+    assert!(
+        stop_sent,
+        "the watch loop ended with Ok before it was told to stop"
+    );
     runtime.shutdown_timeout(Duration::from_secs(5));
 }
 
