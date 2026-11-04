@@ -126,8 +126,9 @@ impl TempKbLayout {
         write_under(&self.kb, rel, content.as_bytes(), "TempKbLayout::write");
     }
 
-    /// Write the bytes `content` to `kb()/rel`, creating parents. For binary documents
-    /// (`.docx`, `.pdf`, ...) that [`TempKbLayout::write`] cannot carry as a `&str`.
+    /// Write the bytes `content` to `rel` under [`TempKbLayout::kb`], creating parents.
+    /// For binary documents (`.docx`, `.pdf`, ...) that [`TempKbLayout::write`] cannot
+    /// carry as a `&str`.
     pub fn write_bytes(&self, rel: &str, content: &[u8]) {
         write_under(&self.kb, rel, content, "TempKbLayout::write_bytes");
     }

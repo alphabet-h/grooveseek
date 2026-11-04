@@ -15,8 +15,9 @@
 //! # Design notes (read before changing the fixtures)
 //!
 //! - **The query words live in the article bodies, not in the headings or the filename.**
-//!   The file is `r1.docx` with no `docProps/core.xml`, so its title is the meaningless file
-//!   name, and every query paraphrases its article's body rather than naming the article. A
+//!   The file ([`crate::RULES_PATH`]) has no `docProps/core.xml`, so its title is the
+//!   meaningless file name, and every query paraphrases its article's body rather than
+//!   naming the article. A
 //!   heading-only match would otherwise let the right chunk rank first for the wrong reason,
 //!   as the binary-format retrieval tests in this directory also guard against.
 //! - **The empty-chunk assertion is the one the fix carries.** With the fold in place the
@@ -29,8 +30,8 @@
 //!   true.
 //! - **Unrelated queries are part of the set.** kuriya #323 was seen on a query about a
 //!   lost laptop, which no article answers; one of the Markdown distractors does.
-//! - **`bge-m3`**: the corpus and the queries are Japanese, which the English `bge-small`
-//!   model does not read.
+//! - **The model is BGE-M3 ([`crate::MODEL`])**: the corpus and the queries are Japanese,
+//!   which the English `bge-small` model does not read.
 //!
 //! `#[ignore]`: downloads BGE-M3 (~2.3 GB) on first use and builds an index. Run with
 //! `cargo test --test eval_docx_japanese_rules -- --ignored`. `nightly.yml` runs it on the
@@ -227,9 +228,10 @@ fn groove_with_config(cfg: &Path) -> Command {
     cmd
 }
 
-/// `groove --config <cfg> search <query> --kb-path <kb> --format json --model bge-m3 --limit
-/// TOP_K` ([`crate::common::cli::search_json`]), returning the `results` array. The quality
-/// filter and the confidence cutoff keep their defaults.
+/// `groove --config <cfg> search <query> --kb-path <kb> --format json --model <model> --limit <k>`
+/// ([`crate::common::cli::search_json`]), with the model [`MODEL`] and k = [`TOP_K`],
+/// returning the `results` array. The quality filter and the confidence cutoff keep their
+/// defaults.
 fn search(cfg: &Path, kb: &Path, query: &str) -> Vec<serde_json::Value> {
     let limit = TOP_K.to_string();
     let v = search_json(
