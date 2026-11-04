@@ -82,8 +82,10 @@ pub fn json_response(status: &str, body: &str) -> String {
 /// holds it open without reading or writing, until the test process exits. Returns the bound
 /// loopback address. This is the shape of a busy daemon.
 ///
-/// `daemon::tests::confirm_stopped_refuses_a_port_that_is_still_bound` has the same listener
-/// inline in its body, which stays as it is because test bodies are not edited.
+/// One of the daemon module's tests, the one that a still-bound port is not reported as stopped,
+/// has the same listener inline in its body, which stays as it is because test bodies are not
+/// edited. (This file is compiled into both the library and the binary target, and the daemon
+/// module lives only in the binary, so it is named here rather than linked.)
 pub fn hold_connections() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind holding listener");
     let addr = listener.local_addr().expect("holding listener addr");
