@@ -17,15 +17,16 @@
 //! - **The query words live in the article bodies, not in the headings or the filename.**
 //!   The file is `r1.docx` with no `docProps/core.xml`, so its title is the meaningless file
 //!   name, and every query paraphrases its article's body rather than naming the article. A
-//!   heading-only match would otherwise let the right chunk rank first for the wrong reason
-//!   (see `tests/eval_binary_formats.rs`).
+//!   heading-only match would otherwise let the right chunk rank first for the wrong reason,
+//!   as the binary-format retrieval tests in this directory also guard against.
 //! - **The empty-chunk assertion is the one the fix carries.** With the fold in place the
 //!   index holds no empty chunk at all, so on the fixed code that assertion holds trivially;
 //!   it fails only when the chapters become empty chunks again. That is checked by
 //!   reverting the fold by hand (AX-20 mutation run), not by this test.
 //! - **Two paraphrases share no three-character run with the rules**, so the trigram
 //!   full-text side cannot match them and only the vector side can rank the article.
-//!   `paraphrases_share_no_trigram_with_the_rules`, which needs no model, keeps that true.
+//!   [`crate::paraphrases_share_no_trigram_with_the_rules`], which needs no model, keeps that
+//!   true.
 //! - **Unrelated queries are part of the set.** kuriya #323 was seen on a query about a
 //!   lost laptop, which no article answers; one of the Markdown distractors does.
 //! - **`bge-m3`**: the corpus and the queries are Japanese, which the English `bge-small`
