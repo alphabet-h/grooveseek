@@ -4143,6 +4143,163 @@ mod tests {
         assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 11)]);
     }
 
+    /// (AX-42) A block of a generated `<w:body>`: a heading of a level, a body paragraph, or a
+    /// table.
+    #[derive(Debug, Clone)]
+    enum Ax42Block {
+        Heading(u8, &'static str),
+        Paragraph(&'static str),
+        Table(crate::parser::Ax42Table),
+    }
+
+    /// (AX-42) A body that opens with a heading, then up to 7 blocks, half of them tables, so
+    /// a section holds several tables, none, or only rows that write nothing. Body paragraphs
+    /// and headings are often blank (a space, a newline) or padded, so tables sit next to
+    /// whitespace at the start and end of a section as well as between paragraphs.
+    fn ax42_blocks() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Block>> {
+        use proptest::prelude::*;
+        let heading = (
+            1_u8..=2,
+            proptest::sample::select(&["Ledger", " 章 ", " "][..]),
+        )
+            .prop_map(|(level, text)| Ax42Block::Heading(level, text));
+        let block = prop_oneof![
+            heading.clone(),
+            proptest::sample::select(&["", " ", "\n", "  preface  ", "preface", "東京"][..])
+                .prop_map(Ax42Block::Paragraph),
+            crate::parser::ax42_table().prop_map(Ax42Block::Table),
+            crate::parser::ax42_table().prop_map(Ax42Block::Table),
+        ];
+        (heading, proptest::collection::vec(block, 0..=7)).prop_map(|(first, mut rest)| {
+            rest.insert(0, first);
+            rest
+        })
+    }
+
+    /// (AX-42) A cell paragraph as Word writes it: one run, its text in `<w:t>` and its breaks
+    /// and tabs as `<w:br/>` and `<w:tab/>` between them.
+    fn ax42_para(pieces: &[crate::parser::Ax42Piece]) -> String {
+        use crate::parser::Ax42Piece;
+        let run: String = pieces
+            .iter()
+            .map(|piece| match piece {
+                Ax42Piece::Text(text) => format!("<w:t>{text}</w:t>"),
+                Ax42Piece::Break => "<w:br/>".to_string(),
+                Ax42Piece::Tab => "<w:tab/>".to_string(),
+            })
+            .collect();
+        format!("<w:p><w:r>{run}</w:r></w:p>")
+    }
+
+    /// (AX-42) `blocks` as the inside of a `<w:body>`, each cell paragraph an [`ax42_para`] and
+    /// a cell without one the `<w:p/>` Word writes; with the chunks they should make, as
+    /// [`crate::parser::ax42_check_rows`] takes them.
+    ///
+    /// The chunks are worked out from the rules the parser documents, not by calling its fold:
+    /// every heading paragraph opens a section, whatever its text, after a section with no
+    /// heading that holds what comes before the first one; a section's body is its non-blank
+    /// paragraphs and its rows, and the rows stay in the section they were written in. A
+    /// section with a body is a chunk; one without folds its heading text into the next
+    /// section that has one, which moves no row from chunk to chunk. When no section has a
+    /// body, every section with a heading is a chunk of its own, with no row.
+    fn ax42_body(blocks: &[Ax42Block]) -> (String, crate::parser::Ax42Chunks) {
+        /// A section as [`ax42_body`] expects the parser to read it.
+        #[derive(Default)]
+        struct Expected {
+            heading: bool,
+            body: bool,
+            rows: Vec<(usize, String)>,
+        }
+        let mut body = String::new();
+        // The first section is the one before any heading.
+        let mut sections = vec![Expected::default()];
+        for (index, block) in blocks.iter().enumerate() {
+            let section = sections.len() - 1;
+            match block {
+                Ax42Block::Heading(level, text) => {
+                    body.push_str(&heading_para(*level, text));
+                    sections.push(Expected {
+                        heading: true,
+                        ..Expected::default()
+                    });
+                }
+                Ax42Block::Paragraph(text) => {
+                    body.push_str(&body_para(text));
+                    if !text.trim().is_empty() {
+                        sections[section].body = true;
+                    }
+                }
+                Ax42Block::Table(table) => {
+                    body.push_str("<w:tbl>");
+                    for row in table {
+                        body.push_str("<w:tr>");
+                        for cell in row {
+                            body.push_str("<w:tc>");
+                            if cell.is_empty() {
+                                body.push_str("<w:p/>");
+                            }
+                            for paragraph in cell {
+                                body.push_str(&ax42_para(paragraph));
+                            }
+                            body.push_str("</w:tc>");
+                        }
+                        body.push_str("</w:tr>");
+                        if let Some(line) = crate::parser::ax42_expected_line(row) {
+                            sections[section].body = true;
+                            sections[section].rows.push((index, line));
+                        }
+                    }
+                    body.push_str("</w:tbl>");
+                }
+            }
+        }
+        let chunks = if sections.iter().any(|s| s.body) {
+            sections
+                .into_iter()
+                .filter(|s| s.body)
+                .map(|s| s.rows)
+                .collect()
+        } else {
+            sections
+                .into_iter()
+                .filter(|s| s.heading)
+                .map(|s| s.rows)
+                .collect()
+        };
+        (body, chunks)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) Through the parser: every chunk of a generated `.docx` marks its table rows
+        /// by the contract of [`crate::parser::TableRowSpan`] (see
+        /// [`crate::parser::ax42_check_rows`]), each span holding exactly the line its row was
+        /// written as, breaks and tabs in a cell included, in the chunk of the section the row
+        /// was written in. The index entry runs under a budget of its own
+        /// ([`crate::parser::AX42_INDEX_BUDGET`]) and the read entry under the built-in one, and
+        /// both are held to that.
+        #[test]
+        fn prop_docx_table_rows_mark_the_rows_written(blocks in ax42_blocks()) {
+            proptest::prop_assert_ne!(
+                crate::parser::AX42_INDEX_BUDGET,
+                crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES
+            );
+            let (body, rows) = ax42_body(&blocks);
+            let bytes = wrap_document_xml(&body);
+            let index = DocxParser::with_budget(crate::parser::AX42_INDEX_BUDGET)
+                .parse_bytes(&bytes, "ax42.docx", &[])
+                .expect("a generated document parses");
+            let read = DocxParser::default()
+                .parse_bytes_for_read(&bytes, "ax42.docx", &[])
+                .expect("a generated document parses");
+            crate::parser::ax42_check_entries(&index, &read, &rows)?;
+        }
+    }
+
     /// (AX-42) The parts of a [`DocxSection`] a property test draws: heading, level, ancestry,
     /// body and row spans as `(table, start, end)`.
     type Ax42Section = (

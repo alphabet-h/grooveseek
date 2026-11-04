@@ -221,6 +221,182 @@ pub(crate) fn assert_spans_hold(chunk: &Chunk) {
     );
 }
 
+/// (AX-42) One piece of a table-cell paragraph a property test writes: text, or the element an
+/// application writes for a line break or a tab.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Ax42Piece {
+    /// A run of text, written as it is (it may hold a raw tab or newline of its own).
+    Text(&'static str),
+    /// A line break: `<w:br/>` in a `.docx`, `<a:br/>` in a `.pptx`.
+    Break,
+    /// A tab: `<w:tab/>` in a `.docx`; a `.pptx` has no tab element, so a run of `\t` there.
+    Tab,
+}
+
+/// (AX-42) A table a property test writes into a `.docx` or `.pptx`: rows of cells, each cell
+/// its paragraphs, each paragraph its pieces. Drawn by [`ax42_table`].
+#[cfg(test)]
+pub(crate) type Ax42Table = Vec<Vec<Vec<Vec<Ax42Piece>>>>;
+
+/// (AX-42) Tables of up to 3 rows of 1 to 3 cells, each cell 0 to 2 paragraphs of 0 to 3
+/// pieces. The texts are often empty or blank, so rows and whole tables write nothing; some
+/// carry a raw tab or newline, or padding to trim, and one is multibyte; breaks and tabs come
+/// as the elements Word and PowerPoint write.
+#[cfg(test)]
+pub(crate) fn ax42_table() -> impl proptest::strategy::Strategy<Value = Ax42Table> {
+    use proptest::prelude::*;
+    let piece = prop_oneof![
+        3 => proptest::sample::select(&["", " ", "alder", "項目", " pad ", "ink\nwell", "a\tb"][..])
+            .prop_map(Ax42Piece::Text),
+        1 => Just(Ax42Piece::Break),
+        1 => Just(Ax42Piece::Tab),
+    ];
+    let paragraph = proptest::collection::vec(piece, 0..=3);
+    let cell = proptest::collection::vec(paragraph, 0..=2);
+    let row = proptest::collection::vec(cell, 1..=3);
+    proptest::collection::vec(row, 0..=3)
+}
+
+/// (AX-42) The line a row of an [`Ax42Table`] should be written as, worked out from the rules
+/// the parsers document rather than through [`ooxml::row_line`], so the property does not take
+/// the code under test as its own answer: inside a cell a line break is a space and a tab is a
+/// tab (`push_paragraph_separator` in [`crate::parser::docx`], `push_line_break` in
+/// [`crate::parser::pptx`]); each paragraph trimmed, the non-empty ones of a cell joined with a
+/// space, the fields joined with a tab, and no line when every field is empty.
+#[cfg(test)]
+pub(crate) fn ax42_expected_line(row: &[Vec<Vec<Ax42Piece>>]) -> Option<String> {
+    let paragraph = |pieces: &[Ax42Piece]| -> String {
+        pieces
+            .iter()
+            .map(|piece| match piece {
+                Ax42Piece::Text(text) => text,
+                Ax42Piece::Break => " ",
+                Ax42Piece::Tab => "\t",
+            })
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let fields: Vec<String> = row
+        .iter()
+        .map(|cell| {
+            cell.iter()
+                .map(|p| paragraph(p))
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    (!fields.iter().all(String::is_empty)).then(|| fields.join("\t"))
+}
+
+/// (AX-42) The decompression budget a property test builds the index-entry parser with: far
+/// more than a generated document takes, and not [`DEFAULT_MAX_DECOMPRESSED_BYTES`], the one
+/// the read entry keeps whatever the parser was built with. The two entries then run under
+/// budgets of their own.
+#[cfg(test)]
+pub(crate) const AX42_INDEX_BUDGET: u64 = 1024 * 1024;
+
+/// (AX-42) The rows a test wrote, as the chunks a parser should make of them: one entry per
+/// chunk, in order, holding that chunk's rows in order as `(table, line)`, `table` numbering
+/// the tables across the whole document.
+#[cfg(test)]
+pub(crate) type Ax42Chunks = Vec<Vec<(usize, String)>>;
+
+/// (AX-42) [`ax42_check_rows`] on both `index`, the index entry's parse, and `read`, the read
+/// entry's parse of the same bytes, each against its own content; and the same table rows,
+/// chunk for chunk, from both.
+#[cfg(test)]
+pub(crate) fn ax42_check_entries(
+    index: &ParsedDocument,
+    read: &ParsedDocument,
+    expected: &[Vec<(usize, String)>],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    ax42_check_rows(&index.chunks, expected)?;
+    ax42_check_rows(&read.chunks, expected)?;
+    let marks = |doc: &ParsedDocument| -> Vec<Option<Vec<TableRowSpan>>> {
+        doc.chunks.iter().map(|c| c.table_rows.clone()).collect()
+    };
+    proptest::prop_assert_eq!(marks(read), marks(index));
+    Ok(())
+}
+
+/// (AX-42) The [`Chunk::table_rows`] a parser produced, against the rows a test wrote, chunk
+/// by chunk ([`Ax42Chunks`]):
+///
+/// - there are as many chunks as expected;
+/// - every chunk carries `Some`, the same contract [`table_rows_fit`] gives the read side;
+/// - each span slices its chunk's content (in range, on char boundaries, not empty) to a text
+///   that does not end in a newline;
+/// - in each chunk the span texts are exactly the lines expected there, in order, so a row
+///   cannot pass by turning up in a neighbouring chunk, and a chunk with no row carries
+///   `Some(vec![])`;
+/// - in each chunk the tables are numbered by the order the document's tables first appear in
+///   it, from 0.
+#[cfg(test)]
+pub(crate) fn ax42_check_rows(
+    chunks: &[Chunk],
+    expected: &[Vec<(usize, String)>],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    use proptest::{prop_assert, prop_assert_eq};
+    let contents: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+    prop_assert_eq!(
+        chunks.len(),
+        expected.len(),
+        "chunks {:?}, expected rows {:?}",
+        contents,
+        expected
+    );
+    for (index, (chunk, rows)) in chunks.iter().zip(expected).enumerate() {
+        let content = &chunk.content;
+        let Some(spans) = chunk.table_rows.as_deref() else {
+            return Err(proptest::test_runner::TestCaseError::fail(format!(
+                "chunk {index} has no table rows: {content:?}"
+            )));
+        };
+        prop_assert!(
+            table_rows_fit(content, spans),
+            "chunk {}: {:?} in {:?}",
+            index,
+            spans,
+            content
+        );
+        let mut lines: Vec<&str> = Vec::new();
+        for span in spans {
+            let text = content.get(span.start as usize..span.end as usize);
+            prop_assert!(
+                text.is_some_and(|t| !t.is_empty() && !t.ends_with('\n')),
+                "chunk {}: {:?} does not slice {:?} to a row",
+                index,
+                span,
+                content
+            );
+            lines.push(text.unwrap_or_default());
+        }
+        let want: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        prop_assert_eq!(&lines, &want, "chunk {}: {:?}", index, content);
+        let mut order: Vec<usize> = Vec::new();
+        for (span, (doc_table, line)) in spans.iter().zip(rows) {
+            let number = match order.iter().position(|t| t == doc_table) {
+                Some(n) => n,
+                None => {
+                    order.push(*doc_table);
+                    order.len() - 1
+                }
+            };
+            prop_assert_eq!(
+                span.table as usize,
+                number,
+                "chunk {} row {:?}: tables numbered by first appearance",
+                index,
+                line
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A fully parsed document: frontmatter + chunks + retained raw content.
 #[derive(Debug, Clone)]
 pub struct ParsedDocument {

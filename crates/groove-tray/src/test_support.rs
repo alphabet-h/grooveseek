@@ -39,6 +39,88 @@ pub fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", unique_suffix()))
 }
 
+/// A stand-in daemon for one request: bind a loopback port, and on a background thread accept
+/// one connection, read the request up to the end of its headers and write `response`, the
+/// whole HTTP response as bytes on the wire, then close. Returns the bound address.
+///
+/// The accept has no timeout: if no connection comes, the thread blocks until the test process
+/// exits. Once a connection is accepted, each read of the request gives up after 3 seconds
+/// without data, and the thread then ends without answering; the test that started it fails on
+/// its own terms.
+pub fn serve_one_response(response: String) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in daemon");
+    let addr = listener.local_addr().expect("stand-in daemon addr");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = stream.write_all(response.as_bytes());
+    });
+    addr
+}
+
+/// The response [`serve_one_response`] takes for `status` (the status line after
+/// `HTTP/1.1 `) with a JSON `body`, the connection closed after it.
+pub fn json_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A port that is bound and never answers: a background thread accepts every connection and
+/// holds it open without reading or writing, until the test process exits. Returns the bound
+/// loopback address. This is the shape of a busy daemon.
+///
+/// One of the daemon module's tests, the one that a still-bound port is not reported as stopped,
+/// has the same listener inline in its body, which stays as it is because test bodies are not
+/// edited. (This file is compiled into both the library and the binary target, and the daemon
+/// module lives only in the binary, so it is named here rather than linked.)
+pub fn hold_connections() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind holding listener");
+    let addr = listener.local_addr().expect("holding listener addr");
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => held.push(s),
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
+/// A port that is bound and answers nothing: a background thread accepts every connection and
+/// closes it at once, without reading or writing, until the test process exits. Returns the
+/// bound loopback address. This is the shape of a daemon that drops a request.
+///
+/// The listener stays bound for the life of the process, so unlike a port bound and released
+/// to stand for "nothing listening", no test running beside the caller can be given it.
+pub fn close_on_accept() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closing listener");
+    let addr = listener.local_addr().expect("closing listener addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => drop(s),
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

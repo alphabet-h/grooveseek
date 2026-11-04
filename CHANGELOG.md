@@ -112,6 +112,21 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `watcher_repeat` input (1 to 50) runs the watcher end-to-end tests that many times on macOS
   and tallies the failures per test, skipping the rest of the nightly; the scheduled run is
   unchanged (audit AX-42, kuriya 627).
+- New property tests run generated `.docx` and `.pptx` files through their parsers, both the
+  index and the read entry, and check every chunk's table-row spans: present on every chunk
+  (`Some([])` where there is no row), each slicing the content on char boundaries to a text
+  that does not end in a newline, read in order exactly the lines the rows were written as
+  (line breaks and tabs in a cell written as the `<w:br/>` / `<w:tab/>` / `<a:br/>` elements
+  the applications write, and as raw characters in the text; padded or empty paragraphs; rows
+  that write nothing; blank or padded paragraphs and titles around tables, and tables at the
+  start or end of a section or slide), tables numbered per chunk by first appearance from 0,
+  and no span in a slide's notes, which are read. New `groove-tray` tests point the status
+  poll's fetch at a stand-in daemon on loopback: a status answer is read, a partial one takes
+  the defaults, a failure status fails with the status whatever the body, a body that is not
+  a status fails to decode, a daemon that closes the connection without answering is a
+  transport failure, and one that never answers fails on the client's timeout, no sooner than
+  it and at most 2 seconds after; that timeout, now a named constant, is pinned shorter than
+  the polling interval (audit AX-42, kuriya 627).
 
 ## [1.24.0] - 2026-11-02
 
