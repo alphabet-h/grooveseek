@@ -76,9 +76,9 @@ fn rows(db: &Mutex<Database>, from: &str, to: &str) -> (usize, usize) {
 
 /// `(emitted, started, finished)` of the probe. `emitted` counts every batch the debouncer
 /// handed over, before the channel send and whatever it returned, so a batch dropped on a full
-/// channel moves it and never `started`; `started` and `finished` move around one
-/// `handle_events` in the loop, `finished` after it returned (`watcher.rs` touches them nowhere
-/// else).
+/// channel moves it and never `started`; `started` and `finished` move around one call of
+/// `handle_events` in [`grooveseek::watcher`]'s loop, `finished` after it returned (that module
+/// touches them nowhere else).
 fn counts(probe: &WatchBatchProbe) -> (u64, u64, u64) {
     (
         probe.emitted.load(Ordering::SeqCst),
