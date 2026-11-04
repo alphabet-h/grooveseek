@@ -38,20 +38,12 @@
 //! other BGE-M3 tests (the skip is a substring match; its line matches this test alone).
 
 mod common;
-use common::eval_gate::groove_bin;
+use common::eval_gate::{groove_bin, index_corpus, pinned_config};
 use common::temp::TempKbLayout;
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-/// `groove.toml` next to the KB (inside the layout's cleanup root, with the `.groove.db`),
-/// enabling Markdown and `.docx`.
-fn write_config(kb: &TempKbLayout) -> PathBuf {
-    let cfg = kb.root().join("groove.toml");
-    std::fs::write(&cfg, "[parsers]\nenabled = [\"md\", \"docx\"]\n").unwrap();
-    cfg
-}
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -305,7 +297,9 @@ fn is_empty_chapter_excerpt(hit: &serde_json::Value) -> bool {
 #[ignore = "requires embedding model download (BGE-M3 ~2.3 GB) and an index build"]
 fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
     let kb = TempKbLayout::new("groove-eval-ja-rules");
-    let cfg = write_config(&kb);
+    // `groove.toml` in the layout's cleanup root, beside the `.groove.db`; `[parsers]` is
+    // the only key, so the defaults of retrieval apply.
+    let cfg = pinned_config(kb.root(), &["md", "docx"]);
     kb.write_bytes(RULES_PATH, &rules_docx());
     for (path, content) in DISTRACTORS {
         kb.write(path, content);
@@ -314,21 +308,7 @@ fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
     let bin = groove_bin();
 
     // 1) Index. `[parsers].enabled` is config-only, hence `--config`.
-    let out = Command::new(&bin)
-        .arg("--config")
-        .arg(&cfg)
-        .arg("index")
-        .arg("--kb-path")
-        .arg(kb.kb())
-        .arg("--model")
-        .arg(MODEL)
-        .output()
-        .expect("spawn groove index");
-    assert!(
-        out.status.success(),
-        "index failed: stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    index_corpus(kb.kb(), &cfg, MODEL);
 
     // 2) Every document made it in, so a parser that skipped the `.docx` reads as that
     //    rather than as a retrieval miss below.
