@@ -217,7 +217,9 @@ pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 ///
 /// Existing watcher tests carry private copies of this fixture; they are left
 /// as they are because this repository does not edit existing tests. A new
-/// watcher test uses this one.
+/// watcher test uses this one. (Reading the server's stderr is a separate
+/// matter and has one implementation, [`ServerGuard::stderr`] then
+/// `StderrLog::stripped_lines`, which those tests' helpers call.)
 pub fn served_watching(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
     let fx = fixture(prefix, files, WATCH_TOML);
     fx.index();

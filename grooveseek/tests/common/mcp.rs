@@ -123,17 +123,21 @@ impl StderrLog {
         self.lines().iter().any(|l| l.contains(needle))
     }
 
-    /// What has been read so far, ANSI colours removed, one line per line: the
-    /// form a failure message quotes. Several watcher tests carry a private
-    /// copy of this (`stderr_text` / `stderr_lines`); they are left as they are
-    /// because this repository does not edit existing tests, and a new test
-    /// uses this one.
-    pub fn text(&self) -> String {
+    /// What has been read so far, one entry per line, with the ANSI colours the
+    /// Windows tracing subscriber adds removed: the form an assertion matches
+    /// against. The watcher tests' `stderr_lines` / `stderr_text` helpers call
+    /// this rather than strip the lines themselves.
+    pub fn stripped_lines(&self) -> Vec<String> {
         self.lines()
             .iter()
             .map(|l| super::ansi::strip_ansi(l))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
+    }
+
+    /// [`StderrLog::stripped_lines`] joined by newlines: the form a failure
+    /// message quotes.
+    pub fn text(&self) -> String {
+        self.stripped_lines().join("\n")
     }
 }
 

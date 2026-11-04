@@ -22,7 +22,6 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
 use common::embed_cli::{Fixture, fixture};
 use common::embed_mock::{hermetic, wait_until};
 use common::mcp::{ServerGuard, spawn_serve_with};
@@ -84,12 +83,7 @@ fn text_of(fx: &Fixture, rel: &str) -> String {
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 /// Wait until the index holds exactly `want` and `holds` accepts it; the last paths seen.

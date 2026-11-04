@@ -14,7 +14,6 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
 use common::embed_cli::{Fixture, fixture};
 use common::embed_mock::{hermetic, wait_until};
 use common::mcp::{ServerGuard, spawn_serve_with};
@@ -78,12 +77,7 @@ fn paths(fx: &Fixture) -> Vec<String> {
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 /// Require the index to reach exactly `want` and to keep it for [`HOLD`], checked over and

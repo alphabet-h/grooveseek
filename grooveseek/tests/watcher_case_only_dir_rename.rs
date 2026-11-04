@@ -31,7 +31,6 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
 use common::embed_cli::fixture;
 use common::embed_mock::hermetic;
 use common::mcp::{ServerGuard, spawn_serve_with};
@@ -206,13 +205,7 @@ fn poll_until(
 }
 
 fn stderr_text(guard: &ServerGuard) -> String {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect::<Vec<_>>()
-        .join("\n")
+    guard.stderr().text()
 }
 
 /// (AX-14) Renaming the indexed `Docs/` to `docs/` moves every row under it, the nested one

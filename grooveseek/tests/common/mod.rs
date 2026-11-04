@@ -46,8 +46,10 @@
 //!   the `groove index` summary line and the reader-connection snapshot of the
 //!   index rows that the AX-42 tests share, and the fixture served with the
 //!   watcher on ([`crate::common::embed_cli::served_watching`]) for new watcher
-//!   tests; the existing watcher tests keep private copies of it because
-//!   existing tests are not edited.
+//!   tests; the existing watcher tests keep private copies of that fixture
+//!   because existing tests are not edited. The server's stderr with ANSI
+//!   colours removed is not among the copies: every watcher test reads it
+//!   through [`crate::common::mcp::StderrLog::stripped_lines`] (or `text`).
 //! - [`crate::common::in_process`] — rerunning a test body in a hermetic child
 //!   and opening the index and the embedder in-process, for tests that call
 //!   the indexer's library functions against [`crate::common::embed_mock`].

@@ -17,7 +17,6 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
 use common::embed_cli::{Fixture, fixture};
 use common::embed_mock::{hermetic, wait_until};
 use common::mcp::{ServerGuard, spawn_serve_with};
@@ -69,12 +68,7 @@ fn serve(fx: &Fixture) -> ServerGuard {
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 /// Wait up to 30 s for a stderr line holding `needle`; every line seen so far comes back too.
