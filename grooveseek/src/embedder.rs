@@ -1544,9 +1544,9 @@ impl Reranker {
 
 /// (#544 PR-2, J1) A provider that answers every input in process with one fixed vector of its
 /// dimension, for the lib's unit tests of writes that embed:
-/// `Reindex::Force` in [`crate::indexer`] reads no stored vectors and embeds every chunk, which
-/// the closed-port embedder of the indexer's tests cannot. (`Reindex` is private to that module,
-/// so rustdoc does not resolve a link to it from here.)
+/// the `Force` mode of `Reindex` in [`crate::indexer`] reads no stored vectors and embeds every
+/// chunk, which the closed-port embedder of the indexer's tests cannot. (Not linked: `Reindex`
+/// is private to that module, and rustdoc resolves no private item of it from here.)
 #[cfg(any(test, feature = "test-helpers"))]
 struct FixedVectorProvider {
     dimension: usize,
