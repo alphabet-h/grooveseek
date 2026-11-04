@@ -134,6 +134,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   those queries nor for queries no article answers; with the fold of empty headings (1.17.0)
   undone, the chapters come back as empty excerpts at ranks two to five (audit AX-20,
   kuriya 616).
+- `notify` and `notify-debouncer-full` are pinned to exactly `8.2.0` and `0.6.0`, the versions
+  the lock already resolved, so `Cargo.lock` is unchanged. The macOS stale-create filter in front
+  of the debouncer relies on the order in which that notify turns an FSEvents record into events
+  and on that debouncer dropping a path's queue on a `Remove`; a semver bump could change either
+  without a manifest edit. Raising them is now a deliberate edit, after the filter's premise is
+  checked again on macOS (audit AX-39, kuriya 624).
 
 ## [1.24.0] - 2026-11-02
 
