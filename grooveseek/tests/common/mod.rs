@@ -28,6 +28,14 @@
 //!   reading the run back. Shared by the prose retrieval gate
 //!   (`eval_corpus_quality.rs`) and the code one (`code_eval_quality.rs`).
 //!   How a golden is grouped and where its floors sit stays with each gate.
+//! - [`crate::common::cli`] — the counts `groove status` prints and the JSON of
+//!   `groove search --format json`, read for a command the caller has built (a
+//!   real model's or [`crate::common::embed_cli::Fixture`]'s hermetic one).
+//!   Shared by that fixture and the Japanese rules retrieval check (AX-20).
+//! - [`crate::common::ooxml`] — packing generated Office Open XML parts into a
+//!   zip. Shared by the binary-format and Japanese rules retrieval checks; the
+//!   other tests that pack zips keep their copies, as existing tests are not
+//!   edited.
 //! - [`crate::common::code_fixtures`] — the source file and the configurations the
 //!   code-parser tests read. Shared by the `#[ignore]` end-to-end suite
 //!   (`code_formats_cli.rs`) and the in-process one that runs on every pull
@@ -79,6 +87,7 @@
 #![allow(dead_code)] // helpers are referenced lazily from individual integration tests
 
 pub mod ansi;
+pub mod cli;
 pub mod code_fixtures;
 pub mod docs;
 pub mod embed_cli;
@@ -86,6 +95,7 @@ pub mod embed_mock;
 pub mod eval_gate;
 pub mod in_process;
 pub mod mcp;
+pub mod ooxml;
 pub mod production;
 pub mod rename;
 pub mod source;

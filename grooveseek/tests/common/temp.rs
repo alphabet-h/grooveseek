@@ -77,12 +77,7 @@ impl TempRoot {
     /// Write `content` to `path()/rel`, creating any missing parents.
     /// Panics on I/O failure (test convention).
     pub fn write(&self, rel: &str, content: &str) {
-        let full = self.path.join(rel);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)
-                .expect("TempRoot::write: failed to create parent directories");
-        }
-        fs::write(&full, content).expect("TempRoot::write: failed to write file");
+        write_under(&self.path, rel, content.as_bytes(), "TempRoot::write");
     }
 }
 
@@ -128,13 +123,29 @@ impl TempKbLayout {
 
     /// Write `content` to `kb()/rel`, creating parents.
     pub fn write(&self, rel: &str, content: &str) {
-        let full = self.kb.join(rel);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)
-                .expect("TempKbLayout::write: failed to create parent directories");
-        }
-        fs::write(&full, content).expect("TempKbLayout::write: failed to write file");
+        write_under(&self.kb, rel, content.as_bytes(), "TempKbLayout::write");
     }
+
+    /// Write the bytes `content` to `rel` under [`TempKbLayout::kb`], creating parents.
+    /// For binary documents (`.docx`, `.pdf`, ...) that [`TempKbLayout::write`] cannot
+    /// carry as a `&str`.
+    pub fn write_bytes(&self, rel: &str, content: &[u8]) {
+        write_under(&self.kb, rel, content, "TempKbLayout::write_bytes");
+    }
+}
+
+/// Write `content` to `dir/rel`, creating any missing parents; the one body behind
+/// [`TempRoot::write`], [`TempKbLayout::write`] and [`TempKbLayout::write_bytes`].
+///
+/// Panics on I/O failure (test convention), with `caller` opening the message the way
+/// each of them always worded it (`"<caller>: failed to write file: <error>"`).
+fn write_under(dir: &Path, rel: &str, content: &[u8], caller: &str) {
+    let full = dir.join(rel);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("{caller}: failed to create parent directories: {e:?}"));
+    }
+    fs::write(&full, content).unwrap_or_else(|e| panic!("{caller}: failed to write file: {e:?}"));
 }
 
 impl Drop for TempKbLayout {
@@ -192,6 +203,16 @@ mod tests {
         assert!(t.kb().starts_with(t.root()));
         assert_eq!(t.kb().parent().unwrap(), t.root());
         assert!(t.kb().exists());
+    }
+
+    #[test]
+    fn test_tempkblayout_write_bytes_creates_parents() {
+        let t = TempKbLayout::new("groove-test-layout-bytes");
+        t.write_bytes("a/b/c.bin", &[0x50, 0x4b, 0x00, 0xff]);
+        assert_eq!(
+            std::fs::read(t.kb().join("a/b/c.bin")).unwrap(),
+            vec![0x50, 0x4b, 0x00, 0xff]
+        );
     }
 
     #[test]

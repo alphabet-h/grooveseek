@@ -39,7 +39,11 @@
 //! nightly via `--include-ignored`, or manually with
 //! `cargo test --test eval_binary_formats -- --ignored`.
 
-use std::io::Write as _;
+mod common;
+use common::eval_gate::{groove_bin, pinned_config};
+use common::ooxml::zip_parts;
+use common::temp::TempKbLayout;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -49,60 +53,33 @@ use std::process::Command;
 
 /// Root holds the KB plus the sibling `.groove.db` and `groove.toml`, so the
 /// `Drop` guard removes the database too (it lands at `kb_path.parent()`).
-struct TempKb {
-    root: PathBuf,
-    kb: PathBuf,
-}
+///
+/// The names the test body calls, over the shared
+/// [`crate::common::temp::TempKbLayout`] (unique naming, cleanup) and
+/// [`crate::common::eval_gate::pinned_config`] (the `[parsers]`-only
+/// `groove.toml`); the test body is not edited.
+struct TempKb(TempKbLayout);
 
 impl TempKb {
     fn new(prefix: &str) -> Self {
-        // `src/test_support.rs` carries this same naming but is `#[cfg(test)]`
-        // gated, so it is reachable from lib unit tests only — integration
-        // tests each keep a copy, as `tests/eval_cli.rs` does.
-        //
-        // The counter is not redundant with the clock: a test binary runs its
-        // tests on parallel threads of one process, so PID and nanos alone
-        // collide (AU-54).
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{seq}"));
-        let kb = root.join("kb");
-        std::fs::create_dir_all(&kb).unwrap();
-        Self { root, kb }
+        Self(TempKbLayout::new(prefix))
     }
 
     fn kb(&self) -> &Path {
-        &self.kb
+        self.0.kb()
     }
 
     fn write_text(&self, rel: &str, content: &str) {
-        std::fs::write(self.kb.join(rel), content).unwrap();
+        self.0.write(rel, content);
     }
 
     fn write_bytes(&self, rel: &str, content: &[u8]) {
-        std::fs::write(self.kb.join(rel), content).unwrap();
+        self.0.write_bytes(rel, content);
     }
 
     /// `groove.toml` next to the KB, enabling every parser under test.
     fn write_config(&self) -> PathBuf {
-        let cfg = self.root.join("groove.toml");
-        std::fs::write(
-            &cfg,
-            "[parsers]\nenabled = [\"md\", \"pdf\", \"docx\", \"xlsx\", \"pptx\"]\n",
-        )
-        .unwrap();
-        cfg
-    }
-}
-
-impl Drop for TempKb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        pinned_config(self.0.root(), &["md", "pdf", "docx", "xlsx", "pptx"])
     }
 }
 
@@ -226,21 +203,6 @@ fn make_pptx(body: &str) -> Vec<u8> {
     ])
 }
 
-fn zip_parts(parts: &[(&str, &str)]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let opts: zip::write::FileOptions<()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for (name, body) in parts {
-            zip.start_file(*name, opts).unwrap();
-            zip.write_all(body.as_bytes()).unwrap();
-        }
-        zip.finish().unwrap();
-    }
-    buf
-}
-
 // ---------------------------------------------------------------------------
 // Corpus
 // ---------------------------------------------------------------------------
@@ -324,8 +286,9 @@ const DISTRACTORS: &[(&str, &str)] = &[
 // Test
 // ---------------------------------------------------------------------------
 
+/// The name the test body calls for [`crate::common::eval_gate::groove_bin`].
 fn grooveseek_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_groove"))
+    groove_bin()
 }
 
 #[test]

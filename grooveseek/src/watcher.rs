@@ -467,6 +467,14 @@ type Backend = notify::RecommendedWatcher;
 /// rows under the old directory stay until the next full index. Dropping
 /// events cannot recover that; it is the same family as the unpaired macOS
 /// renames the watcher tests already allow for.
+///
+/// (audit AX-39) Both premises are version-specific: the flag order is
+/// notify 8.2.0's and the queue dropping is notify-debouncer-full 0.6.0's.
+/// This crate's manifest pins the two crates to exactly those versions, so
+/// raising either is a deliberate edit there, to be made only after this
+/// filter's premise has been checked again on macOS. It pins notify-types
+/// (2.1.0) as well, the event types both crates share: [`is_stale_create`]
+/// matches on `EventKind`, which can gain variants in a 2.x minor release.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct StaleCreateFilter<W>(W);
 
