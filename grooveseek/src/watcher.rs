@@ -472,7 +472,9 @@ type Backend = notify::RecommendedWatcher;
 /// notify 8.2.0's and the queue dropping is notify-debouncer-full 0.6.0's.
 /// `grooveseek/Cargo.toml` pins the two crates to exactly those versions, so
 /// raising either is a deliberate edit there, to be made only after this
-/// filter's premise has been checked again on macOS.
+/// filter's premise has been checked again on macOS. It pins notify-types
+/// (2.1.0) as well, the event types both crates share: [`is_stale_create`]
+/// matches on `EventKind`, which can gain variants in a 2.x minor release.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct StaleCreateFilter<W>(W);
 

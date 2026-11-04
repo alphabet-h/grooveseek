@@ -92,6 +92,8 @@ regex = "1"
 # Pinned exactly: watcher.rs's StaleCreateFilter relies on these versions (AX-39); re-check its premise on macOS before raising either.
 notify = "=8.2.0"
 notify-debouncer-full = "=0.6.0"
+# Not used directly: declared only to pin the event types both crates above share (EventKind can gain variants in a 2.x minor).
+notify-types = "=2.1.0"
 # [feature 26] path_globs filter 用
 globset = "0.4"
 # [feature-49 / C-7] `.grooveignore`。gitignore 構文のマッチャとしてのみ使い、

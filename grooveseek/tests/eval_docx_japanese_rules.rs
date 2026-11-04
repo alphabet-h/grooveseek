@@ -23,70 +23,33 @@
 //!   index holds no empty chunk at all, so on the fixed code that assertion holds trivially;
 //!   it fails only when the chapters become empty chunks again. That is checked by
 //!   reverting the fold by hand (AX-20 mutation run), not by this test.
+//! - **Two paraphrases share no three-character run with the rules**, so the trigram
+//!   full-text side cannot match them and only the vector side can rank the article.
+//!   `paraphrases_share_no_trigram_with_the_rules`, which needs no model, keeps that true.
 //! - **Unrelated queries are part of the set.** kuriya #323 was seen on a query about a
 //!   lost laptop, which no article answers; one of the Markdown distractors does.
 //! - **`bge-m3`**: the corpus and the queries are Japanese, which the English `bge-small`
 //!   model does not read.
 //!
 //! `#[ignore]`: downloads BGE-M3 (~2.3 GB) on first use and builds an index. Run with
-//! `cargo test --test eval_docx_japanese_rules -- --ignored`.
+//! `cargo test --test eval_docx_japanese_rules -- --ignored`. `nightly.yml` runs it on the
+//! Linux leg only: its skip list for the windows and macOS legs names it, as it names the
+//! other BGE-M3 tests (the skip is a substring match; its line matches this test alone).
+
+mod common;
+use common::eval_gate::groove_bin;
+use common::temp::TempKbLayout;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ---------------------------------------------------------------------------
-// Temp KB (tempfile crate is not used in this project; see CLAUDE.local.md)
-// ---------------------------------------------------------------------------
-
-/// Root holds the KB plus the sibling `.groove.db` and `groove.toml`, so the `Drop` guard
-/// removes the database too (it lands at `kb_path.parent()`).
-struct TempKb {
-    root: PathBuf,
-    kb: PathBuf,
-}
-
-impl TempKb {
-    fn new(prefix: &str) -> Self {
-        // The counter is not redundant with the clock: a test binary runs its tests on
-        // parallel threads of one process, so PID and nanos alone collide (AU-54).
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{seq}"));
-        let kb = root.join("kb");
-        std::fs::create_dir_all(&kb).unwrap();
-        Self { root, kb }
-    }
-
-    fn kb(&self) -> &Path {
-        &self.kb
-    }
-
-    fn write_text(&self, rel: &str, content: &str) {
-        std::fs::write(self.kb.join(rel), content).unwrap();
-    }
-
-    fn write_bytes(&self, rel: &str, content: &[u8]) {
-        std::fs::write(self.kb.join(rel), content).unwrap();
-    }
-
-    /// `groove.toml` next to the KB, enabling Markdown and `.docx`.
-    fn write_config(&self) -> PathBuf {
-        let cfg = self.root.join("groove.toml");
-        std::fs::write(&cfg, "[parsers]\nenabled = [\"md\", \"docx\"]\n").unwrap();
-        cfg
-    }
-}
-
-impl Drop for TempKb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
+/// `groove.toml` next to the KB (inside the layout's cleanup root, with the `.groove.db`),
+/// enabling Markdown and `.docx`.
+fn write_config(kb: &TempKbLayout) -> PathBuf {
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, "[parsers]\nenabled = [\"md\", \"docx\"]\n").unwrap();
+    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +119,21 @@ const CHAPTERS: &[Chapter] = &[
             },
         ],
     },
+];
+
+/// `(article heading, query)`: queries that share no three-character run with any heading or
+/// body of the rules, so the full-text side (a trigram index) cannot match them and only the
+/// vector side can rank the article. [`paraphrases_share_no_trigram_with_the_rules`] keeps
+/// that true when the fixture changes.
+const PARAPHRASES: &[(&str, &str)] = &[
+    (
+        "第3条（始業及び終業）",
+        "お昼ごはんに使える時間はどれくらいか",
+    ),
+    (
+        "第2条（秘密保持）",
+        "辞めた社員がお客さんの住所を他人にしゃべってよいか",
+    ),
 ];
 
 /// Queries no article answers. kuriya #323 saw the empty chapter excerpts rank third to
@@ -260,10 +238,6 @@ const RULES_PATH: &str = "r1.docx";
 const MODEL: &str = "bge-m3";
 const TOP_K: usize = 5;
 
-fn grooveseek_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_groove"))
-}
-
 /// `groove --config <cfg> search <query> --kb-path <kb> --model bge-m3 --limit TOP_K
 /// --format json`, returning the `results` array.
 fn search(bin: &Path, cfg: &Path, kb: &Path, query: &str) -> Vec<serde_json::Value> {
@@ -329,14 +303,14 @@ fn is_empty_chapter_excerpt(hit: &serde_json::Value) -> bool {
 #[test]
 #[ignore = "requires embedding model download (BGE-M3 ~2.3 GB) and an index build"]
 fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
-    let kb = TempKb::new("groove-eval-ja-rules");
-    let cfg = kb.write_config();
+    let kb = TempKbLayout::new("groove-eval-ja-rules");
+    let cfg = write_config(&kb);
     kb.write_bytes(RULES_PATH, &rules_docx());
     for (path, content) in DISTRACTORS {
-        kb.write_text(path, content);
+        kb.write(path, content);
     }
 
-    let bin = grooveseek_bin();
+    let bin = groove_bin();
 
     // 1) Index. `[parsers].enabled` is config-only, hence `--config`.
     let out = Command::new(&bin)
@@ -365,6 +339,11 @@ fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
         .arg(kb.kb())
         .output()
         .expect("spawn groove status");
+    assert!(
+        status.status.success(),
+        "status failed: stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
     let status_out = String::from_utf8_lossy(&status.stdout);
     let expected_docs = 1 + DISTRACTORS.len();
     assert!(
@@ -402,6 +381,26 @@ fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
         }
     }
 
+    // 3b) The same for the paraphrases the full-text side cannot match.
+    for (heading, query) in PARAPHRASES {
+        let hits = search(&bin, &cfg, kb.kb(), query);
+        let top = hits.first();
+        if top.and_then(|h| h["path"].as_str()) != Some(RULES_PATH)
+            || top.and_then(|h| h["heading"].as_str()) != Some(*heading)
+        {
+            failures.push(format!(
+                "  paraphrase {query:?} should rank {RULES_PATH} / {heading} first; got:\n{}",
+                describe(&hits)
+            ));
+        }
+        if hits.iter().any(is_empty_chapter_excerpt) {
+            failures.push(format!(
+                "  paraphrase {query:?} has an empty chapter excerpt in its top {TOP_K}:\n{}",
+                describe(&hits)
+            ));
+        }
+    }
+
     // 4) A query no article answers keeps the chapter excerpts out of its top results too:
     //    the shape kuriya #323 reported.
     for query in UNRELATED_QUERIES {
@@ -419,4 +418,41 @@ fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
         "the Japanese rules did not rank as expected:\n{}",
         failures.join("\n")
     );
+}
+
+/// Model-free guard for [`PARAPHRASES`]: none shares a run of three characters with the
+/// preamble or with any heading or body of the rules, and each names a real article. Edit
+/// the fixture and this fails before the paraphrases quietly turn into full-text matches.
+#[test]
+fn paraphrases_share_no_trigram_with_the_rules() {
+    let mut texts: Vec<&str> = vec![PREAMBLE];
+    for chapter in CHAPTERS {
+        texts.push(chapter.heading);
+        for article in chapter.articles {
+            texts.push(article.heading);
+            texts.push(article.body);
+        }
+    }
+    let corpus = texts.join("\n");
+    for (heading, query) in PARAPHRASES {
+        assert!(
+            CHAPTERS
+                .iter()
+                .flat_map(|c| c.articles)
+                .any(|a| a.heading == *heading),
+            "paraphrase {query:?} names no article: {heading:?}"
+        );
+        let chars: Vec<char> = query.chars().collect();
+        let shared: Vec<String> = chars
+            .windows(3)
+            .map(|w| w.iter().collect::<String>())
+            .filter(|t| corpus.contains(t.as_str()))
+            .collect();
+        assert!(
+            shared.is_empty(),
+            "paraphrase {query:?} shares {shared:?} with the rules"
+        );
+    }
+    // The check itself can fail: a run copied from a body is found.
+    assert!(corpus.contains("通勤手"));
 }

@@ -135,6 +135,17 @@ impl TempKbLayout {
         }
         fs::write(&full, content).expect("TempKbLayout::write: failed to write file");
     }
+
+    /// Write the bytes `content` to `kb()/rel`, creating parents. For binary documents
+    /// (`.docx`, `.pdf`, ...) that [`TempKbLayout::write`] cannot carry as a `&str`.
+    pub fn write_bytes(&self, rel: &str, content: &[u8]) {
+        let full = self.kb.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)
+                .expect("TempKbLayout::write_bytes: failed to create parent directories");
+        }
+        fs::write(&full, content).expect("TempKbLayout::write_bytes: failed to write file");
+    }
 }
 
 impl Drop for TempKbLayout {
@@ -192,6 +203,16 @@ mod tests {
         assert!(t.kb().starts_with(t.root()));
         assert_eq!(t.kb().parent().unwrap(), t.root());
         assert!(t.kb().exists());
+    }
+
+    #[test]
+    fn test_tempkblayout_write_bytes_creates_parents() {
+        let t = TempKbLayout::new("groove-test-layout-bytes");
+        t.write_bytes("a/b/c.bin", &[0x50, 0x4b, 0x00, 0xff]);
+        assert_eq!(
+            std::fs::read(t.kb().join("a/b/c.bin")).unwrap(),
+            vec![0x50, 0x4b, 0x00, 0xff]
+        );
     }
 
     #[test]
