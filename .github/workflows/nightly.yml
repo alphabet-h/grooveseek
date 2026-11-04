@@ -35,6 +35,19 @@ on:
           exercise the reporting path end to end.
         type: boolean
         default: false
+      watcher_repeat:
+        description: >-
+          Run the watcher end-to-end tests (tests/watcher_e2e.rs) on macOS this
+          many times, 1 to 50, to measure how often they fail (AX-42). 0, the
+          default, is the ordinary nightly. Above 0 the run is that
+          measurement alone: every other job is skipped and nothing is
+          reported to the tracking issue. Above 50 the job fails at its first
+          step; a negative value runs the ordinary nightly and measures
+          nothing. Dispatch it on a branch other than main: this workflow's
+          concurrency group is per ref, so on main it queues behind, or
+          replaces a pending, scheduled nightly.
+        type: number
+        default: 0
 
 # 同一 ref で同時実行を抑制 (手動 + schedule が重なった場合の保険)。
 concurrency:
@@ -47,6 +60,8 @@ env:
 jobs:
   ignored-tests:
     name: ignored tests (${{ matrix.os }})
+    # Skipped only by a watcher measurement run (see `watcher-e2e-repeat`).
+    if: ${{ !(inputs.watcher_repeat > 0) }}
     runs-on: ${{ matrix.os }}
     strategy:
       # 片方の OS が落ちても、もう片方の結果は最後まで見たい。
@@ -265,8 +280,140 @@ jobs:
           --bench search_latency
           --bench string_ops
 
+  # (AX-42, kuriya 627) How flaky the watcher end-to-end tests are on macOS, by
+  # count rather than by one red night. FSEvents reports a path's collected
+  # flags in one record (kuriya trap 525), so whether these tests pass there
+  # can depend on timing, and the one leg above runs them once a day. This job
+  # runs them `watcher_repeat` times in a row on one runner and tallies the
+  # failures per test in the step summary.
+  #
+  # Only on a manual run with `watcher_repeat` above 0; the schedule never
+  # starts it, and a manual run left at 0 is the nightly it always was. Such a
+  # run skips every other job (each carries the opposite condition), so a
+  # measurement does not also spend an hour of each leg on the full suite, and
+  # `report` stays out of it, since a run whose checks were skipped says
+  # nothing about the tracking issue.
+  #
+  # A loop on one runner, not a matrix of runners: the test binary is built
+  # once, and macOS runners are the scarce ones. What it does not measure is
+  # the spread between runner machines; dispatch it more than once for that.
+  # The loop does not stop at the first failure and fails at the end if any
+  # run failed. Each run is written to the summary as it ends, so a job cut
+  # short by its timeout or a cancel still shows the runs it finished; only the
+  # per-test tally needs the loop to complete.
+  #
+  # `--ignored`, not `--include-ignored`: every test in that file is ignored, so
+  # the two run the same tests, and `cdylib_artifacts_built_in_ci.rs` finds the
+  # nightly suite step by `--include-ignored`, which this job must not share.
+  watcher-e2e-repeat:
+    name: watcher e2e x${{ inputs.watcher_repeat }} (macos-latest)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.watcher_repeat > 0 }}
+    runs-on: macos-latest
+    # About a minute a run once built (an estimate, not measured on the runner),
+    # plus a cold build; the input is capped at 50 to stay inside this.
+    timeout-minutes: 120
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+      REPEAT: ${{ inputs.watcher_repeat }}
+    steps:
+      # First, before a cold build spends half an hour on a run that cannot
+      # measure anything.
+      - name: Check watcher_repeat
+        shell: bash
+        run: |
+          if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [ "$REPEAT" -lt 1 ] || [ "$REPEAT" -gt 50 ]; then
+            echo "::error::watcher_repeat must be a whole number from 1 to 50, got '$REPEAT'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A manual measurement should not add an entry to an Actions cache
+          # that is already over its limit; it builds cold if it must.
+          save-if: false
+
+      # Restore only. The macOS leg of `ignored-tests` owns this entry and saves
+      # it; a second writer of the same key would race it (see "Cache fastembed
+      # models"). The paths are that leg's two, `.fastembed_cache` and its
+      # `default_model_dir`: the cache version hashes the paths, so restoring
+      # with fewer would miss every time (the coverage job does the same).
+      - name: Restore fastembed models (shared with ignored-tests)
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .fastembed_cache
+            ~/Library/Caches/fastembed
+          key: fastembed-v4-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            fastembed-v4-${{ runner.os }}-
+
+      # One process downloads BGE-small if the restore missed, so the tests
+      # below start on a warm cache. Retried for the reason the pre-warm of
+      # `ignored-tests` gives.
+      - name: Pre-warm embedding model cache (serial)
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test --test index_progress_cli -- --test-threads=1; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
+
+      - name: Build the watcher tests
+        run: cargo test --test watcher_e2e --no-run
+
+      # Each run's line goes to the summary as soon as it ends, so a run cut
+      # short by the timeout or a cancel still shows what was measured; the
+      # per-test tally is added only when the loop finishes.
+      - name: Run the watcher tests repeatedly
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p watcher-runs
+          echo "### watcher_e2e on $RUNNER_OS, $REPEAT runs" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for i in $(seq 1 "$REPEAT"); do
+            log="watcher-runs/run-$i.log"
+            if cargo test --test watcher_e2e -- --ignored > "$log" 2>&1; then
+              echo "run $i: ok"
+              echo "- run $i: ok" >> "$GITHUB_STEP_SUMMARY"
+            else
+              failed=$((failed + 1))
+              echo "::warning::run $i of $REPEAT failed"
+              names=$(sed -n -E 's/^test (.*) \.\.\. FAILED$/\1/p' "$log" | paste -sd ' ' -)
+              echo "$names"
+              echo "- run $i: failed ${names}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**$failed of $REPEAT runs failed**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| test | runs it failed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          cat watcher-runs/*.log | sed -n -E 's/^test (.*) \.\.\. FAILED$/\1/p' | sort | uniq -c | sort -rn | awk '{print "| " $2 " | " $1 " |"}' >> "$GITHUB_STEP_SUMMARY"
+          test "$failed" -eq 0
+
+      - name: Keep the logs of every run
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: watcher-e2e-runs
+          path: watcher-runs/
+          if-no-files-found: ignore
+
   cargo-audit:
     name: cargo audit
+    if: ${{ !(inputs.watcher_repeat > 0) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -288,6 +435,7 @@ jobs:
   # 再生成して commit 済みの copy と突き合わせ、ずれていれば fail させる。
   third-party-licenses:
     name: THIRD-PARTY-LICENSES.md is current
+    if: ${{ !(inputs.watcher_repeat > 0) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -318,6 +466,7 @@ jobs:
 
   coverage:
     name: line coverage (cargo-llvm-cov)
+    if: ${{ !(inputs.watcher_repeat > 0) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -562,7 +711,9 @@ jobs:
     needs: [ignored-tests, cargo-audit, third-party-licenses, coverage]
     # always(): 失敗した時こそ動く必要がある。scheduled 実行と、明示的に
     # 頼まれた手動実行だけに絞り、branch での試し撃ちが issue を作らないようにする。
-    if: always() && (github.event_name == 'schedule' || inputs.notify)
+    # A watcher measurement run (`watcher_repeat` above 0) skipped the jobs this
+    # reports on, so it would close the issue on checks that never ran.
+    if: always() && (github.event_name == 'schedule' || inputs.notify) && !(inputs.watcher_repeat > 0)
     runs-on: ubuntu-latest
     permissions:
       # repo の既定は read (`actions/permissions/workflow` で実測)。ここを

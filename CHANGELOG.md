@@ -101,6 +101,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   all four stored vectors and sends nothing, while `force` embeds every chunk and reuses none
   (`tests/index_chunk_vector_reuse.rs`). The shared spawn helper gains a variant that does not
   wait for the watcher to arm, for a server that starts as a reader (audit AX-42, kuriya 627).
+- The macOS watcher's known limit (a directory renamed and created again before the event
+  arrives leaves the old rows until the next full index) is pinned from its far end: with a live
+  watcher, on every platform, the next full `groove index` leaves exactly the rows the disk
+  backs, whatever the watcher wrote (`tests/watcher_dir_rename_recreated_full_index.rs`). A new
+  CI job, `tokio-floor`, pins tokio in the lock to the `1.52.1` floor the workspace declares
+  and checks the workspace against it on Linux and Windows, so the floor stays true after the
+  lock moves on; the
+  command block in `AGENTS.md` / `CONTRIBUTING.md` lists it. A manual nightly run with the new
+  `watcher_repeat` input (1 to 50) runs the watcher end-to-end tests that many times on macOS
+  and tallies the failures per test, skipping the rest of the nightly; the scheduled run is
+  unchanged (audit AX-42, kuriya 627).
 
 ## [1.24.0] - 2026-11-02
 

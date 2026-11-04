@@ -12,10 +12,9 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
-use common::embed_cli::{Fixture, fixture};
-use common::embed_mock::{DOC_MODEL, hermetic, wait_until};
-use common::mcp::{ServerGuard, spawn_serve_with};
+use common::embed_cli::{Fixture, served_watching};
+use common::embed_mock::{DOC_MODEL, wait_until};
+use common::mcp::ServerGuard;
 use std::time::Duration;
 
 const RUNBOOK: &str = "runbook.md";
@@ -54,27 +53,11 @@ fn runbook(sections: &[(&str, &str)]) -> String {
 
 /// A knowledge base holding [`RUNBOOK`], indexed once, served with the watcher on.
 fn served_runbook(prefix: &str) -> (Fixture, ServerGuard) {
-    let fx = fixture(
-        prefix,
-        &[(RUNBOOK, &runbook(&SECTIONS))],
-        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
-    );
-    fx.index();
-    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`, so the edits
-    // below cannot fall before the debouncer is armed.
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
-    (fx, guard)
+    served_watching(prefix, &[(RUNBOOK, &runbook(&SECTIONS))])
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 #[test]

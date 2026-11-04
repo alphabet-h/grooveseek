@@ -22,8 +22,7 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
-use common::embed_cli::{Fixture, fixture};
+use common::embed_cli::{Fixture, fixture, served_watching};
 use common::embed_mock::{hermetic, wait_until};
 use common::mcp::{ServerGuard, spawn_serve_with};
 use grooveseek::db::Database;
@@ -44,18 +43,7 @@ fn note(title: &str, marker: &str) -> String {
 
 /// A knowledge base holding `files`, indexed once, served with the watcher on.
 fn served(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
-    let fx = fixture(
-        prefix,
-        files,
-        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
-    );
-    fx.index();
-    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`, so the edits a
-    // test makes next cannot fall before the debouncer is armed.
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
-    (fx, guard)
+    served_watching(prefix, files)
 }
 
 /// The index the server writes, opened beside it (WAL, with a busy timeout), and closed again
@@ -84,12 +72,7 @@ fn text_of(fx: &Fixture, rel: &str) -> String {
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 /// Wait until the index holds exactly `want` and `holds` accepts it; the last paths seen.

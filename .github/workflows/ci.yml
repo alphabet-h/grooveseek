@@ -171,3 +171,49 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  # (AX-42, kuriya 627) The root Cargo.toml asks for `tokio = "1.52.1"`: a floor,
+  # because 1.52.0 can leave a `spawn_blocking` task queued (#344, CHANGELOG
+  # 1.17.1). Every other job builds whatever Cargo.lock pins, so once a lock
+  # update moves tokio past 1.52.1, code that needs the newer tokio would pass
+  # them all while the manifest still promises 1.52.1 to anyone resolving
+  # their own lock. This job builds the workspace against the floor itself.
+  #
+  # Two OSes, each for code only it compiles: Linux for the Unix-only tokio
+  # use (`UnixListener` in `transport/http.rs`), Windows for the tray, whose
+  # use of tokio (`tokio::process`, `tokio::time`) sits under
+  # `cfg(windows)` and is type-checked nowhere else. macOS adds nothing
+  # neither of them compiles, and its runners are the scarce ones.
+  # `cargo check` of the libraries and binaries only. No `--all-targets`: the
+  # floor is what a user of the binary or the library gets, and tests are not
+  # built by them. Both commands read the same under bash and pwsh, the
+  # default shells of the two runners.
+  #
+  # `--precise` fails if anything in the tree needs a newer tokio, which is
+  # itself the answer that the floor is no longer true. It rewrites Cargo.lock;
+  # the runner is thrown away afterwards, so nothing here puts it back. The
+  # command block in AGENTS.md / CONTRIBUTING.md tells a contributor to.
+  #
+  # The cache is saved from `main` only and restored everywhere: PR runs read
+  # the default branch's entry, so the job adds one entry per OS to an Actions
+  # cache that is already over its limit, not one per branch. rust-cache keys
+  # by job id and runner OS, as the three legs of `test` above rely on, so the
+  # two legs neither share an entry with each other nor with another job.
+  tokio-floor:
+    name: tokio floor 1.52.1 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    # A check of the workspace on a warm cache; cold, the C build scripts
+    # (sqlite, tree-sitter) dominate. 20 minutes, like clippy.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo update -p tokio --precise 1.52.1
+      - run: cargo check --workspace --locked

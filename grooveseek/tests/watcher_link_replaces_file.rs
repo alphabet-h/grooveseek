@@ -14,10 +14,9 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
-use common::embed_cli::{Fixture, fixture};
-use common::embed_mock::{hermetic, wait_until};
-use common::mcp::{ServerGuard, spawn_serve_with};
+use common::embed_cli::{Fixture, served_watching_after};
+use common::embed_mock::wait_until;
+use common::mcp::ServerGuard;
 use common::rename::rename_retrying;
 use grooveseek::db::Database;
 use std::path::Path;
@@ -48,19 +47,7 @@ fn served_after(
     files: &[(&str, &str)],
     between: impl FnOnce(&Fixture),
 ) -> (Fixture, ServerGuard) {
-    let fx = fixture(
-        prefix,
-        files,
-        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
-    );
-    fx.index();
-    between(&fx);
-    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`, so the edits a
-    // test makes next cannot fall before the debouncer is armed.
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
-    (fx, guard)
+    served_watching_after(prefix, files, between)
 }
 
 /// The index the server writes, opened beside it (WAL, with a busy timeout), and closed again
@@ -78,12 +65,7 @@ fn paths(fx: &Fixture) -> Vec<String> {
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 /// Require the index to reach exactly `want` and to keep it for [`HOLD`], checked over and

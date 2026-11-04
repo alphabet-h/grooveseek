@@ -14,7 +14,7 @@ use super::embed_mock::{
     EmbedMock, Framing, MockReply, MockResponse, Recorded, default_response, hermetic,
     openai_config_toml,
 };
-use super::mcp::grooveseek_bin;
+use super::mcp::{ServerGuard, grooveseek_bin, spawn_serve_with};
 use super::temp::TempKbLayout;
 use grooveseek::db::Database;
 
@@ -124,6 +124,21 @@ impl Fixture {
         );
     }
 
+    /// `groove serve` over this knowledge base with the watcher on, under the
+    /// pinned environment. Returns only after the server printed
+    /// `watcher: watching`, so an edit the caller makes next cannot fall
+    /// before the debouncer is armed. The fixture's `groove.toml` has to turn
+    /// the watcher on itself; [`served_watching`] builds one that does.
+    ///
+    /// Dropping the guard kills the server, which releases the writer lease,
+    /// so a `groove index` run after that is not refused.
+    pub fn serve_watching(&self) -> ServerGuard {
+        let (guard, _base) = spawn_serve_with(self.kb(), &self.config, true, |c| {
+            hermetic(c, &self.cache);
+        });
+        guard
+    }
+
     /// `groove index --force`, whatever the exit code.
     pub fn index_force(&self) -> Output {
         self.cmd()
@@ -193,6 +208,49 @@ impl Fixture {
     }
 }
 
+/// The `[watch]` section [`served_watching`] appends: the watcher on, with a
+/// debounce short enough for a test to wait out.
+pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
+
+/// A knowledge base holding `files`, indexed once and served with the watcher
+/// on ([`Fixture::serve_watching`]).
+///
+/// The fixture the watcher tests' helpers share: those helpers keep their old
+/// names and delegate to it (or [`served_watching_after`]), and a
+/// helper that takes a fixture the test built itself calls
+/// [`Fixture::index`] then [`Fixture::serve_watching`]. So does a helper that
+/// builds its own fixture because it needs more (other keys, a shorter
+/// timeout, an answer swapped once the server runs): it keeps those steps and
+/// starts the server with [`Fixture::serve_watching`]. What still starts its
+/// own server is a test body that does something this does not: appends other keys before
+/// [`WATCH_TOML`], changes the knowledge base or the endpoint's answer
+/// between the index and the server, uses another debounce, or builds the
+/// older fixture the OpenAI-compatible provider tests keep. One exception: the
+/// body of the case-only directory rename test does the same setup this does
+/// (a fixture, an index, a server with the watcher on) inline; test bodies
+/// are not edited, so it stays. New code uses this. (Reading the server's
+/// stderr goes through [`ServerGuard::stderr`] then
+/// [`crate::common::mcp::StderrLog::stripped_lines`]; a few test bodies still
+/// strip inline, for the same reason.)
+pub fn served_watching(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
+    served_watching_after(prefix, files, |_| {})
+}
+
+/// [`served_watching`], with `between` run on the knowledge base after the
+/// index and before the server starts: what it changes reaches the watcher as
+/// no event.
+pub fn served_watching_after(
+    prefix: &str,
+    files: &[(&str, &str)],
+    between: impl FnOnce(&Fixture),
+) -> (Fixture, ServerGuard) {
+    let fx = fixture(prefix, files, WATCH_TOML);
+    fx.index();
+    between(&fx);
+    let guard = fx.serve_watching();
+    (fx, guard)
+}
+
 /// A reply of `status` carrying [`BODY_SENTINEL`] and `headers`.
 pub fn reply(status: u16, headers: &[(&str, &str)]) -> MockReply {
     MockReply {
@@ -234,6 +292,27 @@ pub fn done_line(out: &Output) -> String {
         .find(|l| l.contains("Done in"))
         .unwrap_or_else(|| panic!("no Done in line:\n{}", stderr_of(out)))
         .to_string()
+}
+
+/// `groove index --wait <secs>`, which must succeed; its `Done in` line.
+///
+/// For a run right after a writer was stopped: the operating system releases
+/// the writer lease of a killed process a little after the process is reaped
+/// (the writer lease CLI tests poll for it for the same reason), and a plain
+/// `groove index` that arrives first is refused rather than kept waiting.
+pub fn index_ok_waiting(fx: &Fixture, secs: u64) -> String {
+    let out = fx
+        .cmd()
+        .args(["index", "--wait", &secs.to_string(), "--kb-path"])
+        .arg(fx.kb())
+        .output()
+        .expect("spawn groove index --wait");
+    assert!(
+        out.status.success(),
+        "groove index --wait {secs} failed:\n{}",
+        stderr_of(&out)
+    );
+    done_line(&out)
 }
 
 /// `groove index`, which must succeed; its `Done in` line.

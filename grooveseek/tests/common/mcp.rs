@@ -122,6 +122,28 @@ impl StderrLog {
     pub fn contains(&self, needle: &str) -> bool {
         self.lines().iter().any(|l| l.contains(needle))
     }
+
+    /// What has been read so far, one entry per line, with the ANSI colours the
+    /// Windows tracing subscriber adds removed: the form an assertion matches
+    /// against. The watcher tests' stderr helpers delegate to this rather than
+    /// strip the lines themselves. A few test bodies (the OpenAI-compatible
+    /// failure and provider tests) still strip the same lines inline with a
+    /// closure of their own; test bodies are not edited, so those stay. New
+    /// code uses this.
+    pub fn stripped_lines(&self) -> Vec<String> {
+        self.lines()
+            .iter()
+            .map(|l| super::ansi::strip_ansi(l))
+            .collect()
+    }
+
+    /// [`StderrLog::stripped_lines`] joined by newlines: the form a failure
+    /// message quotes. Same standing as [`StderrLog::stripped_lines`]: the
+    /// helpers delegate to it, a few test bodies still strip inline, and new
+    /// code uses this.
+    pub fn text(&self) -> String {
+        self.stripped_lines().join("\n")
+    }
 }
 
 /// [`drain_stderr`], keeping the lines in `log` as they go past.

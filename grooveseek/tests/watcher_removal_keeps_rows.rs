@@ -20,10 +20,9 @@
 
 mod common;
 
-use common::ansi::strip_ansi;
-use common::embed_cli::{Fixture, fixture, reply};
-use common::embed_mock::{hermetic, wait_until};
-use common::mcp::{ServerGuard, spawn_serve_with};
+use common::embed_cli::{Fixture, WATCH_TOML, fixture, reply};
+use common::embed_mock::wait_until;
+use common::mcp::ServerGuard;
 use std::time::Duration;
 
 const RUNBOOK: &str = "runbook.md";
@@ -51,9 +50,6 @@ const ADDED: (&str, &str) = (
     "Watch the queue depth dashboard during the first hour after rollout.",
 );
 
-/// Turns the watcher on with a short debounce. Appended after the `[embedding]` keys.
-const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
-
 /// The start of every line the watcher prints for a removal of `runbook.md` that found the path
 /// holding a file again: the line that says the rows were dropped and the one that says they
 /// were kept both begin with it.
@@ -71,21 +67,11 @@ fn runbook(sections: &[(&str, &str)]) -> String {
 /// `groove index` once, then `groove serve` with the watcher on.
 fn serve(fx: &Fixture) -> ServerGuard {
     fx.index();
-    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`, so the edits a
-    // test makes next cannot fall before the debouncer is armed.
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
-    guard
+    fx.serve_watching()
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {
-    guard
-        .stderr()
-        .lines()
-        .iter()
-        .map(|l| strip_ansi(l))
-        .collect()
+    guard.stderr().stripped_lines()
 }
 
 /// Wait up to 30 s for a stderr line holding `needle`; every line seen so far comes back too.
