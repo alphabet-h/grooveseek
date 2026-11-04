@@ -60,6 +60,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- Nightly now measures the benches instead of only running each body once: a new `bench` job
+  (ubuntu) runs every bench target with short criterion settings and writes the times and each
+  bench's checked counts to the job summary, keeping `target/criterion` as an artifact. Three
+  new bench targets: `ooxml_parse` (`docx_parse/1000_tables`, `pptx_parse/500_slides`),
+  `reindex_large_doc` (`reindex_one_section_of_large_doc`, which checks one chunk embedded and
+  the rest reused) and `watcher_dir_rename` (`5000_rows`, the running watcher following a
+  directory rename, which checks nothing is sent to the embedder). `Embedder::stub_for_tests`
+  and `Embedder::texts_embedded` are public under the `test-helpers` feature for them (AX-19,
+  kuriya 615).
 - The chunk counts of a document that a run updated (the `this run: N embedded, M reused` part
   of the `Done in` line, `chunks_embedded` / `chunks_reused` in the `rebuild_index` reply, and
   the watcher's `reindexed ... (N chunks, M reused)` line) come from that document's own reuse

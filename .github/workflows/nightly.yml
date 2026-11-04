@@ -11,6 +11,9 @@ name: Nightly
 # - cargo test --bench: criterion の test mode で bench を 1 回ずつ実行する
 #   (BU-25)。**計測ではなく生存確認**で、compile が通るだけの bench が
 #   「何も測っていない」状態に腐るのを止めるのが目的 (詳細は当該 step の注)。
+# - cargo bench (AX-19): ubuntu だけで bench を短い設定で**実際に計測**し、
+#   時間と件数 (`bench-count:` 行) を job summary に、criterion の出力を
+#   artifact に残す。閾値は持たない (詳細は `bench` job の注)。
 # - cargo audit: 依存ツリーを RustSec advisory DB と突合。新しい advisory
 #   が出た時に nightly が fail することで notification として機能する。
 # - cargo about: THIRD-PARTY-LICENSES.md を Cargo.lock から再生成し、commit 済みの
@@ -277,11 +280,18 @@ jobs:
       #
       # `heavy-bench` stays off: running those bodies needs the ~2.3 GB reranker
       # that the Windows leg deliberately does not download (see `skip_args`).
+      #
+      # (AX-19) `watcher_dir_rename` is not here: it drives the real watch loop,
+      # and on macOS FSEvents folds a path's flags into one record (kuriya trap
+      # 525), so one run there says more about that backend's timing than about
+      # the bench. The `bench` job below runs it, on ubuntu only, measured.
       - name: cargo test --bench (criterion test mode, no measurement)
         run: >
           cargo test --features test-helpers
           --bench index_throughput
           --bench mmr_perf
+          --bench ooxml_parse
+          --bench reindex_large_doc
           --bench search_latency
           --bench string_ops
 
@@ -698,6 +708,149 @@ jobs:
           cargo llvm-cov report --summary-only --color never \
             --fail-under-file-lines "$FLOOR" --ignore-filename-regex "$IGNORE"
 
+  # (AX-19, kuriya 615) The benches **measured**, not only run once. The
+  # criterion test-mode step in `ignored-tests` proves each bench body still
+  # runs; nothing until this job kept a number. Each night this runs every
+  # bench target with short criterion settings on one ubuntu runner, writes a
+  # table of the times and the `bench-count:` lines (what each bench checked
+  # before timing: the chunks a reindex embedded and reused, the inputs a
+  # directory rename sent to the embedder, the table rows a parse read) to the
+  # job summary, and keeps `target/criterion` as an artifact for comparing
+  # nights.
+  #
+  # Still no threshold, for the reason the test-mode step gives: a shared
+  # runner's wall clock is too noisy to gate on. What fails this job is a bench
+  # whose own checks fail (a reindex that embeds more than the edited section,
+  # a rename that sends anything to the embedder, a parse that loses rows),
+  # which is a count, not a time.
+  #
+  # One OS, its own job: `cargo bench` builds the release profile, which on top
+  # of the debug build of an `ignored-tests` leg is the disk a runner ran out of
+  # before (kuriya trap 695). Even alone, the job first frees the preinstalled
+  # toolchains it never uses, and logs `df -h` before and after.
+  # `heavy-bench` stays off (the reranker download). BGE-small is the only
+  # model the benches load (`search_latency` starts `groove`), so it comes from
+  # the BGE-small cache `ci.yml` saves, restore only: the `fastembed-v4-*` one
+  # of `ignored-tests` holds 2.7 GB and is the first evicted under the repo's
+  # 10 GB cache limit. On a miss `groove` downloads the ~130 MB itself.
+  #
+  # The benches' stderr goes to a file: the watcher writes one line per row it
+  # moves, thousands per iteration. Its tail is printed when the step fails,
+  # and the whole file is kept in the artifact.
+  bench:
+    name: bench (criterion, measured)
+    if: ${{ !(inputs.watcher_repeat > 0) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - uses: actions/checkout@v6
+
+      # Before anything lands on the disk: the release build and its cache are
+      # what this job adds, and the ubuntu runner has run out of space under
+      # the nightly before (kuriya trap 695). None of these is used here.
+      - name: Free disk space on the runner
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+
+      # Same `path` and `key` as the BGE-small cache in ci.yml, which saves it.
+      - name: Restore the BGE-small model (shared with ci.yml)
+        uses: actions/cache/restore@v5
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-small-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # `--sample-size 10 --warm-up-time 1 --measurement-time 3` is the short
+      # setting for a smoke run: a tenth of criterion's default samples (100)
+      # and 1 s + 3 s against its default 3 s + 5 s, so a fast bench takes
+      # about half its default time, with the confidence interval still
+      # reported. A group that
+      # sets its own (`watcher_dir_rename`: 10 flat samples of one rename each)
+      # keeps it; criterion lets a group's settings win over the command line.
+      - name: cargo bench (measured, short settings)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Whatever a restored cache brought along is not tonight's: a bench
+          # that fails before writing would otherwise show last night's row.
+          # Night-to-night comparison goes through the artifacts below.
+          rm -rf target/criterion
+          if ! cargo bench -p grooveseek --features test-helpers \
+              --bench index_throughput \
+              --bench mmr_perf \
+              --bench ooxml_parse \
+              --bench reindex_large_doc \
+              --bench search_latency \
+              --bench string_ops \
+              --bench watcher_dir_rename \
+              -- --sample-size 10 --warm-up-time 1 --measurement-time 3 \
+              2> bench-stderr.log | tee bench-stdout.log; then
+            tail -n 200 bench-stderr.log
+            exit 1
+          fi
+
+      # One row per benchmark from criterion's own estimates (nanoseconds),
+      # then the counts. `if: always()` so a night that fails still shows what
+      # it measured before the failure.
+      - name: Write the results to the job summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Benchmarks (criterion, ubuntu-latest, short settings)"
+            echo ""
+            echo "| benchmark | mean | median | mean, 95% CI |"
+            echo "|---|---|---|---|"
+            # A night whose build failed has no target/criterion, and `find`
+            # on a missing directory exits 1, which `set -e` would let end the
+            # summary right here, before the counts and the disk line.
+            if [ -d target/criterion ]; then
+              find target/criterion -path '*/new/estimates.json' | sort | while read -r est; do
+                dir=$(dirname "$est")
+                id=$(jq -r '.full_id' "$dir/benchmark.json")
+                jq -r --arg id "$id" '
+                  def t: if . >= 1e9 then "\(. / 1e7 | round / 100) s"
+                         elif . >= 1e6 then "\(. / 1e4 | round / 100) ms"
+                         elif . >= 1e3 then "\(. / 10 | round / 100) us"
+                         else "\(. * 100 | round / 100) ns" end;
+                  "| \($id) | \(.mean.point_estimate | t) | \(.median.point_estimate | t) | \(.mean.confidence_interval.lower_bound | t) .. \(.mean.confidence_interval.upper_bound | t) |"
+                ' "$est"
+              done
+            else
+              echo "| (none: target/criterion was not written, see the bench step) | | | |"
+            fi
+            echo ""
+            echo "### Counts each bench checked before timing"
+            echo ""
+            echo '```'
+            grep '^bench-count:' bench-stdout.log || echo "(none: the bench step did not get that far)"
+            echo '```'
+            echo ""
+            echo "Disk left on the runner: $(df -h --output=avail . | tail -n 1 | tr -d ' ')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep criterion's output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: criterion
+          path: |
+            target/criterion
+            bench-stdout.log
+            bench-stderr.log
+          retention-days: 30
+          if-no-files-found: ignore
+
   # ---------------------------------------------------------------------------
   # 失敗を「気付ける場所」に置く。
   #
@@ -713,7 +866,7 @@ jobs:
   # ---------------------------------------------------------------------------
   report:
     name: report nightly status
-    needs: [ignored-tests, cargo-audit, third-party-licenses, coverage]
+    needs: [ignored-tests, cargo-audit, third-party-licenses, coverage, bench]
     # always(): 失敗した時こそ動く必要がある。scheduled 実行と、明示的に
     # 頼まれた手動実行だけに絞り、branch での試し撃ちが issue を作らないようにする。
     # A watcher measurement run (`watcher_repeat` above 0) skipped the jobs this
@@ -762,8 +915,8 @@ jobs:
           Run: $RUN_URL
 
           The heavy checks live only here - \`--include-ignored\`, \`cargo audit\`,
-          the THIRD-PARTY-LICENSES.md drift check, the per-file coverage floor
-          and the golden-query retrieval gate. While
+          the THIRD-PARTY-LICENSES.md drift check, the per-file coverage floor,
+          the measured benches and the golden-query retrieval gate. While
           this is red that whole layer is off, so a green CI on a pull request is
           saying less than it looks like it is.
 

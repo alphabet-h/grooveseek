@@ -1276,9 +1276,10 @@ impl Embedder {
     /// embedded. Failed calls, queries and the probe are not counted. (kuriya 621) The indexer
     /// no longer reads it: its chunk counts come from each document's own plan, and a run-wide
     /// counter read across a call is what another caller in between would throw off. Only this
-    /// module's tests read it now.
-    #[cfg(test)]
-    pub(crate) fn texts_embedded(&self) -> u64 {
+    /// module's tests read it now, and (AX-19) the benches under `benches/`, through the
+    /// `test-helpers` feature, which own the embedder they read it from.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn texts_embedded(&self) -> u64 {
         self.texts_embedded
     }
 
@@ -1543,14 +1544,15 @@ impl Reranker {
 
 /// (#544 PR-2, J1) A provider that answers every input in process with one fixed vector of its
 /// dimension, for the lib's unit tests of writes that embed:
-/// [`crate::indexer::Reindex::Force`] reads no stored vectors and embeds every chunk, which the
-/// closed-port embedder of the indexer's tests cannot.
-#[cfg(test)]
+/// the `Force` mode of `Reindex` in [`crate::indexer`] reads no stored vectors and embeds every
+/// chunk, which the closed-port embedder of the indexer's tests cannot. (Not linked: `Reindex`
+/// is private to that module, and rustdoc resolves no private item of it from here.)
+#[cfg(any(test, feature = "test-helpers"))]
 struct FixedVectorProvider {
     dimension: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 impl FixedVectorProvider {
     /// A unit vector with every component equal, so its norm is one.
     fn vector(&self) -> Vec<f32> {
@@ -1559,7 +1561,7 @@ impl FixedVectorProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 impl EmbeddingProvider for FixedVectorProvider {
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|_| self.vector()).collect())
@@ -1570,12 +1572,15 @@ impl EmbeddingProvider for FixedVectorProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 impl Embedder {
     /// (#544 PR-2, J1) An embedder that uses no network and answers each input with the same
     /// vector, as long as the dimension it is given, under the identity `test-model` the indexer's test databases
     /// declare. Its counts move as the real ones do: [`Embedder::embed_texts`] is the same code.
-    pub(crate) fn stub_for_tests(dimension: usize) -> Self {
+    ///
+    /// (AX-19) Public under the `test-helpers` feature for the benches under `benches/`, which
+    /// time the indexer and the watcher without a model download or an endpoint in the loop.
+    pub fn stub_for_tests(dimension: usize) -> Self {
         Self::from_provider(
             Box::new(FixedVectorProvider { dimension }),
             EmbeddingIdentity {
