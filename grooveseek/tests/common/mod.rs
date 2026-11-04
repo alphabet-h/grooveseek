@@ -49,10 +49,14 @@
 //!   watcher tests' own `served` / `serve` helpers call under their old names.
 //!   The watcher tests that still start their server by hand do something
 //!   between the index and the server, or append other keys, that it does not
-//!   (its doc lists them). The server's stderr with ANSI colours removed has
-//!   one reader too: every watcher test reads it through
-//!   [`crate::common::mcp::StderrLog::stripped_lines`] (or
-//!   [`crate::common::mcp::StderrLog::text`]).
+//!   (its doc lists them), with one exception: the body of the case-only
+//!   directory rename test sets up the same fixture inline, and test bodies
+//!   are not edited, so it stays. The server's stderr with ANSI colours
+//!   removed is read the same way: the watcher tests' stderr helpers delegate
+//!   to [`crate::common::mcp::StderrLog::stripped_lines`] (or
+//!   [`crate::common::mcp::StderrLog::text`]). The OpenAI-compatible failure
+//!   and provider tests still strip inline in a few test bodies, for the same
+//!   reason. New code uses the shared versions.
 //! - [`crate::common::in_process`] — rerunning a test body in a hermetic child
 //!   and opening the index and the embedder in-process, for tests that call
 //!   the indexer's library functions against [`crate::common::embed_mock`].

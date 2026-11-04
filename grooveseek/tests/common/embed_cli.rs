@@ -215,16 +215,20 @@ pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 /// A knowledge base holding `files`, indexed once and served with the watcher
 /// on ([`Fixture::serve_watching`]).
 ///
-/// The one implementation of this fixture: the watcher tests' own `served`
-/// helpers keep their names and call it (or [`served_watching_after`]), and a
+/// The fixture the watcher tests' helpers share: those helpers keep their old
+/// names and delegate to it (or [`served_watching_after`]), and a
 /// helper that takes a fixture the test built itself calls
-/// [`Fixture::index`] then [`Fixture::serve_watching`]. What still sets up
-/// its own server does something this does not: appends other keys before
+/// [`Fixture::index`] then [`Fixture::serve_watching`]. What still sets up its
+/// own server does something this does not: appends other keys before
 /// [`WATCH_TOML`], changes the knowledge base or the endpoint's answer
 /// between the index and the server, uses another debounce, or builds the
-/// older fixture the OpenAI-compatible provider tests keep. (Reading the server's
-/// stderr has one implementation too, [`ServerGuard::stderr`] then
-/// [`crate::common::mcp::StderrLog::stripped_lines`].)
+/// older fixture the OpenAI-compatible provider tests keep. One exception: the
+/// body of the case-only directory rename test does the same setup this does
+/// (a fixture, an index, a server with the watcher on) inline; test bodies
+/// are not edited, so it stays. New code uses this. (Reading the server's
+/// stderr goes through [`ServerGuard::stderr`] then
+/// [`crate::common::mcp::StderrLog::stripped_lines`]; a few test bodies still
+/// strip inline, for the same reason.)
 pub fn served_watching(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
     served_watching_after(prefix, files, |_| {})
 }
