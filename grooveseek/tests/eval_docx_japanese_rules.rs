@@ -221,7 +221,7 @@ const MODEL: &str = "bge-m3";
 const TOP_K: usize = 5;
 
 /// `groove --config <cfg>`, the command [`crate::common::cli`] reads from.
-fn groove(cfg: &Path) -> Command {
+fn groove_with_config(cfg: &Path) -> Command {
     let mut cmd = Command::new(groove_bin());
     cmd.arg("--config").arg(cfg);
     cmd
@@ -233,7 +233,7 @@ fn groove(cfg: &Path) -> Command {
 fn search(cfg: &Path, kb: &Path, query: &str) -> Vec<serde_json::Value> {
     let limit = TOP_K.to_string();
     let v = search_json(
-        groove(cfg),
+        groove_with_config(cfg),
         kb,
         query,
         &["--model", MODEL, "--limit", &limit],
@@ -290,7 +290,7 @@ fn eval_japanese_rules_docx_chapter_article_ranks_the_article() {
     //    rather than as a retrieval miss below. The count is read whole: `Documents: 10`
     //    is not 1.
     let expected_docs = 1 + DISTRACTORS.len() as u64;
-    let documents = run_status_count(groove(&cfg), kb.kb(), "Documents:");
+    let documents = run_status_count(groove_with_config(&cfg), kb.kb(), "Documents:");
     assert_eq!(
         documents, expected_docs,
         "expected {expected_docs} indexed documents, got {documents}"

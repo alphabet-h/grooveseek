@@ -11,12 +11,12 @@ use super::ansi::strip_ansi;
 use std::path::Path;
 use std::process::Command;
 
-/// The number on the line of `stdout` that starts with `label` (`"Documents:"`,
+/// The number on the line of `stdout` that starts with the given label (`"Documents:"`,
 /// `"Chunks:"`), as `groove status` prints it.
 ///
 /// The whole rest of the line, trimmed, must be the number: `Documents: 10` reads as 10,
 /// never as a 1 that happens to be its first digit, and a line with anything after the
-/// number reads as `None`. The first line that starts with `label` decides.
+/// number reads as `None`. The first line that starts with the label decides.
 pub fn status_count(stdout: &str, label: &str) -> Option<u64> {
     stdout
         .lines()
@@ -24,7 +24,7 @@ pub fn status_count(stdout: &str, label: &str) -> Option<u64> {
         .and_then(|n| n.trim().parse().ok())
 }
 
-/// `<cmd> status --kb-path <kb>`, which must succeed, and the `label` count it prints
+/// `<cmd> status --kb-path <kb>`, which must succeed, and the count it prints after the label
 /// ([`status_count`]). `cmd` is `groove` with `--config` and any environment already set.
 pub fn run_status_count(mut cmd: Command, kb: &Path, label: &str) -> u64 {
     let out = cmd
