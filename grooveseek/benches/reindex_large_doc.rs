@@ -120,7 +120,20 @@ fn bench_reindex_one_section(c: &mut Criterion) {
                 let start = Instant::now();
                 let result = run(&db, &mut embedder, &kb, &registry);
                 total += start.elapsed();
-                assert_eq!(result.chunks_embedded, 1, "one chunk embedded per edit");
+                // The same check as before the timing, on every timed run, so a reuse that
+                // drops chunks on repeated updates fails here rather than letting the later
+                // samples time a shrunken index. `total_chunks` is the index's chunk count,
+                // read by the run itself (`Database::chunk_count`).
+                assert_eq!(result.updated, 1, "the edited document is updated");
+                assert_eq!(
+                    (result.chunks_embedded, result.chunks_reused),
+                    (1, chunks - 1),
+                    "edit {variant}: one section embeds one chunk and reuses the rest"
+                );
+                assert_eq!(
+                    result.total_chunks, chunks,
+                    "edit {variant}: the index keeps every chunk"
+                );
             }
             total
         });

@@ -9,17 +9,18 @@
 //! This drives the real watch loop ([`grooveseek::watcher::run_watch_loop_until`]) over a
 //! temporary KB rather than calling the dispatch functions, which are private. One iteration
 //! renames the directory to the other of two names and is timed from the rename until every
-//! row sits under the new name and every batch the debouncer handed over has finished
+//! row sits under the new name and the batch that moved them has returned
 //! ([`grooveseek::watcher::WatchBatchProbe`]). The debounce window is part of that time; it
 //! is set short here ([`crate::DEBOUNCE_MS`]) so the per-row work dominates, and is a constant
-//! either way.
+//! either way. A later batch the debouncer hands over for the same rename is not timed: it is
+//! waited out, together with a quiet window, after the clock stops and before the next
+//! sample.
 //!
 //! The embedder is [`grooveseek::embedder::Embedder::stub_for_tests`] (the `test-helpers`
 //! feature, hence `required-features` on this target). Following a rename embeds nothing, and
-//! the number of
-//! inputs the embedder was handed during one rename is printed as a `bench-count:` line for
-//! the nightly summary, so a regression that starts re-embedding the moved documents shows as
-//! a count and not only as a slower time against the stub.
+//! the number of inputs the embedder was handed during one rename is printed as a
+//! `bench-count:` line for the nightly summary, so a regression that starts re-embedding the
+//! moved documents shows as a count and not only as a slower time against the stub.
 //!
 //! The nightly job measures this on Linux only (inotify). The watcher's end-to-end tests cover
 //! the other platforms; FSEvents on macOS folds a path's flags into one record (kuriya trap
@@ -73,8 +74,33 @@ fn rows(db: &Mutex<Database>, from: &str, to: &str) -> (usize, usize) {
     )
 }
 
-/// Rename `from` to `to` on disk and wait until the watcher has followed it. Returns the time
-/// from the rename to the settled state.
+/// `(emitted, started, finished)` of the probe. `emitted` counts every batch the debouncer
+/// handed over, before the channel send and whatever it returned, so a batch dropped on a full
+/// channel moves it and never `started`; `started` and `finished` move around one
+/// `handle_events` in the loop, `finished` after it returned (`watcher.rs` touches them nowhere
+/// else).
+fn counts(probe: &WatchBatchProbe) -> (u64, u64, u64) {
+    (
+        probe.emitted.load(Ordering::SeqCst),
+        probe.started.load(Ordering::SeqCst),
+        probe.finished.load(Ordering::SeqCst),
+    )
+}
+
+/// No batch is being handled: `started` read on both sides of `finished` and equal to it.
+fn idle(probe: &WatchBatchProbe) -> Option<u64> {
+    let before = probe.started.load(Ordering::SeqCst);
+    let finished = probe.finished.load(Ordering::SeqCst);
+    let after = probe.started.load(Ordering::SeqCst);
+    (before == finished && finished == after).then_some(after)
+}
+
+/// Rename `from` to `to` on disk and wait until the watcher has followed it.
+///
+/// Returns the time from the rename until every row sits under `to` and the loop is idle
+/// after a batch started since the rename: the batch that moved the rows has returned. A
+/// batch the debouncer hands over later for the same rename is not in that time. It is
+/// waited out after the clock stops ([`quiesce`]), so it cannot run into the next sample.
 fn rename_and_settle(
     kb: &TempKbLayout,
     db: &Mutex<Database>,
@@ -82,22 +108,50 @@ fn rename_and_settle(
     from: &str,
     to: &str,
 ) -> Duration {
+    let (_, started_before, _) = counts(probe);
     let start = Instant::now();
     std::fs::rename(kb.kb().join(from), kb.kb().join(to)).expect("rename the directory");
-    loop {
+    let took = loop {
         let moved = rows(db, from, to) == (0, ROWS);
-        let emitted = probe.emitted.load(Ordering::SeqCst);
-        let finished = probe.finished.load(Ordering::SeqCst);
-        if moved && finished >= emitted {
-            return start.elapsed();
+        if moved && idle(probe).is_some_and(|started| started > started_before) {
+            break start.elapsed();
         }
         assert!(
             start.elapsed() < SETTLE_LIMIT,
             "the watcher did not follow the rename of {from} to {to} within {SETTLE_LIMIT:?}: \
-             rows (old, new) = {:?}, batches emitted {emitted} finished {finished}",
-            rows(db, from, to)
+             rows (old, new) = {:?}, batches (emitted, started, finished) = {:?}",
+            rows(db, from, to),
+            counts(probe)
         );
         std::thread::sleep(POLL);
+    };
+    quiesce(probe);
+    took
+}
+
+/// Wait, off the clock, until the loop is idle and no batch was emitted, started or finished
+/// for a quiet window longer than the debounce window with room to spare: the debouncer has
+/// nothing left of the last rename to hand over. Read again after the window, so a batch
+/// emitted just after the first read restarts the wait.
+fn quiesce(probe: &WatchBatchProbe) {
+    let quiet = Duration::from_millis(3 * DEBOUNCE_MS + 300);
+    let start = Instant::now();
+    loop {
+        let seen = counts(probe);
+        if idle(probe).is_some() {
+            std::thread::sleep(quiet);
+            if counts(probe) == seen && idle(probe).is_some() {
+                return;
+            }
+        } else {
+            std::thread::sleep(POLL);
+        }
+        assert!(
+            start.elapsed() < SETTLE_LIMIT,
+            "the watcher did not go quiet within {SETTLE_LIMIT:?}: batches (emitted, started, \
+             finished) = {:?}",
+            counts(probe)
+        );
     }
 }
 
