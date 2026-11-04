@@ -39,7 +39,9 @@
 //! nightly via `--include-ignored`, or manually with
 //! `cargo test --test eval_binary_formats -- --ignored`.
 
-use std::io::Write as _;
+mod common;
+use common::ooxml::zip_parts;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -224,21 +226,6 @@ fn make_pptx(body: &str) -> Vec<u8> {
         ),
         ("ppt/slides/slide1.xml", &slide_xml),
     ])
-}
-
-fn zip_parts(parts: &[(&str, &str)]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let opts: zip::write::FileOptions<()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for (name, body) in parts {
-            zip.start_file(*name, opts).unwrap();
-            zip.write_all(body.as_bytes()).unwrap();
-        }
-        zip.finish().unwrap();
-    }
-    buf
 }
 
 // ---------------------------------------------------------------------------

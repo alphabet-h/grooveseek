@@ -10,6 +10,7 @@
 //! the same thing uses this module rather than copying either.
 
 use super::ansi::strip_ansi;
+use super::cli::{run_status_count, search_json};
 use super::embed_mock::{
     EmbedMock, Framing, MockReply, MockResponse, Recorded, default_response, hermetic,
     openai_config_toml,
@@ -148,23 +149,9 @@ impl Fixture {
             .expect("spawn groove index --force")
     }
 
+    /// [`crate::common::cli::run_status_count`] under this fixture's environment.
     fn status_count(&self, label: &str) -> u64 {
-        let out = self
-            .cmd()
-            .args(["status", "--kb-path"])
-            .arg(self.kb())
-            .output()
-            .expect("spawn groove status");
-        assert!(
-            out.status.success(),
-            "groove status failed:\n{}",
-            stderr_of(&out)
-        );
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|l| l.strip_prefix(label))
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or_else(|| panic!("no {label} line in groove status"))
+        run_status_count(self.cmd(), self.kb(), label)
     }
 
     /// `Documents:` from `groove status`.
@@ -182,29 +169,22 @@ impl Fixture {
         self.mock.requests().split_off(before)
     }
 
-    /// `groove search <query> --format json`, which must succeed.
+    /// `groove search <query> --format json`, which must succeed
+    /// ([`crate::common::cli::search_json`] under this fixture's environment, at most five
+    /// hits, the quality filter and the confidence cutoff off).
     pub fn search_json(&self, query: &str) -> serde_json::Value {
-        let out = self
-            .cmd()
-            .args(["search", query, "--kb-path"])
-            .arg(self.kb())
-            .args([
-                "--format",
-                "json",
+        search_json(
+            self.cmd(),
+            self.kb(),
+            query,
+            &[
                 "--limit",
                 "5",
                 "--include-low-quality",
                 "--min-confidence-ratio",
                 "0",
-            ])
-            .output()
-            .expect("spawn groove search");
-        assert!(
-            out.status.success(),
-            "groove search failed:\n{}",
-            stderr_of(&out)
-        );
-        serde_json::from_slice(&out.stdout).expect("search stdout is JSON")
+            ],
+        )
     }
 }
 
