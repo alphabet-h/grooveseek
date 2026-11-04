@@ -137,12 +137,15 @@ fn rename_and_settle(
 ///
 /// `emitted` moves before the channel send and a batch taken off the channel moves `started`
 /// and then `finished`, so the three are equal exactly when no batch is waiting in the channel,
-/// none is being handled, and none was dropped on a full channel. A batch in the channel is
-/// taken within the quiet window; one that is not after the window was dropped, and its events
-/// (part of a rename) were never handled, so that fails the bench instead of timing the next
-/// sample on top of it. The clock in [`rename_and_settle`] does not ask for the equality: it
-/// covers the batch that moved the rows, and a batch emitted after it is judged here, before
-/// the next sample starts.
+/// none is being handled, and none was dropped on a full channel. Anything else is taken as
+/// not settled yet and waited for: a batch queued in the channel whose receiver has not been
+/// scheduled stands at `(n + 1, n, n)` just as a dropped one does, and a batch being handled
+/// (one rename can take seconds) can leave the counts still for the whole window. Only when
+/// [`SETTLE_LIMIT`] runs out without the three settling equal does the bench fail, as a batch
+/// that was dropped or a loop that is stuck, with the counts; so the next sample never starts
+/// on top of an unhandled batch. The clock in [`rename_and_settle`] does not ask for the
+/// equality: it covers the batch that moved the rows, and a batch emitted after it is judged
+/// here, before the next sample starts.
 fn quiesce(probe: &WatchBatchProbe) {
     let quiet = Duration::from_millis(3 * DEBOUNCE_MS + 300);
     let start = Instant::now();
@@ -150,20 +153,14 @@ fn quiesce(probe: &WatchBatchProbe) {
         let seen = counts(probe);
         std::thread::sleep(quiet);
         let (emitted, started, finished) = seen;
-        // A batch still being handled (one rename can take seconds) is not quiet yet, however
-        // long the counts stand still.
-        if counts(probe) == seen && started == finished {
-            assert_eq!(
-                emitted, started,
-                "the watcher was quiet for {quiet:?} with batches (emitted, started, finished) = \
-                 {seen:?}: a batch emitted and never handled was dropped on a full channel"
-            );
+        if counts(probe) == seen && emitted == started && started == finished {
             return;
         }
         assert!(
             start.elapsed() < SETTLE_LIMIT,
-            "the watcher did not go quiet within {SETTLE_LIMIT:?}: batches (emitted, started, \
-             finished) = {:?}",
+            "the watcher did not settle within {SETTLE_LIMIT:?}: batches (emitted, started, \
+             finished) = {:?}; a batch emitted and never handled was dropped on a full channel, \
+             or the loop is stuck",
             counts(probe)
         );
     }
