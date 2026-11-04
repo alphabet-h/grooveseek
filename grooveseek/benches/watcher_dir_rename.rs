@@ -10,11 +10,13 @@
 //! temporary KB rather than calling the dispatch functions, which are private. One iteration
 //! renames the directory to the other of two names and is timed from the rename until every
 //! row sits under the new name and every batch the debouncer handed over has finished
-//! ([`WatchBatchProbe`]). The debounce window is part of that time; it is set short here
-//! ([`DEBOUNCE_MS`]) so the per-row work dominates, and is a constant either way.
+//! ([`grooveseek::watcher::WatchBatchProbe`]). The debounce window is part of that time; it
+//! is set short here ([`crate::DEBOUNCE_MS`]) so the per-row work dominates, and is a constant
+//! either way.
 //!
-//! The embedder is [`Embedder::stub_for_tests`] (the `test-helpers` feature, hence
-//! `required-features` on this target). Following a rename embeds nothing, and the number of
+//! The embedder is [`grooveseek::embedder::Embedder::stub_for_tests`] (the `test-helpers`
+//! feature, hence `required-features` on this target). Following a rename embeds nothing, and
+//! the number of
 //! inputs the embedder was handed during one rename is printed as a `bench-count:` line for
 //! the nightly summary, so a regression that starts re-embedding the moved documents shows as
 //! a count and not only as a slower time against the stub.

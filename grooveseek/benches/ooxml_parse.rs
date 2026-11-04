@@ -7,8 +7,9 @@
 //! zip read or the XML walk grows with the document rather than with the corpus.
 //!
 //! Each document is generated in memory before the timing starts, so the bench needs no
-//! fixture on disk and no model. The timed body is [`ParserExt::parse_bytes`], the entry the
-//! indexer calls (panic isolation included). Throughput is reported per input byte, and the
+//! fixture on disk and no model. The timed body is
+//! [`grooveseek::parser::ParserExt::parse_bytes`], the entry the indexer calls (panic
+//! isolation included). Throughput is reported per input byte, and the
 //! chunk count is printed once, as a `bench-count:` line the nightly job lifts into its
 //! summary, so a parser that silently stops reading the tables shows as a count change and
 //! not as a faster bench.

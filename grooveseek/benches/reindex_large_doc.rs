@@ -1,20 +1,20 @@
-//! (AX-19) `reindex_one_section_of_large_doc`: an incremental `rebuild_index` after one section
-//! of a large Markdown document changed.
+//! (AX-19) `reindex_one_section_of_large_doc`: an incremental
+//! [`grooveseek::indexer::rebuild_index`] after one section of a large Markdown document
+//! changed.
 //!
 //! feature-69 made this case cheap by copying the stored vector of every chunk whose embed
 //! input did not change, so only the edited section goes to the embedder. What makes it cheap
 //! is a count, not a time: a regression that re-embeds the whole document is a few hundred
 //! more embeddings against a real model, while against the stub used here it is only a little
-//! slower. So the run's [`IndexResult::chunks_embedded`] and [`IndexResult::chunks_reused`]
-//! are checked before the timing starts and printed as a `bench-count:` line, which the
-//! nightly job lifts into its summary next to the time.
+//! slower. So the run's [`grooveseek::indexer::IndexResult::chunks_embedded`] and
+//! [`grooveseek::indexer::IndexResult::chunks_reused`] are checked before the timing starts
+//! and printed as a `bench-count:` line, which the nightly job lifts into its summary next to
+//! the time.
 //!
-//! The embedder is [`Embedder::stub_for_tests`] (the `test-helpers` feature, hence
-//! `required-features` on this target): no model download and no endpoint, so the time is the
-//! indexer's own -- the walk, the parse, the reuse plan and the write -- and not a network's.
-//!
-//! [`IndexResult::chunks_embedded`]: grooveseek::indexer::IndexResult::chunks_embedded
-//! [`IndexResult::chunks_reused`]: grooveseek::indexer::IndexResult::chunks_reused
+//! The embedder is [`grooveseek::embedder::Embedder::stub_for_tests`] (the `test-helpers`
+//! feature, hence `required-features` on this target): no model download and no endpoint, so
+//! the time is the indexer's own -- the walk, the parse, the reuse plan and the write -- and
+//! not a network's.
 
 #[path = "../tests/common/temp.rs"]
 #[allow(dead_code, unused_imports)]
