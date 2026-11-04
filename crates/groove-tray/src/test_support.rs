@@ -39,6 +39,43 @@ pub fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", unique_suffix()))
 }
 
+/// A stand-in daemon for one request: bind a loopback port, and on a background thread accept
+/// one connection, read the request up to the end of its headers and write `response`, the
+/// whole HTTP response as bytes on the wire, then close. Returns the bound address.
+///
+/// A request that does not arrive within 3 seconds, or a connection that never comes, leaves
+/// the thread to end on its own; the test that started it fails on its own terms.
+pub fn serve_one_response(response: String) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in daemon");
+    let addr = listener.local_addr().expect("stand-in daemon addr");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = stream.write_all(response.as_bytes());
+    });
+    addr
+}
+
+/// The response [`serve_one_response`] takes for `status` (the status line after
+/// `HTTP/1.1 `) with a JSON `body`, the connection closed after it.
+pub fn json_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

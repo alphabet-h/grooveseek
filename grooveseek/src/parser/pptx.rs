@@ -2097,6 +2097,130 @@ mod tests {
         assert_eq!(spans_of(&chunk), vec![row_span(0, 0, 17)]);
     }
 
+    /// (AX-42) A block of a generated slide's shape tree: a text shape or a table.
+    #[derive(Debug, Clone)]
+    enum Ax42Block {
+        Paragraph(&'static str),
+        Table(crate::parser::Ax42Table),
+    }
+
+    /// (AX-42) A slide: an optional title, up to 4 blocks, and optional notes whose shape tree
+    /// holds a table too, which must carry no span.
+    type Ax42Slide = (
+        Option<&'static str>,
+        Vec<Ax42Block>,
+        Option<crate::parser::Ax42Table>,
+    );
+
+    /// (AX-42) Decks of 1 to 3 slides, half the blocks tables.
+    fn ax42_deck() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Slide>> {
+        use proptest::prelude::*;
+        let block = prop_oneof![
+            proptest::sample::select(&["", "overview", "東京"][..]).prop_map(Ax42Block::Paragraph),
+            crate::parser::ax42_table().prop_map(Ax42Block::Table),
+        ];
+        let slide = (
+            proptest::option::of(proptest::sample::select(&["Deck", "表"][..])),
+            proptest::collection::vec(block, 0..=4),
+            proptest::option::of(crate::parser::ax42_table()),
+        );
+        proptest::collection::vec(slide, 1..=3)
+    }
+
+    /// (AX-42) A [`table_of`] of `table`, each cell paragraph one [`run_of`].
+    fn ax42_table_xml(table: &crate::parser::Ax42Table) -> String {
+        let rows: Vec<Vec<String>> = table
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        let runs: Vec<String> = cell.iter().map(|p| run_of(p)).collect();
+                        let refs: Vec<&str> = runs.iter().map(String::as_str).collect();
+                        cell_with("", &refs)
+                    })
+                    .collect()
+            })
+            .collect();
+        table_of(&rows)
+    }
+
+    /// (AX-42) `deck` as a `.pptx`, each slide's notes tied by its rels the way
+    /// [`deck_with_notes`] ties them; with the rows the slides (not the notes) should write,
+    /// as [`crate::parser::ax42_check_rows`] takes them.
+    fn ax42_pptx(deck: &[Ax42Slide]) -> (Vec<u8>, Vec<(usize, String)>) {
+        let mut parts: Vec<(String, String)> = Vec::new();
+        let mut rows = Vec::new();
+        let mut tables = 0_usize;
+        for (index, (title, blocks, notes)) in deck.iter().enumerate() {
+            let n = index + 1;
+            let mut tree = title.map(|t| title_shape(&run_of(t))).unwrap_or_default();
+            for block in blocks {
+                match block {
+                    Ax42Block::Paragraph(text) => tree.push_str(&shape_of(&[&run_of(text)])),
+                    Ax42Block::Table(table) => {
+                        tree.push_str(&ax42_table_xml(table));
+                        for row in table {
+                            if let Some(line) = crate::parser::ax42_expected_line(row) {
+                                rows.push((tables, line));
+                            }
+                        }
+                        tables += 1;
+                    }
+                }
+            }
+            parts.push((format!("ppt/slides/slide{n}.xml"), slide_with(&tree)));
+            if let Some(table) = notes {
+                let notes_tree =
+                    format!("{}{}", shape_of(&[&run_of("quill")]), ax42_table_xml(table));
+                parts.push((
+                    format!("ppt/notesSlides/notesSlide{n}.xml"),
+                    format!(
+                        r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{notes_tree}</p:spTree></p:cSld></p:notes>"#
+                    ),
+                ));
+                parts.push((
+                    format!("ppt/slides/_rels/slide{n}.xml.rels"),
+                    format!(
+                        r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>"#
+                    ),
+                ));
+            }
+        }
+        let entries: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, xml)| (name.as_str(), xml.as_bytes()))
+            .collect();
+        (pptx_of(&entries), rows)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) Through the parser, both entries: every chunk of a generated `.pptx` marks
+        /// its table rows by the contract of [`crate::parser::TableRowSpan`] (see
+        /// [`crate::parser::ax42_check_rows`]), with each span holding exactly the line its row
+        /// was written as and no span in the notes, and the read entry marks the same rows as
+        /// the index entry.
+        #[test]
+        fn prop_pptx_table_rows_mark_the_rows_written(deck in ax42_deck()) {
+            let (bytes, rows) = ax42_pptx(&deck);
+            let index = PptxParser::default()
+                .parse_bytes(&bytes, "ax42.pptx", &[])
+                .expect("a generated deck parses");
+            crate::parser::ax42_check_rows(&index.chunks, &rows)?;
+            let read = PptxParser::default()
+                .parse_bytes_for_read(&bytes, "ax42.pptx", &[])
+                .expect("a generated deck parses");
+            let marks = |doc: &ParsedDocument| -> Vec<Option<Vec<crate::parser::TableRowSpan>>> {
+                doc.chunks.iter().map(|c| c.table_rows.clone()).collect()
+            };
+            proptest::prop_assert_eq!(marks(&read), marks(&index));
+        }
+    }
+
     /// feature-66 Review Focus 3 (spec U2): a newline in a cell's own text stays in the content
     /// and inside the row's span.
     #[test]

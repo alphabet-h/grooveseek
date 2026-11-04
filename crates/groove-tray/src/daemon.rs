@@ -683,32 +683,11 @@ mod tests {
     /// The child side: answer one status request on loopback with a pid, and
     /// require [`probe_daemon`] to read it.
     fn probe_through_proxy_environment_in_child() {
-        use std::io::{Read, Write};
-        let daemon = std::net::TcpListener::bind("127.0.0.1:0").expect("bind daemon");
-        let status_url = format!(
-            "http://{}/api/admin/status",
-            daemon.local_addr().expect("daemon addr")
-        );
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = daemon.accept() else {
-                return;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let body = r#"{"daemon":{"pid":4242}}"#;
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-        });
+        let daemon = crate::test_support::serve_one_response(crate::test_support::json_response(
+            "200 OK",
+            r#"{"daemon":{"pid":4242}}"#,
+        ));
+        let status_url = format!("http://{daemon}/api/admin/status");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

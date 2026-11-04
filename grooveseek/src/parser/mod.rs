@@ -221,6 +221,112 @@ pub(crate) fn assert_spans_hold(chunk: &Chunk) {
     );
 }
 
+/// (AX-42) A table a property test writes into a `.docx` or `.pptx`: rows of cells, each cell
+/// the text of its paragraphs. Drawn by [`ax42_table`].
+#[cfg(test)]
+pub(crate) type Ax42Table = Vec<Vec<Vec<String>>>;
+
+/// (AX-42) Tables of up to 3 rows of 1 to 3 cells, each cell 0 to 2 paragraphs. The paragraph
+/// texts are often empty or blank, so rows and whole tables write nothing; some carry a tab or
+/// a newline of their own, or padding to trim, and one is multibyte.
+#[cfg(test)]
+pub(crate) fn ax42_table() -> impl proptest::strategy::Strategy<Value = Ax42Table> {
+    use proptest::prelude::*;
+    let paragraph =
+        proptest::sample::select(&["", " ", "alder", "項目", " pad ", "ink\nwell", "a\tb"][..])
+            .prop_map(str::to_string);
+    let cell = proptest::collection::vec(paragraph, 0..=2);
+    let row = proptest::collection::vec(cell, 1..=3);
+    proptest::collection::vec(row, 0..=3)
+}
+
+/// (AX-42) The line a row of an [`Ax42Table`] should be written as, worked out from the rules
+/// the parsers document rather than through `ooxml::row_line`, so the property does not take
+/// the code under test as its own answer: each paragraph trimmed, the non-empty ones of a cell
+/// joined with a space, the fields joined with a tab, and no line when every field is empty.
+#[cfg(test)]
+pub(crate) fn ax42_expected_line(row: &[Vec<String>]) -> Option<String> {
+    let fields: Vec<String> = row
+        .iter()
+        .map(|cell| {
+            cell.iter()
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    (!fields.iter().all(String::is_empty)).then(|| fields.join("\t"))
+}
+
+/// (AX-42) The [`Chunk::table_rows`] a parser produced, against the rows a test wrote:
+/// `expected` holds, in document order, each written row as `(table, line)`, with `table`
+/// numbering the tables across the whole document.
+///
+/// - every chunk carries `Some`, the same contract [`table_rows_fit`] gives the read side;
+/// - each span slices its chunk's content (in range, on char boundaries, not empty) to a text
+///   that does not end in a newline;
+/// - read over every chunk in order, the span texts are exactly the expected lines, so a chunk
+///   with no row carries `Some(vec![])`;
+/// - in each chunk the tables are numbered by the order the document's tables first appear in
+///   it, from 0.
+#[cfg(test)]
+pub(crate) fn ax42_check_rows(
+    chunks: &[Chunk],
+    expected: &[(usize, String)],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    use proptest::{prop_assert, prop_assert_eq};
+    let mut written: Vec<(usize, u32, &str)> = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let content = &chunk.content;
+        let Some(spans) = chunk.table_rows.as_deref() else {
+            return Err(proptest::test_runner::TestCaseError::fail(format!(
+                "chunk {index} has no table rows: {content:?}"
+            )));
+        };
+        prop_assert!(
+            table_rows_fit(content, spans),
+            "chunk {}: {:?} in {:?}",
+            index,
+            spans,
+            content
+        );
+        for span in spans {
+            let text = content.get(span.start as usize..span.end as usize);
+            prop_assert!(
+                text.is_some_and(|t| !t.is_empty() && !t.ends_with('\n')),
+                "chunk {}: {:?} does not slice {:?} to a row",
+                index,
+                span,
+                content
+            );
+            written.push((index, span.table, text.unwrap_or_default()));
+        }
+    }
+    let lines: Vec<&str> = written.iter().map(|w| w.2).collect();
+    let want: Vec<&str> = expected.iter().map(|e| e.1.as_str()).collect();
+    prop_assert_eq!(&lines, &want);
+    let mut seen: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (&(chunk, table, line), (doc_table, _)) in written.iter().zip(expected) {
+        let order = seen.entry(chunk).or_default();
+        let number = match order.iter().position(|t| t == doc_table) {
+            Some(n) => n,
+            None => {
+                order.push(*doc_table);
+                order.len() - 1
+            }
+        };
+        prop_assert_eq!(
+            table as usize,
+            number,
+            "chunk {} row {:?}: tables numbered by first appearance",
+            chunk,
+            line
+        );
+    }
+    Ok(())
+}
+
 /// A fully parsed document: frontmatter + chunks + retained raw content.
 #[derive(Debug, Clone)]
 pub struct ParsedDocument {

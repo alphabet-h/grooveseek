@@ -4143,6 +4143,99 @@ mod tests {
         assert_eq!(spans_of(&doc.chunks[0]), vec![row_span(0, 0, 11)]);
     }
 
+    /// (AX-42) A block of a generated `<w:body>`: a heading of a level, a body paragraph, or a
+    /// table.
+    #[derive(Debug, Clone)]
+    enum Ax42Block {
+        Heading(u8, &'static str),
+        Paragraph(&'static str),
+        Table(crate::parser::Ax42Table),
+    }
+
+    /// (AX-42) A body that opens with a heading, then up to 7 blocks, half of them tables, so
+    /// a section holds several tables, none, or only rows that write nothing.
+    fn ax42_blocks() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Block>> {
+        use proptest::prelude::*;
+        let heading = (
+            1_u8..=2,
+            proptest::sample::select(&["Ledger", "章", " "][..]),
+        )
+            .prop_map(|(level, text)| Ax42Block::Heading(level, text));
+        let block = prop_oneof![
+            heading.clone(),
+            proptest::sample::select(&["", "preface", "東京"][..]).prop_map(Ax42Block::Paragraph),
+            crate::parser::ax42_table().prop_map(Ax42Block::Table),
+            crate::parser::ax42_table().prop_map(Ax42Block::Table),
+        ];
+        (heading, proptest::collection::vec(block, 0..=7)).prop_map(|(first, mut rest)| {
+            rest.insert(0, first);
+            rest
+        })
+    }
+
+    /// (AX-42) `blocks` as the inside of a `<w:body>`, each cell paragraph a [`body_para`] and
+    /// a cell without one the `<w:p/>` Word writes; with the rows they should write, as
+    /// [`crate::parser::ax42_check_rows`] takes them.
+    fn ax42_body(blocks: &[Ax42Block]) -> (String, Vec<(usize, String)>) {
+        let (mut body, mut rows) = (String::new(), Vec::new());
+        for (index, block) in blocks.iter().enumerate() {
+            match block {
+                Ax42Block::Heading(level, text) => body.push_str(&heading_para(*level, text)),
+                Ax42Block::Paragraph(text) => body.push_str(&body_para(text)),
+                Ax42Block::Table(table) => {
+                    body.push_str("<w:tbl>");
+                    for row in table {
+                        body.push_str("<w:tr>");
+                        for cell in row {
+                            body.push_str("<w:tc>");
+                            if cell.is_empty() {
+                                body.push_str("<w:p/>");
+                            }
+                            for paragraph in cell {
+                                body.push_str(&body_para(paragraph));
+                            }
+                            body.push_str("</w:tc>");
+                        }
+                        body.push_str("</w:tr>");
+                        if let Some(line) = crate::parser::ax42_expected_line(row) {
+                            rows.push((index, line));
+                        }
+                    }
+                    body.push_str("</w:tbl>");
+                }
+            }
+        }
+        (body, rows)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// (AX-42) Through the parser, both entries: every chunk of a generated `.docx` marks
+        /// its table rows by the contract of [`crate::parser::TableRowSpan`] (see
+        /// [`crate::parser::ax42_check_rows`]), with each span holding exactly the line its row
+        /// was written as, and the read entry marks the same rows as the index entry.
+        #[test]
+        fn prop_docx_table_rows_mark_the_rows_written(blocks in ax42_blocks()) {
+            let (body, rows) = ax42_body(&blocks);
+            let bytes = wrap_document_xml(&body);
+            let index = DocxParser::default()
+                .parse_bytes(&bytes, "ax42.docx", &[])
+                .expect("a generated document parses");
+            crate::parser::ax42_check_rows(&index.chunks, &rows)?;
+            let read = DocxParser::default()
+                .parse_bytes_for_read(&bytes, "ax42.docx", &[])
+                .expect("a generated document parses");
+            let marks = |doc: &ParsedDocument| -> Vec<Option<Vec<crate::parser::TableRowSpan>>> {
+                doc.chunks.iter().map(|c| c.table_rows.clone()).collect()
+            };
+            proptest::prop_assert_eq!(marks(&read), marks(&index));
+        }
+    }
+
     /// (AX-42) The parts of a [`DocxSection`] a property test draws: heading, level, ancestry,
     /// body and row spans as `(table, start, end)`.
     type Ax42Section = (
