@@ -333,6 +333,11 @@ fn probe_liveness(authority: &str) -> Liveness {
     }
 }
 
+/// How long [`status_client`] lets one request to the daemon take, connection to last byte.
+/// Shorter than the polling interval (`POLL_INTERVAL` in [`crate::poll`]), so a daemon that
+/// never answers fails one poll before the next one is due.
+pub(crate) const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// The one HTTP client the tray talks to its daemon with, for the stop probe
 /// here and the status polling in [`crate::poll`].
 ///
@@ -342,7 +347,7 @@ fn probe_liveness(authority: &str) -> Liveness {
 /// `/api/admin/status`.
 pub(crate) fn status_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(STATUS_TIMEOUT)
         .no_proxy()
         .build()
         .context("build status http client")

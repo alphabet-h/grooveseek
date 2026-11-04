@@ -99,20 +99,24 @@ pub fn hold_connections() -> std::net::SocketAddr {
     addr
 }
 
-/// A loopback address with nothing listening on it: a port the OS handed out to a bind that
-/// is then dropped.
+/// A port that is bound and answers nothing: a background thread accepts every connection and
+/// closes it at once, without reading or writing, until the test process exits. Returns the
+/// bound loopback address. This is the shape of a daemon that drops a request.
 ///
-/// The port is only known to be free when this returns. Another bind in the same process
-/// between then and the use (as [`serve_one_response`] or [`hold_connections`] in a test
-/// running beside it) could be given the same port: unlikely, not ruled out. A test that uses
-/// this should make its connection right after, and is exposed to that race for as long as it
-/// takes to get there.
-///
-/// `daemon::tests::confirm_stopped_accepts_a_free_port` has the same bind and drop inline in
-/// its body, which stays as it is because test bodies are not edited.
-pub fn free_loopback_addr() -> std::net::SocketAddr {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    probe.local_addr().expect("probe addr")
+/// The listener stays bound for the life of the process, so unlike a port bound and released
+/// to stand for "nothing listening", no test running beside the caller can be given it.
+pub fn close_on_accept() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closing listener");
+    let addr = listener.local_addr().expect("closing listener addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => drop(s),
+                Err(_) => break,
+            }
+        }
+    });
+    addr
 }
 
 #[cfg(test)]

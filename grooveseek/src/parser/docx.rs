@@ -4153,17 +4153,20 @@ mod tests {
     }
 
     /// (AX-42) A body that opens with a heading, then up to 7 blocks, half of them tables, so
-    /// a section holds several tables, none, or only rows that write nothing.
+    /// a section holds several tables, none, or only rows that write nothing. Body paragraphs
+    /// and headings are often blank (a space, a newline) or padded, so tables sit next to
+    /// whitespace at the start and end of a section as well as between paragraphs.
     fn ax42_blocks() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Block>> {
         use proptest::prelude::*;
         let heading = (
             1_u8..=2,
-            proptest::sample::select(&["Ledger", "章", " "][..]),
+            proptest::sample::select(&["Ledger", " 章 ", " "][..]),
         )
             .prop_map(|(level, text)| Ax42Block::Heading(level, text));
         let block = prop_oneof![
             heading.clone(),
-            proptest::sample::select(&["", "preface", "東京"][..]).prop_map(Ax42Block::Paragraph),
+            proptest::sample::select(&["", " ", "\n", "  preface  ", "preface", "東京"][..])
+                .prop_map(Ax42Block::Paragraph),
             crate::parser::ax42_table().prop_map(Ax42Block::Table),
             crate::parser::ax42_table().prop_map(Ax42Block::Table),
         ];

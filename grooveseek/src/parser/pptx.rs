@@ -2127,15 +2127,20 @@ mod tests {
     /// that the notes were read.
     const AX42_NOTES_TEXT: &str = "quill";
 
-    /// (AX-42) Decks of 1 to 3 slides, half the blocks tables.
+    /// (AX-42) Decks of 1 to 3 slides, half the blocks tables. A slide's text paragraphs and
+    /// title are often blank (a space, a newline) or padded, and a table often opens or closes
+    /// the slide (no title, a table first or last), so the slide's trim of its content (R1.10,
+    /// which keeps a tab and moves the spans by what it takes off the head) meets rows at both
+    /// ends and whitespace around them.
     fn ax42_deck() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Slide>> {
         use proptest::prelude::*;
         let block = prop_oneof![
-            proptest::sample::select(&["", "overview", "東京"][..]).prop_map(Ax42Block::Paragraph),
+            proptest::sample::select(&["", " ", "\n", "  overview  ", "overview", "東京"][..])
+                .prop_map(Ax42Block::Paragraph),
             crate::parser::ax42_table().prop_map(Ax42Block::Table),
         ];
         let slide = (
-            proptest::option::of(proptest::sample::select(&["Deck", "表"][..])),
+            proptest::option::of(proptest::sample::select(&["Deck", " 表 ", " "][..])),
             proptest::collection::vec(block, 0..=4),
             proptest::option::of(crate::parser::ax42_table()),
         );

@@ -3,6 +3,10 @@ use crate::state::{AdminStatus, StatusState};
 use std::time::Duration;
 use tao::event_loop::EventLoopProxy;
 
+/// How often [`run`] polls the daemon. Longer than one request may take
+/// ([`crate::daemon::STATUS_TIMEOUT`]).
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Long-running tokio task that polls `/api/admin/status` every 5 seconds and
 /// publishes the resulting [`crate::state::StatusDot`]/text via the event loop proxy so the
 /// tray (running on the main thread) can update its icon and menu label.
@@ -12,7 +16,7 @@ use tao::event_loop::EventLoopProxy;
 /// (= no hysteresis, spec section 6 "回復セマンティクス").
 pub async fn run(status_url: String, proxy: EventLoopProxy<UserEvent>) {
     let mut state = StatusState::new();
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut interval = tokio::time::interval(POLL_INTERVAL);
     let client = match crate::daemon::status_client() {
         Ok(c) => c,
         Err(e) => {
@@ -57,9 +61,10 @@ async fn fetch(client: &reqwest::Client, url: &str) -> anyhow::Result<AdminStatu
 /// loop uses ([`crate::daemon::status_client`]): each way it answers, and each way it fails.
 #[cfg(test)]
 mod tests {
-    use super::{AdminStatus, fetch};
+    use super::{AdminStatus, POLL_INTERVAL, fetch};
+    use crate::daemon::STATUS_TIMEOUT;
     use crate::test_support::{
-        free_loopback_addr, hold_connections, json_response, serve_one_response,
+        close_on_accept, hold_connections, json_response, serve_one_response,
     };
 
     fn status_url(addr: std::net::SocketAddr) -> String {
@@ -131,29 +136,32 @@ mod tests {
         }
     }
 
-    /// Nothing listening: a transport failure, neither a status nor a decode error.
+    /// A daemon that accepts the connection and closes it without answering: a transport
+    /// failure, neither a status, a decode error nor a timeout.
     ///
-    /// Not asserted as `is_connect()`: the doc of `Liveness` in [`crate::daemon`] records that
-    /// no refusal was ever classified that way on the development machine, whose firewall
-    /// drops packets to a closed port, so the failure there may come as the client's timeout
-    /// instead.
-    ///
-    /// The free port comes from [`free_loopback_addr`], whose race with a bind in a test
-    /// running beside this one is narrowed by building the client first and connecting right
-    /// after the port is taken.
+    /// The listener is this test's own ([`close_on_accept`]), so no test running beside it
+    /// can take the port, as one could a port bound and released for "nothing listening".
     #[tokio::test]
-    async fn nothing_listening_is_a_transport_failure() {
+    async fn a_daemon_that_closes_without_answering_is_a_transport_failure() {
+        let addr = close_on_accept();
         let client = crate::daemon::status_client().expect("client");
-        let addr = free_loopback_addr();
         let err = fetch(&client, &status_url(addr))
             .await
-            .expect_err("a free port is a failure");
+            .expect_err("a connection closed without an answer is a failure");
         let source = transport_error(&err);
-        assert!(!source.is_decode() && !source.is_status(), "{err:#}");
+        assert!(
+            !source.is_decode() && !source.is_status() && !source.is_timeout(),
+            "{err:#}"
+        );
     }
 
+    /// How far past [`STATUS_TIMEOUT`] a timed-out request may come back: room for the
+    /// scheduling of a loaded Windows CI runner, not for a longer timeout.
+    const TIMEOUT_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// A daemon that accepts and never answers fails on the client's timeout rather than
-    /// holding the polling loop, within a bound well past the 3 seconds the client sets.
+    /// holding the polling loop: no sooner than [`STATUS_TIMEOUT`], and no later than
+    /// [`TIMEOUT_SLACK`] after it.
     #[tokio::test]
     async fn a_daemon_that_never_answers_times_out() {
         let addr = hold_connections();
@@ -162,11 +170,25 @@ mod tests {
         let err = fetch(&client, &status_url(addr))
             .await
             .expect_err("no answer is a failure");
+        let took = started.elapsed();
         assert!(transport_error(&err).is_timeout(), "{err:#}");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "took {:?}",
-            started.elapsed()
+            took >= STATUS_TIMEOUT,
+            "came back after {took:?}, before the {STATUS_TIMEOUT:?} timeout"
+        );
+        assert!(
+            took <= STATUS_TIMEOUT + TIMEOUT_SLACK,
+            "came back after {took:?}, past the {STATUS_TIMEOUT:?} timeout and {TIMEOUT_SLACK:?}"
+        );
+    }
+
+    /// A request that times out ends before the next poll is due, so a daemon that stops
+    /// answering costs one failure per poll and the polls do not pile up behind it.
+    #[test]
+    fn a_request_times_out_before_the_next_poll() {
+        assert!(
+            STATUS_TIMEOUT < POLL_INTERVAL,
+            "{STATUS_TIMEOUT:?} is not shorter than {POLL_INTERVAL:?}"
         );
     }
 }
