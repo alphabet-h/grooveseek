@@ -12,7 +12,8 @@ mod common;
 
 use common::ansi::strip_ansi;
 use common::embed_cli::{
-    BODY_SENTINEL, DIM, REJECT_MARKER, files, fixture, note, rejects_marker, reply, stderr_of,
+    BODY_SENTINEL, DIM, REJECT_MARKER, WATCH_TOML, files, fixture, note, rejects_marker, reply,
+    stderr_of,
 };
 use common::embed_mock::{
     DOC_MODEL, EmbedMock, Framing, MockReply, MockResponse, QUERY_MODEL, Recorded, StallEnd,
@@ -1655,8 +1656,6 @@ fn search_orders_results_the_same_when_the_endpoint_returns_scaled_vectors() {
     assert_dir_empty(&unit.cache);
     assert_dir_empty(&scaled.cache);
 }
-
-const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 
 /// Cut `fx`'s request timeout to one second, so a stalled body fails fast.
 fn one_second_timeout(fx: &common::embed_cli::Fixture) {

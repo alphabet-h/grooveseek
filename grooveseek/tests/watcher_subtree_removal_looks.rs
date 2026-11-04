@@ -17,13 +17,10 @@
 
 mod common;
 
-use common::embed_cli::{Fixture, fixture};
-use common::embed_mock::{hermetic, wait_until};
-use common::mcp::{ServerGuard, spawn_serve_with};
+use common::embed_cli::{Fixture, WATCH_TOML, fixture};
+use common::embed_mock::wait_until;
+use common::mcp::ServerGuard;
 use std::time::Duration;
-
-/// Turns the watcher on with a short debounce. Appended after the `[embedding]` keys.
-const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 
 /// A word only `sub/a.md` holds.
 const A_MARKER: &str = "zephyrquill";
@@ -59,12 +56,7 @@ fn note_with(title: &str, marker: &str) -> String {
 /// `groove index` once, then `groove serve` with the watcher on.
 fn serve(fx: &Fixture) -> ServerGuard {
     fx.index();
-    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`, so the edits a
-    // test makes next cannot fall before the debouncer is armed.
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
-    guard
+    fx.serve_watching()
 }
 
 fn stderr_lines(guard: &ServerGuard) -> Vec<String> {

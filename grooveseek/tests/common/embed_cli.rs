@@ -215,14 +215,31 @@ pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 /// A knowledge base holding `files`, indexed once and served with the watcher
 /// on ([`Fixture::serve_watching`]).
 ///
-/// Existing watcher tests carry private copies of this fixture; they are left
-/// as they are because this repository does not edit existing tests. A new
-/// watcher test uses this one. (Reading the server's stderr is a separate
-/// matter and has one implementation, [`ServerGuard::stderr`] then
-/// `StderrLog::stripped_lines`, which those tests' helpers call.)
+/// The one implementation of this fixture: the watcher tests' own `served`
+/// helpers keep their names and call it (or [`served_watching_after`]), and a
+/// helper that takes a fixture the test built itself calls
+/// [`Fixture::index`] then [`Fixture::serve_watching`]. What still sets up
+/// its own server does something this does not: appends other keys before
+/// [`WATCH_TOML`], changes the knowledge base or the endpoint's answer
+/// between the index and the server, uses another debounce, or builds the
+/// older fixture the OpenAI-compatible provider tests keep. (Reading the server's
+/// stderr has one implementation too, [`ServerGuard::stderr`] then
+/// [`crate::common::mcp::StderrLog::stripped_lines`].)
 pub fn served_watching(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
+    served_watching_after(prefix, files, |_| {})
+}
+
+/// [`served_watching`], with `between` run on the knowledge base after the
+/// index and before the server starts: what it changes reaches the watcher as
+/// no event.
+pub fn served_watching_after(
+    prefix: &str,
+    files: &[(&str, &str)],
+    between: impl FnOnce(&Fixture),
+) -> (Fixture, ServerGuard) {
     let fx = fixture(prefix, files, WATCH_TOML);
     fx.index();
+    between(&fx);
     let guard = fx.serve_watching();
     (fx, guard)
 }

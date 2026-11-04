@@ -23,9 +23,9 @@
 
 mod common;
 
-use common::embed_cli::{Fixture, fixture};
-use common::embed_mock::{hermetic, wait_until};
-use common::mcp::{ServerGuard, spawn_serve_with};
+use common::embed_cli::{Fixture, served_watching};
+use common::embed_mock::wait_until;
+use common::mcp::ServerGuard;
 use common::rename::rename_retrying;
 use grooveseek::db::Database;
 use std::time::Duration;
@@ -45,18 +45,7 @@ fn note(title: &str, marker: &str) -> String {
 
 /// A knowledge base holding `files`, indexed once, served with the watcher on.
 fn served(prefix: &str, files: &[(&str, &str)]) -> (Fixture, ServerGuard) {
-    let fx = fixture(
-        prefix,
-        files,
-        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
-    );
-    fx.index();
-    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`, so the edits a
-    // test makes next cannot fall before the debouncer is armed.
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
-    (fx, guard)
+    served_watching(prefix, files)
 }
 
 /// The index the server writes, opened beside it (WAL, with a busy timeout), and closed again
