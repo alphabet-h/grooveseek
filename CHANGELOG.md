@@ -127,6 +127,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   transport failure, and one that never answers fails on the client's timeout, no sooner than
   it and at most 2 seconds after; that timeout, now a named constant, is pinned shorter than
   the polling interval (audit AX-42, kuriya 627).
+- A new retrieval check, `tests/eval_docx_japanese_rules.rs` (`#[ignore]`, `bge-m3`), indexes
+  a Japanese `.docx` of work rules, chapters with no body of their own each followed directly
+  by its articles, among unrelated Japanese Markdown notes. A query paraphrasing an article's
+  body ranks that article first, and no empty chapter excerpt reaches the top five, neither for
+  those queries nor for queries no article answers; with the fold of empty headings (1.17.0)
+  undone, the chapters come back as empty excerpts at ranks two to five (audit AX-20,
+  kuriya 616).
 
 ## [1.24.0] - 2026-11-02
 
