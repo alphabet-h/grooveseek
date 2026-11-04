@@ -261,9 +261,9 @@ pub(crate) fn ax42_table() -> impl proptest::strategy::Strategy<Value = Ax42Tabl
 /// (AX-42) The line a row of an [`Ax42Table`] should be written as, worked out from the rules
 /// the parsers document rather than through [`ooxml::row_line`], so the property does not take
 /// the code under test as its own answer: inside a cell a line break is a space and a tab is a
-/// tab (`push_paragraph_separator` in the `.docx` parser, `push_line_break` in the `.pptx`
-/// one); each paragraph trimmed, the non-empty ones of a cell joined with a space, the fields
-/// joined with a tab, and no line when every field is empty.
+/// tab (`push_paragraph_separator` in [`crate::parser::docx`], `push_line_break` in
+/// [`crate::parser::pptx`]); each paragraph trimmed, the non-empty ones of a cell joined with a
+/// space, the fields joined with a tab, and no line when every field is empty.
 #[cfg(test)]
 pub(crate) fn ax42_expected_line(row: &[Vec<Vec<Ax42Piece>>]) -> Option<String> {
     let paragraph = |pieces: &[Ax42Piece]| -> String {
