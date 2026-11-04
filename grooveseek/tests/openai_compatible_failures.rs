@@ -1701,22 +1701,13 @@ fn watcher_failure_line(
         one_second_timeout(&fx);
     }
     fx.index();
-    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
-        hermetic(c, &fx.cache);
-    });
+    let guard = fx.serve_watching();
     fx.answer_with(answer);
     fx.layout.write(
         "fresh.md",
         &note("Fresh", "Brand new text about the tides."),
     );
-    let lines = || -> Vec<String> {
-        guard
-            .stderr()
-            .lines()
-            .iter()
-            .map(|l| strip_ansi(l))
-            .collect()
-    };
+    let lines = || -> Vec<String> { guard.stderr().stripped_lines() };
     let failed_prefix = "watcher: reindex fresh.md failed: ";
     let failed = wait_until(Duration::from_secs(30), || {
         lines().iter().any(|l| l.contains(failed_prefix))

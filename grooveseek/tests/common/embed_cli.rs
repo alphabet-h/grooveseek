@@ -218,8 +218,11 @@ pub const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
 /// The fixture the watcher tests' helpers share: those helpers keep their old
 /// names and delegate to it (or [`served_watching_after`]), and a
 /// helper that takes a fixture the test built itself calls
-/// [`Fixture::index`] then [`Fixture::serve_watching`]. What still sets up its
-/// own server does something this does not: appends other keys before
+/// [`Fixture::index`] then [`Fixture::serve_watching`]. So does a helper that
+/// builds its own fixture because it needs more (other keys, a shorter
+/// timeout, an answer swapped once the server runs): it keeps those steps and
+/// starts the server with [`Fixture::serve_watching`]. What still starts its
+/// own server is a test body that does something this does not: appends other keys before
 /// [`WATCH_TOML`], changes the knowledge base or the endpoint's answer
 /// between the index and the server, uses another debounce, or builds the
 /// older fixture the OpenAI-compatible provider tests keep. One exception: the
