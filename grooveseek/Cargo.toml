@@ -251,6 +251,26 @@ harness = false
 name = "index_throughput"
 harness = false
 
+# (AX-19) Large `.docx` / `.pptx` through the parsers. Generated in memory; no model.
+[[bench]]
+name = "ooxml_parse"
+harness = false
+
+# (AX-19) Incremental reindex of one edited section of a large document, with the embedded /
+# reused chunk counts. `test-helpers` for `Embedder::stub_for_tests` (no model, no endpoint);
+# without the feature cargo skips the target rather than failing the build.
+[[bench]]
+name = "reindex_large_doc"
+harness = false
+required-features = ["test-helpers"]
+
+# (AX-19) The running watcher following a directory rename of 5000 indexed documents.
+# `test-helpers` for the same reason as above.
+[[bench]]
+name = "watcher_dir_rename"
+harness = false
+required-features = ["test-helpers"]
+
 # (feature-56 PR-3a) Grammar plugin fixtures for `tests/grammar_plugin_cli.rs`.
 #
 # `[[example]]` with `crate-type = ["cdylib"]` because that is the shape a real grammar plugin
