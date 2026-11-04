@@ -291,16 +291,30 @@ pub(crate) fn ax42_expected_line(row: &[Vec<Vec<Ax42Piece>>]) -> Option<String> 
     (!fields.iter().all(String::is_empty)).then(|| fields.join("\t"))
 }
 
-/// (AX-42) [`ax42_check_rows`] on the chunks of `index`, the document the index entry parsed,
-/// and the same table rows, chunk for chunk, from `read`, the read entry's parse of the same
-/// bytes.
+/// (AX-42) The decompression budget a property test builds the index-entry parser with: far
+/// more than a generated document takes, and not [`DEFAULT_MAX_DECOMPRESSED_BYTES`], the one
+/// the read entry keeps whatever the parser was built with. The two entries then run under
+/// budgets of their own.
+#[cfg(test)]
+pub(crate) const AX42_INDEX_BUDGET: u64 = 1024 * 1024;
+
+/// (AX-42) The rows a test wrote, as the chunks a parser should make of them: one entry per
+/// chunk, in order, holding that chunk's rows in order as `(table, line)`, `table` numbering
+/// the tables across the whole document.
+#[cfg(test)]
+pub(crate) type Ax42Chunks = Vec<Vec<(usize, String)>>;
+
+/// (AX-42) [`ax42_check_rows`] on both `index`, the index entry's parse, and `read`, the read
+/// entry's parse of the same bytes, each against its own content; and the same table rows,
+/// chunk for chunk, from both.
 #[cfg(test)]
 pub(crate) fn ax42_check_entries(
     index: &ParsedDocument,
     read: &ParsedDocument,
-    expected: &[(usize, String)],
+    expected: &[Vec<(usize, String)>],
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     ax42_check_rows(&index.chunks, expected)?;
+    ax42_check_rows(&read.chunks, expected)?;
     let marks = |doc: &ParsedDocument| -> Vec<Option<Vec<TableRowSpan>>> {
         doc.chunks.iter().map(|c| c.table_rows.clone()).collect()
     };
@@ -308,25 +322,33 @@ pub(crate) fn ax42_check_entries(
     Ok(())
 }
 
-/// (AX-42) The [`Chunk::table_rows`] a parser produced, against the rows a test wrote:
-/// `expected` holds, in document order, each written row as `(table, line)`, with `table`
-/// numbering the tables across the whole document.
+/// (AX-42) The [`Chunk::table_rows`] a parser produced, against the rows a test wrote, chunk
+/// by chunk ([`Ax42Chunks`]):
 ///
+/// - there are as many chunks as expected;
 /// - every chunk carries `Some`, the same contract [`table_rows_fit`] gives the read side;
 /// - each span slices its chunk's content (in range, on char boundaries, not empty) to a text
 ///   that does not end in a newline;
-/// - read over every chunk in order, the span texts are exactly the expected lines, so a chunk
-///   with no row carries `Some(vec![])`;
+/// - in each chunk the span texts are exactly the lines expected there, in order, so a row
+///   cannot pass by turning up in a neighbouring chunk, and a chunk with no row carries
+///   `Some(vec![])`;
 /// - in each chunk the tables are numbered by the order the document's tables first appear in
 ///   it, from 0.
 #[cfg(test)]
 pub(crate) fn ax42_check_rows(
     chunks: &[Chunk],
-    expected: &[(usize, String)],
+    expected: &[Vec<(usize, String)>],
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     use proptest::{prop_assert, prop_assert_eq};
-    let mut written: Vec<(usize, u32, &str)> = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
+    let contents: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+    prop_assert_eq!(
+        chunks.len(),
+        expected.len(),
+        "chunks {:?}, expected rows {:?}",
+        contents,
+        expected
+    );
+    for (index, (chunk, rows)) in chunks.iter().zip(expected).enumerate() {
         let content = &chunk.content;
         let Some(spans) = chunk.table_rows.as_deref() else {
             return Err(proptest::test_runner::TestCaseError::fail(format!(
@@ -340,6 +362,7 @@ pub(crate) fn ax42_check_rows(
             spans,
             content
         );
+        let mut lines: Vec<&str> = Vec::new();
         for span in spans {
             let text = content.get(span.start as usize..span.end as usize);
             prop_assert!(
@@ -349,29 +372,27 @@ pub(crate) fn ax42_check_rows(
                 span,
                 content
             );
-            written.push((index, span.table, text.unwrap_or_default()));
+            lines.push(text.unwrap_or_default());
         }
-    }
-    let lines: Vec<&str> = written.iter().map(|w| w.2).collect();
-    let want: Vec<&str> = expected.iter().map(|e| e.1.as_str()).collect();
-    prop_assert_eq!(&lines, &want);
-    let mut seen: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    for (&(chunk, table, line), (doc_table, _)) in written.iter().zip(expected) {
-        let order = seen.entry(chunk).or_default();
-        let number = match order.iter().position(|t| t == doc_table) {
-            Some(n) => n,
-            None => {
-                order.push(*doc_table);
-                order.len() - 1
-            }
-        };
-        prop_assert_eq!(
-            table as usize,
-            number,
-            "chunk {} row {:?}: tables numbered by first appearance",
-            chunk,
-            line
-        );
+        let want: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        prop_assert_eq!(&lines, &want, "chunk {}: {:?}", index, content);
+        let mut order: Vec<usize> = Vec::new();
+        for (span, (doc_table, line)) in spans.iter().zip(rows) {
+            let number = match order.iter().position(|t| t == doc_table) {
+                Some(n) => n,
+                None => {
+                    order.push(*doc_table);
+                    order.len() - 1
+                }
+            };
+            prop_assert_eq!(
+                span.table as usize,
+                number,
+                "chunk {} row {:?}: tables numbered by first appearance",
+                index,
+                line
+            );
+        }
     }
     Ok(())
 }

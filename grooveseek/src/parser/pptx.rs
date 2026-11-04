@@ -2180,18 +2180,28 @@ mod tests {
     }
 
     /// (AX-42) `deck` as a `.pptx`, each slide's notes tied by its rels the way
-    /// [`deck_with_notes`] ties them; with the rows the slides (not the notes) should write,
-    /// as [`crate::parser::ax42_check_rows`] takes them.
-    fn ax42_pptx(deck: &[Ax42Slide]) -> (Vec<u8>, Vec<(usize, String)>) {
+    /// [`deck_with_notes`] ties them; with the chunks it should make, as
+    /// [`crate::parser::ax42_check_rows`] takes them, and for each of those chunks whether its
+    /// slide has notes.
+    ///
+    /// The chunks are worked out from the rules the parser documents: a slide is one chunk,
+    /// holding the rows its tables write (never those of its notes), unless it has no title, no
+    /// text and no notes once trimmed, in which case it is no chunk at all.
+    fn ax42_pptx(deck: &[Ax42Slide]) -> (Vec<u8>, crate::parser::Ax42Chunks, Vec<bool>) {
         let mut parts: Vec<(String, String)> = Vec::new();
-        let mut rows = Vec::new();
+        let (mut chunks, mut with_notes) = (Vec::new(), Vec::new());
         let mut tables = 0_usize;
         for (index, (title, blocks, notes)) in deck.iter().enumerate() {
             let n = index + 1;
             let mut tree = title.map(|t| title_shape(&run_of(t))).unwrap_or_default();
+            let mut has_text = title.is_some_and(|t| !t.trim().is_empty()) || notes.is_some();
+            let mut rows = Vec::new();
             for block in blocks {
                 match block {
-                    Ax42Block::Paragraph(text) => tree.push_str(&shape_of(&[&run_of(text)])),
+                    Ax42Block::Paragraph(text) => {
+                        tree.push_str(&shape_of(&[&run_of(text)]));
+                        has_text |= !text.trim().is_empty();
+                    }
                     Ax42Block::Table(table) => {
                         tree.push_str(&ax42_table_xml(table));
                         for row in table {
@@ -2202,6 +2212,10 @@ mod tests {
                         tables += 1;
                     }
                 }
+            }
+            if has_text || !rows.is_empty() {
+                chunks.push(rows);
+                with_notes.push(notes.is_some());
             }
             parts.push((format!("ppt/slides/slide{n}.xml"), slide_with(&tree)));
             if let Some(table) = notes {
@@ -2221,7 +2235,7 @@ mod tests {
             .iter()
             .map(|(name, xml)| (name.as_str(), xml.as_bytes()))
             .collect();
-        (pptx_of(&entries), rows)
+        (pptx_of(&entries), chunks, with_notes)
     }
 
     proptest::proptest! {
@@ -2232,28 +2246,31 @@ mod tests {
 
         /// (AX-42) Through the parser: every chunk of a generated `.pptx` marks its table rows
         /// by the contract of [`crate::parser::TableRowSpan`] (see
-        /// [`crate::parser::ax42_check_rows`]), with each span holding exactly the line its row
-        /// was written as, breaks and tabs in a cell included, and no span in the notes, which
-        /// are read (each notes slide's text is in a chunk). The read entry, the same reader
-        /// under another size budget, is held to the same rows.
+        /// [`crate::parser::ax42_check_rows`]), each span holding exactly the line its row was
+        /// written as, breaks and tabs in a cell included, in the chunk of its own slide, and no
+        /// span in the notes, which are read into that same chunk. The index entry runs under
+        /// a budget of its own ([`crate::parser::AX42_INDEX_BUDGET`]) and the read entry under
+        /// the built-in one, and both are held to that.
         #[test]
         fn prop_pptx_table_rows_mark_the_rows_written(deck in ax42_deck()) {
-            let (bytes, rows) = ax42_pptx(&deck);
-            let index = PptxParser::default()
+            proptest::prop_assert_ne!(
+                crate::parser::AX42_INDEX_BUDGET,
+                crate::parser::DEFAULT_MAX_DECOMPRESSED_BYTES
+            );
+            let (bytes, chunks, with_notes) = ax42_pptx(&deck);
+            let index = PptxParser::with_budget(crate::parser::AX42_INDEX_BUDGET)
                 .parse_bytes(&bytes, "ax42.pptx", &[])
                 .expect("a generated deck parses");
             let read = PptxParser::default()
                 .parse_bytes_for_read(&bytes, "ax42.pptx", &[])
                 .expect("a generated deck parses");
-            crate::parser::ax42_check_entries(&index, &read, &rows)?;
+            crate::parser::ax42_check_entries(&index, &read, &chunks)?;
             let marker = format!("[notes]\n{AX42_NOTES_TEXT}");
-            let with_notes = deck.iter().filter(|slide| slide.2.is_some()).count();
-            let read_notes = index
-                .chunks
-                .iter()
-                .filter(|chunk| chunk.content.contains(&marker))
-                .count();
-            proptest::prop_assert_eq!(read_notes, with_notes);
+            for doc in [&index, &read] {
+                let read_notes: Vec<bool> =
+                    doc.chunks.iter().map(|c| c.content.contains(&marker)).collect();
+                proptest::prop_assert_eq!(&read_notes, &with_notes);
+            }
         }
     }
 
