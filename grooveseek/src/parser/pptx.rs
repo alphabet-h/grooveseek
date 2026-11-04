@@ -848,15 +848,13 @@ mod tests {
                     .unwrap();
                 zip.write_all(slide_xml.as_bytes()).unwrap();
                 if let Some(note) = notes {
-                    let notes_xml = format!(
-                        r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{note}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#
-                    );
+                    let notes_xml = notes_with(&format!(
+                        r#"<p:sp><p:txBody><a:p><a:r><a:t>{note}</a:t></a:r></a:p></p:txBody></p:sp>"#
+                    ));
                     zip.start_file(format!("ppt/notesSlides/notesSlide{n}.xml"), opt)
                         .unwrap();
                     zip.write_all(notes_xml.as_bytes()).unwrap();
-                    let rels_xml = format!(
-                        r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>"#
-                    );
+                    let rels_xml = notes_rels(n);
                     zip.start_file(format!("ppt/slides/_rels/slide{n}.xml.rels"), opt)
                         .unwrap();
                     zip.write_all(rels_xml.as_bytes()).unwrap();
@@ -1426,13 +1424,26 @@ mod tests {
         doc.chunks.into_iter().next().unwrap()
     }
 
+    /// A notes slide (`ppt/notesSlides/notesSlide{n}.xml`) whose `<p:spTree>` holds `tree`.
+    fn notes_with(tree: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{tree}</p:spTree></p:cSld></p:notes>"#
+        )
+    }
+
+    /// The rels of slide `n` (`ppt/slides/_rels/slide{n}.xml.rels`) tying it to notes slide
+    /// `n` the way PowerPoint ties them, the only way the parser resolves notes.
+    fn notes_rels(n: usize) -> String {
+        format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>"#
+        )
+    }
+
     /// feature-65: a deck of one slide (`slide_xml`) whose notes slide holds `notes_tree`,
     /// tied by the slide's rels the way PowerPoint ties them.
     fn deck_with_notes(slide_xml: &str, notes_tree: &str) -> Vec<u8> {
-        let notes = format!(
-            r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{notes_tree}</p:spTree></p:cSld></p:notes>"#
-        );
-        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#;
+        let notes = notes_with(notes_tree);
+        let rels = notes_rels(1);
         pptx_of(&[
             ("ppt/slides/slide1.xml", slide_xml.as_bytes()),
             ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
@@ -2112,6 +2123,10 @@ mod tests {
         Option<crate::parser::Ax42Table>,
     );
 
+    /// (AX-42) The text shape every generated notes slide opens with, so the property can see
+    /// that the notes were read.
+    const AX42_NOTES_TEXT: &str = "quill";
+
     /// (AX-42) Decks of 1 to 3 slides, half the blocks tables.
     fn ax42_deck() -> impl proptest::strategy::Strategy<Value = Vec<Ax42Slide>> {
         use proptest::prelude::*;
@@ -2127,15 +2142,30 @@ mod tests {
         proptest::collection::vec(slide, 1..=3)
     }
 
-    /// (AX-42) A [`table_of`] of `table`, each cell paragraph one [`run_of`].
+    /// (AX-42) A [`table_of`] of `table`, each cell paragraph the inner XML PowerPoint writes
+    /// for its pieces: a [`run_of`] per text, `<a:br/>` per break, and a run of `\t` per tab
+    /// (DrawingML has no tab element; a tab is a character of the run).
     fn ax42_table_xml(table: &crate::parser::Ax42Table) -> String {
+        use crate::parser::Ax42Piece;
         let rows: Vec<Vec<String>> = table
             .iter()
             .map(|row| {
                 row.iter()
                     .map(|cell| {
-                        let runs: Vec<String> = cell.iter().map(|p| run_of(p)).collect();
-                        let refs: Vec<&str> = runs.iter().map(String::as_str).collect();
+                        let paragraphs: Vec<String> = cell
+                            .iter()
+                            .map(|pieces| {
+                                pieces
+                                    .iter()
+                                    .map(|piece| match piece {
+                                        Ax42Piece::Text(text) => run_of(text),
+                                        Ax42Piece::Break => "<a:br/>".to_string(),
+                                        Ax42Piece::Tab => run_of("\t"),
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        let refs: Vec<&str> = paragraphs.iter().map(String::as_str).collect();
                         cell_with("", &refs)
                     })
                     .collect()
@@ -2170,20 +2200,16 @@ mod tests {
             }
             parts.push((format!("ppt/slides/slide{n}.xml"), slide_with(&tree)));
             if let Some(table) = notes {
-                let notes_tree =
-                    format!("{}{}", shape_of(&[&run_of("quill")]), ax42_table_xml(table));
+                let notes_tree = format!(
+                    "{}{}",
+                    shape_of(&[&run_of(AX42_NOTES_TEXT)]),
+                    ax42_table_xml(table)
+                );
                 parts.push((
                     format!("ppt/notesSlides/notesSlide{n}.xml"),
-                    format!(
-                        r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{notes_tree}</p:spTree></p:cSld></p:notes>"#
-                    ),
+                    notes_with(&notes_tree),
                 ));
-                parts.push((
-                    format!("ppt/slides/_rels/slide{n}.xml.rels"),
-                    format!(
-                        r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>"#
-                    ),
-                ));
+                parts.push((format!("ppt/slides/_rels/slide{n}.xml.rels"), notes_rels(n)));
             }
         }
         let entries: Vec<(&str, &[u8])> = parts
@@ -2199,25 +2225,30 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
 
-        /// (AX-42) Through the parser, both entries: every chunk of a generated `.pptx` marks
-        /// its table rows by the contract of [`crate::parser::TableRowSpan`] (see
+        /// (AX-42) Through the parser: every chunk of a generated `.pptx` marks its table rows
+        /// by the contract of [`crate::parser::TableRowSpan`] (see
         /// [`crate::parser::ax42_check_rows`]), with each span holding exactly the line its row
-        /// was written as and no span in the notes, and the read entry marks the same rows as
-        /// the index entry.
+        /// was written as, breaks and tabs in a cell included, and no span in the notes, which
+        /// are read (each notes slide's text is in a chunk). The read entry, the same reader
+        /// under another size budget, is held to the same rows.
         #[test]
         fn prop_pptx_table_rows_mark_the_rows_written(deck in ax42_deck()) {
             let (bytes, rows) = ax42_pptx(&deck);
             let index = PptxParser::default()
                 .parse_bytes(&bytes, "ax42.pptx", &[])
                 .expect("a generated deck parses");
-            crate::parser::ax42_check_rows(&index.chunks, &rows)?;
             let read = PptxParser::default()
                 .parse_bytes_for_read(&bytes, "ax42.pptx", &[])
                 .expect("a generated deck parses");
-            let marks = |doc: &ParsedDocument| -> Vec<Option<Vec<crate::parser::TableRowSpan>>> {
-                doc.chunks.iter().map(|c| c.table_rows.clone()).collect()
-            };
-            proptest::prop_assert_eq!(marks(&read), marks(&index));
+            crate::parser::ax42_check_entries(&index, &read, &rows)?;
+            let marker = format!("[notes]\n{AX42_NOTES_TEXT}");
+            let with_notes = deck.iter().filter(|slide| slide.2.is_some()).count();
+            let read_notes = index
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.content.contains(&marker))
+                .count();
+            proptest::prop_assert_eq!(read_notes, with_notes);
         }
     }
 

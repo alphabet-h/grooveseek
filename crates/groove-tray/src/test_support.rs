@@ -43,8 +43,10 @@ pub fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
 /// one connection, read the request up to the end of its headers and write `response`, the
 /// whole HTTP response as bytes on the wire, then close. Returns the bound address.
 ///
-/// A request that does not arrive within 3 seconds, or a connection that never comes, leaves
-/// the thread to end on its own; the test that started it fails on its own terms.
+/// The accept has no timeout: if no connection comes, the thread blocks until the test process
+/// exits. Once a connection is accepted, each read of the request gives up after 3 seconds
+/// without data, and the thread then ends without answering; the test that started it fails on
+/// its own terms.
 pub fn serve_one_response(response: String) -> std::net::SocketAddr {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in daemon");
@@ -74,6 +76,43 @@ pub fn json_response(status: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// A port that is bound and never answers: a background thread accepts every connection and
+/// holds it open without reading or writing, until the test process exits. Returns the bound
+/// loopback address. This is the shape of a busy daemon.
+///
+/// `daemon::tests::confirm_stopped_refuses_a_port_that_is_still_bound` has the same listener
+/// inline in its body, which stays as it is because test bodies are not edited.
+pub fn hold_connections() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind holding listener");
+    let addr = listener.local_addr().expect("holding listener addr");
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => held.push(s),
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
+/// A loopback address with nothing listening on it: a port the OS handed out to a bind that
+/// is then dropped.
+///
+/// The port is only known to be free when this returns. Another bind in the same process
+/// between then and the use (as [`serve_one_response`] or [`hold_connections`] in a test
+/// running beside it) could be given the same port: unlikely, not ruled out. A test that uses
+/// this should make its connection right after, and is exposed to that race for as long as it
+/// takes to get there.
+///
+/// `daemon::tests::confirm_stopped_accepts_a_free_port` has the same bind and drop inline in
+/// its body, which stays as it is because test bodies are not edited.
+pub fn free_loopback_addr() -> std::net::SocketAddr {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    probe.local_addr().expect("probe addr")
 }
 
 #[cfg(test)]

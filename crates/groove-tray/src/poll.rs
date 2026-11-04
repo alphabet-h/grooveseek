@@ -54,11 +54,13 @@ async fn fetch(client: &reqwest::Client, url: &str) -> anyhow::Result<AdminStatu
 }
 
 /// (AX-42) [`fetch`] against a stand-in daemon on loopback, through the client the polling
-/// loop uses (`crate::daemon::status_client`): each way it answers, and each way it fails.
+/// loop uses ([`crate::daemon::status_client`]): each way it answers, and each way it fails.
 #[cfg(test)]
 mod tests {
     use super::{AdminStatus, fetch};
-    use crate::test_support::{json_response, serve_one_response};
+    use crate::test_support::{
+        free_loopback_addr, hold_connections, json_response, serve_one_response,
+    };
 
     fn status_url(addr: std::net::SocketAddr) -> String {
         format!("http://{addr}/api/admin/status")
@@ -100,8 +102,8 @@ mod tests {
         assert_eq!(status.daemon.pid, None);
     }
 
-    /// A status that is not a success fails with the status, before the body is read: the body
-    /// here would parse.
+    /// A status that is not a success fails with the status, whatever the body: the body here
+    /// would parse as a status.
     #[tokio::test]
     async fn a_failure_status_fails_whatever_the_body() {
         for status in [
@@ -131,16 +133,18 @@ mod tests {
 
     /// Nothing listening: a transport failure, neither a status nor a decode error.
     ///
-    /// Not asserted as `is_connect()`: the doc of `daemon::Liveness` records that no refusal
-    /// was ever classified that way on the development machine, whose firewall drops packets
-    /// to a closed port, so the failure there may come as the client's timeout instead.
+    /// Not asserted as `is_connect()`: the doc of `Liveness` in [`crate::daemon`] records that
+    /// no refusal was ever classified that way on the development machine, whose firewall
+    /// drops packets to a closed port, so the failure there may come as the client's timeout
+    /// instead.
+    ///
+    /// The free port comes from [`free_loopback_addr`], whose race with a bind in a test
+    /// running beside this one is narrowed by building the client first and connecting right
+    /// after the port is taken.
     #[tokio::test]
     async fn nothing_listening_is_a_transport_failure() {
-        let addr = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            probe.local_addr().expect("addr")
-        };
         let client = crate::daemon::status_client().expect("client");
+        let addr = free_loopback_addr();
         let err = fetch(&client, &status_url(addr))
             .await
             .expect_err("a free port is a failure");
@@ -152,17 +156,7 @@ mod tests {
     /// holding the polling loop, within a bound well past the 3 seconds the client sets.
     #[tokio::test]
     async fn a_daemon_that_never_answers_times_out() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(s) => held.push(s),
-                    Err(_) => break,
-                }
-            }
-        });
+        let addr = hold_connections();
         let client = crate::daemon::status_client().expect("client");
         let started = std::time::Instant::now();
         let err = fetch(&client, &status_url(addr))

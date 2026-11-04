@@ -116,11 +116,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   index and the read entry, and check every chunk's table-row spans: present on every chunk
   (`Some([])` where there is no row), each slicing the content on char boundaries to a text
   that does not end in a newline, read in order exactly the lines the rows were written as
-  (cells with a tab or a newline of their own, padded or empty paragraphs, rows that write
-  nothing), tables numbered per chunk by first appearance from 0, and no span in a slide's
-  notes. New `groove-tray` tests point the status poll's fetch at a stand-in daemon on
-  loopback: a status answer is read, a partial one takes the defaults, a failure status fails
-  before the body is read, a body that is not a status fails to decode, and nothing listening
+  (line breaks and tabs in a cell written as the `<w:br/>` / `<w:tab/>` / `<a:br/>` elements
+  the applications write, and as raw characters in the text; padded or empty paragraphs; rows
+  that write nothing), tables numbered per chunk by first appearance from 0, and no span in a
+  slide's notes, which are read. New `groove-tray` tests point the status poll's fetch at a
+  stand-in daemon on loopback: a status answer is read, a partial one takes the defaults, a
+  failure status fails with the status whatever the body, a body that is not a status fails
+  to decode, and nothing listening
   or a daemon that never answers is a transport failure, the latter on the client's timeout
   (audit AX-42, kuriya 627).
 

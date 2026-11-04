@@ -4173,7 +4173,22 @@ mod tests {
         })
     }
 
-    /// (AX-42) `blocks` as the inside of a `<w:body>`, each cell paragraph a [`body_para`] and
+    /// (AX-42) A cell paragraph as Word writes it: one run, its text in `<w:t>` and its breaks
+    /// and tabs as `<w:br/>` and `<w:tab/>` between them.
+    fn ax42_para(pieces: &[crate::parser::Ax42Piece]) -> String {
+        use crate::parser::Ax42Piece;
+        let run: String = pieces
+            .iter()
+            .map(|piece| match piece {
+                Ax42Piece::Text(text) => format!("<w:t>{text}</w:t>"),
+                Ax42Piece::Break => "<w:br/>".to_string(),
+                Ax42Piece::Tab => "<w:tab/>".to_string(),
+            })
+            .collect();
+        format!("<w:p><w:r>{run}</w:r></w:p>")
+    }
+
+    /// (AX-42) `blocks` as the inside of a `<w:body>`, each cell paragraph an [`ax42_para`] and
     /// a cell without one the `<w:p/>` Word writes; with the rows they should write, as
     /// [`crate::parser::ax42_check_rows`] takes them.
     fn ax42_body(blocks: &[Ax42Block]) -> (String, Vec<(usize, String)>) {
@@ -4192,7 +4207,7 @@ mod tests {
                                 body.push_str("<w:p/>");
                             }
                             for paragraph in cell {
-                                body.push_str(&body_para(paragraph));
+                                body.push_str(&ax42_para(paragraph));
                             }
                             body.push_str("</w:tc>");
                         }
@@ -4214,10 +4229,11 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
 
-        /// (AX-42) Through the parser, both entries: every chunk of a generated `.docx` marks
-        /// its table rows by the contract of [`crate::parser::TableRowSpan`] (see
+        /// (AX-42) Through the parser: every chunk of a generated `.docx` marks its table rows
+        /// by the contract of [`crate::parser::TableRowSpan`] (see
         /// [`crate::parser::ax42_check_rows`]), with each span holding exactly the line its row
-        /// was written as, and the read entry marks the same rows as the index entry.
+        /// was written as, breaks and tabs in a cell included. The read entry, the same reader
+        /// under another size budget, is held to the same rows.
         #[test]
         fn prop_docx_table_rows_mark_the_rows_written(blocks in ax42_blocks()) {
             let (body, rows) = ax42_body(&blocks);
@@ -4225,14 +4241,10 @@ mod tests {
             let index = DocxParser::default()
                 .parse_bytes(&bytes, "ax42.docx", &[])
                 .expect("a generated document parses");
-            crate::parser::ax42_check_rows(&index.chunks, &rows)?;
             let read = DocxParser::default()
                 .parse_bytes_for_read(&bytes, "ax42.docx", &[])
                 .expect("a generated document parses");
-            let marks = |doc: &ParsedDocument| -> Vec<Option<Vec<crate::parser::TableRowSpan>>> {
-                doc.chunks.iter().map(|c| c.table_rows.clone()).collect()
-            };
-            proptest::prop_assert_eq!(marks(&read), marks(&index));
+            crate::parser::ax42_check_entries(&index, &read, &rows)?;
         }
     }
 
