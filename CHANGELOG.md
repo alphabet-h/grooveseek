@@ -65,8 +65,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   crafted self-referential DIFAT chain, so a file of a few hundred bytes could drive it to
   multi-gigabyte allocations, and an allocation failure aborts the process. `.xlsx` reaches that
   reader: calamine checks every workbook for a password-protected compound file before it opens
-  the zip, and the preflight lets bytes that are not a zip through. A `.xlsx` holding such a
-  compound file is now skipped as damaged. The copy of calamine's sheet-to-part rules used to
+  the zip, and the preflight lets bytes that are not a zip through. 0.38.0 still follows a
+  sector chain with no length limit, so a 1,024-byte compound file whose FAT points a sector at
+  itself grows one buffer until the allocation fails. A `.xlsx` that is not a zip, or that
+  starts with the compound file magic, is now refused before calamine opens it, with the reason
+  it got before (encrypted when it holds an `EncryptedPackage` stream name, damaged otherwise).
+  The copy of calamine's sheet-to-part rules used to
   read a part shared by several sheets once follows 0.38.0, which names the workbook part after
   the package relationship instead of always `workbook.xml`. calamine 0.38.0 also reads cell
   styles while it opens a workbook and copies a format's font name and number format into every
@@ -83,7 +87,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   64 KiB `Target` made it allocate about 256 MiB. Every entry is read for `<sheet>` and
   `<Relationship>` elements (the workbook part may have any name), and the workbook is skipped
   the same way when that bound exceeds `[index].max_decompressed_size`. calamine is pinned to
-  0.38.0, since the bounds follow its internals (kuriya 706).
+  0.38.0, since the bounds follow its internals. The rest of what calamine allocates while it
+  opens a workbook (shared strings, defined names, the relationship table, the XML reader's
+  stack of open element names) is not bounded by these checks: it grows with the input and can
+  reach a constant multiple of `max_decompressed_size` (about 5 to 12 times by estimate) (kuriya
+  706).
 
 ### Internal
 

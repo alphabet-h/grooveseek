@@ -271,11 +271,14 @@ fn parse_xlsx_bytes_capped(
 ///   CPU だけ食う) の backstop。**割り込めない区間がある**: `calamine::Xlsx::new` (sharedStrings /
 ///   styles / rels / workbook を読む)、`docProps/core.xml` から title を読む [`xlsx_frontmatter`]
 ///   (共有の [`crate::parser::ooxml`] helper)、`sheet_names` の複製、1 回の `next_cell` (セルを
-///   1 つも含まない part ならその part 全体) の途中では時間を見られない (前後では見る)。どの
-///   仕事量も、preflight が archive 全体を縛る展開量 (`[index].max_decompressed_size`) に比例する
-///   範囲に収まる。`Xlsx::new` の中で入力に比例しない複製をする 2 か所 (styles の `<xf>` ごとの
-///   font 名と表示形式、workbook の `<sheet>` ごとの part の path) は、preflight がそれぞれの上界を
-///   展開 budget と比べて縛る ([`StylesTally`]、[`SheetsTally`]。kuriya 706)
+///   1 つも含まない part ならその part 全体) の途中では時間を見られない (前後では見る)。
+///   `Xlsx::new` の確保について preflight が縛るのは 3 つだけ (kuriya 706): styles の `<xf>` ごとの
+///   font 名と表示形式の複製 ([`StylesTally`])、workbook の `<sheet>` ごとの part の path の複製
+///   ([`SheetsTally`]) (どちらも入力の大きさに比例しない)、上限なしで鎖を辿る compound file の
+///   reader (calamine に渡さない、[`refuse_what_calamine_would_read_as_a_compound_file`])。それ
+///   以外 (共有文字列の `Vec<String>`、定義名、relationship の表、quick-xml の要素名の stack) は
+///   入力に比例して増え、preflight が縛る展開量 (`[index].max_decompressed_size`) の定数倍まで
+///   届きうる (review の見積もりで 5〜12 倍、推定。実測していない)
 fn parse_xlsx_bytes_limited(
     bytes: &[u8],
     path_hint: &str,
@@ -304,13 +307,50 @@ fn parse_xlsx_bytes_limited(
 }
 
 /// (#660) Why `calamine::Xlsx::new` could not open `bytes`: calamine's own `Password` verdict
-/// first, then [`super::ooxml::cause_of_unopenable_ooxml`] sniffs the bytes (the preflight lets
-/// bytes that are not a zip through, so an encrypted package fails here).
+/// first, then [`super::ooxml::cause_of_unopenable_ooxml`] sniffs the bytes. (kuriya 706) Bytes
+/// that are not a zip, or that start with the compound file magic, no longer reach calamine
+/// ([`refuse_what_calamine_would_read_as_a_compound_file`] gives them the same sniffed cause), so
+/// `Password`, which calamine only reports for a compound file, is not expected here any more; the
+/// arm stays so the mapping does not depend on that.
 fn cause_of_unopenable_xlsx(e: &calamine::XlsxError, bytes: &[u8]) -> ParseCause {
     match e {
         calamine::XlsxError::Password => ParseCause::Encrypted,
         _ => super::ooxml::cause_of_unopenable_ooxml(bytes),
     }
+}
+
+/// (kuriya 706) calamine に渡す前に、zip でない bytes と、CFB (OLE2 compound file) の magic で
+/// 始まる bytes を拒否する。
+///
+/// calamine 0.38.0 の `Xlsx::new` は zip を開く前に `check_for_password_protected` で必ず
+/// `Cfb::new` を走らせる (`src/xlsx/mod.rs:2792`、`:3193-3204`)。`Cfb::new` は directory の鎖を
+/// 長さの上限なしで辿り (`src/cfb.rs:138` の `get_chain(.., usize::MAX)`)、`get_chain`
+/// (`:328-347`) は訪れた sector を覚えないので、FAT で自分を指す sector が 1 つあれば鎖を
+/// 伸ばし続けて確保に失敗し、process ごと abort する (1,024 B の file で再現した)。`Cfb::new` が
+/// 動くのは magic で始まる bytes だけ (`Header::from_reader` が最初の 8 bytes を見る) なので、
+/// それを calamine に渡さなければこの経路は閉じる。magic の付いた bytes の末尾に zip を足した
+/// file も zip としては開けるので、zip かどうかより先に magic を見る。zip でない bytes は
+/// calamine に渡しても `ZipArchive::new` で開けないだけなので、calamine を呼ばずに同じ理由で返す。
+///
+/// 理由の語彙は calamine を呼んでいた時と同じ [`super::ooxml::cause_of_unopenable_ooxml`]
+/// (UTF-16LE の `EncryptedPackage` を含む compound file は [`ParseCause::Encrypted`]、それ以外は
+/// [`ParseCause::CorruptOrUnsupported`])。calamine の `Password` (`has_directory("EncryptedPackage")`)
+/// はこの名前を directory に持つ compound file にしか出ず、その bytes は必ず名前を含むので、
+/// 判定は calamine を通していた時の上位集合になる。違いは、0.38.0 が大文字小文字を無視して
+/// 照合する (`src/cfb.rs:174-178`) 名前の綴り違いだけ (sniff は `EncryptedPackage` の綴りで探す)。
+fn refuse_what_calamine_would_read_as_a_compound_file(bytes: &[u8], path_hint: &str) -> Result<()> {
+    let reason = if bytes.starts_with(&super::ooxml::CFB_MAGIC) {
+        "a compound file (OLE2), which is not opened".to_string()
+    } else {
+        match zip::ZipArchive::new(Cursor::new(bytes)) {
+            Ok(_) => return Ok(()),
+            Err(e) => e.to_string(),
+        }
+    };
+    Err(unindexable(
+        super::ooxml::cause_of_unopenable_ooxml(bytes),
+        format!("{path_hint}: cannot open workbook (encrypted or corrupt): {reason}"),
+    ))
 }
 
 /// preflight を通った workbook を開いてシートを読む ([`parse_xlsx_bytes_limited`] の後半)。
@@ -324,10 +364,12 @@ fn extract_xlsx_workbook(
 ) -> Result<ParsedDocument> {
     // 時間を見る所 (codex review of fd695ec)。preflight の後、シートを読む前に走る段は、
     // calamine の内側 (`Xlsx::new`、frontmatter の core.xml 1 本、`sheet_names` の複製) では
-    // 見られないので、段の境目ごとに見る。内側の仕事量は、どれも preflight が縛った展開量
-    // (`[index].max_decompressed_size`) に比例する範囲に収まる (`Xlsx::new` の中の、入力に比例
-    // しない複製は preflight の [`StylesTally`] と [`SheetsTally`] が縛る)。sheet の解決は中でも見る。
+    // 見られないので、段の境目ごとに見る。`Xlsx::new` の中の確保で preflight が縛るのは、入力に
+    // 比例しない 2 つの複製 ([`StylesTally`] と [`SheetsTally`]) と compound file の reader (下で
+    // calamine に渡さない) だけで、それ以外は展開量の定数倍まで届きうる
+    // ([`parse_xlsx_bytes_limited`] の doc)。sheet の解決は中でも見る。
     guard.check(0)?;
+    refuse_what_calamine_would_read_as_a_compound_file(bytes, path_hint)?;
     let cursor = Cursor::new(bytes);
     // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
     // ではなく、登録拡張子に一致する reader を明示的に使う (WorkbookFormat
@@ -1024,8 +1066,12 @@ fn preflight_xlsx_decompression_budget_capped(
 ///    (calamine は閉じ tag で抜けて EOF の CRC を見ない part があり、media はそもそも
 ///    読まない)。申告 size の上限は CRC の照合と独立に zip が掛ける。
 ///
-/// 代償として正規の xlsx でも XML パートを 1 回余分に展開する (calamine が
-/// 後でもう一度展開する)。実測 (release、この機の場合): calamine が読まない
+/// 代償として正規の xlsx でも entry を余分に展開する (calamine が後でもう一度展開する)。
+/// 層 2 で全 entry を 1 回、kuriya 706 の [`SheetsTally`] で全 entry をもう 1 回、
+/// [`StylesTally`] で名前が `styles.xml` で終わる entry をさらに 1 回。層 2 は 8 KiB の固定
+/// buffer で数えて捨て、2 つの tally は quick-xml の event buffer (いちばん長いタグ 1 つ分) と
+/// `BufReader` の 8 KiB で流すので、どれも entry を丸ごとは持たない。以下の実測は層 2 だけの
+/// 時のもの (kuriya 706 の 2 回分は測っていない) (release、この機の場合): calamine が読まない
 /// 11.8 MB の XML パートを持つ xlsx で `parse_bytes` が 12 µs → **5.08 ms**
 /// (≈ 2.3 GB/s、この 5 ms が pre-flight のほぼ純粋なコスト)。16 MB の
 /// worksheet を持つ実用サイズの xlsx では 29.6 ms → 37.4 ms。cap いっぱい
@@ -1080,11 +1126,12 @@ fn preflight_xlsx_decompression_budget_capped(
 /// `"unlimited"` では掛からない (他の展開量の守りと同じ)。同じく全 entry をもう 1 回展開して
 /// [`SheetsTally`] を数え、calamine の `read_workbook` が `<sheet>` ごとに part の path を複製する
 /// 量の上界が `cap` を超えれば `Err` にする (styles とは別に `cap` と比べる。`Xlsx::new` の中の
-/// 複製は合わせて `cap` の 2 倍以内)。
+/// 2 つの複製は合わせて `cap` の 2 倍以内)。
 ///
-/// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
-/// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
-/// parser は zip 展開を経由しない)。
+/// zip として開けない場合は対象外として `Ok(())` を返す (展開する物が無い)。そうした bytes
+/// (と CFB の magic で始まる bytes) は、この後 calamine を呼ぶ前に
+/// [`refuse_what_calamine_would_read_as_a_compound_file`] が拒否する (kuriya 706。calamine の
+/// compound file の reader は鎖を上限なしで辿る)。
 ///
 /// cap を注入できる版として分離する (unit test が小さい cap で on-the-fly の
 /// 小さい fixture のまま超過分岐を突くため。`parse_workbook_bytes_capped`
@@ -1115,7 +1162,8 @@ fn preflight_xlsx_decompression_budget_timed(
     };
     // 全 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
     let mut total: u64 = 0;
-    // (kuriya 706) 全 entry の `<sheet>` と `<Relationship>` の数 (entry ごとの最大)。
+    // (kuriya 706) 全 entry の `<sheet>` の数とタグの合計、最長の `<Relationship>` のタグ
+    // (それぞれ entry ごとの最大)。
     let mut sheets = SheetsTally::default();
     for i in 0..zip.len() {
         // 申告 size は metadata だけで取れる (`by_index_raw` は圧縮データを
@@ -4080,7 +4128,10 @@ mod tests {
     /// bytes failed`, no panic. The first read of sector 0 hits the end of the file and returns
     /// nothing, but the header's own DIFAT entries (zeros) keep the chain at sector 0, and from
     /// the second read on the sector comes back as 512 zero bytes.
-    /// 0.38.0 stops the chain, and the file is skipped as damaged.
+    /// 0.38.0 stops the chain, and the file is skipped as damaged. Since the third review of
+    /// kuriya 706 a compound file does not reach calamine at all
+    /// ([`refuse_what_calamine_would_read_as_a_compound_file`]); the test still holds the
+    /// fixture and the answer.
     #[test]
     fn a_self_referencing_difat_chain_is_skipped_not_followed() {
         let mut bytes = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec(); // compound file magic
@@ -4302,6 +4353,91 @@ mod tests {
             tally.absorb(SheetsTally::scan(archive.by_index(i).unwrap(), &|| false).unwrap());
         }
         tally
+    }
+
+    /// A 1,024-byte compound file whose FAT points sector 0 at itself, with the directory chain
+    /// starting at sector 0. calamine 0.38.0's `Cfb::new` follows that chain with no length
+    /// limit and no record of the sectors it visited, so `calamine::Xlsx::new` on these bytes
+    /// grows one buffer until the allocation fails (measured: with an allocator capped at
+    /// 256 MiB, `memory allocation of 268435456 bytes failed` within about 3 s).
+    fn self_looping_fat_compound_file() -> Vec<u8> {
+        let mut bytes = vec![0u8; 1024];
+        bytes[0..8].copy_from_slice(&crate::parser::ooxml::CFB_MAGIC);
+        bytes[24..26].copy_from_slice(&0x003Eu16.to_le_bytes()); // minor version
+        bytes[26..28].copy_from_slice(&3u16.to_le_bytes()); // major version 3
+        bytes[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes()); // byte order
+        bytes[30..32].copy_from_slice(&0x0009u16.to_le_bytes()); // 512-byte sectors
+        bytes[32..34].copy_from_slice(&0x0006u16.to_le_bytes()); // 64-byte mini sectors
+        bytes[44..48].copy_from_slice(&1u32.to_le_bytes()); // one FAT sector
+        bytes[48..52].copy_from_slice(&0u32.to_le_bytes()); // directory chain at sector 0
+        bytes[60..64].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes()); // no mini FAT
+        bytes[68..72].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes()); // no DIFAT sectors
+        bytes[76..80].copy_from_slice(&0u32.to_le_bytes()); // the FAT is sector 0
+        for b in &mut bytes[80..512] {
+            *b = 0xFF; // the other DIFAT slots are free
+        }
+        // Sector 0 is zeros: as the FAT, its entry 0 says sector 0 is followed by sector 0.
+        bytes
+    }
+
+    /// (kuriya 706, third review) A compound file never reaches calamine: its reader is not
+    /// bounded (the self-looping FAT above aborts the process). The answer is the one calamine
+    /// used to lead to, from the same sniff, and calamine is not called (if it were, this test
+    /// would exhaust memory).
+    #[test]
+    fn a_compound_file_is_refused_before_calamine_opens_it() {
+        let bytes = self_looping_fat_compound_file();
+        let mut polyglot = bytes.clone();
+        polyglot.extend(make_minimal_xlsx(&[("S", &[&["x"]])]));
+        assert!(
+            zip::ZipArchive::new(Cursor::new(polyglot.as_slice())).is_ok(),
+            "premise: the polyglot opens as a zip"
+        );
+        // The guard itself first, so a guard that let these through fails here rather than
+        // handing them to calamine below.
+        for (name, input) in [("fat-loop", &bytes), ("polyglot", &polyglot)] {
+            assert!(
+                refuse_what_calamine_would_read_as_a_compound_file(input, name).is_err(),
+                "{name} is refused"
+            );
+        }
+        refuse_what_calamine_would_read_as_a_compound_file(
+            &make_minimal_xlsx(&[("S", &[&["x"]])]),
+            "ok.xlsx",
+        )
+        .expect("a workbook passes");
+
+        let started = std::time::Instant::now();
+        let err = XlsxParser::default()
+            .parse_bytes(&bytes, "fat-loop.xlsx", &[])
+            .expect_err("a compound file is not a workbook");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::CorruptOrUnsupported),
+            "{err:#}"
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot open workbook (encrypted or corrupt): a compound file"),
+            "{err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // A zip appended to the compound file opens as a zip, and is refused all the same.
+        let err = XlsxParser::default()
+            .parse_bytes(&polyglot, "polyglot.xlsx", &[])
+            .expect_err("the magic is checked before the zip");
+        assert!(err.to_string().contains("a compound file"), "{err}");
+
+        // An encrypted package keeps its answer.
+        let err = XlsxParser::default()
+            .parse_bytes(
+                &crate::parser::ooxml::synthetic_encrypted_cfb(),
+                "enc.xlsx",
+                &[],
+            )
+            .expect_err("encrypted");
+        assert_eq!(cause_of(&err), Some(ParseCause::Encrypted), "{err:#}");
     }
 
     /// (kuriya 706, second review of 6033909) calamine's `read_workbook` builds a new path string
