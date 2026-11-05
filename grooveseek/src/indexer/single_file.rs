@@ -1,6 +1,6 @@
 //! (AX-40) Indexing one file: the core [`crate::indexer::single_file::index_single_disk_entry`]
 //! that [`crate::indexer::rebuild_index`] and the watcher share, the watcher's entry points
-//! ([`crate::indexer::single_file::reindex_single_file`] and its siblings), deindexing, and
+//! ([`crate::indexer::reindex_single_file`] and its siblings), deindexing, and
 //! the legacy folded spelling sweep.
 
 use super::*;
