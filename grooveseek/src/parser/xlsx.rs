@@ -254,7 +254,7 @@ fn parse_xlsx_bytes_capped(
 ///    chunk は 1 本で、見出しは `Sheet: Alpha, Beta` のように workbook の順で名前を `", "` で
 ///    並べる ([`shared_part_label`]。[`SHARED_PART_LABEL_MAX_BYTES`] を超える分は
 ///    `", and N more"`)。どの名前で探しても同じ text に当たる。sheet から entry への解決は
-///    [`resolve_sheet_parts`] が calamine 0.37.0 の規則を写して行う。**写しは重複の判定にしか
+///    [`resolve_sheet_parts`] が calamine 0.38.0 の規則を写して行う。**写しは重複の判定にしか
 ///    使わない**: 解決できなければ全シートを読み、写しが calamine とずれても下の上限が文書を
 ///    縛る (上限の正しさは写しに依らない)。
 ///
@@ -621,22 +621,24 @@ fn shared_part_label(name: &str, aliases: &[&str]) -> String {
     label
 }
 
-/// workbook の `<sheet>` を 1 枚ずつ、calamine 0.37.0 がそのシートで開く zip entry の index に
+/// workbook の `<sheet>` を 1 枚ずつ、calamine 0.38.0 がそのシートで開く zip entry の index に
 /// 解決する。戻り値は `calamine_names` (= `Xlsx::sheet_names()`) と同じ並びで、entry が無い
 /// シートは `None`。**重複除去にしか使わない** ([`parse_xlsx_bytes_limited`]): calamine は
 /// sheet から part への path を公開しない (`Xlsx::sheets` は private、公開の `Sheet` は
 /// name / typ / visible だけ) ので、規則を写すしかない。
 ///
-/// 写した規則 (calamine 0.37.0 の `src/xlsx/mod.rs` と `src/utils.rs`):
+/// 写した規則 (calamine 0.38.0 の `src/xlsx/mod.rs` と `src/utils.rs`。0.37.0 からの違いは
+/// workbook part の名前を `Target` から取ることだけ):
 ///
 /// - zip の entry 名は `\` を `/` にして ASCII 小文字にした名前で引く (無ければ path そのまま)。
 ///   同じ小文字名の entry が複数あれば `ZipArchive::file_names` の順で後勝ち
 /// - `_rels/.rels` の `<Relationships>` 以降の `<Relationship>` のうち、`Type` が
 ///   `/relationships/officeDocument` で終わるものの `Target` (entity を展開) の最後の `/`
-///   までが xl_path (先頭の `/` は剥ぐ)。複数あれば後勝ち
-/// - `{xl_path}_rels/workbook.xml.rels` の `<Relationship>` を `Id` で引く表 (後勝ち)。
+///   までが xl_path (先頭の `/` は剥ぐ)、その後ろが workbook part の名前 (空なら
+///   `workbook.xml`、`/` が無ければ `Target` 全体)。複数あれば後勝ち
+/// - `{xl_path}_rels/{workbook part の名前}.rels` の `<Relationship>` を `Id` で引く表 (後勝ち)。
 ///   属性は raw で、`Id` / `Type` / `Target` が 3 つ揃った所で読むのをやめる
-/// - `{xl_path}workbook.xml` の `<sheet>` (`</workbook>` まで) ごとに、`name` (entity を展開) と、
+/// - `{xl_path}{workbook part の名前}` の `<sheet>` (`</workbook>` まで) ごとに、`name` (entity を展開) と、
 ///   local name が `id` の属性 (後勝ち) で表を引く。`Target` が `/` で始まれば先頭を剥いだ
 ///   絶対 path、そうでなければ `xl_path + Target`
 ///
@@ -718,19 +720,26 @@ fn resolve_sheet_parts_until(
         },
     )?;
     let target = document_target?;
-    let xl_path = target
-        .rfind('/')
-        .map(|i| &target[..=i])
-        .map(|p| p.strip_prefix('/').unwrap_or(p))
-        .unwrap_or("")
-        .to_string();
+    // calamine 0.38.0 (tafia/calamine#753): the target splits at its last `/` into the
+    // directory (xl_path, leading `/` stripped) and the workbook part's file name, which
+    // stays `workbook.xml` when the target ends in `/`.
+    let (dir, file) = match target.rfind('/') {
+        Some(i) => target.split_at(i + 1),
+        None => ("", target.as_str()),
+    };
+    let xl_path = dir.strip_prefix('/').unwrap_or(dir).to_string();
+    let workbook_name = if file.is_empty() {
+        "workbook.xml"
+    } else {
+        file
+    };
 
-    // 2. `{xl_path}_rels/workbook.xml.rels` の Id -> Target。
+    // 2. `{xl_path}_rels/{workbook_name}.rels` の Id -> Target。
     let mut relationships: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for_each_xml_element(
         &mut zip,
-        &entry_name(&format!("{xl_path}_rels/workbook.xml.rels")),
+        &entry_name(&format!("{xl_path}_rels/{workbook_name}.rels")),
         b"Relationships",
         expired,
         |local, e| {
@@ -746,9 +755,9 @@ fn resolve_sheet_parts_until(
         },
     )?;
 
-    // 3. `{xl_path}workbook.xml` の `<sheet>` ごとに entry を引く。
+    // 3. `{xl_path}{workbook_name}` の `<sheet>` ごとに entry を引く。
     let mut sheets: Vec<(String, Option<usize>)> = Vec::new();
-    let workbook = entry_name(&format!("{xl_path}workbook.xml"));
+    let workbook = entry_name(&format!("{xl_path}{workbook_name}"));
     let mut pending: Vec<(String, String)> = Vec::new();
     for_each_xml_element(&mut zip, &workbook, b"workbook", expired, |local, e| {
         if local != b"sheet" {
@@ -3686,6 +3695,127 @@ mod tests {
             cause_of_unopenable_xlsx(&calamine::XlsxError::Password, b""),
             ParseCause::Encrypted
         );
+    }
+
+    /// (kuriya 706, RUSTSEC-2026-0436) `calamine::Xlsx::new` hands every file to its compound
+    /// file reader first (the password check), and the preflight lets bytes that are not a zip
+    /// through, so a `.xlsx` holding a compound file reaches that reader. This one is the
+    /// header alone (512 bytes) with the DIFAT chain starting at sector 0, which reads back as
+    /// zeros and so points at sector 0 again. calamine before 0.38.0 followed the chain without
+    /// a bound and grew the DIFAT until the allocation failed, which aborts the process (no
+    /// `catch_unwind` stops it): if this test eats memory, calamine went back below 0.38.0.
+    /// 0.38.0 stops the chain, and the file is skipped as damaged.
+    #[test]
+    fn a_self_referencing_difat_chain_is_skipped_not_followed() {
+        let mut bytes = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec(); // compound file magic
+        bytes.resize(512, 0);
+        bytes[26..28].copy_from_slice(&3u16.to_le_bytes()); // major version 3
+        bytes[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes()); // byte order
+        bytes[30..32].copy_from_slice(&0x0009u16.to_le_bytes()); // 512-byte sectors
+        bytes[32..34].copy_from_slice(&0x0006u16.to_le_bytes()); // 64-byte mini sectors
+        bytes[68..72].copy_from_slice(&0u32.to_le_bytes()); // DIFAT starts at sector 0
+
+        let started = std::time::Instant::now();
+        let err = XlsxParser::default()
+            .parse_bytes(&bytes, "difat-loop.xlsx", &[])
+            .expect_err("a compound file is not a workbook");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("panicked"),
+            "calamine returned, not panicked: {msg}"
+        );
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::CorruptOrUnsupported),
+            "{msg}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the chain is cut short, not walked: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// (kuriya 706) calamine 0.38.0 names the workbook part after the package relationship's
+    /// `Target` (tafia/calamine#753) instead of always `workbook.xml`, and reads its rels from
+    /// `_rels/{name}.rels`. [`resolve_sheet_parts`] follows: a decoy `xl/workbook.xml` that
+    /// wires both sheets to one part is not read, and the two sheets of `xl/book.xml` stay two.
+    #[test]
+    fn resolve_sheet_parts_reads_the_workbook_part_the_relationship_names() {
+        let rels = |pairs: &[(&str, &str)]| {
+            let mut rl = String::from(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            );
+            for (id, target) in pairs {
+                rl.push_str(&format!(r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{target}"/>"#));
+            }
+            rl.push_str("</Relationships>");
+            rl.into_bytes()
+        };
+        let workbook = |sheets: &[(&str, &str)]| {
+            let mut wb = format!(r#"<?xml version="1.0"?><workbook {SPREADSHEET_NS}><sheets>"#);
+            for (i, (name, rid)) in sheets.iter().enumerate() {
+                wb.push_str(&format!(
+                    r#"<sheet name="{name}" sheetId="{}" r:id="{rid}"/>"#,
+                    i + 1
+                ));
+            }
+            wb.push_str("</sheets></workbook>");
+            wb.into_bytes()
+        };
+        let entries: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "[Content_Types].xml",
+                br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels",
+                br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/book.xml"/></Relationships>"#.to_vec(),
+            ),
+            ("xl/book.xml", workbook(&[("A", "rId1"), ("B", "rId2")])),
+            (
+                "xl/_rels/book.xml.rels",
+                rels(&[("rId1", "worksheets/a.xml"), ("rId2", "worksheets/b.xml")]),
+            ),
+            // The decoy, under the name calamine 0.37.0 read.
+            ("xl/workbook.xml", workbook(&[("A", "rId1"), ("B", "rId2")])),
+            (
+                "xl/_rels/workbook.xml.rels",
+                rels(&[("rId1", "worksheets/a.xml"), ("rId2", "worksheets/a.xml")]),
+            ),
+            ("xl/worksheets/a.xml", one_cell_worksheet("text-a")),
+            ("xl/worksheets/b.xml", one_cell_worksheet("text-b")),
+        ];
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            for (name, body) in &entries {
+                zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(body).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+        let a = archive.index_for_name("xl/worksheets/a.xml");
+        let b = archive.index_for_name("xl/worksheets/b.xml");
+        assert!(a.is_some() && b.is_some() && a != b);
+
+        let names = vec!["A".to_string(), "B".to_string()];
+        let xlsx = calamine::Xlsx::new(Cursor::new(bytes.as_slice())).unwrap();
+        assert_eq!(
+            xlsx.sheet_names(),
+            names,
+            "premise: calamine reads xl/book.xml"
+        );
+        assert_eq!(
+            resolve_sheet_parts(&bytes, &names, &live_guard()).unwrap(),
+            Some(vec![a, b])
+        );
+        let doc = XlsxParser::default()
+            .parse_bytes(&bytes, "book.xlsx", &[])
+            .expect("parse");
+        assert_eq!(doc.chunks.len(), 2, "{:?}", doc.chunks);
+        assert!(doc.chunks[1].content.contains("text-b"));
     }
 
     /// (#660, spec §9 T-P6) The document text cap names its limit, and the guard's time mark

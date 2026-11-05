@@ -58,6 +58,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   ends, and the watcher). Such a read now rewrites the row whole, as a same-content rename's
   read does, still reusing the stored vectors (kuriya 670).
 
+### Security
+
+- **calamine 0.37.0 → 0.38.0 for RUSTSEC-2026-0436.** calamine's compound file (CFB / OLE2)
+  reader panicked on a short directory entry and followed a self-referencing DIFAT chain without
+  a bound, so a 512-byte file could grow memory until the process aborted. `.xlsx` reaches that
+  reader: calamine checks every workbook for a password-protected compound file before it opens
+  the zip, and the preflight lets bytes that are not a zip through. A `.xlsx` holding such a
+  compound file is now skipped as damaged. The copy of calamine's sheet-to-part rules used to
+  read a part shared by several sheets once follows 0.38.0, which names the workbook part after
+  the package relationship instead of always `workbook.xml` (kuriya 706).
+
 ### Internal
 
 - Nightly now measures the benches instead of only running each body once: a new `bench` job
