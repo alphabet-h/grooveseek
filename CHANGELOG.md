@@ -58,6 +58,43 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   ends, and the watcher). Such a read now rewrites the row whole, as a same-content rename's
   read does, still reusing the stored vectors (kuriya 670).
 
+### Security
+
+- **calamine 0.37.0 → 0.38.0 for RUSTSEC-2026-0436.** calamine's compound file (CFB / OLE2)
+  reader panicked on malformed input (a short directory entry) and allocated without bound on a
+  crafted self-referential DIFAT chain, so a file of a few hundred bytes could drive it to
+  multi-gigabyte allocations, and an allocation failure aborts the process. `.xlsx` reaches that
+  reader: calamine checks every workbook for a password-protected compound file before it opens
+  the zip, and the preflight lets bytes that are not a zip through. 0.38.0 still follows a
+  sector chain with no length limit, so a 1,024-byte compound file whose FAT points a sector at
+  itself grows one buffer until the allocation fails. A `.xlsx` that is not a zip, or that
+  starts with the compound file magic, is now refused before calamine opens it, as encrypted
+  when it holds an `EncryptedPackage` stream name and as damaged otherwise. For bytes that are not
+  a zip this is the reason they got before; a file that starts with the magic but has a zip
+  appended, which used to open as a workbook, is now refused too.
+  The copy of calamine's sheet-to-part rules used to
+  read a part shared by several sheets once follows 0.38.0, which names the workbook part after
+  the package relationship instead of always `workbook.xml`. calamine 0.38.0 also reads cell
+  styles while it opens a workbook and copies a format's font name and number format into every
+  cell format that uses it, so a 2 KB workbook whose 4,096 cell formats share one 64 KiB font
+  name made it allocate 256.7 MiB, and the same shape scales to an allocation failure. The
+  decompression preflight now reads every entry whose name ends in `styles.xml` and skips the
+  workbook, with the `zip-bomb guard` error, when the most that reading could allocate
+  (the longest font name and number format times the number of cell formats, plus the tables
+  themselves) exceeds `[index].max_decompressed_size`; a styles part that is not well-formed XML
+  is skipped as damaged. Ordinary styles stay far below the default 50 MiB: 3,000 cell formats
+  bound at about 1.5 MB. The same preflight bounds the other copy calamine makes while it opens
+  a workbook, in 0.38.0 as in 0.37.0: every `<sheet>` gets a new string holding the path of the
+  part its relationship names, so a workbook whose 4,096 sheets share one relationship with a
+  64 KiB `Target` made it allocate about 256 MiB. Every entry is read for `<sheet>` and
+  `<Relationship>` elements (the workbook part may have any name), and the workbook is skipped
+  the same way when that bound exceeds `[index].max_decompressed_size`. calamine is pinned to
+  0.38.0, since the bounds follow its internals. The rest of what calamine allocates while it
+  opens a workbook (shared strings, defined names, the relationship table, the XML reader's
+  stack of open element names) is not bounded by these checks: it grows with the input and can
+  reach a constant multiple of `max_decompressed_size` (about 5 to 12 times by estimate) (kuriya
+  706).
+
 ### Internal
 
 - `indexer.rs` is split into submodules under `indexer/`: `reuse` (vector reuse, the table-row
