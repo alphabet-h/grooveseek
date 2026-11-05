@@ -68,8 +68,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the zip, and the preflight lets bytes that are not a zip through. 0.38.0 still follows a
   sector chain with no length limit, so a 1,024-byte compound file whose FAT points a sector at
   itself grows one buffer until the allocation fails. A `.xlsx` that is not a zip, or that
-  starts with the compound file magic, is now refused before calamine opens it, with the reason
-  it got before (encrypted when it holds an `EncryptedPackage` stream name, damaged otherwise).
+  starts with the compound file magic, is now refused before calamine opens it, as encrypted
+  when it holds an `EncryptedPackage` stream name and as damaged otherwise. For bytes that are not
+  a zip this is the reason they got before; a file that starts with the magic but has a zip
+  appended, which used to open as a workbook, is now refused too.
   The copy of calamine's sheet-to-part rules used to
   read a part shared by several sheets once follows 0.38.0, which names the workbook part after
   the package relationship instead of always `workbook.xml`. calamine 0.38.0 also reads cell

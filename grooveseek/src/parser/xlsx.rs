@@ -955,6 +955,13 @@ fn flush_xlsx_row(text: &mut String, row_cells: &[String]) {
 ///
 /// pre-check は **`Xls::new()` より前**にしか置けない: この関数に到達した時点で
 /// 確保は完了しており、`Xls` は `ReaderRef` 未実装なので clone も避けられない。
+///
+/// (kuriya 706) `.xls` を有効に戻すには、密な格子の確保に加えて、compound file の FAT 鎖の
+/// 歩数も縛る必要がある (calamine 側の修正か、自前で CFB の header と FAT を検査する)。
+/// calamine 0.38.0 の `Xls::new` も `Cfb::new` を通り (`src/xls.rs:177`)、directory の鎖を
+/// `get_chain(.., usize::MAX)` で上限なしに辿る (`src/cfb.rs:138`)。`.xls` はどれも CFB の magic
+/// で始まるので、`.xlsx` で使う magic の拒否
+/// ([`refuse_what_calamine_would_read_as_a_compound_file`]) では守れない。
 fn parse_xls_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
