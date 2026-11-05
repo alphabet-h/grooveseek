@@ -31,7 +31,9 @@ pub(crate) use rename::{
     rename_crosses_a_parser, settle_cross_parser_rename, settle_further_crossed_read,
 };
 pub(crate) use reuse::{ChunkVectorCounts, CountedReindex};
-pub(crate) use single_file::{reindex_single_file_checked, reindex_single_file_counted};
+pub(crate) use single_file::{
+    reindex_single_file_checked, reindex_single_file_counted, write_parsed_document_with_vectors,
+};
 
 use rename::{detect_renames, read_crossed_rename_again_explained};
 use reuse::{
@@ -44,7 +46,6 @@ use reuse::{
 use single_file::{
     SinglePathLook, deindex_outside_kb, index_single_disk_entry, look_at_single_path,
     outside_kb_line, readable_as_the_walk_reads, reindex_single_file_checked_explained,
-    write_parsed_document_with_vectors,
 };
 
 // ---------------------------------------------------------------------------
