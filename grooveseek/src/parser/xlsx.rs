@@ -1217,7 +1217,7 @@ fn preflight_xlsx_decompression_budget_timed(
                     return Err(unindexable(
                         ParseCause::CorruptOrUnsupported,
                         format!(
-                            "{path_hint}: entry {name:?} is not well-formed XML, so the memory the workbook reader would allocate for its cell styles cannot be bounded (zip-bomb guard; the archive is rejected whatever [index].max_decompressed_size is)"
+                            "{path_hint}: entry {name:?} is not well-formed XML; every entry whose name ends in styles.xml is checked, since the workbook reader may read it as the cell styles, and one that cannot be read cannot be bounded (zip-bomb guard; the archive is rejected whatever [index].max_decompressed_size is)"
                         ),
                     ));
                 }
@@ -1250,6 +1250,11 @@ fn preflight_xlsx_decompression_budget_timed(
 /// [`preflight_xlsx_decompression_budget_timed`])。末尾の一致は上位集合で、同じ名前の entry
 /// が複数あっても全部を見る (preflight は entry を index で回す)。calamine が読むのは 1 つ
 /// なので、上界は entry ごとに判定する (合計しない)。
+///
+/// 上位集合なので、calamine が読まない part (Excel が書く `xl/richData/richStyles.xml` など) も
+/// 対象になる。そうした part が整形式の XML でなければ、calamine の読む styles が壊れていなくても
+/// workbook ごと拒否する ([`StylesScan::Malformed`])。どれを calamine が読むかを言い当てない代わりの
+/// 代償として受け入れる。
 fn is_styles_part_candidate(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with("styles.xml")
 }
@@ -1297,7 +1302,14 @@ const NUMFMT_MAP_ENTRY_BYTES: u64 = 256;
 ///   属性値を `decode_attr` (= `quick_xml::escape::unescape`、`src/attrs.rs:186`) したもので、
 ///   定義済みの実体と文字参照は展開しても短くなるだけなので、タグの長さを超えない。属性を
 ///   自前で読まないので、calamine の属性の読み方 (`RawAttrIter`) を写さずに済む
-/// - calamine は `</styleSheet>` で読むのをやめる (`:587`)。ここも同じ所で止める
+/// - **Eof まで読む**。calamine が `</styleSheet>` で止まるのは一番外のループ (`:587`) だけで、
+///   内側のループ (`<numFmts>` / `<fonts>` / `<fills>` / `<borders>` / `<cellXfs>` / `<xf>` の本体
+///   と `style_parser.rs` の `parse_font` / `parse_fill` / `parse_border`) は自分の閉じ tag か Eof
+///   でしか抜けない。reader は閉じ tag の名前を照合しないので、`<cellXfs>` の内側に置いた
+///   `</styleSheet>` の後の `<xf>` も calamine は読む。XML の error ではどのループも止まるので、
+///   ここも止まる ([`StylesScan::Malformed`])
+/// - reader は calamine と同じ quick-xml (0.42、`encoding`。Cargo.toml の `quick-xml-calamine`)
+///   で、event の切れ目と local name の解釈が calamine と同じになる
 ///
 /// [`StylesTally::allocation_bound`] が数から上界を作る。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1321,8 +1333,9 @@ struct StylesTally {
 #[derive(Debug, PartialEq, Eq)]
 enum StylesScan {
     Tallied(StylesTally),
-    /// XML として読めない。calamine の `read_styles` もそこで `Err` を返すが、それまでに確保した
-    /// 分は数えきれないので、呼び出し側は拒否する。
+    /// XML として読めない。calamine が読む part なら `read_styles` もそこで `Err` を返すが、それ
+    /// までに確保した分は数えきれないので、呼び出し側は拒否する (calamine が読まない part でも、
+    /// どれが読まれるかを言い当てないので同じく拒否する。[`is_styles_part_candidate`])。
     Malformed,
     /// 文書の時間の上限を過ぎた。
     Expired,
@@ -1331,9 +1344,10 @@ enum StylesScan {
 impl StylesTally {
     /// styles の part を読んで数える。event ごとに `expired` を聞く。
     fn scan(reader: impl std::io::Read, expired: &dyn Fn() -> bool) -> StylesScan {
-        use quick_xml::events::Event;
+        use quick_xml_calamine::events::Event;
 
-        let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(reader));
+        // calamine の `xml_reader` (`src/xlsx/mod.rs`) と同じ crate の版・同じ設定。
+        let mut reader = quick_xml_calamine::Reader::from_reader(std::io::BufReader::new(reader));
         let config = reader.config_mut();
         config.check_end_names = false;
         config.trim_text(false);
@@ -1350,15 +1364,15 @@ impl StylesTally {
                 Ok(Event::Start(e)) => {
                     let tag = e.len() as u64;
                     match e.local_name().as_ref() {
-                        b"xf" => tally.xf += 1,
-                        b"font" => tally.font += 1,
-                        b"fill" => tally.fill += 1,
-                        b"border" => tally.border += 1,
-                        b"name" => {
+                        "xf" => tally.xf += 1,
+                        "font" => tally.font += 1,
+                        "fill" => tally.fill += 1,
+                        "border" => tally.border += 1,
+                        "name" => {
                             tally.name_max = tally.name_max.max(tag);
                             tally.name_sum = tally.name_sum.saturating_add(tag);
                         }
-                        b"numFmt" => {
+                        "numFmt" => {
                             tally.numfmt += 1;
                             tally.numfmt_max = tally.numfmt_max.max(tag);
                             tally.numfmt_sum = tally.numfmt_sum.saturating_add(tag);
@@ -1366,7 +1380,10 @@ impl StylesTally {
                         _ => {}
                     }
                 }
-                Ok(Event::End(e)) if e.local_name().as_ref() == b"styleSheet" => break,
+                // `</styleSheet>` では止めない: calamine が止まるのは一番外のループだけで、
+                // 内側のループ (`<fonts>` / `<cellXfs>` / `<xf>` の本体 / `parse_font` ほか) は自分の
+                // 閉じ tag か Eof まで読み続ける (閉じ tag の名前を照合しないので、内側に置いた
+                // `</styleSheet>` は読み飛ばされる)。Eof まで数えれば、どのループより先には止まらない。
                 Ok(Event::Eof) => break,
                 Ok(_) => {}
                 Err(_) => return StylesScan::Malformed,
@@ -3920,6 +3937,10 @@ mod tests {
     /// zeros and so points at sector 0 again. calamine before 0.38.0 followed the chain without
     /// a bound and grew the DIFAT until the allocation failed, which aborts the process (no
     /// `catch_unwind` stops it): if this test eats memory, calamine went back below 0.38.0.
+    /// Measured on 0.37.0 with an allocator capped at 256 MiB: `memory allocation of 247463936
+    /// bytes failed`, no panic. The first read of sector 0 hits the end of the file and returns
+    /// nothing, but the header's own DIFAT entries (zeros) keep the chain at sector 0, and from
+    /// the second read on the sector comes back as 512 zero bytes.
     /// 0.38.0 stops the chain, and the file is skipped as damaged.
     #[test]
     fn a_self_referencing_difat_chain_is_skipped_not_followed() {
@@ -4058,6 +4079,37 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// (kuriya 706, review of bf9f3f2) calamine stops at `</styleSheet>` only in its outermost
+    /// loop; inside `<cellXfs>` it reads on to `</cellXfs>` (end names are not checked), so a
+    /// `</styleSheet>` placed early does not stop it. The tally reads to the end of the part.
+    #[test]
+    fn test_xlsx_styles_tally_reads_past_an_inner_style_sheet_end() {
+        // `<x>` keeps the end tags balanced (the reader pops one name per end tag whatever it
+        // is), so the part is well-formed for calamine's reader and opens.
+        let styles = |name_len: usize, xf_count: usize| {
+            let mut styles = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><styleSheet {SPREADSHEET_NS}><x><fonts><font><name val=""#
+            );
+            styles.push_str(&"a".repeat(name_len));
+            styles.push_str(r#""/></font></fonts><cellXfs></styleSheet>"#);
+            for _ in 0..xf_count {
+                styles.push_str(r#"<xf fontId="0"/>"#);
+            }
+            styles.push_str("</cellXfs></styleSheet>");
+            styles.into_bytes()
+        };
+        let small = xlsx_with_styles("xl/", "xl/styles.xml", &styles(5, 3));
+        calamine::Xlsx::new(Cursor::new(small.as_slice()))
+            .expect("premise: calamine reads on past the inner </styleSheet> and opens it");
+
+        let styles = styles(65536, 4096);
+        assert_eq!(tally_of(&styles).xf, 4096);
+        let bytes = xlsx_with_styles("xl/", "xl/styles.xml", &styles);
+        let err = preflight_xlsx_decompression_budget(&bytes, "inner-end.xlsx")
+            .expect_err("the cell formats after the inner </styleSheet> are counted");
+        assert!(err.to_string().contains("4096 cell styles"), "{err}");
     }
 
     /// (kuriya 706) The bound is compared with the cap itself: a cap equal to the bound admits

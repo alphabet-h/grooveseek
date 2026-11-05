@@ -61,8 +61,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Security
 
 - **calamine 0.37.0 → 0.38.0 for RUSTSEC-2026-0436.** calamine's compound file (CFB / OLE2)
-  reader panicked on a short directory entry and followed a self-referencing DIFAT chain without
-  a bound, so a 512-byte file could grow memory until the process aborted. `.xlsx` reaches that
+  reader panicked on malformed input (a short directory entry) and allocated without bound on a
+  crafted self-referential DIFAT chain, so a file of a few hundred bytes could drive it to
+  multi-gigabyte allocations, and an allocation failure aborts the process. `.xlsx` reaches that
   reader: calamine checks every workbook for a password-protected compound file before it opens
   the zip, and the preflight lets bytes that are not a zip through. A `.xlsx` holding such a
   compound file is now skipped as damaged. The copy of calamine's sheet-to-part rules used to
