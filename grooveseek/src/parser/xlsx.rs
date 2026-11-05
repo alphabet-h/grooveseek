@@ -273,7 +273,9 @@ fn parse_xlsx_bytes_capped(
 ///   (共有の [`crate::parser::ooxml`] helper)、`sheet_names` の複製、1 回の `next_cell` (セルを
 ///   1 つも含まない part ならその part 全体) の途中では時間を見られない (前後では見る)。どの
 ///   仕事量も、preflight が archive 全体を縛る展開量 (`[index].max_decompressed_size`) に比例する
-///   範囲に収まる
+///   範囲に収まる。`Xlsx::new` の中で入力に比例しない複製をする 2 か所 (styles の `<xf>` ごとの
+///   font 名と表示形式、workbook の `<sheet>` ごとの part の path) は、preflight がそれぞれの上界を
+///   展開 budget と比べて縛る ([`StylesTally`]、[`SheetsTally`]。kuriya 706)
 fn parse_xlsx_bytes_limited(
     bytes: &[u8],
     path_hint: &str,
@@ -323,7 +325,8 @@ fn extract_xlsx_workbook(
     // 時間を見る所 (codex review of fd695ec)。preflight の後、シートを読む前に走る段は、
     // calamine の内側 (`Xlsx::new`、frontmatter の core.xml 1 本、`sheet_names` の複製) では
     // 見られないので、段の境目ごとに見る。内側の仕事量は、どれも preflight が縛った展開量
-    // (`[index].max_decompressed_size`) に比例する範囲に収まる。sheet の解決は中でも見る。
+    // (`[index].max_decompressed_size`) に比例する範囲に収まる (`Xlsx::new` の中の、入力に比例
+    // しない複製は preflight の [`StylesTally`] と [`SheetsTally`] が縛る)。sheet の解決は中でも見る。
     guard.check(0)?;
     let cursor = Cursor::new(bytes);
     // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
@@ -1074,7 +1077,10 @@ fn preflight_xlsx_decompression_budget_capped(
 /// 判定を通った後にもう 1 回展開して [`StylesTally`] を数え、calamine 0.38.0 の `read_styles` が
 /// `Xlsx::new` の中で確保しうる量の上界が `cap` を超えれば `Err` にする (`<xf>` ごとに font 名と
 /// 表示形式を複製するので、確保が part の大きさに比例しない)。この拒否は cap に比べるので、
-/// `"unlimited"` では掛からない (他の展開量の守りと同じ)。
+/// `"unlimited"` では掛からない (他の展開量の守りと同じ)。同じく全 entry をもう 1 回展開して
+/// [`SheetsTally`] を数え、calamine の `read_workbook` が `<sheet>` ごとに part の path を複製する
+/// 量の上界が `cap` を超えれば `Err` にする (styles とは別に `cap` と比べる。`Xlsx::new` の中の
+/// 複製は合わせて `cap` の 2 倍以内)。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -1109,6 +1115,8 @@ fn preflight_xlsx_decompression_budget_timed(
     };
     // 全 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
     let mut total: u64 = 0;
+    // (kuriya 706) 全 entry の `<sheet>` と `<Relationship>` の数 (entry ごとの最大)。
+    let mut sheets = SheetsTally::default();
     for i in 0..zip.len() {
         // 申告 size は metadata だけで取れる (`by_index_raw` は圧縮データを
         // そのまま返す reader = 展開しない)。
@@ -1233,8 +1241,136 @@ fn preflight_xlsx_decompression_budget_timed(
                 ));
             }
         }
+        // kuriya 706: calamine の `read_workbook` が `<sheet>` ごとに複製する量の上界
+        // ([`SheetsTally`])。workbook part の名前は `_rels/.rels` の `Target` で決まり何でもあり得る
+        // ので、part を選ばず全 entry を数える。この entry も上で budget 内と分かっている。
+        if let Ok(entry) =
+            zip.by_index_with_options(i, zip::ZipReadOptions::new().ignore_crc32(true))
+        {
+            match SheetsTally::scan(entry, &expired) {
+                Some(tally) => sheets.absorb(tally),
+                None => return Err(timed_out(&name)),
+            }
+        }
+    }
+    let bound = sheets.allocation_bound();
+    if bound > cap {
+        return Err(unindexable(
+            ParseCause::OverExtractionLimit { limit: cap },
+            format!(
+                "{path_hint}: the workbook would make the workbook reader allocate up to {bound} bytes for {} sheets, over the {cap} bytes cap (zip-bomb guard; each sheet copies the path its relationship names; raise [index].max_decompressed_size to admit this file)",
+                sheets.sheets
+            ),
+        ));
     }
     Ok(())
+}
+
+/// calamine 0.38.0 の `read_workbook` (`Xlsx::new` の中、`src/xlsx/mod.rs:2818`) が確保しうる量を
+/// 見積もるための数 (kuriya 706)。
+///
+/// `read_workbook` (`src/xlsx/mod.rs:596-701`) は workbook part の `<sheet>` 1 件ごとに、`name`
+/// 属性を `decode_attr` した `String` (`:619`) とその複製 (`:662`、`Metadata::sheets` の `Sheet`) を
+/// 作り、`r:id` で引いた relationship の raw な `Target` から part の path を新しい `String` にする
+/// (`:645-649`: `/` で始まれば先頭を剥いだ複製、そうでなければ `xl_path + Target`)。それを
+/// `self.sheets` に push する (`:666`)。relationship の表 (`read_relationships`、`:772-801`) は
+/// `Target` を 1 回ずつしか持たないが、多数の `<sheet>` が同じ `r:id` を指せば path の複製は
+/// 「`Target` の長さ × `<sheet>` の数」に膨らむ (64 KiB の `Target` × 4096 件で 256 MiB 級)。重複
+/// 除去も件数の上限も無い。0.37.0 も同じ (`src/xlsx/mod.rs` の `read_workbook`)。
+///
+/// 数え方は calamine の上位集合:
+/// - **全 entry を読む**。workbook part の名前は `_rels/.rels` の officeDocument の `Target` の
+///   最後の `/` の後ろで、名前の末尾で言い当てられない (0.38.0)。rels の part も xl_path も
+///   同じ。数は entry ごとに取り、part を問わず最大を使う ([`SheetsTally::absorb`]。calamine が
+///   読むのは workbook part 1 本と rels 2 本なので、それぞれの最大で抑えれば足りる)
+/// - `<sheet>` は local name で、`<definedName>` の中でも数える (calamine は `<definedName>` の
+///   中を読み飛ばす、`:676-692`)
+/// - 長さは**要素のタグ全体**で抑える ([`StylesTally`] と同じ): sheet 名は `<sheet>` のタグ、
+///   `Target` と xl_path (`_rels/.rels` の `Target` の一部) は `<Relationship>` のタグ
+/// - XML の error では、そこまでの数を使う (styles と違って拒否しない。全 entry を読むので
+///   画像などはここで error になる)。calamine は同じ quick-xml (`quick-xml-calamine`、同じ版に
+///   固定) を同じ設定で使い、`read_workbook` のどのループも XML の error で止まる (`:682` の
+///   `?`、`:695`) ので、calamine が読むのは error の手前までで、そこまでは数えてある
+/// - Eof まで読む (calamine の一番外のループは `</workbook>` で止まるが、内側の
+///   `<definedName>` のループは名前の一致する閉じ tag まで読む。写すとずれる)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SheetsTally {
+    /// `<sheet>` の数。
+    sheets: u64,
+    /// `<sheet>` のタグの合計 (bytes)。
+    sheet_tag_sum: u64,
+    /// `<Relationship>` のタグの最長 (bytes)。
+    relationship_tag_max: u64,
+}
+
+impl SheetsTally {
+    /// entry 1 本を読んで数える。event ごとに `expired` を聞き、過ぎたら `None`。
+    fn scan(reader: impl std::io::Read, expired: &dyn Fn() -> bool) -> Option<SheetsTally> {
+        use quick_xml_calamine::events::Event;
+
+        let mut reader = quick_xml_calamine::Reader::from_reader(std::io::BufReader::new(reader));
+        let config = reader.config_mut();
+        config.check_end_names = false;
+        config.trim_text(false);
+        config.check_comments = false;
+        config.expand_empty_elements = true;
+        let mut tally = SheetsTally::default();
+        let mut buf = Vec::new();
+        loop {
+            if expired() {
+                return None;
+            }
+            buf.clear();
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    let tag = e.len() as u64;
+                    match e.local_name().as_ref() {
+                        "sheet" => {
+                            tally.sheets += 1;
+                            tally.sheet_tag_sum = tally.sheet_tag_sum.saturating_add(tag);
+                        }
+                        "Relationship" => {
+                            tally.relationship_tag_max = tally.relationship_tag_max.max(tag);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        Some(tally)
+    }
+
+    /// 別の entry の数を合わせる (それぞれの最大)。
+    fn absorb(&mut self, other: SheetsTally) {
+        self.sheets = self.sheets.max(other.sheets);
+        self.sheet_tag_sum = self.sheet_tag_sum.max(other.sheet_tag_sum);
+        self.relationship_tag_max = self.relationship_tag_max.max(other.relationship_tag_max);
+    }
+
+    /// `read_workbook` が `<sheet>` について確保しうる bytes の上界。
+    ///
+    /// - `self.sheets` (`Vec<(String, String)>`) と `Metadata::sheets` (`Vec<calamine::Sheet>`) の
+    ///   伸び ([`vec_peak_bytes`])
+    /// - `<sheet>` 1 件の path: xl_path と `Target` (どちらも `<Relationship>` のタグ以下) で
+    ///   `2 × relationship_tag_max`、確保 3 回分 (名前、名前の複製、path) の
+    ///   [`ALLOCATION_OVERHEAD_BYTES`]
+    /// - 名前は `<sheet>` ごとに自分のタグから作るので 2 回分の合計 (`2 × sheet_tag_sum`)
+    fn allocation_bound(&self) -> u64 {
+        let per_sheet = self
+            .relationship_tag_max
+            .saturating_mul(2)
+            .saturating_add(3 * ALLOCATION_OVERHEAD_BYTES);
+        [
+            vec_peak_bytes(self.sheets, std::mem::size_of::<(String, String)>()),
+            vec_peak_bytes(self.sheets, std::mem::size_of::<calamine::Sheet>()),
+            self.sheets.saturating_mul(per_sheet),
+            self.sheet_tag_sum.saturating_mul(2),
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
+    }
 }
 
 /// calamine が styles の part として読みうる entry か (kuriya 706)。
@@ -1307,7 +1443,9 @@ const NUMFMT_MAP_ENTRY_BYTES: u64 = 256;
 ///   と `style_parser.rs` の `parse_font` / `parse_fill` / `parse_border`) は自分の閉じ tag か Eof
 ///   でしか抜けない。reader は閉じ tag の名前を照合しないので、`<cellXfs>` の内側に置いた
 ///   `</styleSheet>` の後の `<xf>` も calamine は読む。XML の error ではどのループも止まるので、
-///   ここも止まる ([`StylesScan::Malformed`])
+///   ここも止まる ([`StylesScan::Malformed`])。代わりに、一番外の `</styleSheet>` の後ろに壊れた
+///   bytes がある part は、calamine なら開けても拒否する (拒否する側に倒れる)。一番外のループの
+///   抜け方 (どの `</styleSheet>` が一番外か) を写すと、写しのずれで再び数え漏れが出るので写さない
 /// - reader は calamine と同じ quick-xml (0.42、`encoding`。Cargo.toml の `quick-xml-calamine`)
 ///   で、event の切れ目と local name の解釈が calamine と同じになる
 ///
@@ -1530,8 +1668,8 @@ fn count_decompressed_bytes_scanning(
 /// 展開したバイト列から `uniqueCount` 属性の値 (の最大) を探す (AX-41 / calamine の
 /// tafia/calamine#684)。
 ///
-/// calamine 0.37.0 は sharedStrings の `<sst uniqueCount="N">` の N をそのまま
-/// `Vec::reserve(N)` する (`src/xlsx/mod.rs` の `read_shared_strings`)。1 件 24 bytes なので、
+/// calamine 0.37.0 / 0.38.0 は sharedStrings の `<sst uniqueCount="N">` の N をそのまま
+/// `Vec::reserve(N)` する (`src/xlsx/mod.rs` の `read_shared_strings`。0.38.0 では `:362-364`)。1 件 24 bytes なので、
 /// 1.7 KB の xlsx が `uniqueCount="100000000000"` と書くだけで 2.4 TB の確保に失敗して
 /// **プロセスが abort する** (catch できない)。preflight は全 entry の全 byte を既に読んでいる
 /// ので、そこで値を見る。
@@ -2305,7 +2443,8 @@ mod tests {
         // (b) worksheet 自身の CRC が合わない。preflight は CRC を見ないので、これも通す。
         // その先で calamine が EOF まで読んで CRC で止まるかは calamine の読み方次第なので、
         // ここでは pin しない (止まっても、その sheet だけの skip に乗る。calamine 0.37.0 は
-        // 閉じ tag で抜けて、この sheet を読み切った)。
+        // 閉じ tag で抜けて、この sheet を読み切った。0.38.0 も `</sheetData>` で抜ける
+        // (`src/xlsx/cells_reader.rs:311`) が、0.38.0 では実測していない)。
         let forged = forge_crc32(&workbook, "xl/worksheets/sheet1.xml");
         preflight_xlsx_decompression_budget_capped(&forged, "crc.xlsx", cap)
             .expect("the preflight does not check a worksheet's CRC either");
@@ -3096,7 +3235,7 @@ mod tests {
         );
     }
 
-    /// Pins the copy of calamine 0.37.0's sheet-to-entry rules in [`resolve_sheet_parts`]:
+    /// Pins the copy of calamine 0.38.0's sheet-to-entry rules in [`resolve_sheet_parts`]:
     /// a non-standard xl_path, relative / absolute / differently cased targets, and the
     /// fallback when the resolved names disagree with calamine's.
     #[test]
@@ -4110,6 +4249,118 @@ mod tests {
         let err = preflight_xlsx_decompression_budget(&bytes, "inner-end.xlsx")
             .expect_err("the cell formats after the inner </styleSheet> are counted");
         assert!(err.to_string().contains("4096 cell styles"), "{err}");
+    }
+
+    /// A workbook whose part is `xl/{workbook}` (the name calamine 0.38.0 takes from the package
+    /// relationship), with one worksheet relationship whose `Target` is `target_len` bytes long
+    /// and `sheets` `<sheet>` elements that all use it.
+    fn xlsx_with_shared_sheet_target(workbook: &str, target_len: usize, sheets: usize) -> Vec<u8> {
+        let target = format!("worksheets/{}.xml", "t".repeat(target_len));
+        let mut wb = format!(r#"<?xml version="1.0"?><workbook {SPREADSHEET_NS}><sheets>"#);
+        for i in 0..sheets {
+            wb.push_str(&format!(
+                r#"<sheet name="S{i}" sheetId="{}" r:id="a"/>"#,
+                i + 1
+            ));
+        }
+        wb.push_str("</sheets></workbook>");
+        let entries: Vec<(String, Vec<u8>)> = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels".to_string(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/{workbook}"/></Relationships>"#).into_bytes(),
+            ),
+            (format!("xl/{workbook}"), wb.into_bytes()),
+            (
+                format!("xl/_rels/{workbook}.rels"),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="a" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{target}"/></Relationships>"#).into_bytes(),
+            ),
+            // No worksheet part: `Xlsx::new` does not open one, and a zip entry name cannot be
+            // 64 KiB long.
+        ];
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            for (name, body) in &entries {
+                zip.start_file(name.as_str(), SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(body).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        bytes
+    }
+
+    /// [`SheetsTally`] over every entry, as the preflight takes it.
+    fn sheets_tally_of(bytes: &[u8]) -> SheetsTally {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut tally = SheetsTally::default();
+        for i in 0..archive.len() {
+            tally.absorb(SheetsTally::scan(archive.by_index(i).unwrap(), &|| false).unwrap());
+        }
+        tally
+    }
+
+    /// (kuriya 706, second review of 6033909) calamine's `read_workbook` builds a new path string
+    /// (`xl_path` + the relationship's `Target`) for every `<sheet>`, inside `Xlsx::new`, with no
+    /// limit on how many sheets share one relationship: a 64 KiB `Target` used by 4096 sheets
+    /// made calamine 0.38.0 alone allocate about 256 MiB. The preflight refuses it before
+    /// calamine opens anything, whatever the workbook part is named.
+    #[test]
+    fn test_xlsx_refuses_sheets_that_copy_a_long_relationship_target() {
+        let small = xlsx_with_shared_sheet_target("main.xml", 8, 3);
+        let xlsx = calamine::Xlsx::new(Cursor::new(small.as_slice()))
+            .expect("premise: calamine opens the shape, through xl/main.xml");
+        assert_eq!(xlsx.sheet_names().len(), 3, "premise: one path per sheet");
+
+        let bytes = xlsx_with_shared_sheet_target("main.xml", 65536, 4096);
+        assert!(
+            bytes.len() < 64 * 1024,
+            "a small file: {} bytes",
+            bytes.len()
+        );
+        let err = preflight_xlsx_decompression_budget(&bytes, "sheets.xlsx")
+            .expect_err("refused in the preflight, before calamine runs");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit {
+                limit: super::super::DEFAULT_MAX_DECOMPRESSED_BYTES
+            }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("4096 sheets"), "{err}");
+    }
+
+    /// (kuriya 706) The sheet bound is compared with the cap itself: a cap equal to the bound
+    /// admits the workbook, one byte less refuses it.
+    #[test]
+    fn test_xlsx_sheets_bound_admits_at_the_cap_and_refuses_one_byte_below() {
+        let bytes = xlsx_with_shared_sheet_target("workbook.xml", 1000, 100);
+        let bound = sheets_tally_of(&bytes).allocation_bound();
+        let inflated: u64 = {
+            let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+            (0..archive.len())
+                .map(|i| archive.by_index(i).unwrap().size())
+                .sum()
+        };
+        assert!(
+            inflated < bound,
+            "premise: the archive fits a cap of {bound}"
+        );
+
+        preflight_xlsx_decompression_budget_capped(&bytes, "edge.xlsx", bound)
+            .expect("a bound equal to the cap is admitted");
+        let err = preflight_xlsx_decompression_budget_capped(&bytes, "edge.xlsx", bound - 1)
+            .expect_err("one byte over the cap");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: bound - 1 }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("100 sheets"), "{err}");
     }
 
     /// (kuriya 706) The bound is compared with the cap itself: a cap equal to the bound admits

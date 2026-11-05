@@ -77,7 +77,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (the longest font name and number format times the number of cell formats, plus the tables
   themselves) exceeds `[index].max_decompressed_size`; a styles part that is not well-formed XML
   is skipped as damaged. Ordinary styles stay far below the default 50 MiB: 3,000 cell formats
-  bound at about 1.5 MB (kuriya 706).
+  bound at about 1.5 MB. The same preflight bounds the other copy calamine makes while it opens
+  a workbook, in 0.38.0 as in 0.37.0: every `<sheet>` gets a new string holding the path of the
+  part its relationship names, so a workbook whose 4,096 sheets share one relationship with a
+  64 KiB `Target` made it allocate about 256 MiB. Every entry is read for `<sheet>` and
+  `<Relationship>` elements (the workbook part may have any name), and the workbook is skipped
+  the same way when that bound exceeds `[index].max_decompressed_size`. calamine is pinned to
+  0.38.0, since the bounds follow its internals (kuriya 706).
 
 ### Internal
 

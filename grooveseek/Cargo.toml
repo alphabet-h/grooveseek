@@ -120,13 +120,18 @@ oxidize-pdf = "=4.3.0"
 # zip/quick-xml は calamine が transitive で導入済のため direct dep に昇格
 # (docx/pptx を自前実装するのに使う。XML スタックを 1 本化して追加 heavy dep ゼロ)。
 # quick-xml の `encoding` は calamine 0.36 までは feature unification で有効だった。calamine 0.37 / 0.38 は quick-xml 0.42 を使うので 0.41 側で明示して挙動を保つ (oxidize-pdf =4.3.0 が 0.41 を要求する間は 2 版が並ぶ)。
-calamine = "0.38"
+# (kuriya 706) Pinned: the xlsx preflight (`src/parser/xlsx.rs`: `resolve_sheet_parts`,
+# `StylesTally`, `SheetsTally`, the `uniqueCount` scan) copies rules and `size_of`s from this exact
+# release. When raising calamine, re-read its `Xlsx::new` (read_package_relationships,
+# read_shared_strings, read_styles, read_relationships, read_workbook) against those copies,
+# and move `quick-xml-calamine` below to the quick-xml version the new calamine uses.
+calamine = "=0.38.0"
 zip = "9"
 quick-xml = { version = "0.41", features = ["encoding"] }
 # (kuriya 706) The xlsx preflight counts the styles part with the quick-xml calamine itself
 # reads it with (calamine 0.38 depends on 0.42 with `encoding`), so the events it counts are the
 # events calamine sees. Already in the tree through calamine: no new crate is built.
-quick-xml-calamine = { package = "quick-xml", version = "0.42", features = ["encoding"] }
+quick-xml-calamine = { package = "quick-xml", version = "=0.42.0", features = ["encoding"] }
 
 # (feature-56) Source code parsed into one chunk per definition. `tree-sitter` is
 # the runtime, `tree-sitter-tags` turns a parse tree into definitions and
