@@ -1,9 +1,7 @@
 use super::*;
 // (AX-40) The items only these tests use, from the submodules they moved to.
 use super::rename::{read_crossed_rename_again, reindex_renamed_entry, settle_rename_destination};
-use super::single_file::{
-    names_a_walked_path, sort_single_path_look, write_parsed_document_with_vectors,
-};
+use super::single_file::{names_a_walked_path, sort_single_path_look};
 
 use std::collections::HashMap;
 
