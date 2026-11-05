@@ -60,6 +60,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- `indexer.rs` is split into submodules under `indexer/`: `reuse` (vector reuse, the table-row
+  decision, the one-time re-read passes), `single_file` (one file's indexing and the watcher's
+  entry points), `rename`, and the unit tests in `tests`. A move only: every path under
+  `crate::indexer` stays as it was through re-exports (AX-40, kuriya 625).
 - Nightly now measures the benches instead of only running each body once: a new `bench` job
   (ubuntu) runs every bench target with short criterion settings and writes the times and each
   bench's checked counts to the job summary, keeping `target/criterion` as an artifact. Three
