@@ -1,5 +1,6 @@
-//! (AX-40) Renames: the pairs a full run detects ([`detect_renames`]), a rename across
-//! parsers and its settling, and the watcher's [`rename_single_file`].
+//! (AX-40) Renames: the pairs a full run detects
+//! ([`crate::indexer::rename::detect_renames`]), a rename across parsers and its settling,
+//! and the watcher's [`crate::indexer::rename::rename_single_file`].
 
 use super::*;
 

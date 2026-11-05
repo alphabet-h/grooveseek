@@ -1,7 +1,8 @@
 //! (AX-40) Keeping what the index already holds for a document: the stored vectors a
-//! changed document's chunks can reuse ([`plan_vector_reuse`]), the meta-only write for
-//! chunks that still match, the table-row decision, and the one-time re-read passes
-//! ([`Reindex`]) that ask the same questions of unchanged rows.
+//! changed document's chunks can reuse ([`crate::indexer::reuse::plan_vector_reuse`]), the
+//! meta-only write for chunks that still match, the table-row decision, and the one-time
+//! re-read passes ([`crate::indexer::reuse::Reindex`]) that ask the same questions of
+//! unchanged rows.
 
 use super::*;
 
