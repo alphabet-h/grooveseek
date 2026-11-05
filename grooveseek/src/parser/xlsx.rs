@@ -1070,6 +1070,12 @@ fn preflight_xlsx_decompression_budget_capped(
 /// calamine が申告件数を先に reserve して abort するのを、calamine を呼ぶ前に止める)。この拒否は
 /// cap に依らないので、`[index].max_decompressed_size` を上げる案内は付けない。
 ///
+/// (kuriya 706) 名前が `styles.xml` で終わる entry ([`is_styles_part_candidate`]) は、budget の
+/// 判定を通った後にもう 1 回展開して [`StylesTally`] を数え、calamine 0.38.0 の `read_styles` が
+/// `Xlsx::new` の中で確保しうる量の上界が `cap` を超えれば `Err` にする (`<xf>` ごとに font 名と
+/// 表示形式を複製するので、確保が part の大きさに比例しない)。この拒否は cap に比べるので、
+/// `"unlimited"` では掛からない (他の展開量の守りと同じ)。
+///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
 /// parser は zip 展開を経由しない)。
@@ -1173,6 +1179,7 @@ fn preflight_xlsx_decompression_budget_timed(
             }
         };
         unique_counts.finish();
+        drop(entry);
         total = total.saturating_add(actual);
         if total > cap {
             return Err(unindexable(
@@ -1194,8 +1201,217 @@ fn preflight_xlsx_decompression_budget_timed(
                 ),
             ));
         }
+        // kuriya 706: calamine 0.38.0 の `read_styles` が `<xf>` ごとに複製する量の上界
+        // ([`StylesTally`])。この entry は上で budget 内と分かっているので、もう 1 回展開しても
+        // 展開量は cap 以内。
+        if is_styles_part_candidate(&name) {
+            let Ok(entry) =
+                zip.by_index_with_options(i, zip::ZipReadOptions::new().ignore_crc32(true))
+            else {
+                continue;
+            };
+            let tally = match StylesTally::scan(entry, &expired) {
+                StylesScan::Tallied(tally) => tally,
+                StylesScan::Expired => return Err(timed_out(&name)),
+                StylesScan::Malformed => {
+                    return Err(unindexable(
+                        ParseCause::CorruptOrUnsupported,
+                        format!(
+                            "{path_hint}: entry {name:?} is not well-formed XML, so the memory the workbook reader would allocate for its cell styles cannot be bounded (zip-bomb guard; the archive is rejected whatever [index].max_decompressed_size is)"
+                        ),
+                    ));
+                }
+            };
+            let bound = tally.allocation_bound();
+            if bound > cap {
+                return Err(unindexable(
+                    ParseCause::OverExtractionLimit { limit: cap },
+                    format!(
+                        "{path_hint}: entry {name:?} would make the workbook reader allocate up to {bound} bytes for {} cell styles, over the {cap} bytes cap (zip-bomb guard; each style copies its font name and number format; raise [index].max_decompressed_size to admit this file)",
+                        tally.xf
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// calamine が styles の part として読みうる entry か (kuriya 706)。
+///
+/// calamine 0.38.0 は `{xl_path}styles.xml` を読む (`src/xlsx/mod.rs:416`、`read_styles`)。
+/// xl_path は `_rels/.rels` の officeDocument の `Target` の最後の `/` まで
+/// (`src/xlsx/mod.rs:335-340`)、entry は `\` を `/` にして ASCII 小文字にした名前の表で引き、
+/// 無ければ path そのままで `by_name` する (`src/utils.rs` の `build_zip_path_cache` /
+/// `cached_zip_path`)。どの経路でも、読まれる entry の名前は ASCII 小文字にすると
+/// `styles.xml` で終わる。**xl_path を写して 1 つに絞らない**: [`resolve_sheet_parts`] の写しと
+/// 違ってここは守りの判定なので、写しがずれた時に検査した part と読まれる part が食い違う穴を
+/// 作らない (名前で言い当てて 3 回破られた preflight と同じ理由。
+/// [`preflight_xlsx_decompression_budget_timed`])。末尾の一致は上位集合で、同じ名前の entry
+/// が複数あっても全部を見る (preflight は entry を index で回す)。calamine が読むのは 1 つ
+/// なので、上界は entry ごとに判定する (合計しない)。
+fn is_styles_part_candidate(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("styles.xml")
+}
+
+/// calamine 0.38.0 の組み込みの表示形式 (`builtin_format_code_by_id`、`src/formats.rs:91`) の
+/// いちばん長い文字列 (52 bytes) と `"General"` を上から抑える値。`numFmtId` が `<numFmt>` に
+/// 無い時、`<xf>` はこれを複製する。
+const BUILTIN_FORMAT_CODE_MAX_BYTES: u64 = 64;
+
+/// `Vec<CellFormat>` の 1 件 (calamine の `CellFormat` は field の無い enum で非公開なので、
+/// `size_of` で測れない。1 byte のものを 8 で抑える)。
+const CELL_FORMAT_BYTES: usize = 8;
+
+/// 1 回の heap 確保に allocator が足す分 (`String` の複製は `<xf>` 1 件で 2 回)。
+const ALLOCATION_OVERHEAD_BYTES: u64 = 16;
+
+/// `HashMap<String, String>` (calamine の `number_formats`) の 1 件。entry 48 bytes と制御 byte
+/// に、bucket の余り (load factor 7/8 と 2 の冪) と作り直しの間の新旧の表を掛けて抑える。文字列
+/// の中身は [`StylesTally::numfmt_sum`] で別に数える。
+const NUMFMT_MAP_ENTRY_BYTES: u64 = 256;
+
+/// styles の part 1 本で calamine 0.38.0 の `read_styles` (`Xlsx::new` の中で呼ばれる、
+/// `src/xlsx/mod.rs:2816`) が確保しうる量を見積もるための数 (kuriya 706)。
+///
+/// `read_styles` (`src/xlsx/mod.rs:413-593`) は `<cellXfs>` の `<xf>` 1 件ごとに `Style`
+/// (`size_of::<calamine::Style>()` = 152 B、0.38.0) を作り、参照先の `Font` を `clone` し
+/// (`:515`。`Font::name` の `String` ごと)、`numFmtId` があれば表示形式の文字列を `clone` する
+/// (`:539-548`。`<numFmt>` の `formatCode`、無ければ組み込みの文字列)。複製は参照ごとなので、
+/// 長い font 名 1 つを多数の `<xf>` が指すと確保が「名前の長さ × `<xf>` の数」に膨らむ
+/// (64 KiB の名前 × 4096 件の 2,040 B の file で 256.7 MiB)。0.37.0 は `<xf>` ごとに 1 byte の
+/// `CellFormat` しか持たなかった。
+///
+/// 見積もりは「最長 × 件数」: `<xf>` 1 件は、part の中のどの `<name>` 要素のタグよりも長い font
+/// 名と、どの `<numFmt>` 要素のタグ (と組み込みの文字列) よりも長い表示形式を複製しない。参照先
+/// ごとに正確に積む (`fontId` を引いて font ごとの名前の長さを足す) と calamine の解決 (`fontId` の
+/// 数字の読み方、後勝ち、`<fonts>` の外の `<font>`) を写すことになり、写しのずれが過小評価に
+/// なる。最長 × 件数は写しを持たず、正常な workbook の名前と表示形式は短いので過大評価は小さい。
+///
+/// 数え方はどれも calamine の上位集合:
+/// - 要素は calamine と同じ reader の設定 (空要素を start + end に展開、閉じ tag を照合しない) で
+///   読み、**part のどこにあっても** local name で数える。calamine が `<xf>` を `Style` にするのは
+///   `<cellXfs>` の中だけ (`<cellStyleXfs>` と `<dxfs>` を読む分岐は無い、`:486-586`) だが、
+///   それも数える
+/// - 文字列の長さは**要素のタグ全体** (名前と属性の raw bytes) で抑える。calamine が複製するのは
+///   属性値を `decode_attr` (= `quick_xml::escape::unescape`、`src/attrs.rs:186`) したもので、
+///   定義済みの実体と文字参照は展開しても短くなるだけなので、タグの長さを超えない。属性を
+///   自前で読まないので、calamine の属性の読み方 (`RawAttrIter`) を写さずに済む
+/// - calamine は `</styleSheet>` で読むのをやめる (`:587`)。ここも同じ所で止める
+///
+/// [`StylesTally::allocation_bound`] が数から上界を作る。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StylesTally {
+    /// `<xf>` の数 (part 全体)。
+    xf: u64,
+    /// `<font>` / `<fill>` / `<border>` / `<numFmt>` の数 (part 全体)。
+    font: u64,
+    fill: u64,
+    border: u64,
+    numfmt: u64,
+    /// `<name>` 要素のタグの最長と合計 (bytes)。
+    name_max: u64,
+    name_sum: u64,
+    /// `<numFmt>` 要素のタグの最長と合計 (bytes)。
+    numfmt_max: u64,
+    numfmt_sum: u64,
+}
+
+/// [`StylesTally::scan`] の結果。
+#[derive(Debug, PartialEq, Eq)]
+enum StylesScan {
+    Tallied(StylesTally),
+    /// XML として読めない。calamine の `read_styles` もそこで `Err` を返すが、それまでに確保した
+    /// 分は数えきれないので、呼び出し側は拒否する。
+    Malformed,
+    /// 文書の時間の上限を過ぎた。
+    Expired,
+}
+
+impl StylesTally {
+    /// styles の part を読んで数える。event ごとに `expired` を聞く。
+    fn scan(reader: impl std::io::Read, expired: &dyn Fn() -> bool) -> StylesScan {
+        use quick_xml::events::Event;
+
+        let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(reader));
+        let config = reader.config_mut();
+        config.check_end_names = false;
+        config.trim_text(false);
+        config.check_comments = false;
+        config.expand_empty_elements = true;
+        let mut tally = StylesTally::default();
+        let mut buf = Vec::new();
+        loop {
+            if expired() {
+                return StylesScan::Expired;
+            }
+            buf.clear();
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    let tag = e.len() as u64;
+                    match e.local_name().as_ref() {
+                        b"xf" => tally.xf += 1,
+                        b"font" => tally.font += 1,
+                        b"fill" => tally.fill += 1,
+                        b"border" => tally.border += 1,
+                        b"name" => {
+                            tally.name_max = tally.name_max.max(tag);
+                            tally.name_sum = tally.name_sum.saturating_add(tag);
+                        }
+                        b"numFmt" => {
+                            tally.numfmt += 1;
+                            tally.numfmt_max = tally.numfmt_max.max(tag);
+                            tally.numfmt_sum = tally.numfmt_sum.saturating_add(tag);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"styleSheet" => break,
+                Ok(Event::Eof) => break,
+                Ok(_) => {}
+                Err(_) => return StylesScan::Malformed,
+            }
+        }
+        StylesScan::Tallied(tally)
+    }
+
+    /// `read_styles` が確保しうる bytes の上界。
+    ///
+    /// - `Vec` (`styles` / `formats` / `fonts` / `fills` / `borders`) は `Vec::new()` から push で
+    ///   伸びるので、容量は 4 から始まる 2 の冪 (`p`、`p >= n`)。伸ばす瞬間は新旧の buffer が
+    ///   並ぶので、要素 `n` 件の peak は `size × (p + p / 2)` 以下 ([`vec_peak_bytes`])
+    /// - `<xf>` 1 件の複製: font 名 ([`StylesTally::name_max`]) と表示形式
+    ///   ([`StylesTally::numfmt_max`] と [`BUILTIN_FORMAT_CODE_MAX_BYTES`] の大きい方)、確保 2 回分の
+    ///   [`ALLOCATION_OVERHEAD_BYTES`]
+    /// - `fonts` の名前と `number_formats` の key / 値は 1 回ずつ持つので、タグの合計で抑える
+    fn allocation_bound(&self) -> u64 {
+        let per_xf = self
+            .name_max
+            .saturating_add(self.numfmt_max.max(BUILTIN_FORMAT_CODE_MAX_BYTES))
+            .saturating_add(2 * ALLOCATION_OVERHEAD_BYTES);
+        [
+            vec_peak_bytes(self.xf, std::mem::size_of::<calamine::Style>()),
+            vec_peak_bytes(self.xf, CELL_FORMAT_BYTES),
+            self.xf.saturating_mul(per_xf),
+            vec_peak_bytes(self.font, std::mem::size_of::<calamine::Font>()),
+            self.name_sum,
+            vec_peak_bytes(self.fill, std::mem::size_of::<calamine::Fill>()),
+            vec_peak_bytes(self.border, std::mem::size_of::<calamine::Borders>()),
+            self.numfmt.saturating_mul(NUMFMT_MAP_ENTRY_BYTES),
+            self.numfmt_sum,
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// `Vec::new()` に `n` 件 push した時の、要素の buffer の peak (新旧が並ぶ瞬間を含む) の上界。
+fn vec_peak_bytes(n: u64, size: usize) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let capacity = n.checked_next_power_of_two().unwrap_or(u64::MAX).max(4);
+    (size as u64).saturating_mul(capacity.saturating_add(capacity / 2))
 }
 
 /// [`count_decompressed_bytes_scanning`] が entry を読んで分かったこと。
@@ -3734,6 +3950,196 @@ mod tests {
             "the chain is cut short, not walked: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A one-sheet workbook under `xl_dir` with `styles` written at `styles_entry`.
+    fn xlsx_with_styles(xl_dir: &str, styles_entry: &str, styles: &[u8]) -> Vec<u8> {
+        let entries: Vec<(String, Vec<u8>)> = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels".to_string(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="{xl_dir}workbook.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                format!("{xl_dir}workbook.xml"),
+                format!(r#"<?xml version="1.0"?><workbook {SPREADSHEET_NS}><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#).into_bytes(),
+            ),
+            (
+                format!("{xl_dir}_rels/workbook.xml.rels"),
+                br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_vec(),
+            ),
+            (
+                format!("{xl_dir}worksheets/sheet1.xml"),
+                one_cell_worksheet("styled"),
+            ),
+            (styles_entry.to_string(), styles.to_vec()),
+        ];
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            for (name, body) in &entries {
+                zip.start_file(name.as_str(), SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(body).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        bytes
+    }
+
+    /// A styles part with one font whose name is `name_len` bytes and `xf_count` cell formats
+    /// that all use it (the shape calamine 0.38.0 copies once per `<xf>`), plus `num_fmts`
+    /// custom number formats.
+    fn styles_xml(name_len: usize, xf_count: usize, num_fmts: &[&str]) -> Vec<u8> {
+        let mut styles =
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><styleSheet {SPREADSHEET_NS}>"#);
+        if !num_fmts.is_empty() {
+            styles.push_str("<numFmts>");
+            for (i, code) in num_fmts.iter().enumerate() {
+                styles.push_str(&format!(
+                    r#"<numFmt numFmtId="{}" formatCode="{code}"/>"#,
+                    164 + i
+                ));
+            }
+            styles.push_str("</numFmts>");
+        }
+        styles.push_str(r#"<fonts count="1"><font><sz val="11"/><name val=""#);
+        styles.push_str(&"a".repeat(name_len));
+        styles.push_str(r#""/></font></fonts><cellXfs>"#);
+        for i in 0..xf_count {
+            let fmt = if num_fmts.is_empty() {
+                0
+            } else {
+                164 + i % num_fmts.len()
+            };
+            styles.push_str(&format!(r#"<xf numFmtId="{fmt}" fontId="0"/>"#));
+        }
+        styles.push_str("</cellXfs></styleSheet>");
+        styles.into_bytes()
+    }
+
+    fn tally_of(styles: &[u8]) -> StylesTally {
+        match StylesTally::scan(styles, &|| false) {
+            StylesScan::Tallied(tally) => tally,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// (kuriya 706) calamine 0.38.0 copies a cell format's font name into every `<xf>` that
+    /// uses it, inside `Xlsx::new` where nothing can interrupt it: a 64 KiB name used by 4096
+    /// cell formats made a 2 KB workbook allocate 256.7 MiB (measured with calamine alone),
+    /// and the same shape scales to an allocation failure, which aborts the process. The
+    /// preflight refuses it before calamine opens anything.
+    #[test]
+    fn test_xlsx_refuses_styles_that_copy_a_long_font_name_per_cell_format() {
+        let bytes = xlsx_with_styles("xl/", "xl/styles.xml", &styles_xml(65536, 4096, &[]));
+        assert!(bytes.len() < 4096, "a small file: {} bytes", bytes.len());
+
+        let started = std::time::Instant::now();
+        let err = preflight_xlsx_decompression_budget(&bytes, "styles.xlsx")
+            .expect_err("refused in the preflight, before calamine runs");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit {
+                limit: super::super::DEFAULT_MAX_DECOMPRESSED_BYTES
+            }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("4096 cell styles"), "{err}");
+        let err = XlsxParser::default()
+            .parse_bytes(&bytes, "styles.xlsx", &[])
+            .expect_err("the parser refuses it too");
+        assert!(!err.to_string().contains("panicked"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// (kuriya 706) The bound is compared with the cap itself: a cap equal to the bound admits
+    /// the workbook, one byte less refuses it.
+    #[test]
+    fn test_xlsx_styles_bound_admits_at_the_cap_and_refuses_one_byte_below() {
+        let styles = styles_xml(1000, 100, &["0.00"]);
+        let bound = tally_of(&styles).allocation_bound();
+        let bytes = xlsx_with_styles("xl/", "xl/styles.xml", &styles);
+        let inflated: u64 = {
+            let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+            (0..archive.len())
+                .map(|i| archive.by_index(i).unwrap().size())
+                .sum()
+        };
+        assert!(
+            inflated < bound,
+            "premise: the archive fits a cap of {bound}"
+        );
+
+        preflight_xlsx_decompression_budget_capped(&bytes, "edge.xlsx", bound)
+            .expect("a bound equal to the cap is admitted");
+        let err = preflight_xlsx_decompression_budget_capped(&bytes, "edge.xlsx", bound - 1)
+            .expect_err("one byte over the cap");
+        assert_eq!(
+            cause_of(&err),
+            Some(ParseCause::OverExtractionLimit { limit: bound - 1 }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("100 cell styles"), "{err}");
+    }
+
+    /// (kuriya 706) calamine reads `{xl_path}styles.xml` through a lower-cased lookup, so the
+    /// part may sit outside `xl/` and be spelled in any ASCII case: the preflight checks every
+    /// entry whose name ends in `styles.xml` without resolving `xl_path`.
+    #[test]
+    fn test_xlsx_styles_check_covers_a_nonstandard_path_and_case() {
+        let styles = styles_xml(65536, 4096, &[]);
+        let bytes = xlsx_with_styles("custom/", "custom/STYLES.XML", &styles);
+        // Premise: calamine reads this part -- a truncated styles part there fails the open,
+        // and the same bytes under another name do not.
+        let truncated = b"<styleSheet><fonts>";
+        let open = |entry: &str| {
+            let bytes = xlsx_with_styles("custom/", entry, truncated);
+            calamine::Xlsx::new(Cursor::new(bytes.as_slice())).map(|_| ())
+        };
+        assert!(
+            open("custom/STYLES.XML").is_err(),
+            "premise: calamine reads custom/STYLES.XML"
+        );
+        assert!(
+            open("custom/other.xml").is_ok(),
+            "premise: and not other.xml"
+        );
+        let err = preflight_xlsx_decompression_budget(&bytes, "custom.xlsx")
+            .expect_err("the part calamine reads is the part checked");
+        assert!(err.to_string().contains("cell styles"), "{err}");
+    }
+
+    /// (kuriya 706) A workbook with the styles an Excel workbook typically carries -- a few
+    /// thousand cell formats, font names under 32 bytes, a handful of number formats -- stays
+    /// far under the default budget and reads as before.
+    #[test]
+    fn test_xlsx_ordinary_styles_stay_far_under_the_budget() {
+        let codes = [
+            "#,##0.00",
+            "yyyy/mm/dd",
+            "[$-411]ggge&quot;年&quot;m&quot;月&quot;d&quot;日&quot;",
+            "0.0%",
+        ];
+        let styles = styles_xml(31, 3000, &codes);
+        let bound = tally_of(&styles).allocation_bound();
+        let budget = super::super::DEFAULT_MAX_DECOMPRESSED_BYTES;
+        assert!(bound * 20 < budget, "{bound} bytes is under 5% of {budget}");
+        let doc = XlsxParser::default()
+            .parse_bytes(
+                &xlsx_with_styles("xl/", "xl/styles.xml", &styles),
+                "ordinary.xlsx",
+                &[],
+            )
+            .expect("an ordinary workbook reads");
+        assert!(doc.chunks[0].content.contains("styled"));
     }
 
     /// (kuriya 706) calamine 0.38.0 names the workbook part after the package relationship's

@@ -67,7 +67,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the zip, and the preflight lets bytes that are not a zip through. A `.xlsx` holding such a
   compound file is now skipped as damaged. The copy of calamine's sheet-to-part rules used to
   read a part shared by several sheets once follows 0.38.0, which names the workbook part after
-  the package relationship instead of always `workbook.xml` (kuriya 706).
+  the package relationship instead of always `workbook.xml`. calamine 0.38.0 also reads cell
+  styles while it opens a workbook and copies a format's font name and number format into every
+  cell format that uses it, so a 2 KB workbook whose 4,096 cell formats share one 64 KiB font
+  name made it allocate 256.7 MiB, and the same shape scales to an allocation failure. The
+  decompression preflight now reads every entry whose name ends in `styles.xml` and skips the
+  workbook, with the `zip-bomb guard` error, when the most that reading could allocate
+  (the longest font name and number format times the number of cell formats, plus the tables
+  themselves) exceeds `[index].max_decompressed_size`; a styles part that is not well-formed XML
+  is skipped as damaged. Ordinary styles stay far below the default 50 MiB: 3,000 cell formats
+  bound at about 1.5 MB (kuriya 706).
 
 ### Internal
 
