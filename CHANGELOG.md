@@ -14,6 +14,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Indexing with BGE-M3 uses about half the memory.** The FastEmbed batch for `bge-m3` is now 8 texts instead of 32, and groove hands FastEmbed one batch at a time instead of a document's whole chunk list, so the token-level outputs FastEmbed keeps until a call ends no longer pile up with the length of a document. Indexing a 100-chunk Markdown file with `groove index --model bge-m3 --force` peaked at about 2.4 GB of private bytes instead of about 5 GB on Windows, in about the same time. `bge-small-en-v1.5` keeps its batch of 256 (kuriya 671).
+
 ### Documentation
 
 - **Keeping a knowledge base in git: ignore `.groove.db*`** ([usage.md](docs/usage.md)). The writer lock and holder files (`.groove.db.writer-lock`, `.groove.db.writer.json`) sit beside the database in the parent directory of `kb_path`, and a SQLite-only pattern such as `.groove.db-*` does not match them, so they showed up as untracked. The names stay as they are; they are fixed in [stability.md](docs/stability.md).
