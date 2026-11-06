@@ -13048,7 +13048,7 @@ SOFTWARE.
 
 Used by:
 
-- calamine 0.37.0 (https://github.com/tafia/calamine)
+- calamine 0.38.0 (https://github.com/tafia/calamine)
 - quick-xml 0.42.0 (https://github.com/tafia/quick-xml)
 
 ```text
