@@ -2958,7 +2958,10 @@ mod tests {
         let texts = ["a", "b", "c"];
         let err = embed_in_slices(&texts, 2, |_| Ok(vec![vec![0.0]]))
             .expect_err("one vector for two texts");
-        assert!(err.to_string().contains("returned 1 vectors for 2 texts"), "{err}");
+        assert!(
+            err.to_string().contains("returned 1 vectors for 2 texts"),
+            "{err}"
+        );
     }
 
     #[test]
