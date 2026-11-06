@@ -26,6 +26,14 @@ groove index --kb-path /path/to/knowledge-base --wait 30   # 他の writer を�
 
 1 つの index に書く `groove index` は同時に 1 つだけで (v1.22.0+)、DB の隣の `.groove.db.writer-lock` に OS のロックを持つ。他の groove のプロセスが持っていれば、`groove index` は DB にも embedding モデルにも触れずに exit code 3 で止まり、stderr に持ち主 (pid は `.groove.db.writer.json` による値で、古いことがある) と次の手を出す。代わりに待つなら `--wait <SECONDS>`。書き手の `groove serve` (watcher が有効で、他の process がロックを持っていない時に起動したもの) は watcher が動いている間同じロックを持つので、その server の `rebuild_index` を呼ぶか、server を止めてから `groove index` を打つ。`--no-watch` の server が持つのは MCP `rebuild_index` の間だけで、reader として起動した server はロックを持たず `rebuild_index` を断る。reader と watcher が止まった場合は [behavior.ja.md](behavior.ja.md) を参照。exit code: `0` 成功、`1` 失敗、`2` 使い方の誤り (引数の parser による)、`3` 他の groove プロセスがロックを持っている、または `--wait` の期限が切れた。このロックが効くのはローカルディスク上の DB に限る: network file system 上では、OS のロックが効くかどうかがファイルシステム次第になる。[ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.ja.md) を参照。
 
+KB が git の repository の中の dir だと、DB とその隣のファイルはその repository の中にできる (どれも `kb_path` の親 dir に置かれるため)。`.groove.db` とその `-wal` / `-shm` のほかに、消されることのない writer lock の `.groove.db.writer-lock` と、持ち主のファイル `.groove.db.writer.json` / `.groove.db.writer.json.tmp-<pid>` がある。どれも commit するものではない。repository の `.gitignore` に 1 行書けば全部に当たる:
+
+```gitignore
+.groove.db*
+```
+
+SQLite だけを想定した `.groove.db-*` のような pattern は lock と持ち主のファイルに当たらない: 名前が `-` ではなく `.` で続くため。
+
 ### 外部の OpenAI 互換 embedding
 
 既定は FastEmbed のままで、embedding の推論はプロセス内で行われる。代わりに HTTP の

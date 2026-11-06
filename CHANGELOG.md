@@ -14,6 +14,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Documentation
+
+- **Keeping a knowledge base in git: ignore `.groove.db*`** ([usage.md](docs/usage.md)). The writer lock and holder files (`.groove.db.writer-lock`, `.groove.db.writer.json`) sit beside the database in the parent directory of `kb_path`, and a SQLite-only pattern such as `.groove.db-*` does not match them, so they showed up as untracked. The names stay as they are; they are fixed in [stability.md](docs/stability.md).
+
 ## [1.24.1] - 2026-11-06
 
 ### Changed

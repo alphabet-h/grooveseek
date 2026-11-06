@@ -26,6 +26,14 @@ Switching models on an existing index requires `--force` (the DB records the mod
 
 One `groove index` at a time writes an index (v1.22.0+): it holds an operating-system lock on `.groove.db.writer-lock` beside the database. If another groove process holds it, `groove index` exits with code 3 without touching the database or the embedding model, and prints on stderr who holds it (the pid comes from `.groove.db.writer.json` and can be stale) and what to do next. `--wait <SECONDS>` waits for the holder instead. The writing `groove serve` (watcher on, started while no other process held the lock) holds the same lock while its watcher runs, so call its `rebuild_index` instead, or stop it before a `groove index`; a `--no-watch` server holds it only during an MCP `rebuild_index`, and a server that started as a reader holds none and refuses `rebuild_index`. See [behavior.md](behavior.md) for the reader and the stopped-watcher cases. Exit codes: `0` success, `1` failure, `2` usage error (from the argument parser), `3` another groove process holds the lock, or `--wait` ran out. The lock holds only for a database on a local disk: on a network file system, whether the operating-system lock works depends on the file system. See [ADR-0031](decisions/0031-one-writer-per-index-by-an-os-lock.md).
 
+When the knowledge base is a directory inside a git repository, the database and the files beside it land in that repository, since they sit in the parent directory of `kb_path`. Besides `.groove.db` and its `-wal` / `-shm`, these are the writer lock `.groove.db.writer-lock`, which is never deleted, and the holder files `.groove.db.writer.json` / `.groove.db.writer.json.tmp-<pid>`. None of them is anything to commit. One line in the repository's `.gitignore` covers them all:
+
+```gitignore
+.groove.db*
+```
+
+A pattern written for SQLite alone, such as `.groove.db-*`, misses the lock and holder files: their names go on with `.`, not `-`.
+
 ### External OpenAI-compatible embeddings
 
 FastEmbed remains the default and keeps embedding inference in-process. To use
