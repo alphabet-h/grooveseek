@@ -70,17 +70,18 @@ impl ModelChoice {
         }
     }
 
-    /// fastembed の `embed()` に渡すバッチサイズ。モデルの 1 トークンあたりの
-    /// activation memory が違うため、大きなモデルでは小さめのバッチに絞って
-    /// OOM を避ける。
+    /// fastembed の `embed()` に渡すバッチサイズ。1 回の推論の途中計算 (activation)
+    /// はバッチに比例して増えるので、大きなモデルではバッチを絞る。
     ///
-    /// 計算根拠: `batch * max_length(=512) * hidden_dim * 4 bytes`
-    /// - BgeSmallEnV15 (384 dim) @ 256 → ~200 MB
-    /// - BgeM3         (1024 dim) @ 32 → ~67 MB
+    /// `batch * max_length(=512) * hidden_dim * 4 bytes` は最終層の出力 1 枚分に
+    /// すぎず、ONNX Runtime が推論中に確保する attention などの途中計算を数えていない。
+    /// (kuriya 671) BGE-M3 は 32 x 512 token の batch で private bytes が約 3 GB から
+    /// 約 5 GB に跳ねた。8 では約 2.5 GB で頭打ちになり、1 chunk あたりの時間は
+    /// 32 と変わらなかった (起票時の実測)。
     pub fn batch_size(self) -> usize {
         match self {
             Self::BgeSmallEnV15 => 256,
-            Self::BgeM3 => 32,
+            Self::BgeM3 => 8,
         }
     }
 }
@@ -310,9 +311,39 @@ impl FastEmbedProvider {
     }
 }
 
+/// Embed `texts` one slice of at most `batch` texts at a time, appending only
+/// the vectors.
+///
+/// (kuriya 671) fastembed's `TextEmbedding::embed` runs every batch of its
+/// input first and keeps each batch's raw session outputs (the token-level
+/// hidden states, about 2 MiB per 512-token chunk for BGE-M3) until the last
+/// one is done, and only then pools them into vectors. Handing it one slice per
+/// call lets those outputs go after each slice, so the memory no longer grows
+/// with the number of chunks in a document.
+fn embed_in_slices(
+    texts: &[&str],
+    batch: usize,
+    mut embed_slice: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut embeddings = Vec::with_capacity(texts.len());
+    for slice in texts.chunks(batch.max(1)) {
+        let vectors = embed_slice(slice)?;
+        anyhow::ensure!(
+            vectors.len() == slice.len(),
+            "embedding returned {} vectors for {} texts",
+            vectors.len(),
+            slice.len()
+        );
+        embeddings.extend(vectors);
+    }
+    Ok(embeddings)
+}
+
 impl EmbeddingProvider for FastEmbedProvider {
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.model.embed(texts, Some(self.choice.batch_size()))
+        let batch = self.choice.batch_size();
+        let model = &mut self.model;
+        embed_in_slices(texts, batch, |slice| model.embed(slice, Some(batch)))
     }
 
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -2841,6 +2872,96 @@ mod tests {
             "BGE-M3 batch must be smaller than BGE-small-en-v1.5 batch"
         );
         assert!(ModelChoice::BgeM3.batch_size() > 0);
+    }
+
+    #[test]
+    fn bge_m3_batch_size_is_eight() {
+        // (kuriya 671) ONNX Runtime's activations grow with the batch: 32 x 512 tokens took
+        // BGE-M3 from about 3 GB to about 5 GB of private bytes, 8 peaked near 2.5 GB at
+        // about the same time per chunk.
+        assert_eq!(ModelChoice::BgeM3.batch_size(), 8);
+        assert_eq!(ModelChoice::BgeSmallEnV15.batch_size(), 256);
+    }
+
+    /// Runs [`embed_in_slices`] over `n` numbered texts and returns the vectors and the
+    /// length of every slice it handed to the model, in order.
+    fn run_embed_in_slices(n: usize, batch: usize) -> (Vec<Vec<f32>>, Vec<usize>) {
+        let texts: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&refs, batch, |slice| {
+            calls.push(slice.len());
+            Ok(slice
+                .iter()
+                .map(|t| vec![t.parse::<f32>().expect("numbered text")])
+                .collect())
+        })
+        .expect("embed in slices");
+        (vectors, calls)
+    }
+
+    #[test]
+    fn embed_in_slices_with_no_texts_calls_nothing() {
+        let (vectors, calls) = run_embed_in_slices(0, 8);
+        assert!(vectors.is_empty());
+        assert!(calls.is_empty(), "no model call for no input: {calls:?}");
+    }
+
+    #[test]
+    fn embed_in_slices_below_one_batch_is_one_call() {
+        let (vectors, calls) = run_embed_in_slices(3, 8);
+        assert_eq!(calls, vec![3]);
+        assert_eq!(vectors, vec![vec![0.0], vec![1.0], vec![2.0]]);
+    }
+
+    #[test]
+    fn embed_in_slices_exactly_one_batch_is_one_call() {
+        let (vectors, calls) = run_embed_in_slices(8, 8);
+        assert_eq!(calls, vec![8]);
+        assert_eq!(vectors.len(), 8);
+    }
+
+    #[test]
+    fn embed_in_slices_one_past_a_batch_is_two_calls_in_order() {
+        let (vectors, calls) = run_embed_in_slices(9, 8);
+        assert_eq!(calls, vec![8, 1]);
+        let expected: Vec<Vec<f32>> = (0..9).map(|i| vec![i as f32]).collect();
+        assert_eq!(vectors, expected);
+    }
+
+    #[test]
+    fn embed_in_slices_many_batches_keep_order() {
+        let (vectors, calls) = run_embed_in_slices(100, 8);
+        assert_eq!(calls, [vec![8; 12], vec![4]].concat());
+        let expected: Vec<Vec<f32>> = (0..100).map(|i| vec![i as f32]).collect();
+        assert_eq!(vectors, expected);
+    }
+
+    #[test]
+    fn embed_in_slices_stops_at_the_first_failing_slice() {
+        let texts = ["a", "b", "c", "d", "e"];
+        let mut calls = 0;
+        let err = embed_in_slices(&texts, 2, |slice| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("second slice refused");
+            }
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect_err("second slice fails");
+        assert_eq!(calls, 2, "no call after the failing slice");
+        assert!(err.to_string().contains("second slice refused"), "{err}");
+    }
+
+    #[test]
+    fn embed_in_slices_rejects_a_slice_that_returns_the_wrong_count() {
+        let texts = ["a", "b", "c"];
+        let err = embed_in_slices(&texts, 2, |_| Ok(vec![vec![0.0]]))
+            .expect_err("one vector for two texts");
+        assert!(
+            err.to_string().contains("returned 1 vectors for 2 texts"),
+            "{err}"
+        );
     }
 
     #[test]
