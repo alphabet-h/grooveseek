@@ -12442,7 +12442,11 @@ mod tests {
         );
 
         stop_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop did not end within 5 s of the stop signal")
+            .expect("the loop task panicked")
+            .expect("the loop ended with an error");
     }
 
     // -----------------------------------------------------------------------
