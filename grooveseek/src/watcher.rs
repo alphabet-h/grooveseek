@@ -171,7 +171,8 @@ impl WatcherState {
 pub struct WatchBatchProbe {
     /// Batches the debouncer handed over, counted before the channel send
     /// whatever it returned (a batch sent after the loop stopped finds the
-    /// channel closed and is still counted).
+    /// channel closed and is still counted). A batch of nothing but `Access`
+    /// events is neither sent nor counted (kuriya 741).
     pub emitted: AtomicU64,
     /// Batches the event loop took off the channel.
     pub started: AtomicU64,
@@ -270,7 +271,13 @@ pub async fn run_watch_loop_until(
                     debounce,
                     None,
                     move |res: notify_debouncer_full::DebounceEventResult| match res {
-                        Ok(events) => {
+                        Ok(mut events) => {
+                            // (kuriya 741) Access events go before anything is
+                            // counted or sent: an all-Access batch is neither,
+                            // so the watcher's own reads cannot fill the channel.
+                            if !drop_access_events(&mut events) {
+                                return;
+                            }
                             // F-36: bounded channel なので送信は try_send
                             // (debouncer callback は std thread = blocking_send
                             // が呼べないため)。Full は handle_events 側の
@@ -536,11 +543,27 @@ impl<W: notify::Watcher> notify::Watcher for StaleCreateFilter<W> {
     }
 }
 
+/// Take the `Access` events out of a debounced batch; returns whether any
+/// event is left to send.
+///
+/// (kuriya 741) Linux's inotify backend reports every open, and every close
+/// after a write, as `Access`, so the watcher's own reads during a rename
+/// (one per moved file) came back as batches of nothing but `Access`. They
+/// piled up in the bounded channel while the loop was busy, and once it was
+/// full the batches with real writes were dropped with them. `Access` changes
+/// nothing in the index ([`classify`] ignores it), so it is dropped at the
+/// debouncer callback, before the batch is counted or sent.
+fn drop_access_events(events: &mut Vec<DebouncedEvent>) -> bool {
+    events.retain(|evt| !matches!(evt.event.kind, EventKind::Access(_)));
+    !events.is_empty()
+}
+
 /// 単一 event を以下のどれかに分類する (evaluator High #1 対応):
 /// - Rename (from, to): notify-debouncer-full が paths.len()==2 で渡してきたペア
 /// - Reindex: Create / Data/Metadata/Any/Other Modify (Name は除外)
 /// - Deindex: Remove / Name(From) のみの 1-path 版
-/// - Ignore: Access / Other 種別
+/// - Ignore: Access / Other 種別。Access は debouncer の callback で
+///   `drop_access_events` が先に落とすので、ここに来るのは防御 (kuriya 741)
 ///
 /// 1 パスを同じ batch 内で「reindex も rename も」両方ディスパッチすると、
 /// rename-to のパスに対して upsert + その後の path UPDATE で UNIQUE 制約違反が
@@ -12258,6 +12281,151 @@ mod tests {
             "no batch counted within 10 s of a write after the stop (emitted {before})"
         );
         assert_eq!(probe.started.load(SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // (kuriya 741) Access events are dropped before the channel
+    // -----------------------------------------------------------------------
+
+    fn i741_access_kinds() -> Vec<EventKind> {
+        use notify_debouncer_full::notify::event::{AccessKind, AccessMode};
+        vec![
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Other),
+        ]
+    }
+
+    /// A batch of nothing but `Access` events is emptied, and the callback is
+    /// told there is nothing to send.
+    #[test]
+    fn i741_an_all_access_batch_is_left_empty_and_not_sent() {
+        let mut events: Vec<DebouncedEvent> = i741_access_kinds()
+            .into_iter()
+            .map(|k| mk_evt(k, vec![PathBuf::from("/tmp/a.md")]))
+            .collect();
+        assert!(!drop_access_events(&mut events), "{events:?}");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// Each `Access` kind is dropped on its own.
+    #[test]
+    fn i741_every_access_kind_is_dropped() {
+        for kind in i741_access_kinds() {
+            let mut events = vec![mk_evt(kind, vec![PathBuf::from("/tmp/a.md")])];
+            assert!(!drop_access_events(&mut events), "{kind:?}: {events:?}");
+            assert!(events.is_empty(), "{kind:?}: {events:?}");
+        }
+    }
+
+    /// In a mixed batch only the `Access` events go; the rest stay, in order.
+    #[test]
+    fn i741_a_mixed_batch_keeps_the_non_access_events_in_order() {
+        use notify_debouncer_full::notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, RemoveKind,
+        };
+        let mut events = vec![
+            mk_evt(
+                EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                vec![PathBuf::from("/tmp/a.md")],
+            ),
+            mk_evt(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                vec![PathBuf::from("/tmp/a.md")],
+            ),
+            mk_evt(
+                EventKind::Access(AccessKind::Close(AccessMode::Write)),
+                vec![PathBuf::from("/tmp/a.md")],
+            ),
+            mk_evt(
+                EventKind::Create(CreateKind::File),
+                vec![PathBuf::from("/tmp/b.md")],
+            ),
+            mk_evt(
+                EventKind::Remove(RemoveKind::File),
+                vec![PathBuf::from("/tmp/c.md")],
+            ),
+            mk_evt(EventKind::Any, vec![PathBuf::from("/tmp/d.md")]),
+        ];
+        assert!(drop_access_events(&mut events), "{events:?}");
+        let kinds: Vec<EventKind> = events.iter().map(|e| e.event.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                EventKind::Create(CreateKind::File),
+                EventKind::Remove(RemoveKind::File),
+                EventKind::Any,
+            ]
+        );
+    }
+
+    /// A batch with no `Access` event is left as it is.
+    #[test]
+    fn i741_a_batch_without_access_is_untouched() {
+        use notify_debouncer_full::notify::event::DataChange;
+        let mut events = vec![mk_evt(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            vec![PathBuf::from("/tmp/a.md")],
+        )];
+        assert!(drop_access_events(&mut events));
+        assert_eq!(events.len(), 1);
+    }
+
+    /// (kuriya 741) On Linux inotify reports an open as `Access(Open)`; reading
+    /// files in the kb must not make the debouncer callback count (or send) a
+    /// batch. Before the fix every read turned into a batch of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn i741_reading_files_in_the_kb_emits_no_batch() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let kb = i549_kb("groove-watcher-i741-reads");
+        for i in 0..20 {
+            std::fs::write(kb.0.join(format!("r{i}.md")), format!("# r{i}\n\nbody\n")).unwrap();
+        }
+        let (state, probe, armed) = probed_state(&kb.0);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_watch_loop_until(state, stop_rx));
+        assert!(
+            poll_until(Duration::from_secs(10), || armed.load(SeqCst)).await,
+            "the watch was not registered within 10 s"
+        );
+        // Let anything the registration itself raised pass: no change to
+        // `emitted` for 500 ms, five times the 100 ms window.
+        let mut seen = probe.emitted.load(SeqCst);
+        let mut quiet = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = probe.emitted.load(SeqCst);
+            if now == seen {
+                quiet = true;
+                break;
+            }
+            seen = now;
+        }
+        assert!(quiet, "the watcher did not go quiet within 10 s: {probe:?}");
+
+        for _ in 0..5 {
+            for i in 0..20 {
+                let _ = std::fs::read_to_string(kb.0.join(format!("r{i}.md"))).unwrap();
+            }
+            let _ = std::fs::read_to_string(kb.0.join("doc.md")).unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        // The window and its tick, with room to spare.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            probe.emitted.load(SeqCst),
+            seen,
+            "reads in the kb were counted as batches: {probe:?}"
+        );
+
+        stop_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     // -----------------------------------------------------------------------
