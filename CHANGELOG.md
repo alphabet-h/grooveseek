@@ -17,6 +17,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Fixed
 
 - **Indexing with BGE-M3 uses about half the memory.** The FastEmbed batch for `bge-m3` is now 8 texts instead of 32, and groove hands FastEmbed one batch at a time instead of a document's whole chunk list, so the token-level outputs FastEmbed keeps until a call ends no longer pile up with the length of a document. Indexing a 100-chunk Markdown file with `groove index --model bge-m3 --force` peaked at about 2.4 GB of private bytes instead of about 5 GB on Windows, in about the same time. `bge-small-en-v1.5` keeps its batch of 256 (kuriya 671).
+- **On Linux the watcher no longer drops real changes while it reads files.** The inotify backend reports every open, and every close after a write, as an access event, so the files the watcher itself read (for example, one per moved file while following a directory rename) came back as batches of nothing but access events. They filled the watcher's 64-batch queue while it was busy, and once it was full, batches carrying real writes were dropped with a `event channel full` warning. Access events change nothing in the index, so the watcher now drops them as they arrive and never queues a batch made only of them. Windows and macOS do not report reads, so they were not affected (kuriya 741).
 
 ### Documentation
 
