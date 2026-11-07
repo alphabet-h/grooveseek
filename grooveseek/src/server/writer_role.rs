@@ -1454,10 +1454,11 @@ mod tests {
         let held = DbHolder::hold(Arc::clone(&ts.shared.db));
         let waits_before = probe.lock_waits.load(SeqCst);
         (case.trigger)(&ts.kb.kb);
-        // Not "a batch after `n0` is in flight": on Linux the write's
-        // `Access(Open)` can come as a batch of its own that takes no db and
-        // finishes ahead of the one that blocks. A rise in `lock_waits` says a
-        // batch has reached the held db.
+        // Not "a batch after `n0` is in flight": before kuriya 741, on Linux
+        // the write's `Access(Open)` could come as a batch of its own that took
+        // no db and finished ahead of the one that blocks. Such a batch is no
+        // longer sent; waiting on `lock_waits` is kept as the defensive form.
+        // A rise in `lock_waits` says a batch has reached the held db.
         let reached = eventually(WITHIN, || probe.lock_waits.load(SeqCst) > waits_before).await;
         assert!(
             reached,

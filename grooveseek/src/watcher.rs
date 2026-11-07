@@ -12221,9 +12221,11 @@ mod tests {
         let waits_before = probe.lock_waits.load(SeqCst);
 
         std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten mid batch\n").unwrap();
-        // Not "a batch is in flight": on Linux the write's `Access(Open)` can
-        // come as a batch of its own that takes no lock and finishes first.
-        // A rise in `lock_waits` says a batch has reached the held lock.
+        // Not "a batch is in flight": before kuriya 741, on Linux the write's
+        // `Access(Open)` could come as a batch of its own that took no lock and
+        // finished first. Such a batch is no longer sent, but waiting on
+        // `lock_waits` stays the safe form: a rise says a batch has reached
+        // the held lock.
         let reached = poll_until(Duration::from_secs(10), || {
             probe.lock_waits.load(SeqCst) > waits_before
         })
@@ -12422,6 +12424,21 @@ mod tests {
             probe.emitted.load(SeqCst),
             seen,
             "reads in the kb were counted as batches: {probe:?}"
+        );
+
+        // A filter that dropped more than `Access` would also keep `emitted`
+        // still. A real write must still be counted, taken and handled.
+        std::fs::write(kb.0.join("doc.md"), "# doc\n\nrewritten after the reads\n").unwrap();
+        let handled = poll_until(Duration::from_secs(10), || {
+            let emitted = probe.emitted.load(SeqCst);
+            emitted > seen
+                && probe.started.load(SeqCst) == emitted
+                && probe.finished.load(SeqCst) == emitted
+        })
+        .await;
+        assert!(
+            handled,
+            "a write after the reads was not counted and handled within 10 s (emitted before {seen}): {probe:?}"
         );
 
         stop_tx.send(true).unwrap();
