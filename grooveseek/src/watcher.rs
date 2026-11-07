@@ -563,7 +563,7 @@ fn drop_access_events(events: &mut Vec<DebouncedEvent>) -> bool {
 /// - Reindex: Create / Data/Metadata/Any/Other Modify (Name は除外)
 /// - Deindex: Remove / Name(From) のみの 1-path 版
 /// - Ignore: Access / Other 種別。Access は debouncer の callback で
-///   `drop_access_events` が先に落とすので、ここに来るのは防御 (kuriya 741)
+///   [`drop_access_events`] が先に落とすので、ここに来るのは防御 (kuriya 741)
 ///
 /// 1 パスを同じ batch 内で「reindex も rename も」両方ディスパッチすると、
 /// rename-to のパスに対して upsert + その後の path UPDATE で UNIQUE 制約違反が
