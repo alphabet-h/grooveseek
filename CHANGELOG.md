@@ -14,7 +14,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
-## [1.24.2] - 2026-11-08
+## [1.24.2] - 2026-11-09
 
 ### Fixed
 
