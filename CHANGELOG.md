@@ -14,10 +14,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.24.2] - 2026-11-08
+
 ### Fixed
 
 - **Indexing with BGE-M3 uses about half the memory.** The FastEmbed batch for `bge-m3` is now 8 texts instead of 32, and groove hands FastEmbed one batch at a time instead of a document's whole chunk list, so the token-level outputs FastEmbed keeps until a call ends no longer pile up with the length of a document. Indexing a 100-chunk Markdown file with `groove index --model bge-m3 --force` peaked at about 2.4 GB of private bytes instead of about 5 GB on Windows, in about the same time. `bge-small-en-v1.5` keeps its batch of 256 (kuriya 671).
 - **On Linux the watcher no longer drops real changes while it reads files.** The inotify backend reports every open, and every close after a write, as an access event, so the files the watcher itself read (for example, one per moved file while following a directory rename) came back as batches of nothing but access events. They filled the watcher's 64-batch queue while it was busy, and once it was full, batches carrying real writes were dropped with a `event channel full` warning. Access events change nothing in the index, so the watcher now drops them as they arrive and never queues a batch made only of them. Windows and macOS do not report reads, so they were not affected (kuriya 741).
+
+### Internal
+
+- The nightly `--include-ignored` run no longer picks up `a_second_name_would_drop_the_row_only_if_an_event_reached_the_watcher`, an `#[ignore]`d test of a known, by-design limit (no watcher event for a second name made outside the knowledge base) that had turned `ignored tests (ubuntu-latest)` red every night since 2026-10-28. A `KNOWN` skip list next to the big-model `SKIP` list applies on every leg (kuriya 569).
 
 ### Documentation
 
@@ -7028,7 +7034,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.24.1...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.24.2...HEAD
+[1.24.2]: https://github.com/alphabet-h/grooveseek/compare/v1.24.1...v1.24.2
 [1.24.1]: https://github.com/alphabet-h/grooveseek/compare/v1.24.0...v1.24.1
 [1.24.0]: https://github.com/alphabet-h/grooveseek/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/alphabet-h/grooveseek/compare/v1.22.0...v1.23.0
