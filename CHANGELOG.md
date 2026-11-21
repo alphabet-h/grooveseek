@@ -14,6 +14,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Internal
+
+- **The query loop in `groove tune`'s sweep walks `pre.queries` with `iter_mut().enumerate()` instead of an index.** Rust 1.100.0's clippy reports `clippy::needless_range_loop` on the old `for qi in 0..n_queries` loop, and CI installs `stable` unpinned, so the lint turned `-D warnings` into a failure on code nobody had touched. The loop still visits every query in order and writes the same diagnostics back to each one; no behaviour changed.
+
 ## [1.24.2] - 2026-11-09
 
 ### Fixed

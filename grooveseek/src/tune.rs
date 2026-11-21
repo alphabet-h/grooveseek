@@ -312,20 +312,17 @@ pub fn build_metric_table(
 
     let mut rows: Vec<Vec<crate::eval::QueryMetrics>> = Vec::with_capacity(pre.queries.len());
 
-    // 診断値 (bm25_sensitive / rrf_ties) をループ内で `pre.queries[qi]` へ書き戻す
-    // ため、`pre.queries` を borrow したまま回さず index で回す。ループ先頭で
-    // 必要な入力だけ取り出しておく (`vec_ids` / `expected` は掃引中ずっと使う)。
+    // 診断値 (bm25_sensitive / rrf_ties) をループの末尾で `pq.diag` へ書き戻す
+    // ため、`pre.queries` は `iter_mut` で回す。ループ先頭で必要な入力だけ
+    // 取り出しておく (`vec_ids` / `expected` は掃引中ずっと使う)。
     let n_queries = pre.queries.len();
-    for qi in 0..n_queries {
-        let (qid, query_text, vec_ids, expected) = {
-            let pq = &pre.queries[qi];
-            (
-                pq.id.clone(),
-                pq.query.clone(),
-                pq.vec_ids.clone(),
-                pq.expected.clone(),
-            )
-        };
+    for (qi, pq) in pre.queries.iter_mut().enumerate() {
+        let (qid, query_text, vec_ids, expected) = (
+            pq.id.clone(),
+            pq.query.clone(),
+            pq.vec_ids.clone(),
+            pq.expected.clone(),
+        );
         eprintln!(
             "  [{}/{}] sweeping {} weight conditions for {}",
             qi + 1,
@@ -382,8 +379,8 @@ pub fn build_metric_table(
             (Some(a), Some(b)) => a != b,
             _ => false,
         };
-        pre.queries[qi].diag.bm25_sensitive = sensitive;
-        pre.queries[qi].diag.rrf_ties = ties_at_default;
+        pq.diag.bm25_sensitive = sensitive;
+        pq.diag.rrf_ties = ties_at_default;
     }
 
     Ok(MetricTable::from_rows(rows, k_values.to_vec()))
