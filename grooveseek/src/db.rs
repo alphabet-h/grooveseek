@@ -1351,8 +1351,10 @@ mod tests {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// `trace_v2` takes a plain `fn` pointer, so the sink has to be a static
-    /// thread-local rather than a captured closure.
+    /// The sink is a thread-local that a plain `fn` writes into. rusqlite 0.41's
+    /// `trace_v2` also accepts a `Send + 'static` closure, but a closure that
+    /// captured a buffer would need `Arc<Mutex<_>>`; SQLite calls the trace
+    /// callback on the thread that runs the statement, so a thread-local is enough.
     fn record_traced_sql(evt: rusqlite::trace::TraceEvent<'_>) {
         if let rusqlite::trace::TraceEvent::Stmt(_, sql) = evt {
             TRACED_SQL.with(|v| v.borrow_mut().push(sql.to_string()));
