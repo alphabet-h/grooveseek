@@ -313,8 +313,8 @@ impl FastEmbedModel for TextEmbedding {
 ///    single `[UNK]` token).
 /// 2. BGE-M3: a body with long runs of characters outside the vocabulary and no
 ///    space between them (Unigram's `fuse_unk` makes each run one `<unk>`).
-/// 3. Both models: a body whose first 262,144 characters are mostly spaces,
-///    line breaks or control characters.
+/// 3. Both models: a body whose first [`FASTEMBED_MAX_INPUT_CHARS`] characters
+///    are mostly spaces, line breaks or control characters.
 ///
 /// Such a vector is not recomputed when it changes: feature-69's reuse key is
 /// the text before the cut.
@@ -1577,20 +1577,107 @@ impl RerankerChoice {
     }
 }
 
+/// The context `r` is reranked with, or `None` when it has none worth
+/// prepending (absent, empty or only whitespace). The one place that picks
+/// the arm of [`contextualize_for_rerank`] and [`rerank_document_weight`].
+fn rerank_context(r: &SearchResult) -> Option<&str> {
+    match r.context_text.as_deref() {
+        Some(ctx) if !ctx.trim().is_empty() => Some(ctx),
+        _ => None,
+    }
+}
+
 /// reranker 入力用に context を前置する (feature-46)。context_text が空/None なら
 /// content のみ (off の DB / context なし chunk では従来と同一)。Anthropic 原典の
 /// 結合形 `f"{context}\n\n{chunk}"` に忠実。
+///
+/// The result is cut to [`FASTEMBED_MAX_INPUT_CHARS`] characters. The content
+/// is cut before it is joined, so a huge chunk is not copied whole on every
+/// search, and the joined string is then cut again to the same bound.
 fn contextualize_for_rerank(r: &SearchResult) -> String {
-    match r.context_text.as_deref() {
-        Some(ctx) if !ctx.trim().is_empty() => format!("{ctx}\n\n{}", r.content),
-        _ => r.content.clone(),
+    match rerank_context(r) {
+        Some(ctx) => {
+            let mut joined = format!(
+                "{ctx}\n\n{}",
+                truncate_to_chars(&r.content, FASTEMBED_MAX_INPUT_CHARS)
+            );
+            let keep = truncate_to_chars(&joined, FASTEMBED_MAX_INPUT_CHARS).len();
+            joined.truncate(keep);
+            joined
+        }
+        None => truncate_to_chars(&r.content, FASTEMBED_MAX_INPUT_CHARS).to_string(),
     }
+}
+
+/// The character count of [`contextualize_for_rerank`]`(r)`, worked out
+/// without building it: every count stops at [`FASTEMBED_MAX_INPUT_CHARS`], so
+/// a huge chunk is never walked to its end.
+fn rerank_document_weight(r: &SearchResult) -> usize {
+    let cap = FASTEMBED_MAX_INPUT_CHARS;
+    let content = r.content.chars().take(cap).count();
+    match rerank_context(r) {
+        Some(ctx) => (ctx.chars().take(cap).count() + 2 + content).min(cap),
+        None => content,
+    }
+}
+
+/// The most query-document pairs handed to one reranker call: fastembed's own
+/// batch for `rerank` with `batch_size = None`, so its batches inside a call
+/// break where they did before the calls were sliced.
+const RERANK_SLICE_MAX_ITEMS: usize = 256;
+
+/// The one call [`Reranker`] makes of its model: score `documents` against
+/// `query`, answering `(index into documents, score)` in any order. Behind a
+/// trait so the tests can check what reaches the model without loading one.
+trait RerankModel: Send + Sync {
+    fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>>;
+}
+
+impl RerankModel for TextRerank {
+    fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>> {
+        Ok(self
+            .rerank(query, documents, false, None)?
+            .into_iter()
+            .map(|r| (r.index, r.score))
+            .collect())
+    }
+}
+
+/// Load the fastembed reranker `model` from the model cache, downloading it on
+/// first use.
+fn load_text_rerank(model: RerankerModel) -> Result<TextRerank> {
+    TextRerank::try_new(
+        RerankInitOptions::new(model)
+            .with_cache_dir(resolve_cache_dir()?)
+            .with_show_download_progress(true),
+    )
 }
 
 /// Cross-encoder reranker。`search_hybrid` が返した候補を query との共同
 /// エンコードで再スコア付けし、上位 `limit` 件に絞る。
+///
+/// The query and every candidate ([`contextualize_for_rerank`]) are cut to
+/// [`FASTEMBED_MAX_INPUT_CHARS`] characters, on a character boundary, before
+/// they are tokenized. The reranker's tokenizer (bge-reranker-v2-m3's and the
+/// others') reads the query and the document as one pair and keeps far fewer
+/// tokens than that, so real text scores the same as without the cut. What can
+/// change is a pair the tokenizer turns into few tokens per character:
+///
+/// 1. A WordPiece tokenizer: runs of letters and digits longer than 100
+///    characters with no space or punctuation (each run becomes a single
+///    `[UNK]` token).
+/// 2. A Unigram tokenizer: long runs of characters outside the vocabulary
+///    with no space between them (`fuse_unk` makes each run one `<unk>`).
+/// 3. Any tokenizer: a query or candidate whose first
+///    [`FASTEMBED_MAX_INPUT_CHARS`] characters are mostly spaces, line breaks
+///    or control characters.
+///
+/// One call of the model gets at most [`RERANK_SLICE_MAX_ITEMS`] pairs and at
+/// most [`FASTEMBED_MAX_CHARS_PER_CALL`] characters, summed over the pairs with
+/// the query counted once per pair (fastembed tokenizes it with each
+/// document).
 pub struct Reranker {
-    model: TextRerank,
+    model: Box<dyn RerankModel>,
     #[allow(dead_code)] // choice は model_id ログ用に保持
     choice: RerankerChoice,
 }
@@ -1607,12 +1694,11 @@ impl Reranker {
             choice.model_id(),
             choice.approx_download_mb()
         );
-        let model = TextRerank::try_new(
-            RerankInitOptions::new(fm)
-                .with_cache_dir(resolve_cache_dir()?)
-                .with_show_download_progress(true),
-        )?;
-        Ok(Some(Self { model, choice }))
+        let model = load_text_rerank(fm)?;
+        Ok(Some(Self {
+            model: Box::new(model),
+            choice,
+        }))
     }
 
     /// `candidates` (chunk_id, [`crate::db::SearchResult`]) を cross-encoder でスコア付けし、
@@ -1644,25 +1730,50 @@ impl Reranker {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        // context 込みで rerank する (D-3)。&str 参照ベースだと合成文字列を保持できないので
-        // 一時 Vec<String> バッファを経由する。
-        let contextualized: Vec<String> = candidates
+        let query = truncate_to_chars(query, FASTEMBED_MAX_INPUT_CHARS);
+        // fastembed tokenizes the query with every document, so a pair weighs both.
+        let query_chars = query.chars().count();
+        let weights: Vec<usize> = candidates
             .iter()
-            .map(|(_, r)| contextualize_for_rerank(r))
+            .map(|(_, r)| query_chars + rerank_document_weight(r))
             .collect();
-        let documents: Vec<&str> = contextualized.iter().map(String::as_str).collect();
-        let rerank_results = self.model.rerank(query, documents, false, None)?;
 
-        // rerank_results は score 降順でソート済み。index は documents (= candidates) の位置。
-        let mut out: Vec<(i64, SearchResult)> = Vec::with_capacity(limit as usize);
-        for r in rerank_results.into_iter().take(limit as usize) {
-            let Some((id, mut row)) = candidates.get(r.index).cloned() else {
-                continue;
-            };
-            row.score = r.score;
-            out.push((id, row));
+        // (index into candidates, score) of every slice.
+        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(candidates.len());
+        for range in slice_bounds(
+            &weights,
+            RERANK_SLICE_MAX_ITEMS,
+            FASTEMBED_MAX_CHARS_PER_CALL,
+        ) {
+            // context 込みで rerank する (D-3)。合成文字列は slice ごとに作り、
+            // 呼び出しが返ったら捨てる。
+            let contextualized: Vec<String> = candidates[range.clone()]
+                .iter()
+                .map(|(_, r)| contextualize_for_rerank(r))
+                .collect();
+            let documents: Vec<&str> = contextualized.iter().map(String::as_str).collect();
+            for (i, score) in self.model.rerank_slice(query, &documents)? {
+                // An index past the slice is dropped before it is shifted, so it
+                // can neither become a neighbour's candidate nor take a place
+                // from `limit`.
+                if i < range.len() {
+                    scored.push((range.start + i, score));
+                }
+            }
         }
-        Ok(out)
+
+        // Score descending, ties in candidate order: what fastembed's stable
+        // sort over one call gives, kept across slices.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(scored
+            .into_iter()
+            .take(limit as usize)
+            .map(|(index, score)| {
+                let (id, mut row) = candidates[index].clone();
+                row.score = score;
+                (id, row)
+            })
+            .collect())
     }
 }
 
@@ -1720,7 +1831,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
     struct StubProvider;
@@ -3389,6 +3500,255 @@ mod tests {
     fn test_contextualize_for_rerank_empty_is_content_only() {
         let r = mk_with_context("body", Some(""));
         assert_eq!(contextualize_for_rerank(&r), "body");
+    }
+
+    #[test]
+    fn contextualize_for_rerank_cuts_after_joining() {
+        let content = "b".repeat(CAP + 1);
+        let joined = contextualize_for_rerank(&mk_with_context(&content, Some("T > H")));
+        assert_eq!(
+            joined,
+            truncate_to_chars(&format!("T > H\n\n{content}"), CAP)
+        );
+        assert_eq!(joined.chars().count(), CAP);
+        for ctx in [None, Some("   ")] {
+            let doc = contextualize_for_rerank(&mk_with_context(&content, ctx));
+            assert_eq!(doc.chars().count(), CAP, "{ctx:?}");
+            assert!(doc.chars().all(|c| c == 'b'), "{ctx:?}");
+        }
+    }
+
+    #[test]
+    fn contextualize_for_rerank_cuts_a_cjk_body_on_a_char_boundary() {
+        let content = "あ".repeat(CAP + 1);
+        let doc = contextualize_for_rerank(&mk_with_context(&content, Some("見出し")));
+        assert_eq!(doc.chars().count(), CAP);
+        assert_eq!(doc.chars().last(), Some('あ'));
+    }
+
+    #[test]
+    fn rerank_document_weight_is_the_length_of_what_is_sent() {
+        let ascii = "b".repeat(CAP + 1);
+        let kana = "あ".repeat(CAP + 1);
+        let rows = [
+            mk_with_context(&ascii, Some("T > H")),
+            mk_with_context(&ascii, None),
+            mk_with_context(&ascii, Some("   ")),
+            mk_with_context(&kana, Some("見出し")),
+            mk_with_context("body", Some("T > H")),
+            mk_with_context("body", None),
+            mk_with_context("body", Some("")),
+        ];
+        for r in &rows {
+            assert_eq!(
+                rerank_document_weight(r),
+                contextualize_for_rerank(r).chars().count(),
+                "{:?}",
+                r.context_text
+            );
+        }
+    }
+
+    /// What `FakeRerank` was handed, call by call: the query's character
+    /// count and every document. An alias because the nested type would trip
+    /// clippy's `type_complexity` (`all = deny`, also on test targets).
+    type RerankCalls = Arc<Mutex<Vec<(usize, Vec<String>)>>>;
+
+    /// A stand-in reranker model. Each document scores `score_of(doc)`; each
+    /// slice's results come back in descending index order (neither fastembed's
+    /// order nor ascending index order), so only an explicit index tie-break
+    /// puts equal scores in candidate order. With `bad_index`, every slice also
+    /// answers `(documents.len(), 99.0)`, an index past the slice.
+    struct FakeRerank {
+        calls: RerankCalls,
+        score_of: fn(&str) -> f32,
+        bad_index: bool,
+    }
+
+    impl RerankModel for FakeRerank {
+        fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>> {
+            self.calls.lock().expect("calls lock").push((
+                query.chars().count(),
+                documents.iter().map(|d| d.to_string()).collect(),
+            ));
+            let mut out: Vec<(usize, f32)> = documents
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(i, d)| (i, (self.score_of)(d)))
+                .collect();
+            if self.bad_index {
+                out.push((documents.len(), 99.0));
+            }
+            Ok(out)
+        }
+    }
+
+    fn fake_reranker(score_of: fn(&str) -> f32, bad_index: bool) -> (Reranker, RerankCalls) {
+        let calls: RerankCalls = Arc::new(Mutex::new(Vec::new()));
+        let model = FakeRerank {
+            calls: Arc::clone(&calls),
+            score_of,
+            bad_index,
+        };
+        let reranker = Reranker {
+            model: Box::new(model),
+            choice: RerankerChoice::BgeBase,
+        };
+        (reranker, calls)
+    }
+
+    /// How many documents each recorded call was given.
+    fn rerank_call_sizes(calls: &RerankCalls) -> Vec<usize> {
+        calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .map(|(_, docs)| docs.len())
+            .collect()
+    }
+
+    fn score_one(_: &str) -> f32 {
+        1.0
+    }
+
+    fn score_as_number(doc: &str) -> f32 {
+        doc.parse().expect("a numeric document")
+    }
+
+    /// `n` candidates with ids `0..n` and short contents `"0"`, `"1"`, ...
+    fn numbered_candidates(n: usize) -> Vec<(i64, SearchResult)> {
+        (0..n)
+            .map(|i| (i as i64, mk_with_context(&i.to_string(), None)))
+            .collect()
+    }
+
+    fn ids(out: &[(i64, SearchResult)]) -> Vec<i64> {
+        out.iter().map(|(id, _)| *id).collect()
+    }
+
+    #[test]
+    fn rerank_cuts_the_query_and_every_document_before_the_model() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let query = "q".repeat(CAP + 1);
+        let content = "b".repeat(CAP + 1);
+        let with_ctx = mk_with_context(&content, Some("T > H"));
+        let candidates = vec![
+            (1, with_ctx.clone()),
+            (2, mk_with_context(&content, None)),
+            (3, mk_with_context(&content, Some("   "))),
+        ];
+        let out = reranker
+            .rerank_candidates_with_ids(&query, candidates, 10)
+            .expect("rerank");
+        assert_eq!(out.len(), 3);
+        let calls = calls.lock().expect("calls lock");
+        assert!(!calls.is_empty());
+        for (query_chars, docs) in calls.iter() {
+            assert!(*query_chars <= CAP, "{query_chars}");
+            assert!(docs.iter().all(|d| d.chars().count() <= CAP));
+            let total: usize = docs.iter().map(|d| query_chars + d.chars().count()).sum();
+            assert!(total <= CALL, "{total}");
+        }
+        let sent: Vec<&String> = calls.iter().flat_map(|(_, docs)| docs).collect();
+        assert_eq!(sent[0], &contextualize_for_rerank(&with_ctx));
+    }
+
+    #[test]
+    fn rerank_counts_the_query_once_per_pair() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let query = "q".repeat(CAP);
+        let candidates: Vec<(i64, SearchResult)> = (0..10)
+            .map(|i| (i, mk_with_context(&"d".repeat(10), None)))
+            .collect();
+        reranker
+            .rerank_candidates_with_ids(&query, candidates, 10)
+            .expect("rerank");
+        // A pair weighs CAP + 10: 7 × (CAP + 10) <= 8 × CAP < 8 × (CAP + 10).
+        assert_eq!(rerank_call_sizes(&calls), vec![7, 3]);
+    }
+
+    #[test]
+    fn rerank_counts_the_query_after_cutting_it() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let query = "q".repeat(10 * CAP);
+        let candidates: Vec<(i64, SearchResult)> = (0..10)
+            .map(|i| (i, mk_with_context(&"d".repeat(10), None)))
+            .collect();
+        reranker
+            .rerank_candidates_with_ids(&query, candidates, 10)
+            .expect("rerank");
+        // Counted before the cut, one pair alone would weigh over CALL: [1; 10].
+        assert_eq!(rerank_call_sizes(&calls), vec![7, 3]);
+    }
+
+    #[test]
+    fn rerank_splits_at_256_candidates_and_keeps_ties_in_candidate_order() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let out = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 300)
+            .expect("rerank");
+        assert_eq!(rerank_call_sizes(&calls), vec![256, 44]);
+        assert_eq!(ids(&out), (0..300).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn rerank_takes_the_top_across_slices() {
+        let (mut reranker, _calls) = fake_reranker(score_as_number, false);
+        let out = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 5)
+            .expect("rerank");
+        assert_eq!(ids(&out), vec![299, 298, 297, 296, 295]);
+        for (id, row) in &out {
+            assert_eq!(row.score, *id as f32);
+        }
+        let all = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 1000)
+            .expect("rerank");
+        assert_eq!(all.len(), 300);
+    }
+
+    #[test]
+    fn rerank_drops_an_index_past_its_slice() {
+        let (mut reranker, calls) = fake_reranker(score_one, true);
+        let out = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 1000)
+            .expect("rerank");
+        assert_eq!(out.len(), 300);
+        let mut seen = ids(&out);
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 300);
+
+        // The out-of-range results (score 99) outrank every real one, so a
+        // `limit` counted before they are dropped would lose two of its five.
+        assert!(score_one("0") < 99.0);
+        let top = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 5)
+            .expect("rerank");
+        assert_eq!(rerank_call_sizes(&calls), vec![256, 44, 256, 44]);
+        assert_eq!(top.len(), 5);
+        assert!(top.iter().all(|(id, _)| (0..300).contains(id)));
+    }
+
+    #[test]
+    fn rerank_with_an_empty_query_keeps_every_candidate() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let out = reranker
+            .rerank_candidates_with_ids("", numbered_candidates(3), 10)
+            .expect("rerank");
+        assert_eq!(out.len(), 3);
+        assert_eq!(rerank_call_sizes(&calls), vec![3]);
+    }
+
+    #[test]
+    fn rerank_of_no_candidates_calls_nothing() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let out = reranker
+            .rerank_candidates_with_ids("q", Vec::new(), 10)
+            .expect("rerank");
+        assert!(out.is_empty());
+        assert!(rerank_call_sizes(&calls).is_empty());
     }
 
     #[test]
