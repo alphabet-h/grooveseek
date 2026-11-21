@@ -213,10 +213,11 @@ enabled = ["md"]
 # or "unlimited". 0 is an error that points at "unlimited". A file over a raw
 # cap is skipped with a warning. A value above the default is announced once
 # with a warning: a file being indexed is held in memory whole (as several
-# copies of its text: on Windows each extra byte of a text file took about 9
-# more bytes of committed memory, so a 1 GiB text file needs about 9 GB more
-# than a 50 MiB one), and an allocation failure
-# aborts the process rather than skipping the file.
+# copies of its text: on Windows each extra byte of a text file cost about 9
+# more bytes of committed memory, so a 1 GiB text file would need about 9 GB
+# more than a 50 MiB one, estimated from runs on 50 MiB and 128 MiB of English
+# text; 1 GiB was not measured), and an allocation failure aborts the process
+# rather than skipping the file.
 # max_decompressed_size also caps the text an .xlsx yields when it is indexed
 # (v1.23.0+), as it does a PDF's; a workbook past it is skipped. .xlsx
 # extraction stops after 120 s like PDF's (v1.23.0+), checked as entries are

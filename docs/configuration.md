@@ -125,19 +125,20 @@ max_chunk_chars = 3500
 # to several times the file, and raising the file cap alone keeps the zip-bomb
 # check in place. A value above the default is announced once with a warning:
 # a file is held in memory whole while it is indexed (as several copies of its
-# text: on Windows each extra byte of a text file took about 9 more bytes of
-# committed memory, so a 1 GiB text file needs about 9 GB more than a 50 MiB
-# one), an allocation failure aborts the process
-# instead of skipping the file, and PDF and .xlsx (v1.23.0+) extraction still
-# stop after 120 s (for .xlsx, checked while its entries are inflated, while
-# its sheets are matched to their parts, and at each cell and sheet; opening
-# the archive, calamine opening the workbook or reading one cell is not
-# interrupted, and only the decompression budget bounds them). "unlimited" for
+# text: on Windows each extra byte of a text file cost about 9 more bytes of
+# committed memory, so a 1 GiB text file would need about 9 GB more than a
+# 50 MiB one, estimated from runs on 50 MiB and 128 MiB of English text; 1 GiB
+# was not measured), an allocation failure aborts the process instead of
+# skipping the file, and PDF and .xlsx (v1.23.0+) extraction still stop after
+# 120 s (for .xlsx, checked while its entries are inflated, while its sheets
+# are matched to their parts, and at each cell and sheet; opening the archive,
+# calamine opening the workbook or reading one cell is not interrupted, and
+# only the decompression budget bounds them). "unlimited" for
 # `max_decompressed_size` lifts that guard on purpose: the 120 s for .xlsx then
-# does not reach inside opening the archive and the workbook either. Lowering
-# a cap leaves documents already indexed in
-# place until `groove index --force` runs or the file shrinks under the cap;
-# an edit that leaves it over the cap keeps the old text searchable. Reads do
+# does not reach inside opening the archive and the workbook either. Lowering a
+# cap leaves documents already indexed in place until `groove index --force`
+# runs or the file shrinks under the cap; an edit that leaves it over the cap
+# keeps the old text searchable. Reads do
 # not follow: `get_document` and `resources/read` stop at 50 MiB for binary
 # formats and 1 MiB for text, so a document indexed past that is searchable
 # but carries no `uri`. Reads also parse with the built-in 50 MiB

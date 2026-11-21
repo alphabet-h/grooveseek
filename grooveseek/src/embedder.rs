@@ -341,12 +341,13 @@ impl FastEmbedProvider {
 }
 
 /// The most characters of one input handed to a fastembed model; the rest is
-/// cut off before tokenizing (spec R1-2). 256 Ki characters of real prose run
-/// well past the 512 tokens the models keep, so the cut leaves what they read alone.
+/// cut off before tokenizing (feature-70 spec R1-2). 256 Ki characters of real
+/// prose run well past the 512 tokens the models keep, so the cut leaves what
+/// they read alone.
 const FASTEMBED_MAX_INPUT_CHARS: usize = 256 * 1024;
 
 /// The most characters, summed over the inputs, handed to one fastembed call
-/// (spec R1-3). The tokenizer's memory for a call grows with the total
+/// (feature-70 spec R1-3). The tokenizer's memory for a call grows with the total
 /// characters it is given, not with the tokens the model keeps; eight inputs at
 /// [`FASTEMBED_MAX_INPUT_CHARS`] fit, so a reranker pair always does.
 const FASTEMBED_MAX_CHARS_PER_CALL: usize = 8 * FASTEMBED_MAX_INPUT_CHARS;
@@ -3359,7 +3360,8 @@ mod tests {
         assert_eq!(vectors.len(), 9);
     }
 
-    /// The WordPiece `max_input_chars_per_word` in BGE-small's tokenizer.json (spec R1-2).
+    /// The WordPiece `max_input_chars_per_word` in BGE-small's tokenizer.json
+    /// (feature-70 spec R1-2).
     const WORDPIECE_MAX_CHARS_PER_WORD: usize = 100;
 
     /// Deterministic English prose of exactly `chars` characters: about forty
@@ -3391,7 +3393,7 @@ mod tests {
         out
     }
 
-    /// The input cap must leave room for 512 tokens (P14 (a), spec R1-2):
+    /// The input cap must leave room for 512 tokens (feature-70 spec R1-2):
     /// BGE-small's WordPiece makes every word (split on whitespace and
     /// punctuation) at least one token and a word over 100 characters one
     /// `[UNK]`, so text of words of at most 100 characters with one-character
@@ -3816,8 +3818,8 @@ mod tests {
     }
 
     /// Held by the new tests below that load BGE-M3 or bge-reranker-v2-m3, so
-    /// they do not load the big models in one process at the same time (P19
-    /// (2)). The existing big-model tests do not take it: editing existing
+    /// they do not load the big models in one process at the same time. The
+    /// existing big-model tests do not take it: editing existing
     /// tests is not allowed. A cold cache's fight over the same blob lock is
     /// removed by the nightly Linux leg warming those models one test at a
     /// time before the suite. A poisoned lock is taken all the same, so one
@@ -3853,7 +3855,8 @@ mod tests {
         *state >> 33
     }
 
-    /// The input shapes of P17, 300,000 characters each, which must still
+    /// The input shapes checked against the real tokenizers, 300,000
+    /// characters each, which must still
     /// fill 512 tokens after the cut to [`FASTEMBED_MAX_INPUT_CHARS`].
     fn cut_inputs_that_fill_512_tokens() -> Vec<(&'static str, String)> {
         const N: usize = 300_000;
@@ -3928,7 +3931,7 @@ mod tests {
         ]
     }
 
-    /// Cut each input of P17 to [`FASTEMBED_MAX_INPUT_CHARS`] and check that
+    /// Cut each of those inputs to [`FASTEMBED_MAX_INPUT_CHARS`] and check that
     /// `encode` (returning the token count and the number of overflowing
     /// encodings) gives 512 tokens with an overflow; print the pathological
     /// inputs' counts.
@@ -4023,7 +4026,7 @@ mod tests {
         Ok(())
     }
 
-    /// T1-4b for BGE-small: the inputs of P17 still fill 512 tokens after the cut.
+    /// T1-4b for BGE-small: those inputs still fill 512 tokens after the cut.
     #[test]
     #[ignore] // requires model download (~130 MB)
     fn fastembed_cut_inputs_fill_512_tokens_bge_small() -> Result<()> {
