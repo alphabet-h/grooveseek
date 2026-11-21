@@ -82,7 +82,7 @@ RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `groove.toml` �
 
 ## Stage 2 — Reranker (任意, v0.1.0+)
 
-`--reranker` (または `groove.toml` の `reranker` キー) を設定すると、上位 RRF 候補を cross-encoder で再スコアして返す。`score` 列は RRF から reranker raw score に切り替わる。ファイル由来のモデルは `rerank_by_default` に従うが、**コマンドラインで明示したモデルはそのクエリで無条件に効く**。詳細は [usage.ja.md](usage.ja.md) の再ランクの節。
+`--reranker` (または `groove.toml` の `reranker` キー) を設定すると、上位 RRF 候補を cross-encoder で再スコアして返す。`score` 列は RRF から reranker raw score に切り替わる。ファイル由来のモデルは `rerank_by_default` に従うが、**コマンドラインで明示したモデルはそのクエリで無条件に効く**。詳細は [usage.ja.md](usage.ja.md) の再ランクの節。query と各候補は cross-encoder が tokenize する前に 262,144 文字で切り、候補は 256 組・合わせて 2 Mi 文字までずつ scoring する。実際の文章はその手前でモデルの 512 token に届く。
 
 **MMR が enabled なとき**は reranker に **より大きい候補プール** (`limit × 5`、最小 50) を流して多様性再ランクの操作余地を確保する。MMR off のときは reranker への入力 limit が `limit` (または reranker のみ on の場合は `limit × 5`、これは v0.7.0 以前の reranker overfetch を保つ) になる。Parent retriever は **プールを拡大しない** — 既に選択されたヒットに対する content-only 段なので、`--parent-retriever` 単独 on のとき reranker 負荷は変わらない。
 

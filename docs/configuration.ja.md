@@ -116,7 +116,8 @@ max_chunk_chars = 3500
 # workbook には `max_binary_file_size` と `max_decompressed_size` の両方が要る:
 # 中の XML はファイルの数倍に展開されるので、ファイル側の上限だけを上げても
 # zip-bomb の検査は残る。既定を超える値は 1 回だけ警告される: 索引中はファイルをま
-# るごとメモリに持ち、確保に失敗すると skip ではなく process が abort し、PDF と
+# るごとメモリに持ち (本文の写しが何本も生き、合わせてファイルの数倍になる)、確保に
+# 失敗すると skip ではなく process が abort し、PDF と
 # .xlsx (v1.23.0+) の抽出は上限に関係なく 120 秒で打ち切られる (.xlsx
 # で時間を見るのは entry の展開中、シートを part に対応付けている間、
 # セルごと・シートごと。アーカイブを開く処理、calamine が workbook を開く処理、1

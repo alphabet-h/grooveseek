@@ -14,6 +14,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Indexing a very large `.txt` (or any huge chunk) within the default `max_text_file_size` no longer runs out of memory in the tokenizer.** FastEmbed tokenized a whole chunk before cutting it to the model's 512 tokens, so one 50 MiB text file took a working set of about 5 GB and a larger one could abort the process. Inputs to the embedding model and the reranker are now cut to 262,144 characters before tokenizing, and one call to FastEmbed is given at most 2 Mi characters in all. Real text reaches 512 tokens long before that point, so it keeps the same vectors (up to floating-point noise where large inputs are now grouped into calls differently). A body can embed differently if it is made of long runs the tokenizer collapses into one unknown token (such as a hex dump with no spaces or punctuation), or if it is almost all whitespace or control characters. Raising `max_text_file_size` still costs memory: a file being indexed is held as several copies of its text, a few times its size in all (see the warning in `docs/configuration.md`) (kuriya 797).
+
 ## [1.24.2] - 2026-11-09
 
 ### Fixed
