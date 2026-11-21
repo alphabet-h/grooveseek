@@ -311,8 +311,51 @@ impl FastEmbedProvider {
     }
 }
 
-/// Embed `texts` one slice of at most `batch` texts at a time, appending only
-/// the vectors.
+/// The most characters of one input handed to a fastembed model; the rest is
+/// cut off before tokenizing (spec R1-2). 256 Ki characters of real prose run
+/// well past the 512 tokens the models keep, so the cut leaves what they read alone.
+const FASTEMBED_MAX_INPUT_CHARS: usize = 256 * 1024;
+
+/// The most characters, summed over the inputs, handed to one fastembed call
+/// (spec R1-3). The tokenizer's memory for a call grows with the total
+/// characters it is given, not with the tokens the model keeps; eight inputs at
+/// [`FASTEMBED_MAX_INPUT_CHARS`] fit, so a reranker pair always does.
+const FASTEMBED_MAX_CHARS_PER_CALL: usize = 8 * FASTEMBED_MAX_INPUT_CHARS;
+
+/// Where a list of inputs with these `weights` is cut into model calls: one
+/// greedy pass that closes the current slice when the next input would take
+/// it past `max_items.max(1)` inputs or past `max_weight` in summed weight. An
+/// input always joins an empty slice, so one weighing more than `max_weight`
+/// gets a slice of its own. The ranges cover `0..weights.len()` in order,
+/// without gaps, and none is empty.
+fn slice_bounds(
+    weights: &[usize],
+    max_items: usize,
+    max_weight: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let max_items = max_items.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut sum = 0usize;
+    for (i, &weight) in weights.iter().enumerate() {
+        let count = i - start;
+        if count > 0 && (count + 1 > max_items || sum.saturating_add(weight) > max_weight) {
+            ranges.push(start..i);
+            start = i;
+            sum = 0;
+        }
+        sum = sum.saturating_add(weight);
+    }
+    if start < weights.len() {
+        ranges.push(start..weights.len());
+    }
+    ranges
+}
+
+/// Embed `texts` one slice at a time, appending only the vectors. A slice holds
+/// at most `batch` texts and, beyond the count, at most
+/// [`FASTEMBED_MAX_CHARS_PER_CALL`] characters summed over its texts; where it
+/// is cut is [`slice_bounds`]'s call.
 ///
 /// (kuriya 671) fastembed's `TextEmbedding::embed` runs every batch of its
 /// input first and keeps each batch's raw session outputs (the token-level
@@ -325,8 +368,14 @@ fn embed_in_slices(
     batch: usize,
     mut embed_slice: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
 ) -> Result<Vec<Vec<f32>>> {
+    // Counting stops one past the bound: enough to tell that a text is over it.
+    let weights: Vec<usize> = texts
+        .iter()
+        .map(|t| t.chars().take(FASTEMBED_MAX_CHARS_PER_CALL + 1).count())
+        .collect();
     let mut embeddings = Vec::with_capacity(texts.len());
-    for slice in texts.chunks(batch.max(1)) {
+    for range in slice_bounds(&weights, batch, FASTEMBED_MAX_CHARS_PER_CALL) {
+        let slice = &texts[range];
         let vectors = embed_slice(slice)?;
         anyhow::ensure!(
             vectors.len() == slice.len(),
@@ -2961,6 +3010,160 @@ mod tests {
         assert!(
             err.to_string().contains("returned 1 vectors for 2 texts"),
             "{err}"
+        );
+    }
+
+    const CAP: usize = FASTEMBED_MAX_INPUT_CHARS;
+    const CALL: usize = FASTEMBED_MAX_CHARS_PER_CALL;
+
+    fn lens(r: &[std::ops::Range<usize>]) -> Vec<usize> {
+        r.iter().map(|r| r.len()).collect()
+    }
+
+    #[test]
+    fn slice_bounds_of_nothing_is_empty() {
+        assert!(slice_bounds(&[], 8, CALL).is_empty());
+    }
+
+    #[test]
+    fn slice_bounds_of_small_inputs_cuts_by_count_only() {
+        assert_eq!(
+            lens(&slice_bounds(&[1; 100], 8, CALL)),
+            [vec![8; 12], vec![4]].concat()
+        );
+        // A batch of 0 counts as 1, as `batch.max(1)` did before.
+        assert_eq!(lens(&slice_bounds(&[1; 3], 0, CALL)), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn slice_bounds_of_nine_full_inputs_is_eight_and_one() {
+        for batch in [8, 256] {
+            assert_eq!(
+                lens(&slice_bounds(&[CAP; 9], batch, CALL)),
+                vec![8, 1],
+                "batch {batch}"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_bounds_keeps_the_bge_m3_slices_of_today() {
+        // One greedy pass, not "group by characters first, then by count"
+        // (which would give 8, 2, 8, 2).
+        assert_eq!(
+            lens(&slice_bounds(&[200 * 1024; 20], 8, CALL)),
+            vec![8, 8, 4]
+        );
+    }
+
+    #[test]
+    fn slice_bounds_takes_an_input_of_exactly_the_cap_alone() {
+        assert_eq!(slice_bounds(&[CALL], 8, CALL), vec![0..1]);
+        assert_eq!(slice_bounds(&[CALL, 1], 8, CALL), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn slice_bounds_gives_an_oversized_input_a_slice_of_its_own() {
+        assert_eq!(
+            slice_bounds(&[1, CALL + 5, 1], 8, CALL),
+            vec![0..1, 1..2, 2..3]
+        );
+        assert_eq!(slice_bounds(&[CALL + 5], 8, CALL), vec![0..1]);
+    }
+
+    #[test]
+    fn slice_bounds_covers_every_input_in_order() {
+        let weights = [5, CALL, 3, CALL - 3, 4, 0, 0];
+        let ranges = slice_bounds(&weights, 2, CALL);
+        let mut next = 0;
+        for range in &ranges {
+            assert_eq!(range.start, next, "gap or overlap: {ranges:?}");
+            assert!(!range.is_empty(), "empty range: {ranges:?}");
+            assert!(range.len() <= 2, "too many items: {ranges:?}");
+            if range.len() >= 2 {
+                let sum: usize = weights[range.clone()].iter().sum();
+                assert!(sum <= CALL, "{range:?} weighs {sum}");
+            }
+            next = range.end;
+        }
+        assert_eq!(next, weights.len(), "not every input covered: {ranges:?}");
+    }
+
+    #[test]
+    fn embed_in_slices_also_cuts_by_characters() {
+        let text = "a".repeat(CAP);
+        let texts: Vec<&str> = vec![text.as_str(); 9];
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&texts, 256, |slice| {
+            calls.push(slice.len());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed in slices");
+        assert_eq!(calls, vec![8, 1]);
+        assert_eq!(vectors.len(), 9);
+    }
+
+    /// BGE-small の tokenizer.json の WordPiece `max_input_chars_per_word` (spec R1-2)。
+    const WORDPIECE_MAX_CHARS_PER_WORD: usize = 100;
+
+    /// Deterministic English prose of exactly `chars` characters: about forty
+    /// real words in a fixed cycle, joined by spaces, a sentence end every 12
+    /// words and a paragraph break every 80.
+    fn long_english_text(chars: usize) -> String {
+        const WORDS: [&str; 40] = [
+            "the", "index", "keeps", "every", "chunk", "of", "a", "document", "together", "with",
+            "its", "heading", "path", "so", "that", "search", "can", "return", "the", "section",
+            "where", "an", "answer", "lives", "and", "readers", "find", "context", "without",
+            "opening", "whole", "files", "while", "models", "turn", "text", "into", "vectors",
+            "for", "ranking",
+        ];
+        let mut out = String::with_capacity(chars + 16);
+        let mut n = 0usize;
+        while out.len() < chars {
+            out.push_str(WORDS[n % WORDS.len()]);
+            n += 1;
+            if n.is_multiple_of(80) {
+                out.push_str(".\n\n");
+            } else if n.is_multiple_of(12) {
+                out.push_str(". ");
+            } else {
+                out.push(' ');
+            }
+        }
+        // ASCII only, so a byte length is a character count.
+        out.truncate(chars);
+        out
+    }
+
+    /// The input cap must leave room for 512 tokens (P14 (a), spec R1-2):
+    /// BGE-small's WordPiece makes every word (split on whitespace and
+    /// punctuation) at least one token and a word over 100 characters one
+    /// `[UNK]`, so text of words of at most 100 characters with one-character
+    /// separators reaches 510 tokens (+ `[CLS]` `[SEP]`) within 510 × 101
+    /// characters. The constants are bound to `let`s before the asserts to keep
+    /// clippy's `assertions_on_constants` away, as in
+    /// `grooveseek/src/eval.rs:3462-3464`.
+    #[test]
+    fn fastembed_input_cap_is_long_enough_to_reach_512_tokens() {
+        let cap = FASTEMBED_MAX_INPUT_CHARS;
+        let call = FASTEMBED_MAX_CHARS_PER_CALL;
+        // The inequalities come before the `assert_eq!`s so that a change to a
+        // constant shows which bound it broke.
+        assert!(call >= 2 * cap, "{call} {cap}"); // one reranker pair always fits (spec R1-3)
+        assert!(cap >= 510 * (WORDPIECE_MAX_CHARS_PER_WORD + 1), "{cap}");
+        assert_eq!(cap, 262_144);
+        assert_eq!(call, 2_097_152);
+        let text = long_english_text(300_000);
+        assert_eq!(text.chars().count(), 300_000);
+        let head = truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS);
+        let pieces = head
+            .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+            .filter(|w| !w.is_empty())
+            .count();
+        assert!(pieces >= 510, "{pieces}");
+        assert!(
+            head.split_whitespace()
+                .all(|w| w.chars().count() <= WORDPIECE_MAX_CHARS_PER_WORD)
         );
     }
 
