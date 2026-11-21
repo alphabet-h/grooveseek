@@ -3553,7 +3553,7 @@ mod tests {
         }
     }
 
-    /// What `FakeRerank` was handed, call by call: the query's character
+    /// What [`FakeRerank`] was handed, call by call: the query's character
     /// count and every document. An alias because the nested type would trip
     /// clippy's `type_complexity` (`all = deny`, also on test targets).
     type RerankCalls = Arc<Mutex<Vec<(usize, Vec<String>)>>>;
