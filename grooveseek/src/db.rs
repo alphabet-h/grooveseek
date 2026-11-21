@@ -4789,7 +4789,7 @@ mod tests {
     /// これが崩れる (phrase ごとに 1 文発行する等) と初めて次数が変わる。
     #[test]
     fn fts_or_expansion_is_one_statement_over_the_union_of_its_phrases() {
-        let db = db_with_384();
+        let mut db = db_with_384();
         let doc_id = db
             .upsert_document("u.md", Some("u"), None, None, None, &[], None, "h", 0)
             .unwrap();
@@ -4829,10 +4829,12 @@ mod tests {
         // (codex review P2、PR #136)。rusqlite の `trace` を dev-dependency 側だけで
         // 有効にして、MATCH を含む文の数を直接数える。
         TRACED_SQL.with(|v| v.borrow_mut().clear());
-        db.conn.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(record_traced_sql),
-        );
+        db.conn
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_traced_sql),
+            )
+            .unwrap();
         let _ = db
             .search_fts_candidates(
                 &pathological_or_query(),
@@ -4842,7 +4844,11 @@ mod tests {
             )
             .unwrap();
         db.conn
-            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::empty(),
+                None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+            )
+            .unwrap();
         // SQLite は FTS5 の内部副問い合わせも trace に出すが、それらは `--` 前置
         // (subprogram 表記) で MATCH を含まないので、MATCH を含む文を数えれば
         // 呼び出し側が発行した本数と一致する。診断出力も同じ絞り込みを使う
@@ -6368,17 +6374,19 @@ mod tests {
     /// search, which opens no transaction and keeps its two statements.
     #[test]
     fn a_field_filtered_hybrid_search_runs_inside_one_transaction() {
-        let db = db_with_declared_fields();
+        let mut db = db_with_declared_fields();
         let active = field_map(&[("status", &["active"])]);
         let filtered = SearchFilters {
             fields: Some(&active),
             ..Default::default()
         };
         TRACED_SQL.with(|v| v.borrow_mut().clear());
-        db.conn.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(record_traced_sql),
-        );
+        db.conn
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_traced_sql),
+            )
+            .unwrap();
         let hits = db
             .search_hybrid(
                 "fieldfilter_unique_keyword",
@@ -6389,7 +6397,11 @@ mod tests {
             )
             .unwrap();
         db.conn
-            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::empty(),
+                None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+            )
+            .unwrap();
         assert_eq!(hits.len(), 1);
         let traced: Vec<String> = TRACED_SQL.with(|v| {
             v.borrow()
@@ -8628,7 +8640,7 @@ mod tests {
     ///
     /// Seeding happens before the hook goes on: what is counted is the search.
     fn groove_statements_for_search(chunks: i32, limit: u32) -> usize {
-        let db = db_with_384();
+        let mut db = db_with_384();
         let doc_id = db
             .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h", 0)
             .unwrap();
@@ -8647,10 +8659,12 @@ mod tests {
         }
 
         TRACED_SQL.with(|v| v.borrow_mut().clear());
-        db.conn.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(record_traced_sql),
-        );
+        db.conn
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_traced_sql),
+            )
+            .unwrap();
         let hits = db
             .search_hybrid(
                 "retrieval quality",
@@ -8661,7 +8675,11 @@ mod tests {
             )
             .unwrap();
         db.conn
-            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::empty(),
+                None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+            )
+            .unwrap();
 
         assert!(
             !hits.is_empty(),

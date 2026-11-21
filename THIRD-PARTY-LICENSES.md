@@ -48,7 +48,7 @@ SOFTWARE.
 
 ## Summary
 
-- Apache License 2.0 (Apache-2.0): 353
+- Apache License 2.0 (Apache-2.0): 354
 - MIT License (MIT): 141
 - ISC License (ISC): 24
 - Unicode License v3 (Unicode-3.0): 19
@@ -3378,6 +3378,7 @@ Used by:
 Used by:
 
 - bit_field 0.10.3 (https://github.com/phil-opp/rust-bit-field)
+- unicode-general-category 1.1.0 (https://github.com/yeslogic/unicode-general-category)
 - winapi 0.3.9 (https://github.com/retep998/winapi-rs)
 
 ```text
@@ -3615,7 +3616,7 @@ Used by:
 - no_std_io2 0.9.3 (https://github.com/wcampbell0x2a/no-std-io2)
 - once_cell_polyfill 1.70.2 (https://github.com/polyfill-rs/once_cell_polyfill)
 - openssl-macros 0.1.1
-- openssl 0.10.77 (https://github.com/rust-openssl/rust-openssl)
+- openssl 0.10.82 (https://github.com/rust-openssl/rust-openssl)
 - quick-error 2.0.1 (http://github.com/tailhook/quick-error)
 - serde_spanned 0.6.9 (https://github.com/toml-rs/toml)
 - serde_spanned 1.1.1 (https://github.com/toml-rs/toml)
@@ -7118,7 +7119,7 @@ limitations under the License.
 
 Used by:
 
-- hashlink 0.11.0 (https://github.com/kyren/hashlink)
+- hashlink 0.12.2 (https://github.com/djc/hashlink)
 
 ```text
                               Apache License
@@ -9360,8 +9361,8 @@ Used by:
 - raw-window-handle 0.6.2 (https://github.com/rust-windowing/raw-window-handle)
 - ref-cast-impl 1.0.25 (https://github.com/dtolnay/ref-cast)
 - ref-cast 1.0.25 (https://github.com/dtolnay/ref-cast)
-- rmcp-macros 3.1.2 (https://github.com/modelcontextprotocol/rust-sdk/)
-- rmcp 3.1.2 (https://github.com/modelcontextprotocol/rust-sdk/)
+- rmcp-macros 3.11.0 (https://github.com/modelcontextprotocol/rust-sdk/)
+- rmcp 3.11.0 (https://github.com/modelcontextprotocol/rust-sdk/)
 - rustversion 1.0.22 (https://github.com/dtolnay/rustversion)
 - ryu 1.0.23 (https://github.com/dtolnay/ryu)
 - saphyr-parser-bw 0.0.611 (https://github.com/bourumir-wyngs/saphyr)
@@ -11273,7 +11274,7 @@ fn is_meta_character(c: char) -> bool {
 
 Used by:
 
-- openssl-sys 0.9.113 (https://github.com/rust-openssl/rust-openssl)
+- openssl-sys 0.9.118 (https://github.com/rust-openssl/rust-openssl)
 
 ```text
 Copyright (c) 2014 Alex Crichton
@@ -11337,8 +11338,8 @@ THE SOFTWARE.
 
 Used by:
 
-- libsqlite3-sys 0.37.0 (https://github.com/rusqlite/rusqlite)
-- rusqlite 0.39.0 (https://github.com/rusqlite/rusqlite)
+- libsqlite3-sys 0.39.1 (https://github.com/rusqlite/rusqlite)
+- rusqlite 0.41.1 (https://github.com/rusqlite/rusqlite)
 
 ```text
 Copyright (c) 2014 The rusqlite developers
