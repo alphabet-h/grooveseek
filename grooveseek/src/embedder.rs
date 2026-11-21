@@ -289,8 +289,37 @@ trait EmbeddingProvider: Send {
     }
 }
 
-struct FastEmbedProvider {
-    model: TextEmbedding,
+/// The one call [`FastEmbedProvider`] makes of its model: embed `texts` with
+/// fastembed's own batch size `batch`. Behind a trait so the tests can check
+/// what reaches the model without loading one.
+trait FastEmbedModel: Send {
+    fn embed_batch(&mut self, texts: &[&str], batch: usize) -> Result<Vec<Vec<f32>>>;
+}
+
+impl FastEmbedModel for TextEmbedding {
+    fn embed_batch(&mut self, texts: &[&str], batch: usize) -> Result<Vec<Vec<f32>>> {
+        self.embed(texts, Some(batch))
+    }
+}
+
+/// A local fastembed model. Every document and query is cut to
+/// [`FASTEMBED_MAX_INPUT_CHARS`] characters, on a character boundary, before it
+/// is tokenized ([`embed_truncated`]). Real text reaches the 512 tokens the
+/// models keep long before that, so its vector is the same as without the cut.
+/// What can change is a text the tokenizer turns into few tokens per character:
+///
+/// 1. BGE-small: a body made of runs of letters and digits longer than 100
+///    characters with no space or punctuation (WordPiece turns each run into a
+///    single `[UNK]` token).
+/// 2. BGE-M3: a body with long runs of characters outside the vocabulary and no
+///    space between them (Unigram's `fuse_unk` makes each run one `<unk>`).
+/// 3. Both models: a body whose first 262,144 characters are mostly spaces,
+///    line breaks or control characters.
+///
+/// Such a vector is not recomputed when it changes: feature-69's reuse key is
+/// the text before the cut.
+struct FastEmbedProvider<M: FastEmbedModel = TextEmbedding> {
+    model: M,
     choice: ModelChoice,
 }
 
@@ -388,11 +417,26 @@ fn embed_in_slices(
     Ok(embeddings)
 }
 
-impl EmbeddingProvider for FastEmbedProvider {
+/// Cut each of `texts` to [`FASTEMBED_MAX_INPUT_CHARS`] characters
+/// ([`truncate_to_chars`]) and embed the result through [`embed_in_slices`],
+/// so a call is bounded by count and by total characters as well.
+fn embed_truncated(
+    texts: &[&str],
+    batch: usize,
+    embed_slice: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    let cut: Vec<&str> = texts
+        .iter()
+        .map(|t| truncate_to_chars(t, FASTEMBED_MAX_INPUT_CHARS))
+        .collect();
+    embed_in_slices(&cut, batch, embed_slice)
+}
+
+impl<M: FastEmbedModel> EmbeddingProvider for FastEmbedProvider<M> {
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let batch = self.choice.batch_size();
         let model = &mut self.model;
-        embed_in_slices(texts, batch, |slice| model.embed(slice, Some(batch)))
+        embed_truncated(texts, batch, |slice| model.embed_batch(slice, batch))
     }
 
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -3103,7 +3147,108 @@ mod tests {
         assert_eq!(vectors.len(), 9);
     }
 
-    /// BGE-small の tokenizer.json の WordPiece `max_input_chars_per_word` (spec R1-2)。
+    #[test]
+    fn embed_truncated_cuts_on_char_boundaries() {
+        let exact = "a".repeat(CAP);
+        let ascii = "a".repeat(CAP + 1);
+        let kana = "あ".repeat(CAP + 1);
+        let emoji = "😀".repeat(CAP + 1);
+        let texts: Vec<&str> = vec![&exact, &ascii, &kana, &emoji, ""];
+        let mut seen: Vec<String> = Vec::new();
+        let vectors = embed_truncated(&texts, 8, |slice| {
+            seen.extend(slice.iter().map(|t| t.to_string()));
+            Ok(slice
+                .iter()
+                .map(|t| vec![t.chars().count() as f32])
+                .collect())
+        })
+        .expect("embed truncated");
+        let counts: Vec<usize> = seen.iter().map(|t| t.chars().count()).collect();
+        assert_eq!(counts, vec![CAP, CAP, CAP, CAP, 0]);
+        assert_eq!(seen[0], exact);
+        assert_eq!(seen[2].len(), 3 * CAP);
+        assert!(seen[2].ends_with('あ'));
+        assert_eq!(seen[3].len(), 4 * CAP);
+        assert_eq!(seen[4], "");
+        let order: Vec<f32> = vectors.iter().map(|v| v[0]).collect();
+        assert_eq!(
+            order,
+            vec![CAP as f32, CAP as f32, CAP as f32, CAP as f32, 0.0]
+        );
+    }
+
+    #[test]
+    fn embed_truncated_leaves_short_inputs_alone() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let vectors = embed_truncated(&["hello", "world"], 8, |slice| {
+            calls.push(slice.iter().map(|t| t.to_string()).collect());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed truncated");
+        assert_eq!(calls, vec![vec!["hello".to_string(), "world".to_string()]]);
+        assert_eq!(vectors.len(), 2);
+    }
+
+    /// A stand-in model that records how many characters of each text it was
+    /// given, call by call, and returns `[chars as f32]` for each text.
+    struct RecordingModel {
+        seen: Vec<Vec<usize>>,
+    }
+
+    impl FastEmbedModel for RecordingModel {
+        fn embed_batch(&mut self, texts: &[&str], _batch: usize) -> Result<Vec<Vec<f32>>> {
+            let counts: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
+            let vectors = counts.iter().map(|&n| vec![n as f32]).collect();
+            self.seen.push(counts);
+            Ok(vectors)
+        }
+    }
+
+    fn recording_provider() -> FastEmbedProvider<RecordingModel> {
+        FastEmbedProvider {
+            model: RecordingModel { seen: vec![] },
+            choice: ModelChoice::BgeSmallEnV15,
+        }
+    }
+
+    #[test]
+    fn fastembed_provider_cuts_documents_before_the_model() {
+        let mut p = recording_provider();
+        let long = "x".repeat(CAP + 1);
+        let vectors = p
+            .embed_documents(&[&long, "short"])
+            .expect("embed documents");
+        assert_eq!(p.model.seen, vec![vec![CAP, 5]]);
+        assert_eq!(vectors.len(), 2);
+    }
+
+    #[test]
+    fn fastembed_provider_cuts_queries_before_the_model() {
+        let mut p = recording_provider();
+        let long = "x".repeat(CAP + 1);
+        p.embed_query(&long).expect("embed query");
+        p.embed_queries(&[&long, "q"]).expect("embed queries");
+        assert_eq!(p.model.seen, vec![vec![CAP], vec![CAP, 1]]);
+        assert!(p.model.seen.iter().flatten().all(|&n| n <= CAP));
+    }
+
+    #[test]
+    fn fastembed_provider_cuts_a_call_by_total_characters() {
+        let mut p = recording_provider();
+        let long = "x".repeat(CAP + 1);
+        let texts: Vec<&str> = vec![long.as_str(); 9];
+        let vectors = p.embed_documents(&texts).expect("embed documents");
+        assert_eq!(p.model.seen, vec![vec![CAP; 8], vec![CAP]]);
+        assert!(
+            p.model
+                .seen
+                .iter()
+                .all(|call| call.iter().sum::<usize>() <= CALL)
+        );
+        assert_eq!(vectors.len(), 9);
+    }
+
+    /// The WordPiece `max_input_chars_per_word` in BGE-small's tokenizer.json (spec R1-2).
     const WORDPIECE_MAX_CHARS_PER_WORD: usize = 100;
 
     /// Deterministic English prose of exactly `chars` characters: about forty
