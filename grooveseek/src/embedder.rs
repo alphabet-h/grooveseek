@@ -3804,6 +3804,318 @@ mod tests {
         assert_eq!(emb.len(), 1024);
     }
 
+    /// Cosine of two vectors, summed in f64; neither needs unit length.
+    fn cos(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
+        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        (dot / (norm(a) * norm(b))) as f32
+    }
+
+    /// Held by the new tests below that load BGE-M3 or bge-reranker-v2-m3, so
+    /// they do not load the big models in one process at the same time (P19
+    /// (2)). The existing big-model tests do not take it: editing existing
+    /// tests is not allowed. A cold cache's fight over the same blob lock is
+    /// removed by the nightly Linux leg warming those models one test at a
+    /// time before the suite. A poisoned lock is taken all the same, so one
+    /// failure does not fail the next test.
+    static BIG_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn big_model_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        BIG_MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Text of exactly `chars` characters made by appending `piece(0)`,
+    /// `piece(1)`, ... and cutting the end on a character boundary.
+    fn text_of_chars(chars: usize, mut piece: impl FnMut(usize) -> String) -> String {
+        let mut out = String::new();
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while count < chars {
+            let p = piece(i);
+            count += p.chars().count();
+            out.push_str(&p);
+            i += 1;
+        }
+        truncate_to_chars(&out, chars).to_string()
+    }
+
+    /// A linear congruential generator: the same sequence on every run.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// The input shapes of P17, 300,000 characters each, which must still
+    /// fill 512 tokens after the cut to [`FASTEMBED_MAX_INPUT_CHARS`].
+    fn cut_inputs_that_fill_512_tokens() -> Vec<(&'static str, String)> {
+        const N: usize = 300_000;
+        const JA: [&str; 5] = [
+            "索引は文書の各チャンクを見出しの経路と一緒に保持します。",
+            "検索は答えのある節を返すので、読み手はファイル全体を開かずに文脈を得られます。",
+            "モデルは文章をベクトルに変え、近いものから順に並べます。",
+            "設定ファイルを変えたら、索引を作り直してください。",
+            "日本語の本文は形態素ではなく文字の並びとして扱われます。",
+        ];
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+        const NAMES: [&str; 4] = ["alpha", "bravo", "charlie", "delta-long"];
+        let mut seed = 7u64;
+        let base64: String = (0..N)
+            .map(|_| B64[(lcg(&mut seed) % B64.len() as u64) as usize] as char)
+            .collect();
+        let mut seed = 11u64;
+        let hex_dump = text_of_chars(N, |i| {
+            let bytes: Vec<String> = (0..16)
+                .map(|_| format!("{:02x}", lcg(&mut seed) & 0xff))
+                .collect();
+            format!("{:08x}  {}\n", i * 16, bytes.join(" "))
+        });
+        vec![
+            ("english", long_english_text(N)),
+            (
+                "japanese",
+                text_of_chars(N, |i| JA[i % JA.len()].to_string()),
+            ),
+            ("base64", base64),
+            (
+                "minified js",
+                text_of_chars(N, |i| {
+                    format!(
+                        "function f{i}(a,b){{return a.map(function(x){{return x*b+{i}}})}}var r{i}=f{i}([1,2,3],4);if(r{i}.length>2){{console.log(r{i}.join(','))}};"
+                    )
+                }),
+            ),
+            (
+                "aligned table",
+                text_of_chars(N, |i| {
+                    format!(
+                        "| {:>6} | {:<12} | {:>10} |\n",
+                        i,
+                        NAMES[i % NAMES.len()],
+                        (i * 37) % 10_007
+                    )
+                }),
+            ),
+            ("hex dump", hex_dump),
+        ]
+    }
+
+    /// Inputs the cut may leave short of 512 tokens (the cases listed on
+    /// [`FastEmbedProvider`]): their token counts are printed, not asserted.
+    fn pathological_cut_inputs() -> Vec<(&'static str, String)> {
+        const N: usize = 300_000;
+        let mut seed = 13u64;
+        let hex: String = (0..N)
+            .map(|_| char::from_digit((lcg(&mut seed) % 16) as u32, 16).unwrap_or('0'))
+            .collect();
+        // 95% of the first FASTEMBED_MAX_INPUT_CHARS characters are spaces
+        // and NULs, prose after that.
+        let blank = FASTEMBED_MAX_INPUT_CHARS * 95 / 100;
+        let mut mostly_blank: String = (0..blank)
+            .map(|i| if i % 2 == 0 { ' ' } else { '\0' })
+            .collect();
+        mostly_blank.push_str(&long_english_text(N - blank));
+        vec![
+            ("hex without separators", hex),
+            ("mostly spaces and NULs", mostly_blank),
+        ]
+    }
+
+    /// Cut each input of P17 to [`FASTEMBED_MAX_INPUT_CHARS`] and check that
+    /// `encode` (returning the token count and the number of overflowing
+    /// encodings) gives 512 tokens with an overflow; print the pathological
+    /// inputs' counts.
+    fn check_cut_inputs_fill_512_tokens(model: &str, encode: impl Fn(&str) -> (usize, usize)) {
+        for (kind, text) in cut_inputs_that_fill_512_tokens() {
+            let (n, overflow) = encode(truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS));
+            println!("{model} {kind}: {n} tokens (overflow: {overflow})");
+            assert!(
+                n == 512 && overflow > 0,
+                "{model} {kind}: the cut input gave {n} tokens (overflow: {overflow}), not 512 with an overflow"
+            );
+        }
+        for (kind, text) in pathological_cut_inputs() {
+            let (n, overflow) = encode(truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS));
+            println!("{model} {kind}: {n} tokens (overflow: {overflow})");
+        }
+    }
+
+    /// T1-4: a 300,000-character text and its first 20,000 characters are both
+    /// cut at 512 tokens and embed alike, and a run of words inside those
+    /// tokens still changes the vector. The run is 25 words starting near the
+    /// 1,200th character rather than the single word of spec §11: one word is
+    /// not sure to move a CLS-pooled vector past the 0.9999 bound.
+    #[test]
+    #[ignore] // requires model download (~130 MB)
+    fn fastembed_cut_keeps_the_vector_of_real_text_bge_small() -> Result<()> {
+        let mut p = FastEmbedProvider::new(ModelChoice::BgeSmallEnV15)?;
+        let long = long_english_text(300_000);
+        let head = truncate_to_chars(&long, 20_000);
+        for (name, text) in [("long", long.as_str()), ("head", head)] {
+            let enc = p
+                .model
+                .tokenizer
+                .encode(truncate_to_chars(text, FASTEMBED_MAX_INPUT_CHARS), true)
+                .map_err(anyhow::Error::msg)?;
+            assert!(
+                enc.len() == 512 && !enc.get_overflowing().is_empty(),
+                "{name}: {} tokens, overflow {}",
+                enc.len(),
+                enc.get_overflowing().len()
+            );
+        }
+
+        // The words of `long` (it is ASCII, so byte offsets are char offsets).
+        let mut words = Vec::new();
+        let mut start = None;
+        for (i, c) in long.char_indices() {
+            match (c.is_ascii_alphabetic(), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    words.push(s..i);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        let first = words
+            .iter()
+            .position(|w| w.start >= 1_200)
+            .expect("a word after the 1,200th character");
+        let replaced = &words[first..first + 25];
+        assert!(replaced[0].start < 1_600, "{:?}", replaced[0]);
+        const OTHER: [&str; 5] = ["volcano", "glacier", "quartz", "harbour", "meadow"];
+        let mut changed = String::with_capacity(long.len() + 256);
+        let mut at = 0;
+        for (k, w) in replaced.iter().enumerate() {
+            changed.push_str(&long[at..w.start]);
+            changed.push_str(OTHER[k % OTHER.len()]);
+            at = w.end;
+        }
+        let end = changed.len();
+        changed.push_str(&long[at..]);
+        let before_end = p
+            .model
+            .tokenizer
+            .encode(&changed[..end], true)
+            .map_err(anyhow::Error::msg)?
+            .len();
+        assert!(
+            before_end < 510,
+            "the changed words run to token {before_end}, past the 512 kept"
+        );
+
+        let v = p.embed_documents(&[long.as_str(), head, changed.as_str()])?;
+        let same = cos(&v[0], &v[1]);
+        let differ = cos(&v[2], &v[0]);
+        println!(
+            "bge-small cos(long, head) = {same}, cos(changed, long) = {differ}, changed run ends at token {before_end}"
+        );
+        assert!(same >= 0.9999, "cos(long, head) = {same}");
+        assert!(differ < 0.9999, "cos(changed, long) = {differ}");
+        Ok(())
+    }
+
+    /// T1-4b for BGE-small: the inputs of P17 still fill 512 tokens after the cut.
+    #[test]
+    #[ignore] // requires model download (~130 MB)
+    fn fastembed_cut_inputs_fill_512_tokens_bge_small() -> Result<()> {
+        let p = FastEmbedProvider::new(ModelChoice::BgeSmallEnV15)?;
+        check_cut_inputs_fill_512_tokens("bge-small-en-v1.5", |s| {
+            let enc = p.model.tokenizer.encode(s, true).expect("encode");
+            (enc.len(), enc.get_overflowing().len())
+        });
+        Ok(())
+    }
+
+    /// T1-4b for BGE-M3. The nightly Windows and macOS legs skip this test
+    /// through the `SKIP` list in `.github/workflows/nightly.yml`; a skip
+    /// matches a substring and no existing entry contains this name, so it
+    /// needs a line of its own.
+    #[test]
+    #[ignore] // requires BGE-M3 download (~2.3 GB)
+    fn fastembed_cut_inputs_fill_512_tokens_bge_m3() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let p = FastEmbedProvider::new(ModelChoice::BgeM3)?;
+        check_cut_inputs_fill_512_tokens("bge-m3", |s| {
+            let enc = p.model.tokenizer.encode(s, true).expect("encode");
+            (enc.len(), enc.get_overflowing().len())
+        });
+        Ok(())
+    }
+
+    /// T1-4b for bge-reranker-v2-m3: a short query paired with cut English or
+    /// cut Japanese still fills 512 tokens. The nightly Windows and macOS legs
+    /// skip this test through the `SKIP` list in
+    /// `.github/workflows/nightly.yml`; a skip matches a substring and no
+    /// existing entry contains this name, so it needs a line of its own.
+    #[test]
+    #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
+    fn fastembed_cut_inputs_fill_512_tokens_reranker_bge_v2_m3() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let model = load_text_rerank(RerankerModel::BGERerankerV2M3)?;
+        let query = "where does the answer live?";
+        for (kind, text) in cut_inputs_that_fill_512_tokens()
+            .into_iter()
+            .filter(|(kind, _)| matches!(*kind, "english" | "japanese"))
+        {
+            let enc = model
+                .tokenizer
+                .encode(
+                    (query, truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS)),
+                    true,
+                )
+                .map_err(anyhow::Error::msg)?;
+            let (n, overflow) = (enc.len(), enc.get_overflowing().len());
+            println!("bge-reranker-v2-m3 {kind}: {n} tokens (overflow: {overflow})");
+            assert!(
+                n == 512 && overflow > 0,
+                "bge-reranker-v2-m3 {kind}: the cut pair gave {n} tokens (overflow: {overflow}), not 512 with an overflow"
+            );
+        }
+        Ok(())
+    }
+
+    /// T1-6: the reranker scores a 300,000-character candidate like its first
+    /// 20,000 characters, as both are cut to the same 512 tokens. The nightly
+    /// Windows and macOS legs skip this test through the `SKIP` list in
+    /// `.github/workflows/nightly.yml`; a skip matches a substring and no
+    /// existing entry contains this name, so it needs a line of its own.
+    #[test]
+    #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
+    fn reranker_scores_a_cut_candidate_like_its_head() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let mut r = Reranker::try_new(RerankerChoice::BgeV2M3)?.expect("reranker should be Some");
+        let long = long_english_text(300_000);
+        let head = truncate_to_chars(&long, 20_000);
+        let candidates = vec![
+            (1i64, mk_with_context(&long, None)),
+            (2i64, mk_with_context(head, None)),
+        ];
+        let out = r.rerank_candidates_with_ids("where does the answer live?", candidates, 2)?;
+        assert_eq!(out.len(), 2);
+        let score = |id: i64| {
+            out.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| s.score)
+                .expect("both candidates come back")
+        };
+        let (a, b) = (score(1), score(2));
+        println!("bge-reranker-v2-m3 score(long) = {a}, score(head) = {b}");
+        assert!(
+            (a - b).abs() <= 1e-3,
+            "score(long) = {a}, score(head) = {b}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn truncate_to_chars_cuts_on_a_char_boundary_and_leaves_short_text_alone() {
         let ascii = "x".repeat(9000);

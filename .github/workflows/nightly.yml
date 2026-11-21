@@ -150,8 +150,11 @@ jobs:
       # 追い出された夜に顕在化する (2026-07-26 の dry-run で ubuntu / windows
       # 双方とも再現)。1 プロセスだけに DL させてから本体を warm cache で回す。
       #
-      # BGE-M3 / reranker は lib test binary の中 (= 単一プロセス、別 blob) から
-      # しか触られないので、ここで温めるのは BGE-small だけでよい。
+      # BGE-M3 / reranker は lib の unit test と、integration test が spawn する
+      # groove (BGE-M3 の eval、reranker の search_cli) の両方が引く。feature-70
+      # から lib test binary の中で同じ blob を引く test が複数になったので、次の
+      # step で lib の 2 本を直列に流して温め、後段はどれも warm cache を読む。
+      # ここで温めるのは BGE-small だけ。
       #
       # retry する理由: 上流 (HuggingFace CDN) の一時障害で nightly が赤くなるのを
       # 防ぐため。2026-07-26 の実測では cold cache の run を短時間に繰り返したところ
@@ -176,6 +179,57 @@ jobs:
             fi
           done
           echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
+
+      # BGE-M3 / reranker も本体より前に 1 本ずつ温める (feature-70)。lib test
+      # binary の中で同じ blob を引く test が複数あり (下で流す既存の test と
+      # feature-70 の test)、cold cache の時に libtest の並列で同じ blob の
+      # lock を同じプロセスの別 thread が取り合う。hf-hub の lock は flock を
+      # 1 秒おきに 5 回試すだけなので、2.3 GB の DL 中の相手には負けて
+      # LockAcquisition で落ちる。既存の test を編集せずに流して cache を
+      # 温める。features は本体の step とそろえ、lib の test binary を作り
+      # 直させない。retry の理由は上の step と同じ。
+      #
+      # この step が赤にするのはモデルを load できなかった時だけ。2 本とも
+      # 走り終え (`... ok` か `... FAILED` の行がある)、load の失敗
+      # (`failed to load <name>: `、両 test の expect の文がコロンまで。stdout
+      # の log だけを見る) が無ければ cache は温まって
+      # いるので、assert の失敗は warning にして先へ進め、本体の step で
+      # 他の test と並べて赤にする。ここで止めると本体が走らず、その夜の
+      # ignored test の結果がすべて消える (reranker の test は、rerank の
+      # 結果の index の写しを実物の並びで確かめる唯一の lib の test)。
+      #
+      # stdout と stderr は別の file に取る。libtest は `test X ... ` を書いて
+      # から test を走らせ、終わってから `ok` を書くので、その間に stderr へ
+      # 直接書かれた文が混ざると行の regex に当たらなくなる。panic の文は
+      # libtest が capture して stdout の failures 節に出す。stderr には
+      # cargo / rustc の build の出力も入り、warning はソースの行を抜き出す
+      # ので、load の失敗の grep は stderr に当てない。
+      - name: Pre-warm BGE-M3 and reranker cache (serial)
+        if: matrix.big_models == 'run'
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/big-model-prewarm.log"
+          err="$RUNNER_TEMP/big-model-prewarm.err"
+          for attempt in 1 2 3; do
+            if cargo test --features test-helpers --lib -- --ignored --exact embedder::tests::test_bge_m3_produces_1024_dim embedder::tests::test_bge_reranker_v2_m3_reorders_ja --test-threads=1 2> "$err" | tee "$log"; then
+              cat "$err" >&2
+              exit 0
+            fi
+            cat "$err" >&2
+            if grep -Eq '^test embedder::tests::test_bge_m3_produces_1024_dim \.\.\. (ok|FAILED)$' "$log" \
+              && grep -Eq '^test embedder::tests::test_bge_reranker_v2_m3_reorders_ja \.\.\. (ok|FAILED)$' "$log" \
+              && ! grep -Eq 'failed to load BGE-(M3|reranker-v2-m3): ' "$log"; then
+              echo "::warning::big models are cached but a pre-warm test failed; the suite step below runs it again and reports it" >&2
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::big-model pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::big-model pre-warm failed after 3 attempts" >&2
           exit 1
 
       # `cargo test` builds the `[[example]]` fixtures beside it -- it
@@ -222,6 +276,12 @@ jobs:
         #                                         (BGE-M3 ~2.3 GB、AX-20。日本語の
         #                                         docx は BGE-small では読めないので
         #                                         BGE-small 版は無い)
+        #   - fastembed_cut_inputs_fill_512_tokens_bge_m3
+        #                                         (BGE-M3 ~2.3 GB、feature-70)
+        #   - fastembed_cut_inputs_fill_512_tokens_reranker_bge_v2_m3
+        #                                         (reranker ~2.3 GB、feature-70)
+        #   - reranker_scores_a_cut_candidate_like_its_head
+        #                                         (reranker ~2.3 GB、feature-70)
         # 理由:
         #   (a) windows-latest / macos-latest の空きディスクは公称 14 GB で、
         #       4.6 GB のモデル展開はビルド領域を圧迫する
@@ -254,6 +314,9 @@ jobs:
                   --skip kb_eval_retrieval_quality_bge_m3
                   --skip kb_code_eval_retrieval_quality_bge_m3
                   --skip groove_search_reads_rerank_by_default_from_the_config_file
+                  --skip fastembed_cut_inputs_fill_512_tokens_bge_m3
+                  --skip fastembed_cut_inputs_fill_512_tokens_reranker_bge_v2_m3
+                  --skip reranker_scores_a_cut_candidate_like_its_head
                   --skip eval_japanese_rules_docx'
           else
             SKIP=''
