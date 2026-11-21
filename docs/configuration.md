@@ -138,14 +138,14 @@ max_chunk_chars = 3500
 # does not reach inside opening the archive and the workbook either. Lowering a
 # cap leaves documents already indexed in place until `groove index --force`
 # runs or the file shrinks under the cap; an edit that leaves it over the cap
-# keeps the old text searchable. Reads do
-# not follow: `get_document` and `resources/read` stop at 50 MiB for binary
-# formats and 1 MiB for text, so a document indexed past that is searchable
-# but carries no `uri`. Reads also parse with the built-in 50 MiB
-# decompression budget, so while `max_decompressed_size` is above it no binary
-# document carries a `uri` or is offered by `resources/list`; it stays
-# searchable. The watcher reads these three keys; a config found beside a
-# knowledge base cannot set them (see the table below). Reasoning: ADR-0026.
+# keeps the old text searchable. Reads do not follow: `get_document` and
+# `resources/read` stop at 50 MiB for binary formats and 1 MiB for text, so a
+# document indexed past that is searchable but carries no `uri`. Reads also
+# parse with the built-in 50 MiB decompression budget, so while
+# `max_decompressed_size` is above it no binary document carries a `uri` or is
+# offered by `resources/list`; it stays searchable. The watcher reads these
+# three keys; a config found beside a knowledge base cannot set them (see the
+# table below). Reasoning: ADR-0026.
 # [index]
 # fail_on_frontmatter_error = true
 # max_binary_file_size = "unlimited"

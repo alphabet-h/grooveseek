@@ -1627,9 +1627,10 @@ fn rerank_document_weight(r: &SearchResult) -> usize {
 /// break where they did before the calls were sliced.
 const RERANK_SLICE_MAX_ITEMS: usize = 256;
 
-/// The one call [`Reranker`] makes of its model: score `documents` against
-/// `query`, answering `(index into documents, score)` in any order. Behind a
-/// trait so the tests can check what reaches the model without loading one.
+/// The one call [`Reranker`] makes of its model: score each document against
+/// the query, answering (index into the documents, score) pairs in any order.
+/// Behind a trait so the tests can check what reaches the model without loading
+/// one.
 trait RerankModel: Send + Sync {
     fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>>;
 }
@@ -3399,15 +3400,16 @@ mod tests {
     /// `[UNK]`, so text of words of at most 100 characters with one-character
     /// separators reaches 510 tokens (+ `[CLS]` `[SEP]`) within 510 × 101
     /// characters. The constants are bound to `let`s before the asserts to keep
-    /// clippy's `assertions_on_constants` away, as in
-    /// `grooveseek/src/eval.rs:3462-3464`.
+    /// clippy's `assertions_on_constants` away, as the tests of [`crate::eval`]
+    /// already do.
     #[test]
     fn fastembed_input_cap_is_long_enough_to_reach_512_tokens() {
         let cap = FASTEMBED_MAX_INPUT_CHARS;
         let call = FASTEMBED_MAX_CHARS_PER_CALL;
         // The inequalities come before the `assert_eq!`s so that a change to a
         // constant shows which bound it broke.
-        assert!(call >= 2 * cap, "{call} {cap}"); // one reranker pair always fits (spec R1-3)
+        // One reranker pair always fits (feature-70 spec R1-3).
+        assert!(call >= 2 * cap, "{call} {cap}");
         assert!(cap >= 510 * (WORDPIECE_MAX_CHARS_PER_WORD + 1), "{cap}");
         assert_eq!(cap, 262_144);
         assert_eq!(call, 2_097_152);
@@ -3819,11 +3821,11 @@ mod tests {
 
     /// Held by the new tests below that load BGE-M3 or bge-reranker-v2-m3, so
     /// they do not load the big models in one process at the same time. The
-    /// existing big-model tests do not take it: editing existing
-    /// tests is not allowed. A cold cache's fight over the same blob lock is
-    /// removed by the nightly Linux leg warming those models one test at a
-    /// time before the suite. A poisoned lock is taken all the same, so one
-    /// failure does not fail the next test.
+    /// existing big-model tests do not take it: editing existing tests is not
+    /// allowed. A cold cache's fight over the same blob lock is removed by the
+    /// nightly Linux leg warming those models one test at a time before the
+    /// suite. A poisoned lock is taken all the same, so one failure does not
+    /// fail the next test.
     static BIG_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn big_model_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -3855,9 +3857,9 @@ mod tests {
         *state >> 33
     }
 
-    /// The input shapes checked against the real tokenizers, 300,000
-    /// characters each, which must still
-    /// fill 512 tokens after the cut to [`FASTEMBED_MAX_INPUT_CHARS`].
+    /// The input shapes checked against the real tokenizers, 300,000 characters
+    /// each, which must still fill 512 tokens after the cut to
+    /// [`FASTEMBED_MAX_INPUT_CHARS`].
     fn cut_inputs_that_fill_512_tokens() -> Vec<(&'static str, String)> {
         const N: usize = 300_000;
         const JA: [&str; 5] = [
@@ -3931,10 +3933,11 @@ mod tests {
         ]
     }
 
-    /// Cut each of those inputs to [`FASTEMBED_MAX_INPUT_CHARS`] and check that
-    /// `encode` (returning the token count and the number of overflowing
-    /// encodings) gives 512 tokens with an overflow; print the pathological
-    /// inputs' counts.
+    /// Cut each of the inputs from [`cut_inputs_that_fill_512_tokens`] to
+    /// [`FASTEMBED_MAX_INPUT_CHARS`] and check that `encode` (returning the
+    /// token count and the number of overflowing encodings) gives 512 tokens
+    /// with an overflow; print the counts of the inputs from
+    /// [`pathological_cut_inputs`].
     fn check_cut_inputs_fill_512_tokens(model: &str, encode: impl Fn(&str) -> (usize, usize)) {
         for (kind, text) in cut_inputs_that_fill_512_tokens() {
             let (n, overflow) = encode(truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS));
@@ -3950,11 +3953,12 @@ mod tests {
         }
     }
 
-    /// T1-4: a 300,000-character text and its first 20,000 characters are both
-    /// cut at 512 tokens and embed alike, and a run of words inside those
-    /// tokens still changes the vector. The run is 25 words starting near the
-    /// 1,200th character rather than the single word of spec §11: one word is
-    /// not sure to move a CLS-pooled vector past the 0.9999 bound.
+    /// A 300,000-character text and its first 20,000 characters are both cut
+    /// at 512 tokens and embed alike, and a run of words inside those tokens
+    /// still changes the vector (feature-70 spec T1-4). The run is 25 words
+    /// starting near the 1,200th character rather than the single word of the
+    /// feature-70 spec's section 11: one word is not sure to move a CLS-pooled
+    /// vector past the 0.9999 bound.
     #[test]
     #[ignore] // requires model download (~130 MB)
     fn fastembed_cut_keeps_the_vector_of_real_text_bge_small() -> Result<()> {
@@ -4026,7 +4030,8 @@ mod tests {
         Ok(())
     }
 
-    /// T1-4b for BGE-small: those inputs still fill 512 tokens after the cut.
+    /// The inputs from [`cut_inputs_that_fill_512_tokens`] still fill 512
+    /// tokens after the cut, for BGE-small (feature-70 spec T1-4b).
     #[test]
     #[ignore] // requires model download (~130 MB)
     fn fastembed_cut_inputs_fill_512_tokens_bge_small() -> Result<()> {
@@ -4038,10 +4043,11 @@ mod tests {
         Ok(())
     }
 
-    /// T1-4b for BGE-M3. The nightly Windows and macOS legs skip this test
-    /// through the `SKIP` list in `.github/workflows/nightly.yml`; a skip
-    /// matches a substring and no existing entry contains this name, so it
-    /// needs a line of its own.
+    /// The same check as the BGE-small one above, for BGE-M3 (feature-70 spec
+    /// T1-4b). The nightly Windows and macOS legs skip this test through the
+    /// `SKIP` list in `.github/workflows/nightly.yml`; a skip matches a
+    /// substring and no existing entry contains this name, so it needs a line
+    /// of its own.
     #[test]
     #[ignore] // requires BGE-M3 download (~2.3 GB)
     fn fastembed_cut_inputs_fill_512_tokens_bge_m3() -> Result<()> {
@@ -4054,9 +4060,9 @@ mod tests {
         Ok(())
     }
 
-    /// T1-4b for bge-reranker-v2-m3: a short query paired with cut English or
-    /// cut Japanese still fills 512 tokens. The nightly Windows and macOS legs
-    /// skip this test through the `SKIP` list in
+    /// For bge-reranker-v2-m3, a short query paired with cut English or cut
+    /// Japanese still fills 512 tokens (feature-70 spec T1-4b). The nightly
+    /// Windows and macOS legs skip this test through the `SKIP` list in
     /// `.github/workflows/nightly.yml`; a skip matches a substring and no
     /// existing entry contains this name, so it needs a line of its own.
     #[test]
@@ -4086,11 +4092,12 @@ mod tests {
         Ok(())
     }
 
-    /// T1-6: the reranker scores a 300,000-character candidate like its first
-    /// 20,000 characters, as both are cut to the same 512 tokens. The nightly
-    /// Windows and macOS legs skip this test through the `SKIP` list in
-    /// `.github/workflows/nightly.yml`; a skip matches a substring and no
-    /// existing entry contains this name, so it needs a line of its own.
+    /// The reranker scores a 300,000-character candidate like its first 20,000
+    /// characters, as both are cut to the same 512 tokens (feature-70 spec
+    /// T1-6). The nightly Windows and macOS legs skip this test through the
+    /// `SKIP` list in `.github/workflows/nightly.yml`; a skip matches a
+    /// substring and no existing entry contains this name, so it needs a line
+    /// of its own.
     #[test]
     #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
     fn reranker_scores_a_cut_candidate_like_its_head() -> Result<()> {

@@ -126,15 +126,16 @@ max_chunk_chars = 3500
 # セルごと・シートごと。アーカイブを開く処理、calamine が workbook を開く処理、
 # 1 セルの読み出しの途中では止めず、そこを縛るのは展開 budget だけ)。
 # `max_decompressed_size` の "unlimited" は運用者が展開量の守りを外す設定で、
-# その時は .xlsx の 120 秒もアーカイブと workbook を開く処理の内側までは保証しな
-# い。上限を下げても、索引済みの文書は `groove index --force` を打つか、
-# ファイルが上限の下まで縮むまで残る。上限を超えたままの編集では古いテキストが検索
-# に出続ける。読み出しは連動しない: `get_document` / `resources/read`
-# はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、それを超えて索引した文書は検
-# 索には出るが `uri` を持たない。読み出しは組み込みの展開 budget (50 MiB) でも
-# parse するので、`max_decompressed_size` をそれより上げている間はバイナリ文書のど
-# れにも `uri` が付かず、`resources/list` も提示しない (検索には出る)。この 3
-# キーは watcher も読み、KB の隣で見つかった config からは設定できない (下の表)。
+# その時は .xlsx の 120 秒もアーカイブと workbook を開く処理の内側までは
+# 保証しない。上限を下げても、索引済みの文書は `groove index --force` を
+# 打つか、ファイルが上限の下まで縮むまで残る。上限を超えたままの編集では
+# 古いテキストが検索に出続ける。読み出しは連動しない: `get_document` /
+# `resources/read` はバイナリ形式 50 MiB、テキスト 1 MiB で止まるので、
+# それを超えて索引した文書は検索には出るが `uri` を持たない。読み出しは
+# 組み込みの展開 budget (50 MiB) でも parse するので、
+# `max_decompressed_size` をそれより上げている間はバイナリ文書のどれにも
+# `uri` が付かず、`resources/list` も提示しない (検索には出る)。この 3 キーは
+# watcher も読み、KB の隣で見つかった config からは設定できない (下の表)。
 # 根拠: ADR-0026。
 # [index]
 # fail_on_frontmatter_error = true
