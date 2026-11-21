@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig};
 use rmcp::schemars;
 use rmcp::{ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
@@ -1271,15 +1271,15 @@ impl KbServer {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for KbServer {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` and `Implementation` are `#[non_exhaustive]`, so a
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` and `Implementation` are `#[non_exhaustive]`, so a
         // struct literal will not compile against them from this crate: build
         // from `Default` and assign.
         let mut me = Implementation::default();
         me.name = env!("CARGO_PKG_NAME").to_string();
         me.version = env!("CARGO_PKG_VERSION").to_string();
 
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()

@@ -61,7 +61,7 @@ fastembed = "5"
 # "system-proxy": the OS proxy settings a non-loopback embedding endpoint
 # follows must not depend on another crate's features (AW-13).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "system-proxy"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 sqlite-vec = "0.1"
 pulldown-cmark = "0.13"
 serde = { workspace = true }
@@ -230,7 +230,7 @@ criterion = { version = "0.5", default-features = false }
 # them. The feature is declared **only here**, so a plain `cargo build` links
 # rusqlite without it and the shipped binary is unaffected; Cargo unifies the
 # feature into the same rusqlite when it builds the test targets.
-rusqlite = { version = "0.39", features = ["trace"] }
+rusqlite = { version = "0.41", features = ["trace"] }
 # `tests/docs_links_resolve.rs` のみが使う。GitHub は Markdown のリンク先を
 # percent-decode してから解決するので (`docs/my%20guide.md` → `docs/my guide.md`)、
 # 同じ decode を挟まないと「読者が辿れるリンク」で CI が落ちる。`url` の transitive
