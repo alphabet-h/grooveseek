@@ -289,8 +289,37 @@ trait EmbeddingProvider: Send {
     }
 }
 
-struct FastEmbedProvider {
-    model: TextEmbedding,
+/// The one call [`FastEmbedProvider`] makes of its model: embed `texts` with
+/// fastembed's own batch size `batch`. Behind a trait so the tests can check
+/// what reaches the model without loading one.
+trait FastEmbedModel: Send {
+    fn embed_batch(&mut self, texts: &[&str], batch: usize) -> Result<Vec<Vec<f32>>>;
+}
+
+impl FastEmbedModel for TextEmbedding {
+    fn embed_batch(&mut self, texts: &[&str], batch: usize) -> Result<Vec<Vec<f32>>> {
+        self.embed(texts, Some(batch))
+    }
+}
+
+/// A local fastembed model. Every document and query is cut to
+/// [`FASTEMBED_MAX_INPUT_CHARS`] characters, on a character boundary, before it
+/// is tokenized ([`embed_truncated`]). Real text reaches the 512 tokens the
+/// models keep long before that, so its vector is the same as without the cut.
+/// What can change is a text the tokenizer turns into few tokens per character:
+///
+/// 1. BGE-small: a body made of runs of letters and digits longer than 100
+///    characters with no space or punctuation (WordPiece turns each run into a
+///    single `[UNK]` token).
+/// 2. BGE-M3: a body with long runs of characters outside the vocabulary and no
+///    space between them (Unigram's `fuse_unk` makes each run one `<unk>`).
+/// 3. Both models: a body whose first [`FASTEMBED_MAX_INPUT_CHARS`] characters
+///    are mostly spaces, line breaks or control characters.
+///
+/// Such a vector is not recomputed when it changes: feature-69's reuse key is
+/// the text before the cut.
+struct FastEmbedProvider<M: FastEmbedModel = TextEmbedding> {
+    model: M,
     choice: ModelChoice,
 }
 
@@ -311,8 +340,52 @@ impl FastEmbedProvider {
     }
 }
 
-/// Embed `texts` one slice of at most `batch` texts at a time, appending only
-/// the vectors.
+/// The most characters of one input handed to a fastembed model; the rest is
+/// cut off before tokenizing (feature-70 spec R1-2). 256 Ki characters of real
+/// prose run well past the 512 tokens the models keep, so the cut leaves what
+/// they read alone.
+const FASTEMBED_MAX_INPUT_CHARS: usize = 256 * 1024;
+
+/// The most characters, summed over the inputs, handed to one fastembed call
+/// (feature-70 spec R1-3). The tokenizer's memory for a call grows with the total
+/// characters it is given, not with the tokens the model keeps; eight inputs at
+/// [`FASTEMBED_MAX_INPUT_CHARS`] fit, so a reranker pair always does.
+const FASTEMBED_MAX_CHARS_PER_CALL: usize = 8 * FASTEMBED_MAX_INPUT_CHARS;
+
+/// Where a list of inputs with these `weights` is cut into model calls: one
+/// greedy pass that closes the current slice when the next input would take
+/// it past `max_items.max(1)` inputs or past `max_weight` in summed weight. An
+/// input always joins an empty slice, so one weighing more than `max_weight`
+/// gets a slice of its own. The ranges cover `0..weights.len()` in order,
+/// without gaps, and none is empty.
+fn slice_bounds(
+    weights: &[usize],
+    max_items: usize,
+    max_weight: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let max_items = max_items.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut sum = 0usize;
+    for (i, &weight) in weights.iter().enumerate() {
+        let count = i - start;
+        if count > 0 && (count + 1 > max_items || sum.saturating_add(weight) > max_weight) {
+            ranges.push(start..i);
+            start = i;
+            sum = 0;
+        }
+        sum = sum.saturating_add(weight);
+    }
+    if start < weights.len() {
+        ranges.push(start..weights.len());
+    }
+    ranges
+}
+
+/// Embed `texts` one slice at a time, appending only the vectors. A slice holds
+/// at most `batch` texts and, beyond the count, at most
+/// [`FASTEMBED_MAX_CHARS_PER_CALL`] characters summed over its texts; where it
+/// is cut is [`slice_bounds`]'s call.
 ///
 /// (kuriya 671) fastembed's `TextEmbedding::embed` runs every batch of its
 /// input first and keeps each batch's raw session outputs (the token-level
@@ -325,8 +398,14 @@ fn embed_in_slices(
     batch: usize,
     mut embed_slice: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
 ) -> Result<Vec<Vec<f32>>> {
+    // Counting stops one past the bound: enough to tell that a text is over it.
+    let weights: Vec<usize> = texts
+        .iter()
+        .map(|t| t.chars().take(FASTEMBED_MAX_CHARS_PER_CALL + 1).count())
+        .collect();
     let mut embeddings = Vec::with_capacity(texts.len());
-    for slice in texts.chunks(batch.max(1)) {
+    for range in slice_bounds(&weights, batch, FASTEMBED_MAX_CHARS_PER_CALL) {
+        let slice = &texts[range];
         let vectors = embed_slice(slice)?;
         anyhow::ensure!(
             vectors.len() == slice.len(),
@@ -339,11 +418,26 @@ fn embed_in_slices(
     Ok(embeddings)
 }
 
-impl EmbeddingProvider for FastEmbedProvider {
+/// Cut each of `texts` to [`FASTEMBED_MAX_INPUT_CHARS`] characters
+/// ([`truncate_to_chars`]) and embed the result through [`embed_in_slices`],
+/// so a call is bounded by count and by total characters as well.
+fn embed_truncated(
+    texts: &[&str],
+    batch: usize,
+    embed_slice: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    let cut: Vec<&str> = texts
+        .iter()
+        .map(|t| truncate_to_chars(t, FASTEMBED_MAX_INPUT_CHARS))
+        .collect();
+    embed_in_slices(&cut, batch, embed_slice)
+}
+
+impl<M: FastEmbedModel> EmbeddingProvider for FastEmbedProvider<M> {
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let batch = self.choice.batch_size();
         let model = &mut self.model;
-        embed_in_slices(texts, batch, |slice| model.embed(slice, Some(batch)))
+        embed_truncated(texts, batch, |slice| model.embed_batch(slice, batch))
     }
 
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -1484,20 +1578,108 @@ impl RerankerChoice {
     }
 }
 
+/// The context `r` is reranked with, or `None` when it has none worth
+/// prepending (absent, empty or only whitespace). The one place that picks
+/// the arm of [`contextualize_for_rerank`] and [`rerank_document_weight`].
+fn rerank_context(r: &SearchResult) -> Option<&str> {
+    match r.context_text.as_deref() {
+        Some(ctx) if !ctx.trim().is_empty() => Some(ctx),
+        _ => None,
+    }
+}
+
 /// reranker 入力用に context を前置する (feature-46)。context_text が空/None なら
 /// content のみ (off の DB / context なし chunk では従来と同一)。Anthropic 原典の
 /// 結合形 `f"{context}\n\n{chunk}"` に忠実。
+///
+/// The result is cut to [`FASTEMBED_MAX_INPUT_CHARS`] characters. The content
+/// is cut before it is joined, so a huge chunk is not copied whole on every
+/// search, and the joined string is then cut again to the same bound.
 fn contextualize_for_rerank(r: &SearchResult) -> String {
-    match r.context_text.as_deref() {
-        Some(ctx) if !ctx.trim().is_empty() => format!("{ctx}\n\n{}", r.content),
-        _ => r.content.clone(),
+    match rerank_context(r) {
+        Some(ctx) => {
+            let mut joined = format!(
+                "{ctx}\n\n{}",
+                truncate_to_chars(&r.content, FASTEMBED_MAX_INPUT_CHARS)
+            );
+            let keep = truncate_to_chars(&joined, FASTEMBED_MAX_INPUT_CHARS).len();
+            joined.truncate(keep);
+            joined
+        }
+        None => truncate_to_chars(&r.content, FASTEMBED_MAX_INPUT_CHARS).to_string(),
     }
+}
+
+/// The character count of [`contextualize_for_rerank`]`(r)`, worked out
+/// without building it: every count stops at [`FASTEMBED_MAX_INPUT_CHARS`], so
+/// a huge chunk is never walked to its end.
+fn rerank_document_weight(r: &SearchResult) -> usize {
+    let cap = FASTEMBED_MAX_INPUT_CHARS;
+    let content = r.content.chars().take(cap).count();
+    match rerank_context(r) {
+        Some(ctx) => (ctx.chars().take(cap).count() + 2 + content).min(cap),
+        None => content,
+    }
+}
+
+/// The most query-document pairs handed to one reranker call: fastembed's own
+/// batch for `rerank` with `batch_size = None`, so its batches inside a call
+/// break where they did before the calls were sliced.
+const RERANK_SLICE_MAX_ITEMS: usize = 256;
+
+/// The one call [`Reranker`] makes of its model: score each document against
+/// the query, answering (index into the documents, score) pairs in any order.
+/// Behind a trait so the tests can check what reaches the model without loading
+/// one.
+trait RerankModel: Send + Sync {
+    fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>>;
+}
+
+impl RerankModel for TextRerank {
+    fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>> {
+        Ok(self
+            .rerank(query, documents, false, None)?
+            .into_iter()
+            .map(|r| (r.index, r.score))
+            .collect())
+    }
+}
+
+/// Load the fastembed reranker `model` from the model cache, downloading it on
+/// first use.
+fn load_text_rerank(model: RerankerModel) -> Result<TextRerank> {
+    TextRerank::try_new(
+        RerankInitOptions::new(model)
+            .with_cache_dir(resolve_cache_dir()?)
+            .with_show_download_progress(true),
+    )
 }
 
 /// Cross-encoder reranker。`search_hybrid` が返した候補を query との共同
 /// エンコードで再スコア付けし、上位 `limit` 件に絞る。
+///
+/// The query and every candidate ([`contextualize_for_rerank`]) are cut to
+/// [`FASTEMBED_MAX_INPUT_CHARS`] characters, on a character boundary, before
+/// they are tokenized. The reranker's tokenizer (bge-reranker-v2-m3's and the
+/// others') reads the query and the document as one pair and keeps far fewer
+/// tokens than that, so real text scores the same as without the cut. What can
+/// change is a pair the tokenizer turns into few tokens per character:
+///
+/// 1. A WordPiece tokenizer: runs of letters and digits longer than 100
+///    characters with no space or punctuation (each run becomes a single
+///    `[UNK]` token).
+/// 2. A Unigram tokenizer: long runs of characters outside the vocabulary
+///    with no space between them (`fuse_unk` makes each run one `<unk>`).
+/// 3. Any tokenizer: a query or candidate whose first
+///    [`FASTEMBED_MAX_INPUT_CHARS`] characters are mostly spaces, line breaks
+///    or control characters.
+///
+/// One call of the model gets at most [`RERANK_SLICE_MAX_ITEMS`] pairs and at
+/// most [`FASTEMBED_MAX_CHARS_PER_CALL`] characters, summed over the pairs with
+/// the query counted once per pair (fastembed tokenizes it with each
+/// document).
 pub struct Reranker {
-    model: TextRerank,
+    model: Box<dyn RerankModel>,
     #[allow(dead_code)] // choice は model_id ログ用に保持
     choice: RerankerChoice,
 }
@@ -1514,12 +1696,11 @@ impl Reranker {
             choice.model_id(),
             choice.approx_download_mb()
         );
-        let model = TextRerank::try_new(
-            RerankInitOptions::new(fm)
-                .with_cache_dir(resolve_cache_dir()?)
-                .with_show_download_progress(true),
-        )?;
-        Ok(Some(Self { model, choice }))
+        let model = load_text_rerank(fm)?;
+        Ok(Some(Self {
+            model: Box::new(model),
+            choice,
+        }))
     }
 
     /// `candidates` (chunk_id, [`crate::db::SearchResult`]) を cross-encoder でスコア付けし、
@@ -1551,25 +1732,50 @@ impl Reranker {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        // context 込みで rerank する (D-3)。&str 参照ベースだと合成文字列を保持できないので
-        // 一時 Vec<String> バッファを経由する。
-        let contextualized: Vec<String> = candidates
+        let query = truncate_to_chars(query, FASTEMBED_MAX_INPUT_CHARS);
+        // fastembed tokenizes the query with every document, so a pair weighs both.
+        let query_chars = query.chars().count();
+        let weights: Vec<usize> = candidates
             .iter()
-            .map(|(_, r)| contextualize_for_rerank(r))
+            .map(|(_, r)| query_chars + rerank_document_weight(r))
             .collect();
-        let documents: Vec<&str> = contextualized.iter().map(String::as_str).collect();
-        let rerank_results = self.model.rerank(query, documents, false, None)?;
 
-        // rerank_results は score 降順でソート済み。index は documents (= candidates) の位置。
-        let mut out: Vec<(i64, SearchResult)> = Vec::with_capacity(limit as usize);
-        for r in rerank_results.into_iter().take(limit as usize) {
-            let Some((id, mut row)) = candidates.get(r.index).cloned() else {
-                continue;
-            };
-            row.score = r.score;
-            out.push((id, row));
+        // (index into candidates, score) of every slice.
+        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(candidates.len());
+        for range in slice_bounds(
+            &weights,
+            RERANK_SLICE_MAX_ITEMS,
+            FASTEMBED_MAX_CHARS_PER_CALL,
+        ) {
+            // context 込みで rerank する (D-3)。合成文字列は slice ごとに作り、
+            // 呼び出しが返ったら捨てる。
+            let contextualized: Vec<String> = candidates[range.clone()]
+                .iter()
+                .map(|(_, r)| contextualize_for_rerank(r))
+                .collect();
+            let documents: Vec<&str> = contextualized.iter().map(String::as_str).collect();
+            for (i, score) in self.model.rerank_slice(query, &documents)? {
+                // An index past the slice is dropped before it is shifted, so it
+                // can neither become a neighbour's candidate nor take a place
+                // from `limit`.
+                if i < range.len() {
+                    scored.push((range.start + i, score));
+                }
+            }
         }
-        Ok(out)
+
+        // Score descending, ties in candidate order: what fastembed's stable
+        // sort over one call gives, kept across slices.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(scored
+            .into_iter()
+            .take(limit as usize)
+            .map(|(index, score)| {
+                let (id, mut row) = candidates[index].clone();
+                row.score = score;
+                (id, row)
+            })
+            .collect())
     }
 }
 
@@ -1627,7 +1833,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
     struct StubProvider;
@@ -2964,6 +3170,263 @@ mod tests {
         );
     }
 
+    const CAP: usize = FASTEMBED_MAX_INPUT_CHARS;
+    const CALL: usize = FASTEMBED_MAX_CHARS_PER_CALL;
+
+    fn lens(r: &[std::ops::Range<usize>]) -> Vec<usize> {
+        r.iter().map(|r| r.len()).collect()
+    }
+
+    #[test]
+    fn slice_bounds_of_nothing_is_empty() {
+        assert!(slice_bounds(&[], 8, CALL).is_empty());
+    }
+
+    #[test]
+    fn slice_bounds_of_small_inputs_cuts_by_count_only() {
+        assert_eq!(
+            lens(&slice_bounds(&[1; 100], 8, CALL)),
+            [vec![8; 12], vec![4]].concat()
+        );
+        // A batch of 0 counts as 1, as `batch.max(1)` did before.
+        assert_eq!(lens(&slice_bounds(&[1; 3], 0, CALL)), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn slice_bounds_of_nine_full_inputs_is_eight_and_one() {
+        for batch in [8, 256] {
+            assert_eq!(
+                lens(&slice_bounds(&[CAP; 9], batch, CALL)),
+                vec![8, 1],
+                "batch {batch}"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_bounds_keeps_the_bge_m3_slices_of_today() {
+        // One greedy pass, not "group by characters first, then by count"
+        // (which would give 8, 2, 8, 2).
+        assert_eq!(
+            lens(&slice_bounds(&[200 * 1024; 20], 8, CALL)),
+            vec![8, 8, 4]
+        );
+    }
+
+    #[test]
+    fn slice_bounds_takes_an_input_of_exactly_the_cap_alone() {
+        assert_eq!(slice_bounds(&[CALL], 8, CALL), vec![0..1]);
+        assert_eq!(slice_bounds(&[CALL, 1], 8, CALL), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn slice_bounds_gives_an_oversized_input_a_slice_of_its_own() {
+        assert_eq!(
+            slice_bounds(&[1, CALL + 5, 1], 8, CALL),
+            vec![0..1, 1..2, 2..3]
+        );
+        assert_eq!(slice_bounds(&[CALL + 5], 8, CALL), vec![0..1]);
+    }
+
+    #[test]
+    fn slice_bounds_covers_every_input_in_order() {
+        let weights = [5, CALL, 3, CALL - 3, 4, 0, 0];
+        let ranges = slice_bounds(&weights, 2, CALL);
+        let mut next = 0;
+        for range in &ranges {
+            assert_eq!(range.start, next, "gap or overlap: {ranges:?}");
+            assert!(!range.is_empty(), "empty range: {ranges:?}");
+            assert!(range.len() <= 2, "too many items: {ranges:?}");
+            if range.len() >= 2 {
+                let sum: usize = weights[range.clone()].iter().sum();
+                assert!(sum <= CALL, "{range:?} weighs {sum}");
+            }
+            next = range.end;
+        }
+        assert_eq!(next, weights.len(), "not every input covered: {ranges:?}");
+    }
+
+    #[test]
+    fn embed_in_slices_also_cuts_by_characters() {
+        let text = "a".repeat(CAP);
+        let texts: Vec<&str> = vec![text.as_str(); 9];
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&texts, 256, |slice| {
+            calls.push(slice.len());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed in slices");
+        assert_eq!(calls, vec![8, 1]);
+        assert_eq!(vectors.len(), 9);
+    }
+
+    #[test]
+    fn embed_truncated_cuts_on_char_boundaries() {
+        let exact = "a".repeat(CAP);
+        let ascii = "a".repeat(CAP + 1);
+        let kana = "あ".repeat(CAP + 1);
+        let emoji = "😀".repeat(CAP + 1);
+        let texts: Vec<&str> = vec![&exact, &ascii, &kana, &emoji, ""];
+        let mut seen: Vec<String> = Vec::new();
+        let vectors = embed_truncated(&texts, 8, |slice| {
+            seen.extend(slice.iter().map(|t| t.to_string()));
+            Ok(slice
+                .iter()
+                .map(|t| vec![t.chars().count() as f32])
+                .collect())
+        })
+        .expect("embed truncated");
+        let counts: Vec<usize> = seen.iter().map(|t| t.chars().count()).collect();
+        assert_eq!(counts, vec![CAP, CAP, CAP, CAP, 0]);
+        assert_eq!(seen[0], exact);
+        assert_eq!(seen[2].len(), 3 * CAP);
+        assert!(seen[2].ends_with('あ'));
+        assert_eq!(seen[3].len(), 4 * CAP);
+        assert_eq!(seen[4], "");
+        let order: Vec<f32> = vectors.iter().map(|v| v[0]).collect();
+        assert_eq!(
+            order,
+            vec![CAP as f32, CAP as f32, CAP as f32, CAP as f32, 0.0]
+        );
+    }
+
+    #[test]
+    fn embed_truncated_leaves_short_inputs_alone() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let vectors = embed_truncated(&["hello", "world"], 8, |slice| {
+            calls.push(slice.iter().map(|t| t.to_string()).collect());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed truncated");
+        assert_eq!(calls, vec![vec!["hello".to_string(), "world".to_string()]]);
+        assert_eq!(vectors.len(), 2);
+    }
+
+    /// A stand-in model that records how many characters of each text it was
+    /// given, call by call, and returns `[chars as f32]` for each text.
+    struct RecordingModel {
+        seen: Vec<Vec<usize>>,
+    }
+
+    impl FastEmbedModel for RecordingModel {
+        fn embed_batch(&mut self, texts: &[&str], _batch: usize) -> Result<Vec<Vec<f32>>> {
+            let counts: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
+            let vectors = counts.iter().map(|&n| vec![n as f32]).collect();
+            self.seen.push(counts);
+            Ok(vectors)
+        }
+    }
+
+    fn recording_provider() -> FastEmbedProvider<RecordingModel> {
+        FastEmbedProvider {
+            model: RecordingModel { seen: vec![] },
+            choice: ModelChoice::BgeSmallEnV15,
+        }
+    }
+
+    #[test]
+    fn fastembed_provider_cuts_documents_before_the_model() {
+        let mut p = recording_provider();
+        let long = "x".repeat(CAP + 1);
+        let vectors = p
+            .embed_documents(&[&long, "short"])
+            .expect("embed documents");
+        assert_eq!(p.model.seen, vec![vec![CAP, 5]]);
+        assert_eq!(vectors.len(), 2);
+    }
+
+    #[test]
+    fn fastembed_provider_cuts_queries_before_the_model() {
+        let mut p = recording_provider();
+        let long = "x".repeat(CAP + 1);
+        p.embed_query(&long).expect("embed query");
+        p.embed_queries(&[&long, "q"]).expect("embed queries");
+        assert_eq!(p.model.seen, vec![vec![CAP], vec![CAP, 1]]);
+        assert!(p.model.seen.iter().flatten().all(|&n| n <= CAP));
+    }
+
+    #[test]
+    fn fastembed_provider_cuts_a_call_by_total_characters() {
+        let mut p = recording_provider();
+        let long = "x".repeat(CAP + 1);
+        let texts: Vec<&str> = vec![long.as_str(); 9];
+        let vectors = p.embed_documents(&texts).expect("embed documents");
+        assert_eq!(p.model.seen, vec![vec![CAP; 8], vec![CAP]]);
+        assert!(
+            p.model
+                .seen
+                .iter()
+                .all(|call| call.iter().sum::<usize>() <= CALL)
+        );
+        assert_eq!(vectors.len(), 9);
+    }
+
+    /// The WordPiece `max_input_chars_per_word` in BGE-small's tokenizer.json
+    /// (feature-70 spec R1-2).
+    const WORDPIECE_MAX_CHARS_PER_WORD: usize = 100;
+
+    /// Deterministic English prose of exactly `chars` characters: about forty
+    /// real words in a fixed cycle, joined by spaces, a sentence end every 12
+    /// words and a paragraph break every 80.
+    fn long_english_text(chars: usize) -> String {
+        const WORDS: [&str; 40] = [
+            "the", "index", "keeps", "every", "chunk", "of", "a", "document", "together", "with",
+            "its", "heading", "path", "so", "that", "search", "can", "return", "the", "section",
+            "where", "an", "answer", "lives", "and", "readers", "find", "context", "without",
+            "opening", "whole", "files", "while", "models", "turn", "text", "into", "vectors",
+            "for", "ranking",
+        ];
+        let mut out = String::with_capacity(chars + 16);
+        let mut n = 0usize;
+        while out.len() < chars {
+            out.push_str(WORDS[n % WORDS.len()]);
+            n += 1;
+            if n.is_multiple_of(80) {
+                out.push_str(".\n\n");
+            } else if n.is_multiple_of(12) {
+                out.push_str(". ");
+            } else {
+                out.push(' ');
+            }
+        }
+        // ASCII only, so a byte length is a character count.
+        out.truncate(chars);
+        out
+    }
+
+    /// The input cap must leave room for 512 tokens (feature-70 spec R1-2):
+    /// BGE-small's WordPiece makes every word (split on whitespace and
+    /// punctuation) at least one token and a word over 100 characters one
+    /// `[UNK]`, so text of words of at most 100 characters with one-character
+    /// separators reaches 510 tokens (+ `[CLS]` `[SEP]`) within 510 × 101
+    /// characters. The constants are bound to `let`s before the asserts to keep
+    /// clippy's `assertions_on_constants` away, as the tests of [`crate::eval`]
+    /// already do.
+    #[test]
+    fn fastembed_input_cap_is_long_enough_to_reach_512_tokens() {
+        let cap = FASTEMBED_MAX_INPUT_CHARS;
+        let call = FASTEMBED_MAX_CHARS_PER_CALL;
+        // The inequalities come before the `assert_eq!`s so that a change to a
+        // constant shows which bound it broke.
+        // One reranker pair always fits (feature-70 spec R1-3).
+        assert!(call >= 2 * cap, "{call} {cap}");
+        assert!(cap >= 510 * (WORDPIECE_MAX_CHARS_PER_WORD + 1), "{cap}");
+        assert_eq!(cap, 262_144);
+        assert_eq!(call, 2_097_152);
+        let text = long_english_text(300_000);
+        assert_eq!(text.chars().count(), 300_000);
+        let head = truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS);
+        let pieces = head
+            .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+            .filter(|w| !w.is_empty())
+            .count();
+        assert!(pieces >= 510, "{pieces}");
+        assert!(
+            head.split_whitespace()
+                .all(|w| w.chars().count() <= WORDPIECE_MAX_CHARS_PER_WORD)
+        );
+    }
+
     #[test]
     fn test_reranker_choice_values() {
         assert!(!RerankerChoice::None.is_enabled());
@@ -3044,6 +3507,255 @@ mod tests {
     }
 
     #[test]
+    fn contextualize_for_rerank_cuts_after_joining() {
+        let content = "b".repeat(CAP + 1);
+        let joined = contextualize_for_rerank(&mk_with_context(&content, Some("T > H")));
+        assert_eq!(
+            joined,
+            truncate_to_chars(&format!("T > H\n\n{content}"), CAP)
+        );
+        assert_eq!(joined.chars().count(), CAP);
+        for ctx in [None, Some("   ")] {
+            let doc = contextualize_for_rerank(&mk_with_context(&content, ctx));
+            assert_eq!(doc.chars().count(), CAP, "{ctx:?}");
+            assert!(doc.chars().all(|c| c == 'b'), "{ctx:?}");
+        }
+    }
+
+    #[test]
+    fn contextualize_for_rerank_cuts_a_cjk_body_on_a_char_boundary() {
+        let content = "あ".repeat(CAP + 1);
+        let doc = contextualize_for_rerank(&mk_with_context(&content, Some("見出し")));
+        assert_eq!(doc.chars().count(), CAP);
+        assert_eq!(doc.chars().last(), Some('あ'));
+    }
+
+    #[test]
+    fn rerank_document_weight_is_the_length_of_what_is_sent() {
+        let ascii = "b".repeat(CAP + 1);
+        let kana = "あ".repeat(CAP + 1);
+        let rows = [
+            mk_with_context(&ascii, Some("T > H")),
+            mk_with_context(&ascii, None),
+            mk_with_context(&ascii, Some("   ")),
+            mk_with_context(&kana, Some("見出し")),
+            mk_with_context("body", Some("T > H")),
+            mk_with_context("body", None),
+            mk_with_context("body", Some("")),
+        ];
+        for r in &rows {
+            assert_eq!(
+                rerank_document_weight(r),
+                contextualize_for_rerank(r).chars().count(),
+                "{:?}",
+                r.context_text
+            );
+        }
+    }
+
+    /// What [`FakeRerank`] was handed, call by call: the query's character
+    /// count and every document. An alias because the nested type would trip
+    /// clippy's `type_complexity` (`all = deny`, also on test targets).
+    type RerankCalls = Arc<Mutex<Vec<(usize, Vec<String>)>>>;
+
+    /// A stand-in reranker model. Each document scores `score_of(doc)`; each
+    /// slice's results come back in descending index order (neither fastembed's
+    /// order nor ascending index order), so only an explicit index tie-break
+    /// puts equal scores in candidate order. With `bad_index`, every slice also
+    /// answers `(documents.len(), 99.0)`, an index past the slice.
+    struct FakeRerank {
+        calls: RerankCalls,
+        score_of: fn(&str) -> f32,
+        bad_index: bool,
+    }
+
+    impl RerankModel for FakeRerank {
+        fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>> {
+            self.calls.lock().expect("calls lock").push((
+                query.chars().count(),
+                documents.iter().map(|d| d.to_string()).collect(),
+            ));
+            let mut out: Vec<(usize, f32)> = documents
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(i, d)| (i, (self.score_of)(d)))
+                .collect();
+            if self.bad_index {
+                out.push((documents.len(), 99.0));
+            }
+            Ok(out)
+        }
+    }
+
+    fn fake_reranker(score_of: fn(&str) -> f32, bad_index: bool) -> (Reranker, RerankCalls) {
+        let calls: RerankCalls = Arc::new(Mutex::new(Vec::new()));
+        let model = FakeRerank {
+            calls: Arc::clone(&calls),
+            score_of,
+            bad_index,
+        };
+        let reranker = Reranker {
+            model: Box::new(model),
+            choice: RerankerChoice::BgeBase,
+        };
+        (reranker, calls)
+    }
+
+    /// How many documents each recorded call was given.
+    fn rerank_call_sizes(calls: &RerankCalls) -> Vec<usize> {
+        calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .map(|(_, docs)| docs.len())
+            .collect()
+    }
+
+    fn score_one(_: &str) -> f32 {
+        1.0
+    }
+
+    fn score_as_number(doc: &str) -> f32 {
+        doc.parse().expect("a numeric document")
+    }
+
+    /// `n` candidates with ids `0..n` and short contents `"0"`, `"1"`, ...
+    fn numbered_candidates(n: usize) -> Vec<(i64, SearchResult)> {
+        (0..n)
+            .map(|i| (i as i64, mk_with_context(&i.to_string(), None)))
+            .collect()
+    }
+
+    fn ids(out: &[(i64, SearchResult)]) -> Vec<i64> {
+        out.iter().map(|(id, _)| *id).collect()
+    }
+
+    #[test]
+    fn rerank_cuts_the_query_and_every_document_before_the_model() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let query = "q".repeat(CAP + 1);
+        let content = "b".repeat(CAP + 1);
+        let with_ctx = mk_with_context(&content, Some("T > H"));
+        let candidates = vec![
+            (1, with_ctx.clone()),
+            (2, mk_with_context(&content, None)),
+            (3, mk_with_context(&content, Some("   "))),
+        ];
+        let out = reranker
+            .rerank_candidates_with_ids(&query, candidates, 10)
+            .expect("rerank");
+        assert_eq!(out.len(), 3);
+        let calls = calls.lock().expect("calls lock");
+        assert!(!calls.is_empty());
+        for (query_chars, docs) in calls.iter() {
+            assert!(*query_chars <= CAP, "{query_chars}");
+            assert!(docs.iter().all(|d| d.chars().count() <= CAP));
+            let total: usize = docs.iter().map(|d| query_chars + d.chars().count()).sum();
+            assert!(total <= CALL, "{total}");
+        }
+        let sent: Vec<&String> = calls.iter().flat_map(|(_, docs)| docs).collect();
+        assert_eq!(sent[0], &contextualize_for_rerank(&with_ctx));
+    }
+
+    #[test]
+    fn rerank_counts_the_query_once_per_pair() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let query = "q".repeat(CAP);
+        let candidates: Vec<(i64, SearchResult)> = (0..10)
+            .map(|i| (i, mk_with_context(&"d".repeat(10), None)))
+            .collect();
+        reranker
+            .rerank_candidates_with_ids(&query, candidates, 10)
+            .expect("rerank");
+        // A pair weighs CAP + 10: 7 × (CAP + 10) <= 8 × CAP < 8 × (CAP + 10).
+        assert_eq!(rerank_call_sizes(&calls), vec![7, 3]);
+    }
+
+    #[test]
+    fn rerank_counts_the_query_after_cutting_it() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let query = "q".repeat(10 * CAP);
+        let candidates: Vec<(i64, SearchResult)> = (0..10)
+            .map(|i| (i, mk_with_context(&"d".repeat(10), None)))
+            .collect();
+        reranker
+            .rerank_candidates_with_ids(&query, candidates, 10)
+            .expect("rerank");
+        // Counted before the cut, one pair alone would weigh over CALL: [1; 10].
+        assert_eq!(rerank_call_sizes(&calls), vec![7, 3]);
+    }
+
+    #[test]
+    fn rerank_splits_at_256_candidates_and_keeps_ties_in_candidate_order() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let out = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 300)
+            .expect("rerank");
+        assert_eq!(rerank_call_sizes(&calls), vec![256, 44]);
+        assert_eq!(ids(&out), (0..300).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn rerank_takes_the_top_across_slices() {
+        let (mut reranker, _calls) = fake_reranker(score_as_number, false);
+        let out = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 5)
+            .expect("rerank");
+        assert_eq!(ids(&out), vec![299, 298, 297, 296, 295]);
+        for (id, row) in &out {
+            assert_eq!(row.score, *id as f32);
+        }
+        let all = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 1000)
+            .expect("rerank");
+        assert_eq!(all.len(), 300);
+    }
+
+    #[test]
+    fn rerank_drops_an_index_past_its_slice() {
+        let (mut reranker, calls) = fake_reranker(score_one, true);
+        let out = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 1000)
+            .expect("rerank");
+        assert_eq!(out.len(), 300);
+        let mut seen = ids(&out);
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 300);
+
+        // The out-of-range results (score 99) outrank every real one, so a
+        // `limit` counted before they are dropped would lose two of its five.
+        assert!(score_one("0") < 99.0);
+        let top = reranker
+            .rerank_candidates_with_ids("q", numbered_candidates(300), 5)
+            .expect("rerank");
+        assert_eq!(rerank_call_sizes(&calls), vec![256, 44, 256, 44]);
+        assert_eq!(top.len(), 5);
+        assert!(top.iter().all(|(id, _)| (0..300).contains(id)));
+    }
+
+    #[test]
+    fn rerank_with_an_empty_query_keeps_every_candidate() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let out = reranker
+            .rerank_candidates_with_ids("", numbered_candidates(3), 10)
+            .expect("rerank");
+        assert_eq!(out.len(), 3);
+        assert_eq!(rerank_call_sizes(&calls), vec![3]);
+    }
+
+    #[test]
+    fn rerank_of_no_candidates_calls_nothing() {
+        let (mut reranker, calls) = fake_reranker(score_one, false);
+        let out = reranker
+            .rerank_candidates_with_ids("q", Vec::new(), 10)
+            .expect("rerank");
+        assert!(out.is_empty());
+        assert!(rerank_call_sizes(&calls).is_empty());
+    }
+
+    #[test]
     #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
     fn test_bge_reranker_v2_m3_reorders_ja() {
         let mut r = Reranker::try_new(RerankerChoice::BgeV2M3)
@@ -3094,6 +3806,324 @@ mod tests {
             .embed_single("こんにちは、世界")
             .expect("failed to embed");
         assert_eq!(emb.len(), 1024);
+    }
+
+    /// Cosine of two vectors, summed in f64; neither needs unit length.
+    fn cos(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
+        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        (dot / (norm(a) * norm(b))) as f32
+    }
+
+    /// Held by the new tests below that load BGE-M3 or bge-reranker-v2-m3, so
+    /// they do not load the big models in one process at the same time. The
+    /// existing big-model tests do not take it: editing existing tests is not
+    /// allowed. A cold cache's fight over the same blob lock is removed by the
+    /// nightly Linux leg warming those models one test at a time before the
+    /// suite. A poisoned lock is taken all the same, so one failure does not
+    /// fail the next test.
+    static BIG_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn big_model_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        BIG_MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Text of exactly `chars` characters made by appending `piece(0)`,
+    /// `piece(1)`, ... and cutting the end on a character boundary.
+    fn text_of_chars(chars: usize, mut piece: impl FnMut(usize) -> String) -> String {
+        let mut out = String::new();
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while count < chars {
+            let p = piece(i);
+            count += p.chars().count();
+            out.push_str(&p);
+            i += 1;
+        }
+        truncate_to_chars(&out, chars).to_string()
+    }
+
+    /// A linear congruential generator: the same sequence on every run.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// The input shapes checked against the real tokenizers, 300,000 characters
+    /// each, which must still fill 512 tokens after the cut to
+    /// [`FASTEMBED_MAX_INPUT_CHARS`].
+    fn cut_inputs_that_fill_512_tokens() -> Vec<(&'static str, String)> {
+        const N: usize = 300_000;
+        const JA: [&str; 5] = [
+            "索引は文書の各チャンクを見出しの経路と一緒に保持します。",
+            "検索は答えのある節を返すので、読み手はファイル全体を開かずに文脈を得られます。",
+            "モデルは文章をベクトルに変え、近いものから順に並べます。",
+            "設定ファイルを変えたら、索引を作り直してください。",
+            "日本語の本文は形態素ではなく文字の並びとして扱われます。",
+        ];
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+        const NAMES: [&str; 4] = ["alpha", "bravo", "charlie", "delta-long"];
+        let mut seed = 7u64;
+        let base64: String = (0..N)
+            .map(|_| B64[(lcg(&mut seed) % B64.len() as u64) as usize] as char)
+            .collect();
+        let mut seed = 11u64;
+        let hex_dump = text_of_chars(N, |i| {
+            let bytes: Vec<String> = (0..16)
+                .map(|_| format!("{:02x}", lcg(&mut seed) & 0xff))
+                .collect();
+            format!("{:08x}  {}\n", i * 16, bytes.join(" "))
+        });
+        vec![
+            ("english", long_english_text(N)),
+            (
+                "japanese",
+                text_of_chars(N, |i| JA[i % JA.len()].to_string()),
+            ),
+            ("base64", base64),
+            (
+                "minified js",
+                text_of_chars(N, |i| {
+                    format!(
+                        "function f{i}(a,b){{return a.map(function(x){{return x*b+{i}}})}}var r{i}=f{i}([1,2,3],4);if(r{i}.length>2){{console.log(r{i}.join(','))}};"
+                    )
+                }),
+            ),
+            (
+                "aligned table",
+                text_of_chars(N, |i| {
+                    format!(
+                        "| {:>6} | {:<12} | {:>10} |\n",
+                        i,
+                        NAMES[i % NAMES.len()],
+                        (i * 37) % 10_007
+                    )
+                }),
+            ),
+            ("hex dump", hex_dump),
+        ]
+    }
+
+    /// Inputs the cut may leave short of 512 tokens (the cases listed on
+    /// [`FastEmbedProvider`]): their token counts are printed, not asserted.
+    fn pathological_cut_inputs() -> Vec<(&'static str, String)> {
+        const N: usize = 300_000;
+        let mut seed = 13u64;
+        let hex: String = (0..N)
+            .map(|_| char::from_digit((lcg(&mut seed) % 16) as u32, 16).unwrap_or('0'))
+            .collect();
+        // 95% of the first FASTEMBED_MAX_INPUT_CHARS characters are spaces
+        // and NULs, prose after that.
+        let blank = FASTEMBED_MAX_INPUT_CHARS * 95 / 100;
+        let mut mostly_blank: String = (0..blank)
+            .map(|i| if i % 2 == 0 { ' ' } else { '\0' })
+            .collect();
+        mostly_blank.push_str(&long_english_text(N - blank));
+        vec![
+            ("hex without separators", hex),
+            ("mostly spaces and NULs", mostly_blank),
+        ]
+    }
+
+    /// Cut each of the inputs from [`cut_inputs_that_fill_512_tokens`] to
+    /// [`FASTEMBED_MAX_INPUT_CHARS`] and check that `encode` (returning the
+    /// token count and the number of overflowing encodings) gives 512 tokens
+    /// with an overflow; print the counts of the inputs from
+    /// [`pathological_cut_inputs`].
+    fn check_cut_inputs_fill_512_tokens(model: &str, encode: impl Fn(&str) -> (usize, usize)) {
+        for (kind, text) in cut_inputs_that_fill_512_tokens() {
+            let (n, overflow) = encode(truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS));
+            println!("{model} {kind}: {n} tokens (overflow: {overflow})");
+            assert!(
+                n == 512 && overflow > 0,
+                "{model} {kind}: the cut input gave {n} tokens (overflow: {overflow}), not 512 with an overflow"
+            );
+        }
+        for (kind, text) in pathological_cut_inputs() {
+            let (n, overflow) = encode(truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS));
+            println!("{model} {kind}: {n} tokens (overflow: {overflow})");
+        }
+    }
+
+    /// A 300,000-character text and its first 20,000 characters are both cut
+    /// at 512 tokens and embed alike, and a run of words inside those tokens
+    /// still changes the vector (feature-70 spec T1-4). The run is 25 words
+    /// starting near the 1,200th character rather than the single word of the
+    /// feature-70 spec's section 11: one word is not sure to move a CLS-pooled
+    /// vector past the 0.9999 bound.
+    #[test]
+    #[ignore] // requires model download (~130 MB)
+    fn fastembed_cut_keeps_the_vector_of_real_text_bge_small() -> Result<()> {
+        let mut p = FastEmbedProvider::new(ModelChoice::BgeSmallEnV15)?;
+        let long = long_english_text(300_000);
+        let head = truncate_to_chars(&long, 20_000);
+        for (name, text) in [("long", long.as_str()), ("head", head)] {
+            let enc = p
+                .model
+                .tokenizer
+                .encode(truncate_to_chars(text, FASTEMBED_MAX_INPUT_CHARS), true)
+                .map_err(anyhow::Error::msg)?;
+            assert!(
+                enc.len() == 512 && !enc.get_overflowing().is_empty(),
+                "{name}: {} tokens, overflow {}",
+                enc.len(),
+                enc.get_overflowing().len()
+            );
+        }
+
+        // The words of `long` (it is ASCII, so byte offsets are char offsets).
+        let mut words = Vec::new();
+        let mut start = None;
+        for (i, c) in long.char_indices() {
+            match (c.is_ascii_alphabetic(), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    words.push(s..i);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        let first = words
+            .iter()
+            .position(|w| w.start >= 1_200)
+            .expect("a word after the 1,200th character");
+        let replaced = &words[first..first + 25];
+        assert!(replaced[0].start < 1_600, "{:?}", replaced[0]);
+        const OTHER: [&str; 5] = ["volcano", "glacier", "quartz", "harbour", "meadow"];
+        let mut changed = String::with_capacity(long.len() + 256);
+        let mut at = 0;
+        for (k, w) in replaced.iter().enumerate() {
+            changed.push_str(&long[at..w.start]);
+            changed.push_str(OTHER[k % OTHER.len()]);
+            at = w.end;
+        }
+        let end = changed.len();
+        changed.push_str(&long[at..]);
+        let before_end = p
+            .model
+            .tokenizer
+            .encode(&changed[..end], true)
+            .map_err(anyhow::Error::msg)?
+            .len();
+        assert!(
+            before_end < 510,
+            "the changed words run to token {before_end}, past the 512 kept"
+        );
+
+        let v = p.embed_documents(&[long.as_str(), head, changed.as_str()])?;
+        let same = cos(&v[0], &v[1]);
+        let differ = cos(&v[2], &v[0]);
+        println!(
+            "bge-small cos(long, head) = {same}, cos(changed, long) = {differ}, changed run ends at token {before_end}"
+        );
+        assert!(same >= 0.9999, "cos(long, head) = {same}");
+        assert!(differ < 0.9999, "cos(changed, long) = {differ}");
+        Ok(())
+    }
+
+    /// The inputs from [`cut_inputs_that_fill_512_tokens`] still fill 512
+    /// tokens after the cut, for BGE-small (feature-70 spec T1-4b).
+    #[test]
+    #[ignore] // requires model download (~130 MB)
+    fn fastembed_cut_inputs_fill_512_tokens_bge_small() -> Result<()> {
+        let p = FastEmbedProvider::new(ModelChoice::BgeSmallEnV15)?;
+        check_cut_inputs_fill_512_tokens("bge-small-en-v1.5", |s| {
+            let enc = p.model.tokenizer.encode(s, true).expect("encode");
+            (enc.len(), enc.get_overflowing().len())
+        });
+        Ok(())
+    }
+
+    /// The same check as the BGE-small one above, for BGE-M3 (feature-70 spec
+    /// T1-4b). The nightly Windows and macOS legs skip this test through the
+    /// `SKIP` list in `.github/workflows/nightly.yml`; a skip matches a
+    /// substring and no existing entry contains this name, so it needs a line
+    /// of its own.
+    #[test]
+    #[ignore] // requires BGE-M3 download (~2.3 GB)
+    fn fastembed_cut_inputs_fill_512_tokens_bge_m3() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let p = FastEmbedProvider::new(ModelChoice::BgeM3)?;
+        check_cut_inputs_fill_512_tokens("bge-m3", |s| {
+            let enc = p.model.tokenizer.encode(s, true).expect("encode");
+            (enc.len(), enc.get_overflowing().len())
+        });
+        Ok(())
+    }
+
+    /// For bge-reranker-v2-m3, a short query paired with cut English or cut
+    /// Japanese still fills 512 tokens (feature-70 spec T1-4b). The nightly
+    /// Windows and macOS legs skip this test through the `SKIP` list in
+    /// `.github/workflows/nightly.yml`; a skip matches a substring and no
+    /// existing entry contains this name, so it needs a line of its own.
+    #[test]
+    #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
+    fn fastembed_cut_inputs_fill_512_tokens_reranker_bge_v2_m3() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let model = load_text_rerank(RerankerModel::BGERerankerV2M3)?;
+        let query = "where does the answer live?";
+        for (kind, text) in cut_inputs_that_fill_512_tokens()
+            .into_iter()
+            .filter(|(kind, _)| matches!(*kind, "english" | "japanese"))
+        {
+            let enc = model
+                .tokenizer
+                .encode(
+                    (query, truncate_to_chars(&text, FASTEMBED_MAX_INPUT_CHARS)),
+                    true,
+                )
+                .map_err(anyhow::Error::msg)?;
+            let (n, overflow) = (enc.len(), enc.get_overflowing().len());
+            println!("bge-reranker-v2-m3 {kind}: {n} tokens (overflow: {overflow})");
+            assert!(
+                n == 512 && overflow > 0,
+                "bge-reranker-v2-m3 {kind}: the cut pair gave {n} tokens (overflow: {overflow}), not 512 with an overflow"
+            );
+        }
+        Ok(())
+    }
+
+    /// The reranker scores a 300,000-character candidate like its first 20,000
+    /// characters, as both are cut to the same 512 tokens (feature-70 spec
+    /// T1-6). The nightly Windows and macOS legs skip this test through the
+    /// `SKIP` list in `.github/workflows/nightly.yml`; a skip matches a
+    /// substring and no existing entry contains this name, so it needs a line
+    /// of its own.
+    #[test]
+    #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
+    fn reranker_scores_a_cut_candidate_like_its_head() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let mut r = Reranker::try_new(RerankerChoice::BgeV2M3)?.expect("reranker should be Some");
+        let long = long_english_text(300_000);
+        let head = truncate_to_chars(&long, 20_000);
+        let candidates = vec![
+            (1i64, mk_with_context(&long, None)),
+            (2i64, mk_with_context(head, None)),
+        ];
+        let out = r.rerank_candidates_with_ids("where does the answer live?", candidates, 2)?;
+        assert_eq!(out.len(), 2);
+        let score = |id: i64| {
+            out.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| s.score)
+                .expect("both candidates come back")
+        };
+        let (a, b) = (score(1), score(2));
+        println!("bge-reranker-v2-m3 score(long) = {a}, score(head) = {b}");
+        assert!(
+            (a - b).abs() <= 1e-3,
+            "score(long) = {a}, score(head) = {b}"
+        );
+        Ok(())
     }
 
     #[test]
