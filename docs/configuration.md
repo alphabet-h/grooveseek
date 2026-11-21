@@ -125,7 +125,9 @@ max_chunk_chars = 3500
 # to several times the file, and raising the file cap alone keeps the zip-bomb
 # check in place. A value above the default is announced once with a warning:
 # a file is held in memory whole while it is indexed (as several copies of its
-# text, a few times its size in all), an allocation failure aborts the process
+# text: on Windows each extra byte of a text file took about 9 more bytes of
+# committed memory, so a 1 GiB text file needs about 9 GB more than a 50 MiB
+# one), an allocation failure aborts the process
 # instead of skipping the file, and PDF and .xlsx (v1.23.0+) extraction still
 # stop after 120 s (for .xlsx, checked while its entries are inflated, while
 # its sheets are matched to their parts, and at each cell and sheet; opening
