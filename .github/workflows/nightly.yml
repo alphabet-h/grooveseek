@@ -282,6 +282,8 @@ jobs:
         #                                         (reranker ~2.3 GB、feature-70)
         #   - reranker_scores_a_cut_candidate_like_its_head
         #                                         (reranker ~2.3 GB、feature-70)
+        #   - reranker_model_batches_score_like_one_batch
+        #                                         (reranker ~2.3 GB、kuriya 921)
         # 理由:
         #   (a) windows-latest / macos-latest の空きディスクは公称 14 GB で、
         #       4.6 GB のモデル展開はビルド領域を圧迫する
@@ -317,6 +319,7 @@ jobs:
                   --skip fastembed_cut_inputs_fill_512_tokens_bge_m3
                   --skip fastembed_cut_inputs_fill_512_tokens_reranker_bge_v2_m3
                   --skip reranker_scores_a_cut_candidate_like_its_head
+                  --skip reranker_model_batches_score_like_one_batch
                   --skip eval_japanese_rules_docx'
           else
             SKIP=''

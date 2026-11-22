@@ -4256,6 +4256,127 @@ mod tests {
         Ok(())
     }
 
+    /// 40 inputs of mixed length (kuriya 921, T-7 / T-8): English
+    /// [`long_english_text`] of `150 + 97 * i` characters for even `i` and
+    /// Japanese of `120 + 61 * i` characters for odd `i` (a fixed cycle of real
+    /// sentences through [`text_of_chars`], starting at a different sentence per
+    /// input), so a slice of 32 texts and the single texts pad to different
+    /// lengths and several of the Japanese ones reach 512 tokens.
+    fn mixed_length_inputs() -> Vec<String> {
+        const JA: [&str; 5] = [
+            "索引は文書の各チャンクを見出しの経路と一緒に保持します。",
+            "検索は答えのある節を返すので、読み手はファイル全体を開かずに文脈を得られます。",
+            "モデルは文章をベクトルに変え、近いものから順に並べます。",
+            "設定ファイルを変えたら、索引を作り直してください。",
+            "日本語の本文は形態素ではなく文字の並びとして扱われます。",
+        ];
+        (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    long_english_text(150 + 97 * i)
+                } else {
+                    text_of_chars(120 + 61 * i, |k| JA[(k + i) % JA.len()].to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// bge-small embeds the 40 texts of [`mixed_length_inputs`] alike one at a
+    /// time, in calls of at most 32 texts (what [`FastEmbedProvider`] now makes),
+    /// and in one call of all 40 (how a call was made before kuriya 921): the
+    /// batches pad to different lengths, which the attention mask hides, so the
+    /// vectors differ only by floating-point noise (spec §9 T-7).
+    #[test]
+    #[ignore] // requires model download (~130 MB)
+    fn fastembed_calls_of_32_texts_embed_like_one_at_a_time_bge_small() -> Result<()> {
+        let mut p = FastEmbedProvider::new(ModelChoice::BgeSmallEnV15)?;
+        let texts = mixed_length_inputs();
+        let all: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut single = Vec::with_capacity(all.len());
+        for &t in &all {
+            let v = p
+                .embed_documents(&[t])?
+                .pop()
+                .expect("one vector for one text");
+            single.push(v);
+        }
+        let sliced = p.embed_documents(&all)?;
+        let whole = p.model.embed_batch(&all, 256)?;
+        assert_eq!(sliced.len(), all.len());
+        assert_eq!(whole.len(), all.len());
+        let min_cos = |a: &[Vec<f32>], b: &[Vec<f32>]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| cos(x, y))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let single_sliced = min_cos(&single, &sliced);
+        let sliced_whole = min_cos(&sliced, &whole);
+        let single_whole = min_cos(&single, &whole);
+        println!(
+            "bge-small min cos: single/sliced = {single_sliced}, sliced/whole = {sliced_whole}, single/whole = {single_whole}"
+        );
+        assert!(single_sliced >= 0.9999, "single/sliced = {single_sliced}");
+        assert!(sliced_whole >= 0.9999, "sliced/whole = {sliced_whole}");
+        assert!(single_whole >= 0.9999, "single/whole = {single_whole}");
+        Ok(())
+    }
+
+    /// bge-reranker-v2-m3 scores the 40 pairs of [`mixed_length_inputs`] in
+    /// model batches of [`RERANK_MODEL_BATCH`] (through the real
+    /// [`RerankModel::rerank_slice`] of `TextRerank`) like one batch of 40, up to
+    /// 1e-3 per score, and in the same order wherever two neighbours of the
+    /// one-batch order are more than 2e-3 apart (spec §9 T-8). The nightly
+    /// Windows and macOS legs skip this test through the `SKIP` list in
+    /// `.github/workflows/nightly.yml`; a skip matches a substring and no
+    /// existing entry contains this name, so it needs a line of its own.
+    #[test]
+    #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
+    fn reranker_model_batches_score_like_one_batch() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let mut m = load_text_rerank(RerankerModel::BGERerankerV2M3)?;
+        let query = "where does the index keep the heading path?";
+        let texts = mixed_length_inputs();
+        let docs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut batched = RerankModel::rerank_slice(&mut m, query, &docs)?;
+        let mut whole: Vec<(usize, f32)> = m
+            .rerank(query, &docs, false, Some(docs.len()))?
+            .into_iter()
+            .map(|r| (r.index, r.score))
+            .collect();
+        batched.sort_by_key(|(i, _)| *i);
+        whole.sort_by_key(|(i, _)| *i);
+        assert_eq!(
+            batched.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..docs.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            whole.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..docs.len()).collect::<Vec<_>>()
+        );
+        let max_diff = batched
+            .iter()
+            .zip(&whole)
+            .map(|((_, a), (_, b))| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mut order: Vec<usize> = (0..docs.len()).collect();
+        order.sort_by(|&a, &b| whole[b].1.total_cmp(&whole[a].1));
+        let mut swapped = Vec::new();
+        for pair in order.windows(2) {
+            let (hi, lo) = (pair[0], pair[1]);
+            if whole[hi].1 - whole[lo].1 > 2e-3 && batched[hi].1 <= batched[lo].1 {
+                swapped.push((hi, lo));
+            }
+        }
+        println!(
+            "bge-reranker-v2-m3 max score diff (batches of {RERANK_MODEL_BATCH} vs one of {}) = {max_diff}, swapped = {swapped:?}",
+            docs.len()
+        );
+        assert!(max_diff <= 1e-3, "max score diff = {max_diff}");
+        assert!(swapped.is_empty(), "order swapped: {swapped:?}");
+        Ok(())
+    }
+
     #[test]
     fn truncate_to_chars_cuts_on_a_char_boundary_and_leaves_short_text_alone() {
         let ascii = "x".repeat(9000);
