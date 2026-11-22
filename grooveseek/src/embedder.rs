@@ -1641,10 +1641,21 @@ fn rerank_document_weight(r: &SearchResult) -> usize {
     }
 }
 
-/// The most query-document pairs handed to one reranker call: fastembed's own
-/// batch for `rerank` with `batch_size = None`, so its batches inside a call
-/// break where they did before the calls were sliced.
+/// The most query-document pairs groove hands to one reranker call (a slice).
+/// Together with [`FASTEMBED_MAX_CHARS_PER_CALL`] it decides where the
+/// candidates are cut into calls, which bounds the tokenizer's memory per call.
+/// Inside a call, fastembed runs the model (one ONNX run) on
+/// [`RERANK_MODEL_BATCH`] pairs at a time, and that batch is what sets the
+/// memory peak (kuriya 921). The slice stays at 256 so its contract does not
+/// change.
 const RERANK_SLICE_MAX_ITEMS: usize = 256;
+
+/// The most query-document pairs fastembed runs through the reranker model at
+/// once (kuriya 921). With pairs of 512 tokens, 50 pairs committed 3.9 GB and
+/// 160 pairs 8.4 GB in one run (Windows), about 40 MB per pair. fastembed keeps
+/// only the scores of each batch and drops the model's outputs before the next
+/// one, so the peak is set by one batch.
+const RERANK_MODEL_BATCH: usize = 32;
 
 /// The one call [`Reranker`] makes of its model: score each document against
 /// the query, answering (index into the documents, score) pairs in any order.
@@ -1654,13 +1665,25 @@ trait RerankModel: Send + Sync {
     fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>>;
 }
 
+/// Decide in one place the `batch_size` handed to `TextRerank::rerank`. The
+/// call itself is a closure so the tests can see the value that reaches it.
+fn rerank_in_model_batches(
+    query: &str,
+    documents: &[&str],
+    rerank: impl FnOnce(&str, &[&str], Option<usize>) -> Result<Vec<(usize, f32)>>,
+) -> Result<Vec<(usize, f32)>> {
+    rerank(query, documents, Some(RERANK_MODEL_BATCH))
+}
+
 impl RerankModel for TextRerank {
     fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>> {
-        Ok(self
-            .rerank(query, documents, false, None)?
-            .into_iter()
-            .map(|r| (r.index, r.score))
-            .collect())
+        rerank_in_model_batches(query, documents, |q, d, b| {
+            Ok(self
+                .rerank(q, d, false, b)?
+                .into_iter()
+                .map(|r| (r.index, r.score))
+                .collect())
+        })
     }
 }
 
@@ -1696,7 +1719,8 @@ fn load_text_rerank(model: RerankerModel) -> Result<TextRerank> {
 /// One call of the model gets at most [`RERANK_SLICE_MAX_ITEMS`] pairs and at
 /// most [`FASTEMBED_MAX_CHARS_PER_CALL`] characters, summed over the pairs with
 /// the query counted once per pair (fastembed tokenizes it with each
-/// document).
+/// document). Within that call, one run of the model (ONNX) gets at most
+/// [`RERANK_MODEL_BATCH`] pairs.
 pub struct Reranker {
     model: Box<dyn RerankModel>,
     #[allow(dead_code)] // choice は model_id ログ用に保持
@@ -3841,6 +3865,24 @@ mod tests {
             .expect("rerank");
         assert!(out.is_empty());
         assert!(rerank_call_sizes(&calls).is_empty());
+    }
+
+    /// (kuriya 921) [`rerank_in_model_batches`] hands fastembed's `rerank` a batch
+    /// of [`RERANK_MODEL_BATCH`] pairs, even for a slice of fewer pairs, and returns
+    /// its (index, score) pairs as they came.
+    #[test]
+    fn text_rerank_runs_the_model_in_batches_of_at_most_32() -> Result<()> {
+        let docs = ["a", "b", "c"];
+        let mut seen = None;
+        let out = rerank_in_model_batches("q", &docs, |q, d, b| {
+            seen = Some((q.to_string(), d.len(), b));
+            Ok(vec![(2, 0.5), (0, 0.1)])
+        })?;
+        assert_eq!(seen, Some(("q".to_string(), 3, Some(RERANK_MODEL_BATCH))));
+        assert_eq!(out, vec![(2, 0.5), (0, 0.1)]);
+        let b = RERANK_MODEL_BATCH;
+        assert!((1..=32).contains(&b), "{b}");
+        Ok(())
     }
 
     #[test]
