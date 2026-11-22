@@ -716,8 +716,8 @@ mod tests {
     /// - up to rustc 1.99: `<target>/<profile>/deps/<name>-<hash>.exe`
     /// - from rustc 1.100: `<target>/<profile>/build/<pkg>/<hash>/out/<name>-<hash>.exe`
     ///
-    /// Both put the profile directory right above a directory named `deps` or
-    /// `build`, so the walk anchors on that name instead of counting levels;
+    /// Both put the profile directory right above a `deps/` or `build/`
+    /// directory, so the walk anchors on that name instead of counting levels;
     /// `CARGO_TARGET_DIR` only moves `<target>`, which the walk never names.
     /// The walk stops at the first such anchor, so it never wanders above the
     /// profile directory into an unrelated `groove.exe`; without an anchor it
