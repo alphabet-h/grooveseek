@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.24.3] - 2026-11-22
+
 ### Fixed
 
 - **Indexing a very large `.txt` (or any huge chunk) within the default `max_text_file_size` no longer runs out of memory in the tokenizer.** FastEmbed tokenized a whole chunk before cutting it to the model's 512 tokens, so one 50 MiB text file took a working set of about 5 GB and a larger one could abort the process. Inputs to FastEmbed's embedding model and reranker are now cut to 262,144 characters before tokenizing, and one call to FastEmbed is given at most 2 Mi characters in all. Real text reaches 512 tokens long before that point, so it keeps the same vectors (up to floating-point noise where large inputs are now grouped into calls differently). A body can embed differently if it is made of long runs the tokenizer collapses into one unknown token (such as a hex dump with no spaces or punctuation), or if it is almost all whitespace or control characters. On Windows, indexing a 50 MiB text file with `bge-m3` now peaks at about 2.1 GB of committed memory instead of about 6.1 GB. Raising `max_text_file_size` still costs memory: a file being indexed is held as several copies of its text, and on Windows each extra byte of a text file cost about 9 more bytes of committed memory, so a 1 GiB text file would need about 9 GB more than a 50 MiB one (estimated from runs on 50 MiB and 128 MiB of English text; 1 GiB was not measured) (see the warning in `docs/configuration.md`) (kuriya 797).
@@ -7060,7 +7062,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.24.2...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.24.3...HEAD
+[1.24.3]: https://github.com/alphabet-h/grooveseek/compare/v1.24.2...v1.24.3
 [1.24.2]: https://github.com/alphabet-h/grooveseek/compare/v1.24.1...v1.24.2
 [1.24.1]: https://github.com/alphabet-h/grooveseek/compare/v1.24.0...v1.24.1
 [1.24.0]: https://github.com/alphabet-h/grooveseek/compare/v1.23.0...v1.24.0
