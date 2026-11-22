@@ -6840,7 +6840,7 @@ Used by:
 - fastrand 2.4.1 (https://github.com/smol-rs/fastrand)
 - flate2 1.1.9 (https://github.com/rust-lang/flate2-rs)
 - fnv 1.0.7 (https://github.com/servo/rust-fnv)
-- form_urlencoded 1.2.2 (https://github.com/servo/rust-url)
+- form_urlencoded 1.2.3 (https://github.com/servo/rust-url)
 - getopts 0.2.24 (https://github.com/rust-lang/getopts)
 - hashbrown 0.16.1 (https://github.com/rust-lang/hashbrown)
 - hashbrown 0.17.0 (https://github.com/rust-lang/hashbrown)
@@ -6907,7 +6907,7 @@ Used by:
 - unicode-segmentation 1.13.2 (https://github.com/unicode-rs/unicode-segmentation)
 - unicode-width 0.2.2 (https://github.com/unicode-rs/unicode-width)
 - ureq 2.12.1 (https://github.com/algesten/ureq)
-- url 2.5.8 (https://github.com/servo/rust-url)
+- url 2.5.9 (https://github.com/servo/rust-url)
 - uuid 1.23.1 (https://github.com/uuid-rs/uuid)
 
 ```text

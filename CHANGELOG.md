@@ -18,6 +18,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 - **Indexing a file of many long chunks with `bge-small-en-v1.5`, and reranking many candidates, no longer peaks at 10 GB or more of memory.** FastEmbed pads the texts of a batch to the longest one in it, so a single 512-token chunk made a whole 256-text batch 512 tokens long. groove now hands FastEmbed at most 32 texts per call, and the reranker runs its model on at most 16 pairs at a time. On Windows, indexing a file of 256 chunks of 512 tokens with `bge-small-en-v1.5` peaks at about 2.5 GB instead of about 10.2 GB, in about the same time; a reranked search over 160 candidates at about 2.8 GB instead of about 8.4 GB, and about 15% slower. Vectors are unchanged up to floating-point noise, so existing indexes do not need rebuilding (kuriya 921).
 
+### Security
+
+- **url 2.5.8 → 2.5.9 (form_urlencoded 1.2.2 → 1.2.3) for RUSTSEC-2026-0592** (a stack
+  overflow in `Url::origin()` on nested `blob:` URLs). `Cargo.lock` only; url is reached through
+  `reqwest`, `ureq` and `tao`, and groove's own code does not call `Url::origin()`.
+  `THIRD-PARTY-LICENSES.md` was regenerated with cargo-about 0.9.2 for the new versions
+  (kuriya 924).
+
 ## [1.24.3] - 2026-11-22
 
 ### Fixed
