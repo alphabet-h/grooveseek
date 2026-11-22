@@ -307,6 +307,11 @@ jobs:
         #       event が来ない。watcher の範囲外と決めた仕様どおりの失敗で、
         #       2026-10-28 から ubuntu leg を毎晩赤にしていた。手で調べる時は
         #       `cargo test --test watcher_link_replaces_file -- --ignored`)
+        #
+        # `--no-fail-fast` (kuriya 914): 無いと最初に落ちた test binary で
+        # cargo が止まり、後ろの binary の ignored tests が走らないまま赤になる
+        # (groove-tray の e2e が落ちて、後続の ignored tests が走っていなかった)。
+        # 全 binary を走らせ、落ちたものを全部並べてから赤にする。
         shell: bash
         run: |
           KNOWN='--skip a_second_name_would_drop_the_row_only_if_an_event_reached_the_watcher'
@@ -325,7 +330,7 @@ jobs:
             SKIP=''
           fi
           # Unquoted on purpose: the newlines above are argument separators.
-          cargo test --features test-helpers -- --include-ignored $KNOWN $SKIP
+          cargo test --no-fail-fast --features test-helpers -- --include-ignored $KNOWN $SKIP
 
       # BU-25: the benches under `benches/` were compiled by every PR
       # (`cargo clippy --all-targets`, twice, so the `heavy-bench` halves are

@@ -597,8 +597,10 @@ mod au30_tests {
             .expect_err("--with-tray must be rejected in a test environment");
 
         // Pin *why* it was rejected. On Windows the test binary lives in
-        // `target/debug/deps/`, so the `groove-tray.exe` sibling is one
-        // directory up and the preflight reports it missing; elsewhere the
+        // `target/debug/deps/` (up to rustc 1.99) or
+        // `target/debug/build/<pkg>/<hash>/out/` (from rustc 1.100, kuriya 914),
+        // never next to `groove-tray.exe` in `target/debug/`, so the
+        // preflight reports it missing; elsewhere the
         // whole flag is unsupported. Without this, the test would keep passing
         // if the rejection moved to some unrelated cause.
         let msg = err.to_string();

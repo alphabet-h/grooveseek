@@ -26,6 +26,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `THIRD-PARTY-LICENSES.md` was regenerated with cargo-about 0.9.2 for the new versions
   (kuriya 924).
 
+### Internal
+
+- **The groove-tray end-to-end stop test finds `groove.exe` again under Rust 1.100.0, and the nightly ignored-tests step no longer stops at the first failing test binary.** From Rust 1.100.0 cargo places test binaries in `target/<profile>/build/<pkg>/<hash>/out/` instead of `target/<profile>/deps/`, so the test helper that walked three directories up from the test binary no longer reached `target/<profile>/groove.exe` and the test panicked. The helper now goes to the directory above the nearest `deps` or `build` directory, which is the profile directory in both layouts. The nightly step now passes `--no-fail-fast`, because that one failure had kept the ignored tests of every later test binary from running on the Windows leg. No shipped behaviour changed (kuriya 914).
+
 ## [1.24.3] - 2026-11-22
 
 ### Fixed

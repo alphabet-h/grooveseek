@@ -709,14 +709,36 @@ mod tests {
     }
 
     /// `groove` lives in a sibling package, so `CARGO_BIN_EXE_` is unavailable.
-    /// Walk up from the test binary (`target/<profile>/deps/`) to the profile
-    /// directory and look for it there.
+    /// Walk up from the test binary to the profile directory
+    /// (`<target>/<profile>/`) and look for it there. Where the test binary
+    /// sits depends on the toolchain (kuriya 914):
+    ///
+    /// - up to rustc 1.99: `<target>/<profile>/deps/<name>-<hash>.exe`
+    /// - from rustc 1.100: `<target>/<profile>/build/<pkg>/<hash>/out/<name>-<hash>.exe`
+    ///
+    /// Both put the profile directory right above a `deps/` or `build/`
+    /// directory, so the walk anchors on that name instead of counting levels;
+    /// `CARGO_TARGET_DIR` only moves `<target>`, which the walk never names.
+    /// The walk stops at the first such anchor, so it never wanders above the
+    /// profile directory into an unrelated `groove.exe`; without an anchor it
+    /// falls back to the three nearest directories, as before.
     fn locate_grooveseek() -> Option<std::path::PathBuf> {
         let exe = std::env::current_exe().ok()?;
-        exe.ancestors().skip(1).take(3).find_map(|dir| {
+        let in_dir = |dir: &std::path::Path| {
             let candidate = dir.join("groove.exe");
             candidate.is_file().then_some(candidate)
-        })
+        };
+        let dirs = exe.ancestors().skip(1);
+        let anchor = dirs.clone().find(|dir| {
+            matches!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("deps" | "build")
+            )
+        });
+        match anchor.and_then(std::path::Path::parent) {
+            Some(profile) => in_dir(profile),
+            None => dirs.take(3).find_map(in_dir),
+        }
     }
 }
 
