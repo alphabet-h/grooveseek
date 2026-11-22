@@ -78,6 +78,9 @@ impl ModelChoice {
     /// (kuriya 671) BGE-M3 は 32 x 512 token の batch で private bytes が約 3 GB から
     /// 約 5 GB に跳ねた。8 では約 2.5 GB で頭打ちになり、1 chunk あたりの時間は
     /// 32 と変わらなかった (起票時の実測)。
+    ///
+    /// BGE-small の 256 は fastembed に渡す値で、1 回の呼び出しは
+    /// [`embed_in_slices`] が [`FASTEMBED_MAX_ITEMS_PER_CALL`] 本までに切る (kuriya 921)。
     pub fn batch_size(self) -> usize {
         match self {
             Self::BgeSmallEnV15 => 256,
@@ -352,6 +355,12 @@ const FASTEMBED_MAX_INPUT_CHARS: usize = 256 * 1024;
 /// [`FASTEMBED_MAX_INPUT_CHARS`] fit, so a reranker pair always does.
 const FASTEMBED_MAX_CHARS_PER_CALL: usize = 8 * FASTEMBED_MAX_INPUT_CHARS;
 
+/// The most texts handed to one fastembed embedding call (kuriya 921). fastembed
+/// pads every text of a batch to the longest one in it, and the attention of one
+/// ONNX run grows with the texts times that length squared: 256 texts of 512
+/// tokens committed about 10.2 GB with bge-small, 32 about 1.4 GB.
+const FASTEMBED_MAX_ITEMS_PER_CALL: usize = 32;
+
 /// Where a list of inputs with these `weights` is cut into model calls: one
 /// greedy pass that closes the current slice when the next input would take
 /// it past `max_items.max(1)` inputs or past `max_weight` in summed weight. An
@@ -383,9 +392,15 @@ fn slice_bounds(
 }
 
 /// Embed `texts` one slice at a time, appending only the vectors. A slice holds
-/// at most `batch` texts and, beyond the count, at most
-/// [`FASTEMBED_MAX_CHARS_PER_CALL`] characters summed over its texts; where it
-/// is cut is [`slice_bounds`]'s call.
+/// at most `batch` texts or [`FASTEMBED_MAX_ITEMS_PER_CALL`], whichever is
+/// fewer, and, beyond the count, at most [`FASTEMBED_MAX_CHARS_PER_CALL`]
+/// characters summed over its texts; where it is cut is [`slice_bounds`]'s call.
+///
+/// (kuriya 921) The count cap bounds the attention of one ONNX run: fastembed
+/// pads a batch to its longest text, so one 512-token text in a slice of 256
+/// short ones made the whole slice 512 tokens long and peaked near 10 GB with
+/// bge-small. Its [`ModelChoice::batch_size`] of 256 stays what fastembed is given; a slice of
+/// at most 32 texts is one batch inside fastembed.
 ///
 /// (kuriya 671) fastembed's `TextEmbedding::embed` runs every batch of its
 /// input first and keeps each batch's raw session outputs (the token-level
@@ -404,7 +419,11 @@ fn embed_in_slices(
         .map(|t| t.chars().take(FASTEMBED_MAX_CHARS_PER_CALL + 1).count())
         .collect();
     let mut embeddings = Vec::with_capacity(texts.len());
-    for range in slice_bounds(&weights, batch, FASTEMBED_MAX_CHARS_PER_CALL) {
+    for range in slice_bounds(
+        &weights,
+        batch.min(FASTEMBED_MAX_ITEMS_PER_CALL),
+        FASTEMBED_MAX_CHARS_PER_CALL,
+    ) {
         let slice = &texts[range];
         let vectors = embed_slice(slice)?;
         anyhow::ensure!(
@@ -1622,10 +1641,21 @@ fn rerank_document_weight(r: &SearchResult) -> usize {
     }
 }
 
-/// The most query-document pairs handed to one reranker call: fastembed's own
-/// batch for `rerank` with `batch_size = None`, so its batches inside a call
-/// break where they did before the calls were sliced.
+/// The most query-document pairs groove hands to one reranker call (a slice).
+/// Together with [`FASTEMBED_MAX_CHARS_PER_CALL`] it decides where the
+/// candidates are cut into calls, which bounds the tokenizer's memory per call.
+/// Inside a call, fastembed runs the model (one ONNX run) on
+/// [`RERANK_MODEL_BATCH`] pairs at a time, and that batch is what sets the
+/// memory peak (kuriya 921). The slice stays at 256 so its contract does not
+/// change.
 const RERANK_SLICE_MAX_ITEMS: usize = 256;
+
+/// The most query-document pairs fastembed runs through the reranker model at
+/// once (kuriya 921). With pairs of 512 tokens, 50 pairs committed 3.9 GB and
+/// 160 pairs 8.4 GB in one run (Windows), about 40 MB per pair. fastembed keeps
+/// only the scores of each batch and drops the model's outputs before the next
+/// one, so the peak is set by one batch.
+const RERANK_MODEL_BATCH: usize = 16;
 
 /// The one call [`Reranker`] makes of its model: score each document against
 /// the query, answering (index into the documents, score) pairs in any order.
@@ -1635,13 +1665,25 @@ trait RerankModel: Send + Sync {
     fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>>;
 }
 
+/// Decide in one place the batch size handed to `TextRerank::rerank`. The
+/// call itself is a closure so the tests can see the value that reaches it.
+fn rerank_in_model_batches(
+    query: &str,
+    documents: &[&str],
+    rerank: impl FnOnce(&str, &[&str], Option<usize>) -> Result<Vec<(usize, f32)>>,
+) -> Result<Vec<(usize, f32)>> {
+    rerank(query, documents, Some(RERANK_MODEL_BATCH))
+}
+
 impl RerankModel for TextRerank {
     fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>> {
-        Ok(self
-            .rerank(query, documents, false, None)?
-            .into_iter()
-            .map(|r| (r.index, r.score))
-            .collect())
+        rerank_in_model_batches(query, documents, |q, d, b| {
+            Ok(self
+                .rerank(q, d, false, b)?
+                .into_iter()
+                .map(|r| (r.index, r.score))
+                .collect())
+        })
     }
 }
 
@@ -1677,7 +1719,8 @@ fn load_text_rerank(model: RerankerModel) -> Result<TextRerank> {
 /// One call of the model gets at most [`RERANK_SLICE_MAX_ITEMS`] pairs and at
 /// most [`FASTEMBED_MAX_CHARS_PER_CALL`] characters, summed over the pairs with
 /// the query counted once per pair (fastembed tokenizes it with each
-/// document).
+/// document). Within that call, one run of the model (ONNX) gets at most
+/// [`RERANK_MODEL_BATCH`] pairs.
 pub struct Reranker {
     model: Box<dyn RerankModel>,
     #[allow(dead_code)] // choice は model_id ログ用に保持
@@ -3361,6 +3404,75 @@ mod tests {
         assert_eq!(vectors.len(), 9);
     }
 
+    /// (kuriya 921) bge-small's batch of 256 reaches the model as calls of at most
+    /// 32 texts; exactly 32 is one call, 33 is two, and a batch below 32 (0 counts
+    /// as 1) cuts as it did before.
+    #[test]
+    fn embed_in_slices_caps_a_call_at_32_texts() {
+        let (vectors, calls) = run_embed_in_slices(100, 256);
+        assert_eq!(calls, vec![32, 32, 32, 4]);
+        assert_eq!(
+            vectors,
+            (0..100).map(|i| vec![i as f32]).collect::<Vec<_>>()
+        );
+        assert_eq!(run_embed_in_slices(32, 256).1, vec![32]);
+        assert_eq!(run_embed_in_slices(33, 256).1, vec![32, 1]);
+        assert_eq!(run_embed_in_slices(3, 0).1, vec![1, 1, 1]);
+    }
+
+    /// (kuriya 921) [`FastEmbedProvider`] with bge-small hands the model at most 32
+    /// texts per call, for documents and for queries alike.
+    #[test]
+    fn fastembed_provider_caps_a_call_at_32_texts() {
+        let texts: Vec<String> = (0..40).map(|i| format!("d{i}")).collect();
+        let docs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        let mut p = recording_provider();
+        let vectors = p.embed_documents(&docs).expect("embed documents");
+        let sizes: Vec<usize> = p.model.seen.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![32, 8]);
+        assert_eq!(vectors.len(), 40);
+
+        let mut p = recording_provider();
+        let vectors = p.embed_queries(&docs).expect("embed queries");
+        let sizes: Vec<usize> = p.model.seen.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![32, 8]);
+        assert_eq!(vectors.len(), 40);
+    }
+
+    /// (kuriya 921) The count cap cuts where the character bound does not: 40 texts
+    /// of 32 Ki characters sum to 1.25 Mi, under [`FASTEMBED_MAX_CHARS_PER_CALL`].
+    #[test]
+    fn embed_in_slices_caps_by_count_below_the_character_bound() {
+        let text = "a".repeat(32 * 1024);
+        let texts: Vec<&str> = vec![text.as_str(); 40];
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&texts, 256, |slice| {
+            calls.push(slice.len());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed in slices");
+        assert_eq!(calls, vec![32, 8]);
+        assert_eq!(vectors.len(), 40);
+    }
+
+    /// The same values before and after the count cap of kuriya 921: the character
+    /// bound still cuts under it (spec §9 T-4b). 31 x 65,537 = 2,031,647 fits in
+    /// [`FASTEMBED_MAX_CHARS_PER_CALL`]; 32 x 65,537 = 2,097,184 does not.
+    #[test]
+    fn embed_in_slices_still_cuts_by_characters_under_the_count_cap() {
+        let text = "a".repeat(64 * 1024 + 1);
+        let texts: Vec<&str> = vec![text.as_str(); 40];
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&texts, 256, |slice| {
+            calls.push(slice.len());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed in slices");
+        assert_eq!(calls, vec![31, 9]);
+        assert_eq!(vectors.len(), 40);
+    }
+
     /// The WordPiece `max_input_chars_per_word` in BGE-small's tokenizer.json
     /// (feature-70 spec R1-2).
     const WORDPIECE_MAX_CHARS_PER_WORD: usize = 100;
@@ -3755,6 +3867,24 @@ mod tests {
         assert!(rerank_call_sizes(&calls).is_empty());
     }
 
+    /// (kuriya 921) [`rerank_in_model_batches`] hands fastembed's `rerank` a batch
+    /// of [`RERANK_MODEL_BATCH`] pairs, even for a slice of fewer pairs, and returns
+    /// its (index, score) pairs as they came.
+    #[test]
+    fn text_rerank_runs_the_model_in_batches_of_at_most_32() -> Result<()> {
+        let docs = ["a", "b", "c"];
+        let mut seen = None;
+        let out = rerank_in_model_batches("q", &docs, |q, d, b| {
+            seen = Some((q.to_string(), d.len(), b));
+            Ok(vec![(2, 0.5), (0, 0.1)])
+        })?;
+        assert_eq!(seen, Some(("q".to_string(), 3, Some(RERANK_MODEL_BATCH))));
+        assert_eq!(out, vec![(2, 0.5), (0, 0.1)]);
+        let b = RERANK_MODEL_BATCH;
+        assert!((1..=32).contains(&b), "{b}");
+        Ok(())
+    }
+
     #[test]
     #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
     fn test_bge_reranker_v2_m3_reorders_ja() {
@@ -4123,6 +4253,127 @@ mod tests {
             (a - b).abs() <= 1e-3,
             "score(long) = {a}, score(head) = {b}"
         );
+        Ok(())
+    }
+
+    /// 40 inputs of mixed length (kuriya 921, T-7 / T-8): English
+    /// [`long_english_text`] of `150 + 97 * i` characters for even `i` and
+    /// Japanese of `120 + 61 * i` characters for odd `i` (a fixed cycle of real
+    /// sentences through [`text_of_chars`], starting at a different sentence per
+    /// input), so a slice of 32 texts and the single texts pad to different
+    /// lengths and several of the Japanese ones reach 512 tokens.
+    fn mixed_length_inputs() -> Vec<String> {
+        const JA: [&str; 5] = [
+            "索引は文書の各チャンクを見出しの経路と一緒に保持します。",
+            "検索は答えのある節を返すので、読み手はファイル全体を開かずに文脈を得られます。",
+            "モデルは文章をベクトルに変え、近いものから順に並べます。",
+            "設定ファイルを変えたら、索引を作り直してください。",
+            "日本語の本文は形態素ではなく文字の並びとして扱われます。",
+        ];
+        (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    long_english_text(150 + 97 * i)
+                } else {
+                    text_of_chars(120 + 61 * i, |k| JA[(k + i) % JA.len()].to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// bge-small embeds the 40 texts of [`mixed_length_inputs`] alike one at a
+    /// time, in calls of at most 32 texts (what [`FastEmbedProvider`] now makes),
+    /// and in one call of all 40 (how a call was made before kuriya 921): the
+    /// batches pad to different lengths, which the attention mask hides, so the
+    /// vectors differ only by floating-point noise (spec §9 T-7).
+    #[test]
+    #[ignore] // requires model download (~130 MB)
+    fn fastembed_calls_of_32_texts_embed_like_one_at_a_time_bge_small() -> Result<()> {
+        let mut p = FastEmbedProvider::new(ModelChoice::BgeSmallEnV15)?;
+        let texts = mixed_length_inputs();
+        let all: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut single = Vec::with_capacity(all.len());
+        for &t in &all {
+            let v = p
+                .embed_documents(&[t])?
+                .pop()
+                .expect("one vector for one text");
+            single.push(v);
+        }
+        let sliced = p.embed_documents(&all)?;
+        let whole = p.model.embed_batch(&all, 256)?;
+        assert_eq!(sliced.len(), all.len());
+        assert_eq!(whole.len(), all.len());
+        let min_cos = |a: &[Vec<f32>], b: &[Vec<f32>]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| cos(x, y))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let single_sliced = min_cos(&single, &sliced);
+        let sliced_whole = min_cos(&sliced, &whole);
+        let single_whole = min_cos(&single, &whole);
+        println!(
+            "bge-small min cos: single/sliced = {single_sliced}, sliced/whole = {sliced_whole}, single/whole = {single_whole}"
+        );
+        assert!(single_sliced >= 0.9999, "single/sliced = {single_sliced}");
+        assert!(sliced_whole >= 0.9999, "sliced/whole = {sliced_whole}");
+        assert!(single_whole >= 0.9999, "single/whole = {single_whole}");
+        Ok(())
+    }
+
+    /// bge-reranker-v2-m3 scores the 40 pairs of [`mixed_length_inputs`] in
+    /// model batches of [`RERANK_MODEL_BATCH`] (through the real
+    /// [`RerankModel::rerank_slice`] of `TextRerank`) like one batch of 40, up to
+    /// 1e-3 per score, and in the same order wherever two neighbours of the
+    /// one-batch order are more than 2e-3 apart (spec §9 T-8). The nightly
+    /// Windows and macOS legs skip this test through the `SKIP` list in
+    /// `.github/workflows/nightly.yml`; a skip matches a substring and no
+    /// existing entry contains this name, so it needs a line of its own.
+    #[test]
+    #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
+    fn reranker_model_batches_score_like_one_batch() -> Result<()> {
+        let _guard = big_model_test_lock();
+        let mut m = load_text_rerank(RerankerModel::BGERerankerV2M3)?;
+        let query = "where does the index keep the heading path?";
+        let texts = mixed_length_inputs();
+        let docs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut batched = RerankModel::rerank_slice(&mut m, query, &docs)?;
+        let mut whole: Vec<(usize, f32)> = m
+            .rerank(query, &docs, false, Some(docs.len()))?
+            .into_iter()
+            .map(|r| (r.index, r.score))
+            .collect();
+        batched.sort_by_key(|(i, _)| *i);
+        whole.sort_by_key(|(i, _)| *i);
+        assert_eq!(
+            batched.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..docs.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            whole.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..docs.len()).collect::<Vec<_>>()
+        );
+        let max_diff = batched
+            .iter()
+            .zip(&whole)
+            .map(|((_, a), (_, b))| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mut order: Vec<usize> = (0..docs.len()).collect();
+        order.sort_by(|&a, &b| whole[b].1.total_cmp(&whole[a].1));
+        let mut swapped = Vec::new();
+        for pair in order.windows(2) {
+            let (hi, lo) = (pair[0], pair[1]);
+            if whole[hi].1 - whole[lo].1 > 2e-3 && batched[hi].1 <= batched[lo].1 {
+                swapped.push((hi, lo));
+            }
+        }
+        println!(
+            "bge-reranker-v2-m3 max score diff (batches of {RERANK_MODEL_BATCH} vs one of {}) = {max_diff}, swapped = {swapped:?}",
+            docs.len()
+        );
+        assert!(max_diff <= 1e-3, "max score diff = {max_diff}");
+        assert!(swapped.is_empty(), "order swapped: {swapped:?}");
         Ok(())
     }
 
