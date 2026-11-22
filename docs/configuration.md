@@ -20,7 +20,7 @@ reranker = "bge-v2-m3"
 # Reranking takes time in proportion to the candidates it scores: about 1.4 s
 # per candidate of 512 tokens on the machine it was measured on. A search
 # scores `limit * 5` candidates, or 50 if that is more. The model scores at
-# most 32 of them at a time, which bounds the memory it needs.
+# most 16 of them at a time, which bounds the memory it needs.
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 

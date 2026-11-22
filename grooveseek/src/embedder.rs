@@ -1655,7 +1655,7 @@ const RERANK_SLICE_MAX_ITEMS: usize = 256;
 /// 160 pairs 8.4 GB in one run (Windows), about 40 MB per pair. fastembed keeps
 /// only the scores of each batch and drops the model's outputs before the next
 /// one, so the peak is set by one batch.
-const RERANK_MODEL_BATCH: usize = 32;
+const RERANK_MODEL_BATCH: usize = 16;
 
 /// The one call [`Reranker`] makes of its model: score each document against
 /// the query, answering (index into the documents, score) pairs in any order.
