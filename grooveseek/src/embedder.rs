@@ -78,6 +78,9 @@ impl ModelChoice {
     /// (kuriya 671) BGE-M3 は 32 x 512 token の batch で private bytes が約 3 GB から
     /// 約 5 GB に跳ねた。8 では約 2.5 GB で頭打ちになり、1 chunk あたりの時間は
     /// 32 と変わらなかった (起票時の実測)。
+    ///
+    /// BGE-small の 256 は fastembed に渡す値で、1 回の呼び出しは
+    /// [`embed_in_slices`] が [`FASTEMBED_MAX_ITEMS_PER_CALL`] 本までに切る (kuriya 921)。
     pub fn batch_size(self) -> usize {
         match self {
             Self::BgeSmallEnV15 => 256,
@@ -352,6 +355,12 @@ const FASTEMBED_MAX_INPUT_CHARS: usize = 256 * 1024;
 /// [`FASTEMBED_MAX_INPUT_CHARS`] fit, so a reranker pair always does.
 const FASTEMBED_MAX_CHARS_PER_CALL: usize = 8 * FASTEMBED_MAX_INPUT_CHARS;
 
+/// The most texts handed to one fastembed embedding call (kuriya 921). fastembed
+/// pads every text of a batch to the longest one in it, and the attention of one
+/// ONNX run grows with the texts times that length squared: 256 texts of 512
+/// tokens committed about 10.2 GB with bge-small, 32 about 1.4 GB.
+const FASTEMBED_MAX_ITEMS_PER_CALL: usize = 32;
+
 /// Where a list of inputs with these `weights` is cut into model calls: one
 /// greedy pass that closes the current slice when the next input would take
 /// it past `max_items.max(1)` inputs or past `max_weight` in summed weight. An
@@ -383,9 +392,15 @@ fn slice_bounds(
 }
 
 /// Embed `texts` one slice at a time, appending only the vectors. A slice holds
-/// at most `batch` texts and, beyond the count, at most
-/// [`FASTEMBED_MAX_CHARS_PER_CALL`] characters summed over its texts; where it
-/// is cut is [`slice_bounds`]'s call.
+/// at most `batch` texts or [`FASTEMBED_MAX_ITEMS_PER_CALL`], whichever is
+/// fewer, and, beyond the count, at most [`FASTEMBED_MAX_CHARS_PER_CALL`]
+/// characters summed over its texts; where it is cut is [`slice_bounds`]'s call.
+///
+/// (kuriya 921) The count cap bounds the attention of one ONNX run: fastembed
+/// pads a batch to its longest text, so one 512-token text in a slice of 256
+/// short ones made the whole slice 512 tokens long and peaked near 10 GB with
+/// bge-small. Its `batch_size` of 256 stays what fastembed is given; a slice of
+/// at most 32 texts is one batch inside fastembed.
 ///
 /// (kuriya 671) fastembed's `TextEmbedding::embed` runs every batch of its
 /// input first and keeps each batch's raw session outputs (the token-level
@@ -404,7 +419,11 @@ fn embed_in_slices(
         .map(|t| t.chars().take(FASTEMBED_MAX_CHARS_PER_CALL + 1).count())
         .collect();
     let mut embeddings = Vec::with_capacity(texts.len());
-    for range in slice_bounds(&weights, batch, FASTEMBED_MAX_CHARS_PER_CALL) {
+    for range in slice_bounds(
+        &weights,
+        batch.min(FASTEMBED_MAX_ITEMS_PER_CALL),
+        FASTEMBED_MAX_CHARS_PER_CALL,
+    ) {
         let slice = &texts[range];
         let vectors = embed_slice(slice)?;
         anyhow::ensure!(
@@ -3359,6 +3378,75 @@ mod tests {
                 .all(|call| call.iter().sum::<usize>() <= CALL)
         );
         assert_eq!(vectors.len(), 9);
+    }
+
+    /// (kuriya 921) bge-small's batch of 256 reaches the model as calls of at most
+    /// 32 texts; exactly 32 is one call, 33 is two, and a batch below 32 (0 counts
+    /// as 1) cuts as it did before.
+    #[test]
+    fn embed_in_slices_caps_a_call_at_32_texts() {
+        let (vectors, calls) = run_embed_in_slices(100, 256);
+        assert_eq!(calls, vec![32, 32, 32, 4]);
+        assert_eq!(
+            vectors,
+            (0..100).map(|i| vec![i as f32]).collect::<Vec<_>>()
+        );
+        assert_eq!(run_embed_in_slices(32, 256).1, vec![32]);
+        assert_eq!(run_embed_in_slices(33, 256).1, vec![32, 1]);
+        assert_eq!(run_embed_in_slices(3, 0).1, vec![1, 1, 1]);
+    }
+
+    /// (kuriya 921) [`FastEmbedProvider`] with bge-small hands the model at most 32
+    /// texts per call, for documents and for queries alike.
+    #[test]
+    fn fastembed_provider_caps_a_call_at_32_texts() {
+        let texts: Vec<String> = (0..40).map(|i| format!("d{i}")).collect();
+        let docs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        let mut p = recording_provider();
+        let vectors = p.embed_documents(&docs).expect("embed documents");
+        let sizes: Vec<usize> = p.model.seen.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![32, 8]);
+        assert_eq!(vectors.len(), 40);
+
+        let mut p = recording_provider();
+        let vectors = p.embed_queries(&docs).expect("embed queries");
+        let sizes: Vec<usize> = p.model.seen.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![32, 8]);
+        assert_eq!(vectors.len(), 40);
+    }
+
+    /// (kuriya 921) The count cap cuts where the character bound does not: 40 texts
+    /// of 32 Ki characters sum to 1.25 Mi, under [`FASTEMBED_MAX_CHARS_PER_CALL`].
+    #[test]
+    fn embed_in_slices_caps_by_count_below_the_character_bound() {
+        let text = "a".repeat(32 * 1024);
+        let texts: Vec<&str> = vec![text.as_str(); 40];
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&texts, 256, |slice| {
+            calls.push(slice.len());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed in slices");
+        assert_eq!(calls, vec![32, 8]);
+        assert_eq!(vectors.len(), 40);
+    }
+
+    /// The same values before and after the count cap of kuriya 921: the character
+    /// bound still cuts under it (spec §9 T-4b). 31 x 65,537 = 2,031,647 fits in
+    /// [`FASTEMBED_MAX_CHARS_PER_CALL`]; 32 x 65,537 = 2,097,184 does not.
+    #[test]
+    fn embed_in_slices_still_cuts_by_characters_under_the_count_cap() {
+        let text = "a".repeat(64 * 1024 + 1);
+        let texts: Vec<&str> = vec![text.as_str(); 40];
+        let mut calls = Vec::new();
+        let vectors = embed_in_slices(&texts, 256, |slice| {
+            calls.push(slice.len());
+            Ok(slice.iter().map(|_| vec![0.0]).collect())
+        })
+        .expect("embed in slices");
+        assert_eq!(calls, vec![31, 9]);
+        assert_eq!(vectors.len(), 40);
     }
 
     /// The WordPiece `max_input_chars_per_word` in BGE-small's tokenizer.json
