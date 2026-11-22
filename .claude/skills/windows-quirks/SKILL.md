@@ -1072,6 +1072,15 @@ env `VSCMD_SKIP_SENDTELEMETRY=1` で vctip.exe を起こさせない。上限で
 `.dev/knowledge/cargo-full-test-staged-line-tables.md` の「罠」1 と 6 (KB の記録。DT には無い)。
 関連: 罠 16 (全体 test の打ち方の 5 点目)
 
+## 29. commit message の先頭に BOM が入る — PowerShell 5.1 の `Set-Content -Encoding utf8` で書いた file を `git commit -F` に渡した
+
+**症状**: `git log --oneline` の subject の前に見えない文字 (端末によっては `﻿`) が付く。`git log -1 --format=%B | Format-Hex` の先頭が `EF BB BF`。
+**原因**: PS 5.1 の `-Encoding utf8` (`Set-Content` / `Out-File` / `Add-Content`) は UTF-8 **BOM 付き**で書く。git は message file の BOM を剥がさず、そのまま message に入れる。
+**正しいやり方**: message file は Write tool で書く (BOM なし)。PowerShell で書くなら `[IO.File]::WriteAllText($p, $s, (New-Object Text.UTF8Encoding $false))`。
+入ってしまったら、push 前なら BOM なしの file で `git commit --amend -F <file>` (push 後なら履歴に残る。squash merge の PR なら PR title が subject になるので main には出ない)。
+
+出典: 2026-11-03、grooveseek の AX-42 (PR #432) の branch で controller が踏んだ。push 前に amend で直した。
+
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
 上記のどれにも当てはまらない未知の Windows 固有挙動に遭遇したら、**公式 docs だけで判断せず実機 dogfood で確認する**。本 skill に集約された罠のほぼ全てが「docs 上は問題ないはずなのに実機だけ失敗する」パターンであり、静的 review (codex / subagent self-review) や CI runner (多くは非 interactive logon session) では再現・検出できない。新しい罠を発見したら `.dev/knowledge/<topic>-pitfalls.md` に追記し、本 skill にも反映すること。
