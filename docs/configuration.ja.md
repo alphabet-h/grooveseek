@@ -17,6 +17,9 @@ reranker = "bge-v2-m3"
 # `groove serve` と `groove search` の両方が読む (v0.27.0+)。1 クエリだけ変えたい
 # なら MCP ツールの `rerank` パラメータ、あるいはコマンドラインで `--reranker` を
 # 明示する (`--reranker none` でそのクエリだけ再ランクを切れる)。
+# 再ランクの時間は採点する候補の数に比例する。512 token の候補で 1 件あたり
+# 約 1.4 秒 (測った機械での値)。search が採点する候補は `limit * 5` と 50 の
+# 大きい方。モデルが 1 度に採点するのは 32 件までで、これがメモリの山を縛る。
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 

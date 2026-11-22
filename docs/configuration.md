@@ -17,6 +17,10 @@ reranker = "bge-v2-m3"
 # Read by `groove serve` and by `groove search` alike (v0.27.0+). For a single
 # query, override it with the MCP tool's `rerank` parameter, or by naming
 # `--reranker` on the command line — `--reranker none` opts that query out.
+# Reranking takes time in proportion to the candidates it scores: about 1.4 s
+# per candidate of 512 tokens on the machine it was measured on. A search
+# scores `limit * 5` candidates, or 50 if that is more. The model scores at
+# most 32 of them at a time, which bounds the memory it needs.
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 
