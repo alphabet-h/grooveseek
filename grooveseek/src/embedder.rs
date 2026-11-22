@@ -399,7 +399,7 @@ fn slice_bounds(
 /// (kuriya 921) The count cap bounds the attention of one ONNX run: fastembed
 /// pads a batch to its longest text, so one 512-token text in a slice of 256
 /// short ones made the whole slice 512 tokens long and peaked near 10 GB with
-/// bge-small. Its `batch_size` of 256 stays what fastembed is given; a slice of
+/// bge-small. Its [`ModelChoice::batch_size`] of 256 stays what fastembed is given; a slice of
 /// at most 32 texts is one batch inside fastembed.
 ///
 /// (kuriya 671) fastembed's `TextEmbedding::embed` runs every batch of its
@@ -1665,7 +1665,7 @@ trait RerankModel: Send + Sync {
     fn rerank_slice(&mut self, query: &str, documents: &[&str]) -> Result<Vec<(usize, f32)>>;
 }
 
-/// Decide in one place the `batch_size` handed to `TextRerank::rerank`. The
+/// Decide in one place the batch size handed to `TextRerank::rerank`. The
 /// call itself is a closure so the tests can see the value that reaches it.
 fn rerank_in_model_batches(
     query: &str,
